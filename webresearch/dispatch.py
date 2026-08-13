@@ -1,0 +1,106 @@
+"""Run a named browser tool. Shared by the HTTP API and the LLM agent loop."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import httpx
+
+from webresearch.extract import extract as extract_fields
+from webresearch.fetch import fetch as http_fetch
+from webresearch.parse import parse as parse_doc
+from webresearch.read import captcha_code as dump_url_captcha_code
+from webresearch.read import read as read_url
+from webresearch.search import search as web_search
+from webresearch.session import Browser
+from webresearch.types import CaptchaReport
+
+
+async def invoke(http: httpx.AsyncClient, browser: Browser, name: str, args: dict[str, Any]):
+    if name == "browser_search":
+        engine = args.get("engine") or "auto"
+        if engine not in {"auto", "google", "ddg"}:
+            engine = "auto"
+        return await web_search(args["q"], client=http, max_hits=int(args.get("max_hits", 8)), engine=engine)
+    if name == "browser_read":
+        js = args.get("js") or "auto"
+        if js not in {"auto", "always", "never"}:
+            js = "auto"
+        return await read_url(
+            args["url"],
+            client=http,
+            max_chars=int(args.get("max_chars", 8000)),
+            js=js,
+        )
+    if name == "browser_extract":
+        result = await http_fetch(args["url"], client=http)
+        return extract_fields(parse_doc(result), args.get("fields") or {"title": "title"})
+    if name == "browser_session_create":
+        session = await browser.create()
+        return {"id": session.id}
+    if name == "browser_goto":
+        js = args.get("js") or "auto"
+        return await browser.get(args["session_id"]).goto(
+            args["url"], max_chars=int(args.get("max_chars", 8000)), js=js
+        )
+    if name == "browser_open":
+        return await browser.get(args["session_id"]).open(int(args["n"]), max_chars=int(args.get("max_chars", 8000)))
+    if name == "browser_submit":
+        return await browser.get(args["session_id"]).submit(
+            int(args["n"]), args.get("fields"), max_chars=int(args.get("max_chars", 8000))
+        )
+    if name == "browser_inspect":
+        targets, challenges = browser.get(args["session_id"]).inspect()
+        return {"targets": targets, "challenges": challenges}
+    if name == "browser_frames":
+        return browser.get(args["session_id"]).frames()
+    if name == "browser_frame_source":
+        frame = browser.get(args["session_id"]).frame_source(args["ref"])
+        max_chars = int(args.get("max_chars", 20_000))
+        html = frame.html
+        return {
+            "ref": frame.ref,
+            "url": frame.url,
+            "status": frame.status,
+            "html": html[:max_chars],
+            "truncated": len(html) > max_chars,
+        }
+    if name == "browser_captcha":
+        session_id = args.get("session_id")
+        if session_id:
+            return browser.get(session_id).captcha()
+        url = args.get("url")
+        if not url:
+            raise ValueError("browser_captcha requires session_id or url")
+        page = await read_url(
+            url,
+            client=http,
+            max_chars=int(args.get("max_chars", 8000)),
+            js=args.get("js") or "auto",
+        )
+        return page.captcha or CaptchaReport(
+            present=False,
+            note="No supported CAPTCHA or bot challenge was detected.",
+            view="CAPTCHA: not detected",
+        )
+    if name == "browser_captcha_code":
+        session_id = args.get("session_id")
+        if session_id:
+            return browser.get(session_id).captcha_code()
+        url = args.get("url")
+        if not url:
+            raise ValueError("browser_captcha_code requires session_id or url")
+        return await dump_url_captcha_code(
+            url,
+            client=http,
+            js=args.get("js") or "auto",
+        )
+    if name == "browser_click":
+        return await browser.get(args["session_id"]).click(args["ref"], max_chars=int(args.get("max_chars", 8000)))
+    if name == "browser_type":
+        return await browser.get(args["session_id"]).type(
+            args["ref"], args["text"], max_chars=int(args.get("max_chars", 8000))
+        )
+    if name == "browser_back":
+        return browser.get(args["session_id"]).back()
+    raise ValueError(f"unknown tool: {name}")
