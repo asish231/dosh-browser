@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from selectolax.parser import HTMLParser
+from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 from webresearch.types import FetchResult, Kind, Meta
 
@@ -10,11 +10,12 @@ NOISE_TAGS = {
     "script",
     "style",
     "noscript",
-    "svg",
     "iframe",
     "canvas",
-    "template",
 }
+
+# Script types that carry data an agent may want (JSON-LD, Next data blobs).
+KEEP_SCRIPT_TYPES = {"application/ld+json", "application/json", "text/json"}
 
 
 @dataclass
@@ -35,6 +36,10 @@ def parse(result: FetchResult) -> Document:
         tree = HTMLParser(result.body)
         for tag in NOISE_TAGS:
             for node in tree.css(tag):
+                if tag == "script":
+                    stype = (node.attributes.get("type") or "").strip().lower()
+                    if stype in KEEP_SCRIPT_TYPES or node.attributes.get("id") == "__NEXT_DATA__":
+                        continue
                 node.decompose()
     return Document(
         url=result.final_url or result.url,

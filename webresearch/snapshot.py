@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from selectolax.parser import Node
+from selectolax.lexbor import LexborNode as Node
 
 from webresearch.content import content_root, inside_chrome
 from webresearch.forms import forms as extract_forms
@@ -9,13 +9,49 @@ from webresearch.parse import Document, meta_from
 from webresearch.types import Page
 
 CONTENT_SEL = (
-    "h1, h2, h3, h4, h5, h6, p, li, pre, blockquote, "
+    "h1, h2, h3, h4, h5, h6, p, li, pre, blockquote, table, "
     ".quote, .text, figcaption, [itemprop='reviewBody'], [itemprop='description']"
 )
 
 
 def _text(node: Node) -> str:
     return " ".join(node.text(separator=" ", strip=True).split())
+
+
+def _cell_text(node: Node) -> str:
+    return " ".join(node.text(separator=" ", strip=True).split()).replace("|", "\\|")
+
+
+def _table_md(table: Node) -> str:
+    rows: list[list[str]] = []
+    header: list[str] = []
+    for tr in table.css("tr"):
+        cells = tr.css("th, td")
+        if not cells:
+            continue
+        values = [_cell_text(cell) for cell in cells]
+        if not any(values):
+            continue
+        if not header and (tr.css_first("th") is not None or not rows):
+            header = values
+        else:
+            rows.append(values)
+    if not header and not rows:
+        return ""
+    width = max([len(header)] + [len(r) for r in rows]) if (header or rows) else 0
+    if width == 0:
+        return ""
+
+    def norm(row: list[str]) -> list[str]:
+        return (row + [""] * width)[:width]
+
+    lines: list[str] = []
+    if header:
+        lines.append("| " + " | ".join(norm(header)) + " |")
+        lines.append("| " + " | ".join(["---"] * width) + " |")
+    for row in rows:
+        lines.append("| " + " | ".join(norm(row)) + " |")
+    return "\n".join(lines)
 
 
 def _html_view(doc: Document, max_chars: int) -> tuple[str, list[str]]:
@@ -35,6 +71,13 @@ def _html_view(doc: Document, max_chars: int) -> tuple[str, list[str]]:
             if code.strip():
                 lines.append(f"```\n{code}\n```")
             continue
+        if tag == "table":
+            if node.css_first("table") is not None and node.parent is not None and node.parent.tag == "table":
+                continue
+            md = _table_md(node)
+            if md:
+                lines.append(md)
+            continue
         text = _text(node)
         if not text:
             continue
@@ -53,12 +96,18 @@ def _html_view(doc: Document, max_chars: int) -> tuple[str, list[str]]:
         if compact and compact[-1] == line:
             continue
         compact.append(line)
-    if len("\n\n".join(compact)) < 280:
-        for node in root.css("div, span, article, section"):
+    dense = len("\n\n".join(compact)) < 280
+    if dense or len("\n\n".join(compact)) < 700:
+        seen_text = set(compact)
+        min_len = 2 if dense else 40
+        for node in root.css("div, span, article, section, ul, ol, dl, figure"):
             if inside_chrome(node, stop=root):
                 continue
+            if node.css_first("p, li, h1, h2, h3, table, blockquote") is not None:
+                continue
             text = _text(node)
-            if 50 <= len(text) <= 600 and text not in compact:
+            if min_len <= len(text) <= 800 and text not in seen_text:
+                seen_text.add(text)
                 compact.append(text)
             if len("\n\n".join(compact)) > max_chars:
                 break

@@ -252,6 +252,65 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "browser_scroll",
+            "description": (
+                "Session: scroll the page (default one viewport down). Fires the scroll "
+                "event and IntersectionObserver notifications so lazy content loads."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "y": {"type": "integer", "default": 800},
+                    "x": {"type": "integer", "default": 0},
+                },
+                "required": ["session_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_query",
+            "description": (
+                "Retrieve matching ACD blocks from the current page by substring. "
+                "Use this instead of re-reading the whole page: returns block ids [bN], "
+                "text/tables/actions relevant to the term."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "term": {"type": "string"},
+                    "limit": {"type": "integer", "default": 40},
+                },
+                "required": ["session_id", "term"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_slice",
+            "description": (
+                "Read a contiguous range of ACD blocks by block id, e.g. start=b12 end=b40. "
+                "Use for pagination over long pages."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                    "limit": {"type": "integer", "default": 120},
+                },
+                "required": ["session_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "browser_extract",
             "description": "Extract fields from a URL. CSS selector or builtin: title, description, url, headings, text.",
             "parameters": {

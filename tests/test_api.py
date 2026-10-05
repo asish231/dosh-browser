@@ -6,7 +6,6 @@ from fastapi.testclient import TestClient
 
 from webresearch.server import create_app
 
-
 PARENT = b"""<!doctype html><html><body>
 <div class="g-recaptcha" data-sitekey="api-site-key"></div>
 <iframe src="/anchor" title="reCAPTCHA"></iframe>

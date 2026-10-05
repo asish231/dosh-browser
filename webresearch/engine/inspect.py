@@ -43,12 +43,18 @@ def _is_interactive(node: dict) -> bool:
     return False
 
 
-def _walk_interactive(node: dict, acc: list[dict]) -> None:
+def _collect_interactive(
+    node: dict, acc: list[tuple[dict, list[int]]], path: list[int] | None = None
+) -> None:
+    path = path or []
     if _is_interactive(node):
-        acc.append(node)
-    for child in node.get("c") or []:
+        acc.append((node, list(path)))
+    children = node.get("c") or []
+    index = 0
+    for child in children:
         if isinstance(child, dict) and child.get("t") != "#text":
-            _walk_interactive(child, acc)
+            _collect_interactive(child, acc, [*path, index])
+            index += 1
 
 
 def _role(node: dict) -> str:
@@ -114,10 +120,10 @@ def detect_challenges(html: str, url: str = "", targets: list[Target] | None = N
 
 def inspect_html(html: str, url: str = "") -> tuple[list[Target], list[Challenge]]:
     tree = html_to_tree(html)
-    nodes: list[dict] = []
-    _walk_interactive(tree, nodes)
+    nodes: list[tuple[dict, list[int]]] = []
+    _collect_interactive(tree, nodes)
     targets: list[Target] = []
-    for i, node in enumerate(nodes[:80], start=1):
+    for i, (node, path) in enumerate(nodes[:80], start=1):
         attrs = node.get("a") or {}
         role = _role(node)
         text = _text_of(node)[:120] or attrs.get("value") or attrs.get("title") or attrs.get("name") or attrs.get("aria-label") or ""
@@ -136,6 +142,7 @@ def inspect_html(html: str, url: str = "") -> tuple[list[Target], list[Challenge
                 href=urljoin(url, href) if href and not href.startswith("javascript:") else href,
                 checked=checked,
                 challenge=challenge,
+                path=path,
             )
         )
     return targets, detect_challenges(html, url, targets)
@@ -147,11 +154,11 @@ def click_html(html: str, url: str, ref: str) -> tuple[str, str | None]:
         raise ValueError(f"bad ref: {ref}")
     idx = int(ref[1:]) - 1
     tree = html_to_tree(html)
-    nodes: list[dict] = []
-    _walk_interactive(tree, nodes)
+    nodes: list[tuple[dict, list[int]]] = []
+    _collect_interactive(tree, nodes)
     if idx < 0 or idx >= len(nodes):
         raise ValueError(f"no target [{ref}]")
-    node = nodes[idx]
+    node, _path = nodes[idx]
     tag = node.get("t") or ""
     attrs = node.setdefault("a", {})
     typ = (attrs.get("type") or "").lower()
@@ -187,11 +194,11 @@ def type_html(html: str, ref: str, text: str) -> str:
         raise ValueError(f"bad ref: {ref}")
     idx = int(ref[1:]) - 1
     tree = html_to_tree(html)
-    nodes: list[dict] = []
-    _walk_interactive(tree, nodes)
+    nodes: list[tuple[dict, list[int]]] = []
+    _collect_interactive(tree, nodes)
     if idx < 0 or idx >= len(nodes):
         raise ValueError(f"no target [{ref}]")
-    node = nodes[idx]
+    node, _path = nodes[idx]
     tag = node.get("t") or ""
     attrs = node.setdefault("a", {})
     if tag not in {"input", "textarea", "select"} and (attrs.get("role") or "") != "textbox":
@@ -209,7 +216,7 @@ def agent_view_extras(
     js_ran: bool,
     js_info: dict | None = None,
 ) -> str:
-    lines = [f"ENGINE: {'quickjs' if js_ran else 'html'}"]
+    lines = [f"ENGINE: {(js_info or {}).get('engine') or ('quickjs' if js_ran else 'html')}"]
     info = js_info or {}
     if info.get("skipped_modules"):
         lines.append(

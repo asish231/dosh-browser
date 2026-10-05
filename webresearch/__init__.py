@@ -14,10 +14,10 @@ from webresearch.snapshot import snapshot
 from webresearch.tools import TOOLS
 
 __all__ = [
+    "TOOLS",
     "Browser",
     "Client",
     "Session",
-    "TOOLS",
     "ask",
     "extract",
     "fetch",

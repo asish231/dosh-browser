@@ -24,6 +24,7 @@ document.getElementById('root').textContent = 'hello from js';
 class EngineTests(unittest.TestCase):
     def test_js_mutates_dom(self):
         import asyncio
+
         import httpx
 
         async def run():

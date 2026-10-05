@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from selectolax.parser import HTMLParser, Node
+from selectolax.lexbor import LexborHTMLParser as HTMLParser
+from selectolax.lexbor import LexborNode as Node
 
 CONTENT_SELECTORS = (
     "#mw-content-text .mw-parser-output",

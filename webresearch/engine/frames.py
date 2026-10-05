@@ -186,10 +186,7 @@ def _discover_seeds(
 def _decode_data_url(url: str) -> tuple[str, str]:
     header, _, payload = url.partition(",")
     content_type = header[5:].split(";", 1)[0] or "text/plain"
-    if ";base64" in header.lower():
-        raw = base64.b64decode(payload)
-    else:
-        raw = unquote_to_bytes(payload)
+    raw = base64.b64decode(payload) if ";base64" in header.lower() else unquote_to_bytes(payload)
     return raw.decode("utf-8", errors="replace"), content_type
 
 

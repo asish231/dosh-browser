@@ -4,11 +4,17 @@ from typing import Literal
 
 import httpx
 
-from webresearch.engine.captcha import CaptchaInspection, dump_captcha_code, inspect_captcha
+from webresearch.acd import build_acd
+from webresearch.engine import chromium
+from webresearch.engine.captcha import (
+    CaptchaInspection,
+    dump_captcha_code,
+    inspect_captcha,
+)
 from webresearch.engine.frames import FrameDocument, frame_infos, load_frames
 from webresearch.engine.inspect import agent_view_extras, inspect_html
 from webresearch.engine.runtime import run_scripts
-from webresearch.fetch import fetch
+from webresearch.fetch import _impersonation_allowed, fetch
 from webresearch.parse import parse
 from webresearch.snapshot import snapshot
 from webresearch.types import CaptchaCodeDump, CaptchaReport, FetchResult, Page
@@ -28,6 +34,25 @@ def _decorate(
     targets, challenges = inspect_html(html, page.url)
     extra = agent_view_extras(targets=targets, challenges=challenges, js_ran=js_ran, js_info=js_info)
     infos = frame_infos(frames or [])
+    acd = build_acd(
+        url=page.url,
+        title=page.title,
+        html=html,
+        targets=targets,
+        links=page.links,
+        frames=infos,
+        js_info=js_info,
+    )
+    if acd.counts.get("blocks"):
+        extra += (
+            f"\nACD: {acd.counts['blocks']} blocks, {acd.counts['actions']} actions, "
+            f"{acd.counts['api']} api calls"
+        )
+    info = js_info or {}
+    if info.get("framework_data"):
+        extra += "\nFRAMEWORK_DATA: " + ", ".join(sorted(info["framework_data"].keys()))
+    if info.get("error_messages"):
+        extra += f"\nJS_ERRORS: {len(info['error_messages'])} (see acd.errors)"
     if infos:
         challenge_count = sum(1 for frame in infos if frame.challenge)
         extra += f"\nFRAMES: {len(infos)} loaded, {challenge_count} challenge frame(s)"
@@ -42,6 +67,7 @@ def _decorate(
             "and browser_captcha_code to dump widget/iframe HTML."
         )
     view = f"{page.view}\n\n{extra}".strip()
+    engine = info.get("engine") or ("quickjs" if js_ran else "html")
     return page.model_copy(
         update={
             "view": view,
@@ -51,6 +77,8 @@ def _decorate(
             "challenges": challenges,
             "frames": infos,
             "captcha": captcha,
+            "acd": acd,
+            "engine": engine,
         }
     )
 
@@ -63,8 +91,14 @@ async def read_live(
     max_links: int = 50,
     js: JsMode = "auto",
     sprite_endpoint: str = "",
+    chromium_session: chromium.ChromiumSession | None = None,
 ) -> tuple[Page, str, list[FrameDocument], CaptchaInspection]:
-    """Fetch (+ QuickJS + frames) → page model and live agent state."""
+    """Fetch (+ QuickJS + frames) → page model and live agent state.
+
+    If ``chromium_session`` is provided and the page escalates, the render is
+    done in that persistent browser (kept alive for later interactions) instead
+    of a one-shot headless render.
+    """
     result = await fetch(url, client=client)
     html = result.body
     js_info: dict | None = None
@@ -72,6 +106,20 @@ async def read_live(
     if result.kind == "html" and js != "never":
         html, js_info = await run_scripts(html, result.final_url or url, client, force=(js == "always"))
         js_ran = bool(js_info.get("ran"))
+        if chromium.should_escalate(html, js_info=js_info) and _impersonation_allowed(client):
+            rendered: tuple[str, str] | None = None
+            if chromium_session is not None:
+                try:
+                    rendered = await chromium_session.goto(result.final_url or url)
+                except Exception:
+                    rendered = None
+            if rendered is None:
+                rendered = await chromium.render(result.final_url or url)
+            if rendered:
+                html, final_url = rendered
+                js_ran = True
+                js_info = {**(js_info or {}), "engine": "chromium"}
+                result = result.model_copy(update={"final_url": final_url})
         result = result.model_copy(update={"body": html, "kind": "html", "content_type": "text/html"})
 
     frames = (

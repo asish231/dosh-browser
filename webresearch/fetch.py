@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 from urllib.parse import urlparse
 
 import httpx
@@ -12,12 +14,49 @@ DEFAULT_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
-DEFAULT_TIMEOUT = 15.0
-DEFAULT_MAX_BYTES = 2_000_000
+DEFAULT_TIMEOUT = 20.0
+DEFAULT_MAX_BYTES = 8_000_000
+DEFAULT_IMPERSONATE = os.environ.get("WR_IMPERSONATE", "chrome124")
 
 HTML_TYPES = {"text/html", "application/xhtml+xml"}
 XML_TYPES = {"text/xml", "application/xml", "application/rss+xml", "application/atom+xml"}
 JSON_TYPES = {"application/json", "application/ld+json", "text/json"}
+
+try:  # optional TLS impersonation
+    from curl_cffi import requests as _curl_requests
+except Exception:  # pragma: no cover - optional dependency
+    _curl_requests = None
+
+
+def browser_client_hints(ua: str = DEFAULT_UA, platform: str = "macOS") -> dict[str, str]:
+    """Client hints consistent with a Chrome desktop User-Agent."""
+    version = "128"
+    for token in ua.split():
+        if token.startswith("Chrome/"):
+            version = token.split("/", 1)[1].split(".", 1)[0]
+            break
+    mobile = "?1" if "Mobile" in ua else "?0"
+    return {
+        "sec-ch-ua": f'"Chromium";v="{version}", "Not;A=Brand";v="24", "Google Chrome";v="{version}"',
+        "sec-ch-ua-mobile": mobile,
+        "sec-ch-ua-platform": f'"{platform}"',
+        "upgrade-insecure-requests": "1",
+    }
+
+
+def navigate_headers(url: str) -> dict[str, str]:
+    """Sec-Fetch-* headers for a top-level document load."""
+    return {
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8,"
+            "application/signed-exchange;v=b3;q=0.7"
+        ),
+    }
 
 
 def classify(content_type: str) -> Kind:
@@ -41,8 +80,8 @@ def client_kwargs(
 ) -> dict:
     merged = {
         "User-Agent": DEFAULT_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml,application/json,text/plain;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        **browser_client_hints(),
     }
     if headers:
         merged.update(headers)
@@ -52,6 +91,12 @@ def client_kwargs(
         "headers": merged,
         "limits": httpx.Limits(max_connections=20, max_keepalive_connections=10),
     }
+    try:  # HTTP/2 when the h2 package is present
+        import h2  # noqa: F401
+
+        kwargs["http2"] = True
+    except Exception:
+        pass
     if proxy:
         kwargs["proxy"] = proxy
     return kwargs
@@ -77,22 +122,97 @@ def pretty_json(text: str) -> str:
         return text
 
 
-async def fetch(
+def _build_result(
+    *,
+    url: str,
+    final_url: str,
+    status: int,
+    content_type: str,
+    headers: dict[str, str],
+    raw: bytes,
+    truncated: bool,
+) -> FetchResult:
+    kind = classify(content_type)
+    body = decode_body(raw, content_type)
+    if kind == "json":
+        body = pretty_json(body)
+    return FetchResult(
+        url=url,
+        final_url=final_url,
+        status=status,
+        content_type=content_type,
+        headers={k.lower(): v for k, v in headers.items()},
+        kind=kind,
+        body=body,
+        truncated=truncated,
+    )
+
+
+async def _fetch_impersonated(
     url: str,
     *,
     client: httpx.AsyncClient,
-    method: str = "GET",
-    data: dict[str, str] | None = None,
-    json_body: dict | None = None,
-    headers: dict[str, str] | None = None,
-    max_bytes: int = DEFAULT_MAX_BYTES,
+    method: str,
+    data: dict[str, str] | None,
+    json_body: dict | None,
+    headers: dict[str, str] | None,
+    max_bytes: int,
+    impersonate: str,
+    timeout: float,
 ) -> FetchResult:
-    """HTTP fetch. No browser. No JS. Returns the document bytes as text."""
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise ValueError(f"unsupported url scheme: {parsed.scheme or 'missing'}")
+    merged = dict(client.headers)
+    merged.update(navigate_headers(url))
+    if headers:
+        merged.update(headers)
+    cookies = {k: v for k, v in client.cookies.items()}
+    session = _curl_requests.AsyncSession(
+        impersonate=impersonate,
+        timeout=timeout,
+        headers=merged,
+        cookies=cookies,
+    )
+    try:
+        response = await session.request(
+            method.upper(),
+            url,
+            data=data,
+            json=json_body,
+            headers=merged,
+            allow_redirects=True,
+        )
+        raw = response.content or b""
+        truncated = len(raw) > max_bytes
+        if truncated:
+            raw = raw[:max_bytes]
+        for key, value in session.cookies.items():
+            client.cookies.set(key, value)
+        return _build_result(
+            url=url,
+            final_url=str(response.url),
+            status=response.status_code,
+            content_type=response.headers.get("content-type", ""),
+            headers=dict(response.headers),
+            raw=raw,
+            truncated=truncated,
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await session.close()
 
-    req_headers = headers or None
+
+async def _fetch_httpx(
+    url: str,
+    *,
+    client: httpx.AsyncClient,
+    method: str,
+    data: dict[str, str] | None,
+    json_body: dict | None,
+    headers: dict[str, str] | None,
+    max_bytes: int,
+) -> FetchResult:
+    req_headers = dict(navigate_headers(url))
+    if headers:
+        req_headers.update(headers)
     async with client.stream(
         method.upper(),
         url,
@@ -112,21 +232,72 @@ async def fetch(
                     chunks.append(chunk[:leftover])
                 break
             chunks.append(chunk)
-
         raw = b"".join(chunks)
-        content_type = response.headers.get("content-type", "")
-        kind = classify(content_type)
-        body = decode_body(raw, content_type)
-        if kind == "json":
-            body = pretty_json(body)
-
-        return FetchResult(
+        return _build_result(
             url=url,
             final_url=str(response.url),
             status=response.status_code,
-            content_type=content_type,
-            headers={k.lower(): v for k, v in response.headers.items()},
-            kind=kind,
-            body=body,
+            content_type=response.headers.get("content-type", ""),
+            headers=dict(response.headers),
+            raw=raw,
             truncated=truncated,
         )
+
+
+def _impersonation_allowed(client: httpx.AsyncClient) -> bool:
+    """Skip impersonation for in-memory test transports."""
+    transport = getattr(client, "_transport", None)
+    if transport is None:
+        return True
+    name = type(transport).__name__
+    return name not in {"MockTransport", "ASGITransport", "WSGITransport"}
+
+
+async def fetch(
+    url: str,
+    *,
+    client: httpx.AsyncClient,
+    method: str = "GET",
+    data: dict[str, str] | None = None,
+    json_body: dict | None = None,
+    headers: dict[str, str] | None = None,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    impersonate: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> FetchResult:
+    """HTTP fetch with browser TLS impersonation when available.
+
+    Keeps the httpx client as the cookie jar / identity so the rest of the
+    engine can stay on one session, but performs the request through
+    curl_cffi so JA3/JA4, HTTP/2 and header order match a real Chrome.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"unsupported url scheme: {parsed.scheme or 'missing'}")
+
+    choice = DEFAULT_IMPERSONATE if impersonate is None else impersonate
+    if choice and _curl_requests is not None and _impersonation_allowed(client):
+        try:
+            return await _fetch_impersonated(
+                url,
+                client=client,
+                method=method,
+                data=data,
+                json_body=json_body,
+                headers=headers,
+                max_bytes=max_bytes,
+                impersonate=choice,
+                timeout=timeout,
+            )
+        except Exception:
+            # Fall back to httpx rather than failing the whole navigation.
+            pass
+    return await _fetch_httpx(
+        url,
+        client=client,
+        method=method,
+        data=data,
+        json_body=json_body,
+        headers=headers,
+        max_bytes=max_bytes,
+    )

@@ -1,20 +1,37 @@
 from __future__ import annotations
 
+import os
 import secrets
+import time
 from urllib.parse import urlencode, urlparse, urlunparse
 
 import httpx
 
-from webresearch.engine.captcha import CaptchaInspection, dump_captcha_code, inspect_captcha
+from webresearch.acd import query_acd, slice_acd
+from webresearch.engine import chromium
+from webresearch.engine.captcha import (
+    CaptchaInspection,
+    dump_captcha_code,
+    inspect_captcha,
+)
 from webresearch.engine.frames import FrameDocument, frame_infos, load_frames
 from webresearch.engine.inspect import click_html, inspect_html, type_html
 from webresearch.engine.runtime import run_scripts
 from webresearch.fetch import client_kwargs, fetch
 from webresearch.parse import parse
-from webresearch.read import page_from_html, read_live
+from webresearch.read import _decorate, read_live
 from webresearch.search import search as web_search
 from webresearch.snapshot import snapshot
-from webresearch.types import CaptchaCodeDump, CaptchaReport, Challenge, FrameInfo, Page, SearchResult, Target
+from webresearch.types import (
+    CaptchaCodeDump,
+    CaptchaReport,
+    Challenge,
+    FetchResult,
+    FrameInfo,
+    Page,
+    SearchResult,
+    Target,
+)
 
 
 class Session:
@@ -29,6 +46,10 @@ class Session:
         self.url = ""
         self.frame_documents: list[FrameDocument] = []
         self.captcha_inspection: CaptchaInspection | None = None
+        self.created_at = time.time()
+        self.last_used = self.created_at
+        self.proxy: str | None = None
+        self.chromium_session: chromium.ChromiumSession | None = None
 
     @property
     def page(self) -> Page | None:
@@ -46,13 +67,24 @@ class Session:
         return page
 
     async def goto(self, url: str, *, max_chars: int = 8000, js: str = "auto") -> Page:
+        # Lazily create a persistent Chromium session so an escalated SPA keeps
+        # one live browser across goto/click/type/scroll.
+        if self.chromium_session is None and chromium.available():
+            self.chromium_session = chromium.ChromiumSession(
+                proxy=self.proxy, headers=dict(self.client.headers)
+            )
         page, html, frames, captcha = await read_live(
             url,
             client=self.client,
             max_chars=max_chars,
             js=js,  # type: ignore[arg-type]
             sprite_endpoint=f"/v1/sessions/{self.id}/captcha/sprite",
+            chromium_session=self.chromium_session,
         )
+        # If the page did NOT escalate, the chromium session is unused; drop it.
+        if page.engine != "chromium" and self.chromium_session is not None:
+            await self.chromium_session.close()
+            self.chromium_session = None
         self.frame_documents = frames
         self.captcha_inspection = captcha
         return self._push(page, html)
@@ -73,6 +105,14 @@ class Session:
         form = next((item for item in current.forms if item.n == n), None)
         if form is None:
             raise ValueError(f"no form [{n}] on this page")
+
+        # Dispatch the submit event into the live JS first. If page JS calls
+        # preventDefault (validation / SPA-handled), respect it and do NOT do
+        # the raw HTTP submit; return the JS-mutated page instead.
+        js_outcome = await self._dispatch_form_event(n, fields, max_chars)
+        if js_outcome == "prevented":
+            return self.page
+
         payload = {item.name: item.value for item in form.fields}
         if fields:
             payload.update(fields)
@@ -107,8 +147,6 @@ class Session:
             sprite_endpoint=f"/v1/sessions/{self.id}/captcha/sprite",
         )
         page = snapshot(parse(result), max_chars=max_chars)
-        from webresearch.read import _decorate
-
         page = _decorate(
             page,
             html,
@@ -121,56 +159,220 @@ class Session:
         self.captcha_inspection = captcha
         return self._push(page, html)
 
+    async def _dispatch_form_event(
+        self, n: int, fields: dict[str, str] | None, max_chars: int
+    ) -> str:
+        """Run page JS: set fields + dispatch submit on form index n-1.
+
+        Returns 'submitted' | 'prevented' | 'missing'. If JS prevented default,
+        the session page is updated to the JS-mutated result (and no raw submit
+        should follow).
+        """
+        if not self.html:
+            return "missing"
+        index = int(n) - 1
+        actions: list[dict] = []
+        if fields:
+            actions.append({"kind": "set_form_fields", "index": index, "fields": fields})
+        actions.append({"kind": "submit_form", "index": index})
+        new_html, js_info = await run_scripts(
+            self.html, self.url, self.client, force=True, actions=actions
+        )
+        outcome = str(js_info.get("submit_outcome") or "submitted")
+        if outcome == "prevented":
+            # JS handled submission (validation or SPA). Rebuild page from JS state.
+            js_ran = bool(js_info.get("ran"))
+            result = FetchResult(
+                url=self.url,
+                final_url=self.url,
+                status=200,
+                content_type="text/html",
+                kind="html",
+                body=new_html,
+            )
+            frames = (
+                await load_frames(new_html, self.url, self.client)
+                if new_html
+                else self.frame_documents
+            )
+            captcha = await inspect_captcha(
+                new_html,
+                self.url,
+                self.client,
+                frames,
+                sprite_endpoint=f"/v1/sessions/{self.id}/captcha/sprite",
+            )
+            page = snapshot(parse(result), max_chars=max_chars)
+            page = _decorate(page, new_html, js_ran, js_info, frames=frames, captcha=captcha.report)
+            self.frame_documents = frames
+            self.captcha_inspection = captcha
+            self._push(page, new_html)
+        return outcome
+
     async def click(self, ref: str, *, max_chars: int = 8000) -> Page:
         if not self.html:
             raise ValueError("no current page")
-        html, nav = click_html(self.html, self.url, ref)
-        if nav:
-            return await self.goto(nav, max_chars=max_chars)
-        captcha = await inspect_captcha(
-            html,
-            self.url,
-            self.client,
-            self.frame_documents,
-            sprite_endpoint=f"/v1/sessions/{self.id}/captcha/sprite",
+        targets, _ = inspect_html(self.html, self.url)
+        target = next((item for item in targets if item.ref == ref), None)
+        if target is None:
+            # keep legacy fallback for challenge widgets not in inspect list
+            html, nav = click_html(self.html, self.url, ref)
+            if nav:
+                return await self.goto(nav, max_chars=max_chars)
+            return await self._apply([], html, max_chars)
+        if (
+            target.tag == "a"
+            and target.href
+            and not target.href.startswith("#")
+            and not target.href.lower().startswith("javascript:")
+        ):
+            return await self.goto(target.href, max_chars=max_chars)
+        # Chromium lane: real CDP click on the live page, keep browser state.
+        if self._use_cdp(target):
+            return await self._cdp_click(target, max_chars)
+        return await self._apply(
+            [{"kind": "click", "path": target.path}], self.html, max_chars
         )
-        self.captcha_inspection = captcha
-        page = await page_from_html(
-            html,
-            url=self.url,
-            max_chars=max_chars,
-            js_ran=bool(self.page and self.page.js_ran),
-            frames=self.frame_documents,
-            captcha=captcha.report,
-        )
-        return self._push(page, html)
 
     async def type(self, ref: str, text: str, *, max_chars: int = 8000) -> Page:
         if not self.html:
             raise ValueError("no current page")
-        html = type_html(self.html, ref, text)
+        targets, _ = inspect_html(self.html, self.url)
+        target = next((item for item in targets if item.ref == ref), None)
+        if target is None:
+            html = type_html(self.html, ref, text)
+            return await self._apply([], html, max_chars)
+        if self._use_cdp(target):
+            return await self._cdp_type(target, text, max_chars)
+        return await self._apply(
+            [{"kind": "type", "path": target.path, "text": text}],
+            self.html,
+            max_chars,
+        )
+
+    async def scroll(self, y: int = 800, x: int = 0, *, max_chars: int = 8000) -> Page:
+        """Scroll the page; fires scroll event + IntersectionObserver notifications."""
+        if not self.html:
+            raise ValueError("no current page")
+        if self.chromium_session is not None and self.page and self.page.engine == "chromium":
+            await self.chromium_session.scroll(y)
+            return await self._rebuild_from_chromium(max_chars)
+        return await self._apply(
+            [{"kind": "scroll", "x": x, "y": y}], self.html, max_chars
+        )
+
+    def _use_cdp(self, target: Target) -> bool:
+        return (
+            self.chromium_session is not None
+            and self.page is not None
+            and self.page.engine == "chromium"
+            and bool(target.path)
+        )
+
+    async def _cdp_click(self, target: Target, max_chars: int) -> Page:
+        ok = await self.chromium_session.click_path(target.path)  # type: ignore[union-attr]
+        if not ok:
+            return await self._apply([{"kind": "click", "path": target.path}], self.html, max_chars)
+        return await self._rebuild_from_chromium(max_chars)
+
+    async def _cdp_type(self, target: Target, text: str, max_chars: int) -> Page:
+        ok = await self.chromium_session.type_path(target.path, text)  # type: ignore[union-attr]
+        if not ok:
+            return await self._apply(
+                [{"kind": "type", "path": target.path, "text": text}], self.html, max_chars
+            )
+        return await self._rebuild_from_chromium(max_chars)
+
+    async def _rebuild_from_chromium(self, max_chars: int) -> Page:
+        """Re-read the live Chromium DOM and rebuild the page model."""
+        assert self.chromium_session is not None
+        html = await self.chromium_session.content()
+        url = self.chromium_session.url or self.url
+        self.url = url
+        result = FetchResult(
+            url=url,
+            final_url=url,
+            status=200,
+            content_type="text/html",
+            kind="html",
+            body=html,
+        )
+        frames = (
+            await load_frames(html, url, self.client) if html else self.frame_documents
+        )
         captcha = await inspect_captcha(
             html,
-            self.url,
+            url,
             self.client,
-            self.frame_documents,
+            frames,
             sprite_endpoint=f"/v1/sessions/{self.id}/captcha/sprite",
         )
+        page = snapshot(parse(result), max_chars=max_chars)
+        page = _decorate(
+            page, html, True, {"engine": "chromium", "ran": True, "scripts": 1},
+            frames=frames, captcha=captcha.report,
+        )
+        self.frame_documents = frames
         self.captcha_inspection = captcha
-        page = await page_from_html(
-            html,
+        return self._push(page, html)
+
+    async def _apply(
+        self, actions: list[dict], html: str, max_chars: int
+    ) -> Page:
+        """Re-run page JS with agent interactions, then rebuild the page model."""
+        new_html, js_info = await run_scripts(
+            html, self.url, self.client, force=True, actions=actions
+        )
+        js_ran = bool(js_info.get("ran"))
+        result = FetchResult(
             url=self.url,
-            max_chars=max_chars,
-            js_ran=bool(self.page and self.page.js_ran),
-            frames=self.frame_documents,
+            final_url=self.url,
+            status=200,
+            content_type="text/html",
+            kind="html",
+            body=new_html,
+        )
+        frames = (
+            await load_frames(new_html, self.url, self.client)
+            if new_html
+            else self.frame_documents
+        )
+        captcha = await inspect_captcha(
+            new_html,
+            self.url,
+            self.client,
+            frames,
+            sprite_endpoint=f"/v1/sessions/{self.id}/captcha/sprite",
+        )
+        page = snapshot(parse(result), max_chars=max_chars)
+        page = _decorate(
+            page,
+            new_html,
+            js_ran,
+            js_info,
+            frames=frames,
             captcha=captcha.report,
         )
-        return self._push(page, html)
+        self.frame_documents = frames
+        self.captcha_inspection = captcha
+        return self._push(page, new_html)
 
     def inspect(self) -> tuple[list[Target], list[Challenge]]:
         if not self.html:
             raise ValueError("no current page")
         return inspect_html(self.html, self.url)
+
+    def query(self, term: str, *, limit: int = 40) -> list[dict]:
+        page = self.page
+        if page is None or page.acd is None:
+            raise ValueError("no ACD for the current page")
+        return [block.model_dump() for block in query_acd(page.acd, term, limit=limit)]
+
+    def slice(self, start: str = "", end: str = "", *, limit: int = 120) -> list[dict]:
+        page = self.page
+        if page is None or page.acd is None:
+            raise ValueError("no ACD for the current page")
+        return [block.model_dump() for block in slice_acd(page.acd, start, end, limit=limit)]
 
     def frames(self) -> list[FrameInfo]:
         if not self.html:
@@ -225,26 +427,72 @@ class Session:
         return await web_search(query, client=self.client, engine=engine)  # type: ignore[arg-type]
 
     async def close(self) -> None:
+        if self.chromium_session is not None:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                await self.chromium_session.close()
+            self.chromium_session = None
         await self.client.aclose()
 
 
 class Browser:
-    """Isolated agent sessions (cookie jars)."""
+    """Isolated agent sessions (cookie jars). Bounded + TTL-evicted."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_sessions: int = 64,
+        ttl_seconds: float = 1800.0,
+        proxies: list[str] | None = None,
+    ) -> None:
         self.sessions: dict[str, Session] = {}
+        self.max_sessions = max_sessions
+        self.ttl_seconds = ttl_seconds
+        if proxies is None:
+            env = os.environ.get("WR_PROXIES", "")
+            proxies = [p.strip() for p in env.split(",") if p.strip()]
+        self.proxies = proxies
+        self._proxy_index = 0
+
+    def _next_proxy(self) -> str | None:
+        if not self.proxies:
+            return None
+        proxy = self.proxies[self._proxy_index % len(self.proxies)]
+        self._proxy_index += 1
+        return proxy
 
     async def create(self, *, headers: dict[str, str] | None = None, proxy: str | None = None) -> Session:
+        await self._evict()
         sid = "s_" + secrets.token_hex(4)
-        client = httpx.AsyncClient(**client_kwargs(headers=headers, proxy=proxy))
+        # Explicit proxy wins; otherwise rotate through the pool for isolation.
+        chosen = proxy if proxy is not None else self._next_proxy()
+        client = httpx.AsyncClient(**client_kwargs(headers=headers, proxy=chosen))
         session = Session(client, sid)
+        session.proxy = chosen
         self.sessions[sid] = session
         return session
+
+    async def _evict(self) -> None:
+        now = time.time()
+        expired = [
+            sid
+            for sid, session in self.sessions.items()
+            if now - session.last_used > self.ttl_seconds
+        ]
+        for sid in expired:
+            await self.close(sid)
+        overflow = len(self.sessions) - self.max_sessions + 1
+        if overflow > 0:
+            oldest = sorted(self.sessions, key=lambda s: self.sessions[s].last_used)
+            for sid in oldest[:overflow]:
+                await self.close(sid)
 
     def get(self, session_id: str) -> Session:
         session = self.sessions.get(session_id)
         if session is None:
             raise KeyError(session_id)
+        session.last_used = time.time()
         return session
 
     async def close(self, session_id: str) -> None:

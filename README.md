@@ -22,7 +22,12 @@ python -m webresearch ask "search for example.com and say what it is"
 
 **Google:** do not scrape `google.com` like a person. Call `browser_search`. That is a search *request* (Google HTML, DuckDuckGo if blocked).
 
-**JS sites (TripAdvisor, React):** scripts run in mini-DOM. Classic JS works. ES module / heavy React bundles are skipped until the DOM API grows — you still get SSR HTML + inspect refs.
+**JS sites (TripAdvisor, React):** classic scripts run in mini-DOM; `type="module"`
+bundles are fetched, dependency-ordered and evaluated via a small ESM translator.
+`fetch`/XHR promises are pumped to completion and framework state
+(`__NEXT_DATA__`, `__NUXT__`, Apollo, `__PRELOADED_STATE__`) is captured. Pages
+still too dynamic for the mini-DOM can escalate to a real Chromium lane when
+`patchright`/`playwright` is installed (`WR_USE_CHROMIUM=1`).
 
 ## Install
 
@@ -48,6 +53,17 @@ pip install -e .
 | `browser_click` | Click a top-level `[eN]` link/button/field |
 | `browser_type` | Type into `[eN]` |
 | `browser_submit` | Submit form `[n]` |
+| `browser_query` | Retrieve ACD blocks by substring (structured context) |
+| `browser_slice` | Read ACD block range `b12`→`b40` |
+
+## ACD — Agent Context Document
+
+Every page is projected into a structured `ACD` (alongside the human-readable
+`view`): ordered blocks with stable ids (`b1`, `b2`, …), typed as heading / text /
+list / table / code, plus `actions` (`[eN]`), `links`, observed `api` calls,
+`frames`, `framework` hydration data and `errors`. Agents can retrieve context
+with `browser_query` / `browser_slice` instead of re-reading a flat markdown blob.
+Tables are rendered as markdown in `view` and as `rows` in `acd.blocks`.
 
 ## Challenges / captcha
 

@@ -45,6 +45,7 @@ class Target(BaseModel):
     href: str = ""
     checked: bool | None = None
     challenge: bool = False
+    path: list[int] = Field(default_factory=list)
 
 
 class Challenge(BaseModel):
@@ -134,6 +135,47 @@ class CaptchaCodeDump(BaseModel):
     note: str = ""
 
 
+class AcdBlock(BaseModel):
+    id: str
+    type: str
+    text: str = ""
+    level: int | None = None
+    ref: str = ""
+    role: str = ""
+    href: str = ""
+    rows: list[list[str]] = Field(default_factory=list)
+    locator: str = ""
+
+
+class AcdAction(BaseModel):
+    ref: str
+    kind: str = "click"
+    role: str = ""
+    label: str = ""
+    name: str = ""
+
+
+class AcdApi(BaseModel):
+    index: int
+    url: str
+    status: int = 0
+    content_type: str = ""
+
+
+class Acd(BaseModel):
+    version: str = "1"
+    url: str
+    title: str = ""
+    blocks: list[AcdBlock] = Field(default_factory=list)
+    actions: list[AcdAction] = Field(default_factory=list)
+    links: list[Link] = Field(default_factory=list)
+    api: list[AcdApi] = Field(default_factory=list)
+    frames: list[FrameInfo] = Field(default_factory=list)
+    framework: dict[str, Any] = Field(default_factory=dict)
+    errors: list[str] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+
+
 class Page(BaseModel):
     url: str
     status: int
@@ -151,6 +193,8 @@ class Page(BaseModel):
     challenges: list[Challenge] = Field(default_factory=list)
     frames: list[FrameInfo] = Field(default_factory=list)
     captcha: CaptchaReport | None = None
+    acd: Acd | None = None
+    engine: str = ""
     chars: int = 0
 
 

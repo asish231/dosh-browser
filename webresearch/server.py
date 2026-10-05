@@ -1,23 +1,32 @@
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
 from webresearch.dispatch import invoke as run_tool
 from webresearch.extract import extract as extract_fields
-from webresearch.fetch import client_kwargs, fetch as http_fetch
+from webresearch.fetch import client_kwargs
+from webresearch.fetch import fetch as http_fetch
 from webresearch.parse import parse as parse_doc
 from webresearch.read import captcha_code as dump_url_captcha_code
 from webresearch.read import read as read_url
 from webresearch.search import search as web_search
 from webresearch.session import Browser
 from webresearch.tools import TOOLS
-from webresearch.types import CaptchaCodeDump, CaptchaReport, ExtractResult, FrameInfo, Page, SearchResult
+from webresearch.types import (
+    CaptchaCodeDump,
+    CaptchaReport,
+    ExtractResult,
+    FrameInfo,
+    Page,
+    SearchResult,
+)
 
 TAGS = [
     {"name": "agent", "description": "Tools + invoke. Start here for LLMs."},
@@ -80,6 +89,12 @@ class TypeBody(BaseModel):
     max_chars: int = 8000
 
 
+class ScrollBody(BaseModel):
+    y: int = 800
+    x: int = 0
+    max_chars: int = 8000
+
+
 class InvokeBody(BaseModel):
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
@@ -114,6 +129,19 @@ def create_app() -> FastAPI:
         openapi_tags=TAGS,
     )
 
+    api_token = os.environ.get("WR_API_TOKEN", "")
+
+    @app.middleware("http")
+    async def require_token(request: Request, call_next):
+        if api_token and request.url.path.startswith("/v1"):
+            supplied = request.headers.get("x-api-token", "")
+            auth = request.headers.get("authorization", "")
+            if auth.lower().startswith("bearer "):
+                supplied = supplied or auth.split(" ", 1)[1]
+            if supplied != api_token:
+                return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        return await call_next(request)
+
     def http() -> httpx.AsyncClient:
         return app.state.http
 
@@ -131,8 +159,11 @@ def create_app() -> FastAPI:
         return (
             "<!doctype html><meta charset=utf-8>"
             "<title>webresearch</title>"
-            "<style>body{font:16px/1.5 ui-sans-serif,system-ui;max-width:40rem;margin:3rem auto;padding:0 1.25rem;color:#1c1917;background:#fafaf9}"
-            "h1{font:600 1.35rem/1.3 ui-sans-serif,system-ui}a{color:#1d4ed8}code{font:14px ui-monospace,Menlo,monospace;background:#f5f5f4;padding:.1em .35em}</style>"
+            "<style>body{font:16px/1.5 ui-sans-serif,system-ui;max-width:40rem;margin:3rem auto;"
+            "padding:0 1.25rem;color:#1c1917;background:#fafaf9}"
+            "h1{font:600 1.35rem/1.3 ui-sans-serif,system-ui}"
+            "a{color:#1d4ed8}"
+            "code{font:14px ui-monospace,Menlo,monospace;background:#f5f5f4;padding:.1em .35em}</style>"
             "<h1>webresearch</h1>"
             "<p>Agent browser. Not for humans &mdash; use the API.</p>"
             "<p><a href='/docs'>OpenAPI</a> · <a href='/v1/tools'>/v1/tools</a> · <code>POST /v1/invoke</code></p>"
@@ -196,7 +227,8 @@ def create_app() -> FastAPI:
 
     @app.post("/v1/ask", tags=["llm"])
     async def api_ask(body: AskBody):
-        from webresearch.agent import LlmRateLimitError, ask as llm_ask
+        from webresearch.agent import LlmRateLimitError
+        from webresearch.agent import ask as llm_ask
 
         try:
             result = await llm_ask(
@@ -257,6 +289,29 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         return {"targets": targets, "challenges": challenges}
+
+    @app.get("/v1/sessions/{sid}/acd", tags=["session"])
+    async def api_acd(sid: str):
+        session = session_or_404(sid)
+        if session.page is None or session.page.acd is None:
+            raise HTTPException(404, "no ACD for the current page")
+        return session.page.acd
+
+    @app.get("/v1/sessions/{sid}/query", tags=["session"])
+    async def api_query(sid: str, term: str = "", limit: int = 40):
+        try:
+            return session_or_404(sid).query(term, limit=limit)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/v1/sessions/{sid}/slice", tags=["session"])
+    async def api_slice(
+        sid: str, start: str = "", end: str = "", limit: int = 120
+    ):
+        try:
+            return session_or_404(sid).slice(start, end, limit=limit)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get(
         "/v1/sessions/{sid}/frames",
@@ -357,6 +412,13 @@ def create_app() -> FastAPI:
     async def api_back(sid: str) -> Page:
         try:
             return session_or_404(sid).back()
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/v1/sessions/{sid}/scroll", response_model=Page, tags=["session"])
+    async def api_scroll(sid: str, body: ScrollBody) -> Page:
+        try:
+            return await session_or_404(sid).scroll(y=body.y, x=body.x, max_chars=body.max_chars)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 

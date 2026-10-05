@@ -52,6 +52,16 @@ async def invoke(http: httpx.AsyncClient, browser: Browser, name: str, args: dic
     if name == "browser_inspect":
         targets, challenges = browser.get(args["session_id"]).inspect()
         return {"targets": targets, "challenges": challenges}
+    if name == "browser_query":
+        return browser.get(args["session_id"]).query(
+            args.get("term") or "", limit=int(args.get("limit", 40))
+        )
+    if name == "browser_slice":
+        return browser.get(args["session_id"]).slice(
+            args.get("start") or "",
+            args.get("end") or "",
+            limit=int(args.get("limit", 120)),
+        )
     if name == "browser_frames":
         return browser.get(args["session_id"]).frames()
     if name == "browser_frame_source":
@@ -103,4 +113,10 @@ async def invoke(http: httpx.AsyncClient, browser: Browser, name: str, args: dic
         )
     if name == "browser_back":
         return browser.get(args["session_id"]).back()
+    if name == "browser_scroll":
+        return await browser.get(args["session_id"]).scroll(
+            y=int(args.get("y", 800)),
+            x=int(args.get("x", 0)),
+            max_chars=int(args.get("max_chars", 8000)),
+        )
     raise ValueError(f"unknown tool: {name}")

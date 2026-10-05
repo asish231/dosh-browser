@@ -119,7 +119,8 @@ async def _run_models(args: argparse.Namespace) -> None:
 
 
 async def _run_ask(args: argparse.Namespace) -> None:
-    from webresearch.agent import LlmError, LlmRateLimitError, ask as llm_ask
+    from webresearch.agent import LlmError, LlmRateLimitError
+    from webresearch.agent import ask as llm_ask
 
     def on_event(kind: str, payload: dict) -> None:
         if args.quiet or args.json:

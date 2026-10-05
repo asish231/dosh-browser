@@ -1,12 +1,12 @@
 import unittest
 
-from webresearch.fetch import FetchResult
-from webresearch.search import _parse_google, _unwrap_google
-from webresearch.parse import parse
-from webresearch.snapshot import snapshot
 from webresearch.extract import extract
-from webresearch.links import links
+from webresearch.fetch import FetchResult
 from webresearch.forms import forms
+from webresearch.links import links
+from webresearch.parse import parse
+from webresearch.search import _parse_google, _unwrap_google
+from webresearch.snapshot import snapshot
 
 HTML = """<!doctype html>
 <html lang="en">
