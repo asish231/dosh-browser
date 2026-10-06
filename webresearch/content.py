@@ -20,7 +20,20 @@ CONTENT_SELECTORS = (
 # Wikipedia / many sites wrap section titles in <header>.
 SKIP_TAGS = {"nav", "aside", "form", "footer"}
 SKIP_ROLES = {"navigation", "banner", "contentinfo", "complementary"}
-SKIP_IDS = {"toc", "mw-navigation", "mw-panel", "p-lang", "siteSub", "jump-to-nav"}
+SKIP_IDS = {
+    "toc",
+    "mw-navigation",
+    "mw-panel",
+    "p-lang",
+    "siteSub",
+    "jump-to-nav",
+    "google_ads",
+    "ad-root",
+    "advertisement",
+    "ad_unit",
+    "ad-container",
+    "sponsor-block",
+}
 SKIP_CLASS_TOKENS = {
     "toc",
     "vector-toc",
@@ -34,6 +47,19 @@ SKIP_CLASS_TOKENS = {
     "references",
     "mw-references-wrap",
     "navbox-styles",
+    "ad",
+    "ads",
+    "advertisement",
+    "ad-container",
+    "ad-slot",
+    "banner-ad",
+    "google-ad",
+    "taboola",
+    "outbrain",
+    "sponsored",
+    "promoted",
+    "sponsor",
+    "commercial",
 }
 
 
@@ -49,11 +75,18 @@ def _class_tokens(node: Node) -> set[str]:
     raw = (node.attributes or {}).get("class") or ""
     if isinstance(raw, (list, tuple)):
         raw = " ".join(str(x) for x in raw)
-    return {tok.lower() for tok in str(raw).split() if tok}
+    tokens: set[str] = set()
+    for tok in str(raw).split():
+        low = tok.lower()
+        tokens.add(low)
+        for sub in low.replace("_", "-").split("-"):
+            if sub:
+                tokens.add(sub)
+    return tokens
 
 
 def inside_chrome(node: Node, stop: Node | None = None) -> bool:
-    """True if node sits in nav/aside/toc/infobox, stopping at the article root."""
+    """True if node sits in nav/aside/toc/infobox/ads, stopping at the article root."""
     current: Node | None = node
     while current is not None and current is not stop:
         tag = (current.tag or "").lower()
@@ -64,7 +97,7 @@ def inside_chrome(node: Node, stop: Node | None = None) -> bool:
         if role in SKIP_ROLES:
             return True
         nid = (attrs.get("id") or "").lower()
-        if nid in SKIP_IDS:
+        if nid in SKIP_IDS or any(sub in SKIP_IDS for sub in nid.replace("_", "-").split("-") if sub):
             return True
         if _class_tokens(current) & SKIP_CLASS_TOKENS:
             return True

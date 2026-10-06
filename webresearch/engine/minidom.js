@@ -713,10 +713,13 @@
     return ctx;
   }
 
-  /* Deterministic canvas fingerprint: hash of canvas state -> stable data URL. */
+  /* Deterministic canvas fingerprint: hash of canvas state + real device seed. */
   function _canvasDataURL(canvas) {
+    var dev = (typeof global.__WR_DEVICE === "object" && global.__WR_DEVICE) ? global.__WR_DEVICE : {};
+    var devSeed = (dev.platform || "") + "|" + (dev.cpu_brand || "") + "|" +
+      (dev.machine_model || "") + "|" + (dev.gpu_renderer || "");
     var seed = (canvas.width || 300) + "x" + (canvas.height || 150) + "|" +
-      String(canvas.__ops || 0) + "|" + (canvas.getAttribute ? (canvas.getAttribute("id") || "") : "");
+      String(canvas.__ops || 0) + "|" + (canvas.getAttribute ? (canvas.getAttribute("id") || "") : "") + "|" + devSeed;
     var h = 5381;
     for (var i = 0; i < seed.length; i++) h = (((h << 5) + h) ^ seed.charCodeAt(i)) >>> 0;
     var hex = ("00000000" + h.toString(16)).slice(-8);
@@ -725,13 +728,16 @@
   }
 
   function makeWebGLContext(canvas) {
+    var dev = (typeof global.__WR_DEVICE === "object" && global.__WR_DEVICE) ? global.__WR_DEVICE : {};
+    var renderer = dev.gpu_renderer || "ANGLE (Software, ANGLE Metal Renderer: Generic, Unspecified Version)";
+    var vendor = dev.gpu_vendor || "Google Inc. (Software)";
     var params = {
       0x1F00: "WebKit",                    // VENDOR
       0x1F01: "WebKit WebGL",              // RENDERER
       0x1F02: "WebGL 1.0 (OpenGL ES 2.0 Chromium)", // VERSION
       0x8B8C: "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)", // SHADING_LANGUAGE_VERSION
-      0x9245: "Google Inc. (Apple)",       // UNMASKED_VENDOR_WEBGL
-      0x9246: "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)" // UNMASKED_RENDERER_WEBGL
+      0x9245: vendor,                      // UNMASKED_VENDOR_WEBGL
+      0x9246: renderer                      // UNMASKED_RENDERER_WEBGL
     };
     var exts = ["ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_texture_filter_anisotropic",
       "OES_element_index_uint", "OES_standard_derivatives", "OES_texture_float",
@@ -1141,6 +1147,17 @@
       this.target = null;
       this.preventDefault = function () { this.defaultPrevented = true; };
       this.stopPropagation = function () {};
+      // Copy every remaining init field onto the event. Mouse handlers read
+      // clientX/clientY/buttons to work out a drag, and dropping those made
+      // every drag arrive as a click at (0, 0).
+      if (init && typeof init === "object") {
+        for (var key in init) {
+          if (key === "bubbles" || key === "cancelable") continue;
+          if (!Object.prototype.hasOwnProperty.call(this, key)) {
+            try { this[key] = init[key]; } catch (e) {}
+          }
+        }
+      }
     };
     global.CustomEvent = global.Event;
     global.MessageEvent = function (type, init) {
@@ -1226,7 +1243,61 @@
     el.dispatchEvent(new global.Event("change", { bubbles: true }));
     return true;
   };
-  global.__submitPath = function (path) {
+  global.__activateSelector = function (selector, text) {
+    var el = null;
+    if (global.document.getElementById(selector)) el = global.document.getElementById(selector);
+    else el = global.document.querySelector(selector);
+    if (!el) return false;
+    if (text !== null && text !== undefined && text !== "") {
+        el.value = String(text);
+        el.setAttribute("value", String(text));
+        el.dispatchEvent(new global.Event("input", { bubbles: true }));
+        el.dispatchEvent(new global.Event("change", { bubbles: true }));
+        return true;
+    }
+    // Toggle semantics for checkboxes and radios, so a click reflects what a
+    // browser would do rather than leaving state untouched.
+    var type = (el.getAttribute("type") || "").toLowerCase();
+    if (type === "checkbox" || type === "radio") {
+        if (type === "checkbox") {
+            var on = el.getAttribute("checked") === "checked" || el.getAttribute("aria-checked") === "true";
+            if (on) { el.removeAttribute("checked"); el.setAttribute("aria-checked", "false"); }
+            else { el.setAttribute("checked", "checked"); el.setAttribute("aria-checked", "true"); }
+        } else {
+            el.setAttribute("checked", "checked");
+            el.setAttribute("aria-checked", "true");
+        }
+    }
+    if (typeof el.click === "function") el.click();
+    else el.dispatchEvent(new global.Event("click", { bubbles: true }));
+    return true;
+  };
+global.__dragSelector = function (selector, dx, dy, steps) {
+    var el = null;
+    if (global.document.getElementById(selector)) el = global.document.getElementById(selector);
+    else el = global.document.querySelector(selector);
+    if (!el) return false;
+    var n = Math.max(2, Math.min(40, steps || 12));
+    var move = typeof global.MouseEvent === "function" ? global.MouseEvent : global.Event;
+    var init = { bubbles: true, cancelable: true };
+    try { init.clientX = 0; init.clientY = 0; } catch (e) {}
+    // A slider listens for press, a move chain, then release. Emitting only a
+    // click is what made every drag a no-op against these widgets.
+    el.dispatchEvent(new move("mousedown", init));
+    for (var i = 1; i <= n; i++) {
+      var step = {};
+      for (var k in init) step[k] = init[k];
+      step.clientX = Math.round((dx * i) / n);
+      step.clientY = Math.round((dy * i) / n);
+      el.dispatchEvent(new move("mousemove", step));
+    }
+    var end = {};
+    for (var j in init) end[j] = init[j];
+    end.clientX = dx; end.clientY = dy;
+    el.dispatchEvent(new move("mouseup", end));
+    return true;
+  };
+global.__submitPath = function (path) {
     var el = global.__byPath(path);
     if (!el) return false;
     var form = el.nodeName === "form" ? el : null;

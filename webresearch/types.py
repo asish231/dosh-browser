@@ -160,6 +160,8 @@ class AcdApi(BaseModel):
     url: str
     status: int = 0
     content_type: str = ""
+    method: str = "GET"
+    data: Any = None
 
 
 class Acd(BaseModel):

@@ -22,8 +22,36 @@ def _abs(base: str, href: str) -> str | None:
     return url
 
 
+def count_all_links(doc: Document) -> int:
+    """How many unique navigable links the document actually contains.
+
+    Reported alongside the surfaced set so the reading view can admit what it
+    left out instead of looking like the whole page.
+    """
+    if doc.tree is None:
+        return 0
+    root = content_root(doc.tree) or doc.tree
+    seen: set[str] = set()
+    for a in root.css("a[href]"):
+        if inside_chrome(a, stop=root):
+            continue
+        href = a.attributes.get("href") or ""
+        if href.startswith("#cite") or "cite_note" in href or "cite_ref" in href:
+            continue
+        url = _abs(doc.url, href)
+        if url:
+            seen.add(url)
+    return len(seen)
+
+
 def links(doc: Document, *, max_links: int = 50) -> list[Link]:
-    """Extract unique http(s) links in document order."""
+    """Extract unique http(s) links in document order, up to `max_links`.
+
+    Note that ``inside_chrome`` is applied here and this list is for *reading*:
+    nav, header and footer links are dropped as page furniture. An agent that
+    needs to drive those uses the action surface in ``webresearch.actions``,
+    which enumerates the whole page instead.
+    """
     if doc.tree is None:
         return []
     root = content_root(doc.tree) or doc.tree

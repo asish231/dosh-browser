@@ -78,6 +78,29 @@ class CanvasFingerprintTests(unittest.TestCase):
         html, _info = _run(page)
         self.assertIn("true", html)
 
+    def test_webgl_renderer_reflects_real_device(self):
+        """The UNMASKED_RENDERER string must come from the real host probe."""
+        from webresearch import device
+        from webresearch.engine.runtime import _device_block
+
+        block = _device_block()
+        self.assertIn("gpu_renderer", block)
+        self.assertNotEqual(block["gpu_renderer"], "unknown")
+
+        page = (
+            "<html><body><div id='root'></div><script>"
+            "var gl = document.createElement('canvas').getContext('webgl');"
+            "document.getElementById('root').textContent = gl.getParameter(0x9246);"
+            "</script></body></html>"
+        )
+        html, _info = _run(page)
+        self.assertIn(block["gpu_renderer"], html)
+
+        # On this Apple host the renderer must name the real chip.
+        profile = device.probe()
+        if profile.platform == "Darwin" and profile.cpu_brand != "unknown":
+            self.assertIn(profile.cpu_brand, block["gpu_renderer"])
+
 
 class CorsTests(unittest.TestCase):
     def test_cross_origin_blocked_and_same_origin_allowed(self):

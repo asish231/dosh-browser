@@ -5,7 +5,6 @@ from typing import Literal
 import httpx
 
 from webresearch.acd import build_acd
-from webresearch.engine import chromium
 from webresearch.engine.captcha import (
     CaptchaInspection,
     dump_captcha_code,
@@ -91,14 +90,9 @@ async def read_live(
     max_links: int = 50,
     js: JsMode = "auto",
     sprite_endpoint: str = "",
-    chromium_session: chromium.ChromiumSession | None = None,
+    chromium_session: object | None = None,
 ) -> tuple[Page, str, list[FrameDocument], CaptchaInspection]:
-    """Fetch (+ QuickJS + frames) → page model and live agent state.
-
-    If ``chromium_session`` is provided and the page escalates, the render is
-    done in that persistent browser (kept alive for later interactions) instead
-    of a one-shot headless render.
-    """
+    """Fetch (+ QuickJS + frames) → page model and live agent state. Pure from-scratch engine, no Chromium."""
     result = await fetch(url, client=client)
     html = result.body
     js_info: dict | None = None
@@ -106,21 +100,15 @@ async def read_live(
     if result.kind == "html" and js != "never":
         html, js_info = await run_scripts(html, result.final_url or url, client, force=(js == "always"))
         js_ran = bool(js_info.get("ran"))
-        if chromium.should_escalate(html, js_info=js_info) and _impersonation_allowed(client):
-            rendered: tuple[str, str] | None = None
-            if chromium_session is not None:
-                try:
-                    rendered = await chromium_session.goto(result.final_url or url)
-                except Exception:
-                    rendered = None
-            if rendered is None:
-                rendered = await chromium.render(result.final_url or url)
-            if rendered:
-                html, final_url = rendered
-                js_ran = True
-                js_info = {**(js_info or {}), "engine": "chromium"}
-                result = result.model_copy(update={"final_url": final_url})
         result = result.model_copy(update={"body": html, "kind": "html", "content_type": "text/html"})
+
+    if result.kind == "html":
+        from webresearch.consent import dismiss_consent_dom
+
+        clean_html, dismissed = dismiss_consent_dom(html)
+        if dismissed:
+            html = clean_html
+            result = result.model_copy(update={"body": html})
 
     frames = (
         await load_frames(html, result.final_url or url, client, js=js)

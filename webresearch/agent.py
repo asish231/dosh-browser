@@ -11,7 +11,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from webresearch.dispatch import invoke
-from webresearch.fetch import client_kwargs
+from webresearch.fetch import make_client
 from webresearch.session import Browser
 from webresearch.settings import fallback_chain, llm_config
 from webresearch.tools import TOOLS
@@ -134,10 +134,46 @@ def serialize_tool_result(value: Any, *, limit: int = MAX_TOOL_CHARS) -> str:
                 "note": captcha.get("note"),
             }
         data = compact
-    text = json.dumps(data, ensure_ascii=False, default=str)
+    text = _serialize_actions(data) if "actions" in data and "coverage" in data else json.dumps(
+        data, ensure_ascii=False, default=str
+    )
     if len(text) > limit:
         return text[: limit - 32] + '... [truncated by webresearch]"}'
     return text
+
+
+def _serialize_actions(data: dict) -> str:
+    """Render an action surface compactly.
+
+    A real page exposes hundreds of controls. Dumped as JSON the payload is tens
+    of kilobytes and gets truncated part-way through an object, which leaves the
+    model holding invalid JSON. Grouping by kind also makes the shape of the page
+    legible: what can be reached over HTTP, and what needs a real browser.
+    """
+    actions = data.get("actions") or []
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for action in actions:
+        groups.setdefault(str(action.get("kind") or "other"), []).append(action)
+
+    lines = [str(data.get("coverage") or "")]
+    if data.get("engine_only"):
+        lines.append(
+            f"engine_only={data['engine_only']} (no href and no form: these need a "
+            "real browser, so use browser_act rather than browser_click)"
+        )
+    for kind, items in groups.items():
+        lines.append(f"\n## {kind} ({len(items)})")
+        for action in items[:40]:
+            label = (action.get("label") or "")[:60]
+            target = (action.get("target") or "")[:90]
+            ref = action.get("ref") or ""
+            suffix = f" -> {target}" if target else ""
+            if action.get("disabled"):
+                suffix += " [disabled]"
+            lines.append(f"[{ref}] {label}{suffix}")
+        if len(items) > 40:
+            lines.append(f"... {len(items) - 40} more {kind}")
+    return "\n".join(lines)
 
 
 def message_text(content: Any) -> str:
@@ -302,7 +338,7 @@ async def ask(
     index = 0
     rounds = 0
 
-    async with httpx.AsyncClient(**client_kwargs()) as web:
+    async with make_client() as web:
         async with httpx.AsyncClient(timeout=120.0) as llm:
             try:
                 while rounds < max_rounds:

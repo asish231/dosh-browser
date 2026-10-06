@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import os
 from urllib.parse import urlparse
@@ -148,6 +149,71 @@ def _build_result(
     )
 
 
+def make_client(
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    headers: dict[str, str] | None = None,
+    proxy: str | None = None,
+) -> httpx.AsyncClient:
+    """Create a client tagged with its proxy so the impersonated lane can use it."""
+    client = httpx.AsyncClient(**client_kwargs(timeout=timeout, headers=headers, proxy=proxy))
+    client._wr_proxy = proxy
+    return client
+
+
+def _impersonated_session(
+    client: httpx.AsyncClient,
+    *,
+    impersonate: str,
+    timeout: float,
+    headers: dict[str, str],
+    proxy: str | None,
+):
+    """Reuse one impersonated session per client so cookies + TLS persist."""
+    key = (impersonate, proxy)
+    cached = getattr(client, "_wr_impersonated", None)
+    if cached is not None and getattr(client, "_wr_impersonated_key", None) == key:
+        return cached
+    if cached is not None:
+        client._wr_impersonated = None
+        client._wr_impersonated_key = None
+        with contextlib.suppress(Exception):
+            res = cached.close()
+            if asyncio.iscoroutine(res):
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(res)
+                except Exception:
+                    pass
+    session = _curl_requests.AsyncSession(
+        impersonate=impersonate,
+        timeout=timeout,
+        headers=headers,
+        cookies={k: v for k, v in client.cookies.items()},
+        proxy=proxy,
+    )
+    client._wr_impersonated = session
+    client._wr_impersonated_key = key
+    return session
+
+
+async def _close_session(session) -> None:
+    """Close a curl session. AsyncSession.close() returns a coroutine."""
+    with contextlib.suppress(Exception):
+        result = session.close()
+        if inspect.isawaitable(result):
+            await result
+
+
+async def close_impersonated(client: httpx.AsyncClient) -> None:
+    """Dispose the cached impersonated session attached to a client."""
+    session = getattr(client, "_wr_impersonated", None)
+    client._wr_impersonated = None
+    client._wr_impersonated_key = None
+    if session is not None:
+        await _close_session(session)
+
+
 async def _fetch_impersonated(
     url: str,
     *,
@@ -164,40 +230,33 @@ async def _fetch_impersonated(
     merged.update(navigate_headers(url))
     if headers:
         merged.update(headers)
-    cookies = {k: v for k, v in client.cookies.items()}
-    session = _curl_requests.AsyncSession(
-        impersonate=impersonate,
-        timeout=timeout,
-        headers=merged,
-        cookies=cookies,
+    proxy = getattr(client, "_wr_proxy", None)
+    session = _impersonated_session(
+        client, impersonate=impersonate, timeout=timeout, headers=merged, proxy=proxy
     )
-    try:
-        response = await session.request(
-            method.upper(),
-            url,
-            data=data,
-            json=json_body,
-            headers=merged,
-            allow_redirects=True,
-        )
-        raw = response.content or b""
-        truncated = len(raw) > max_bytes
-        if truncated:
-            raw = raw[:max_bytes]
-        for key, value in session.cookies.items():
-            client.cookies.set(key, value)
-        return _build_result(
-            url=url,
-            final_url=str(response.url),
-            status=response.status_code,
-            content_type=response.headers.get("content-type", ""),
-            headers=dict(response.headers),
-            raw=raw,
-            truncated=truncated,
-        )
-    finally:
-        with contextlib.suppress(Exception):
-            await session.close()
+    response = await session.request(
+        method.upper(),
+        url,
+        data=data,
+        json=json_body,
+        headers=merged,
+        allow_redirects=True,
+    )
+    raw = response.content or b""
+    truncated = len(raw) > max_bytes
+    if truncated:
+        raw = raw[:max_bytes]
+    for key, value in session.cookies.items():
+        client.cookies.set(key, value)
+    return _build_result(
+        url=url,
+        final_url=str(response.url),
+        status=response.status_code,
+        content_type=response.headers.get("content-type", ""),
+        headers=dict(response.headers),
+        raw=raw,
+        truncated=truncated,
+    )
 
 
 async def _fetch_httpx(

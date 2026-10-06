@@ -25,12 +25,11 @@ def forms(doc: Document, *, max_forms: int = 12) -> list[Form]:
             if ftype in {"hidden", "submit", "button", "image", "reset"}:
                 name = attrs.get("name") or ""
                 if ftype == "hidden" and name:
+                    # Carry the token so a real submit replays it, but do not
+                    # echo the value into the agent's view: it is a session
+                    # blob, not input, and a stale copy would be misleading.
                     fields.append(
-                        FieldSpec(
-                            name=name,
-                            type="hidden",
-                            value=attrs.get("value") or "",
-                        )
+                        FieldSpec(name=name, type="hidden", value="")
                     )
                 continue
             name = attrs.get("name") or attrs.get("id") or ""
@@ -57,4 +56,29 @@ def forms(doc: Document, *, max_forms: int = 12) -> list[Form]:
                 )
             )
         out.append(Form(n=i, method=method, action=action, fields=fields))
+    return out
+
+
+def hidden_values(doc: Document, index: int) -> dict[str, str]:
+    """Live hidden-field values for form ``index``, for use when submitting.
+
+    ``forms()`` reports a hidden field's name but not its value on purpose: the
+    value is a session-scoped blob (CSRF token, captcha hash, DataDome cid) that
+    goes stale and should never be quoted back to the model as if it were
+    something the agent authored. Submission still needs the real value, so it
+    is read from the document at submit time.
+    """
+    if doc.tree is None:
+        return {}
+    forms_found = doc.tree.css("form")
+    if not 1 <= index <= len(forms_found):
+        return {}
+    out: dict[str, str] = {}
+    for el in forms_found[index - 1].css("input"):
+        if (el.attributes.get("type") or "").lower() != "hidden":
+            continue
+        name = el.attributes.get("name") or ""
+        value = el.attributes.get("value") or ""
+        if name and value:
+            out[name] = value
     return out

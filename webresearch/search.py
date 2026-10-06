@@ -157,15 +157,15 @@ async def _ddg(query: str, *, client: httpx.AsyncClient, max_hits: int) -> Searc
     return SearchResult(query=query, engine="ddg", hits=hits, view=_view(query, "ddg", hits))
 
 
-async def _google_http(query: str, *, client: httpx.AsyncClient, max_hits: int) -> SearchResult | None:
+async def _google_http(query: str, *, client: httpx.AsyncClient, max_hits: int) -> tuple[SearchResult | None, bool]:
     url = GOOGLE_HTML.format(q=quote_plus(query))
     result = await fetch(url, client=client, headers={"Referer": "https://www.google.com/"})
     if _blocked_google(result):
-        return None
+        return None, True
     hits = _parse_google(parse(result), max_hits=max_hits)
     if not hits:
-        return None
-    return SearchResult(query=query, engine="google", hits=hits, view=_view(query, "google", hits))
+        return None, False
+    return SearchResult(query=query, engine="google", hits=hits, view=_view(query, "google", hits)), False
 
 
 async def search(
@@ -180,9 +180,16 @@ async def search(
         return await _ddg(query, client=client, max_hits=max_hits)
 
     if engine in {"google", "auto"}:
-        html = await _google_http(query, client=client, max_hits=max_hits)
+        html, blocked = await _google_http(query, client=client, max_hits=max_hits)
         if html is not None:
             return html
+        if blocked and engine == "google":
+            return SearchResult(
+                query=query,
+                engine="google",
+                hits=[],
+                view=_view(query, "google", [], note="Google returned HTTP 429/403/503; IP rate-limited."),
+            )
         if engine == "google":
             return SearchResult(
                 query=query,

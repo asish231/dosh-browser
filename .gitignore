@@ -8,5 +8,7 @@ build/
 .env
 .DS_Store
 ISSUES_AUDIT.local.md
+attestation-lab/
 .ruff_cache/
 .pytest_cache/
+tmp/

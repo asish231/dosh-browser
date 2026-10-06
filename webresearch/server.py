@@ -95,6 +95,44 @@ class ScrollBody(BaseModel):
     max_chars: int = 8000
 
 
+class ActBody(BaseModel):
+    """One action from the surface. dx/dy apply to drag controls."""
+
+    ref: str
+    text: str = ""
+    dx: float | None = None
+    dy: float | None = None
+    max_chars: int = 8000
+
+
+class ActionItem(BaseModel):
+    """One control, with how an agent can actually actuate it."""
+
+    ref: str
+    kind: str
+    role: str
+    label: str
+    target: str = ""
+    field_name: str = ""
+    tag: str = ""
+    checked: bool | None = None
+    disabled: bool = False
+    notes: str = ""
+    http_callable: bool = False
+
+
+class ActionList(BaseModel):
+    """The full inventory plus an honest account of what was omitted."""
+
+    coverage: str
+    complete: bool
+    total_found: int
+    returned: int
+    truncated: int
+    engine_only: int
+    actions: list[ActionItem]
+
+
 class InvokeBody(BaseModel):
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
@@ -172,6 +210,13 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         return {"ok": True, "engine": "quickjs"}
+
+    @app.get("/v1/device", tags=["agent"])
+    async def api_device():
+        """Real host hardware profile (CPU/GPU/secure hardware/VM detection)."""
+        from webresearch.device import probe
+
+        return probe().to_dict()
 
     @app.get("/v1/tools", tags=["agent"])
     async def api_tools():
@@ -405,6 +450,48 @@ def create_app() -> FastAPI:
     async def api_type(sid: str, body: TypeBody) -> Page:
         try:
             return await session_or_404(sid).type(body.ref, body.text, max_chars=body.max_chars)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/v1/sessions/{sid}/actions", response_model=ActionList, tags=["session"])
+    async def api_actions(sid: str, max_actions: int = 200) -> ActionList:
+        session = session_or_404(sid)
+        surface = session.action_surface(max_actions=max_actions)
+        return ActionList(
+            coverage=surface.coverage_line(),
+            complete=surface.complete,
+            total_found=surface.total_found,
+            returned=len(surface.actions),
+            truncated=surface.truncated,
+            engine_only=surface.engine_only,
+            actions=[
+                ActionItem(
+                    ref=a.ref,
+                    kind=a.kind,
+                    role=a.role,
+                    label=a.label,
+                    target=a.target,
+                    field_name=a.field_name,
+                    tag=a.tag,
+                    checked=a.checked,
+                    disabled=a.disabled,
+                    notes=a.notes,
+                    http_callable=a.callable_without_engine,
+                )
+                for a in surface.actions
+            ],
+        )
+
+    @app.post("/v1/sessions/{sid}/act", response_model=Page, tags=["session"])
+    async def api_act(sid: str, body: ActBody) -> Page:
+        try:
+            return await session_or_404(sid).act(
+                body.ref,
+                text=body.text,
+                dx=body.dx,
+                dy=body.dy,
+                max_chars=body.max_chars,
+            )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 

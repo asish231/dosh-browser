@@ -8,6 +8,7 @@ flat markdown blob.
 
 from __future__ import annotations
 
+import json
 from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 from webresearch.content import content_root, inside_chrome
@@ -125,6 +126,63 @@ def build_acd(
             if len(blocks) >= max_blocks:
                 break
 
+    # Extract JSON-LD structured data (FAQPage, HowTo, Product, etc.)
+    json_ld_data: list[dict] = []
+    if tree is not None:
+        for script_node in tree.css("script[type='application/ld+json']"):
+            raw = script_node.text(strip=True)
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    json_ld_data.extend(item for item in parsed if isinstance(item, dict))
+                elif isinstance(parsed, dict):
+                    # Check for schema.org @graph
+                    if isinstance(parsed.get("@graph"), list):
+                        json_ld_data.extend(item for item in parsed["@graph"] if isinstance(item, dict))
+                    json_ld_data.append(parsed)
+            except Exception:
+                continue
+
+    # Project high-value JSON-LD schemas (FAQPage, HowTo) into structured ACD blocks
+    for entity in json_ld_data:
+        if len(blocks) >= max_blocks:
+            break
+        etype = entity.get("@type")
+        if etype == "FAQPage" and isinstance(entity.get("mainEntity"), list):
+            for faq in entity["mainEntity"]:
+                if not isinstance(faq, dict) or len(blocks) >= max_blocks:
+                    continue
+                q = str(faq.get("name") or "").strip()
+                ans_obj = faq.get("acceptedAnswer") or {}
+                a = str(ans_obj.get("text") if isinstance(ans_obj, dict) else ans_obj or "").strip()
+                if q and a:
+                    counter += 1
+                    blocks.append(AcdBlock(id=f"b{counter}", type="heading", level=4, text=f"Q: {q}"))
+                    counter += 1
+                    clean_a = " ".join(HTMLParser(a).text(separator=" ", strip=True).split()) if "<" in a else a
+                    blocks.append(AcdBlock(id=f"b{counter}", type="text", text=clean_a))
+        elif etype == "HowTo" and isinstance(entity.get("step"), list):
+            howto_name = str(entity.get("name") or "").strip()
+            if howto_name and len(blocks) < max_blocks:
+                counter += 1
+                blocks.append(AcdBlock(id=f"b{counter}", type="heading", level=3, text=howto_name))
+            for step in entity["step"]:
+                if not isinstance(step, dict) or len(blocks) >= max_blocks:
+                    continue
+                s_name = str(step.get("name") or "").strip()
+                s_text = ""
+                direction = step.get("itemListElement")
+                if isinstance(direction, dict):
+                    s_text = str(direction.get("text") or "").strip()
+                elif isinstance(step.get("text"), str):
+                    s_text = step["text"].strip()
+                combined = f"{s_name}: {s_text}" if s_name and s_text else (s_name or s_text)
+                if combined:
+                    counter += 1
+                    blocks.append(AcdBlock(id=f"b{counter}", type="list", text=combined))
+
     actions: list[AcdAction] = []
     for target in targets:
         if target.challenge:
@@ -149,11 +207,15 @@ def build_acd(
             url=str(item.get("url") or ""),
             status=int(item.get("status") or 0),
             content_type=str(item.get("content_type") or ""),
+            method=str(item.get("method") or "GET"),
+            data=item.get("data"),
         )
         for i, item in enumerate(js_info.get("resource_requests") or [])
     ]
 
-    framework = js_info.get("framework_data") or {}
+    framework = dict(js_info.get("framework_data") or {})
+    if json_ld_data:
+        framework["json_ld"] = json_ld_data
     errors = list(js_info.get("error_messages") or [])
 
     counts = {

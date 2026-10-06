@@ -79,6 +79,39 @@ class AcdTests(unittest.TestCase):
         self.assertIn("__NEXT_DATA__", acd.framework)
         self.assertEqual(acd.errors, ["TypeError: boom"])
 
+    def test_acd_extracts_json_ld_faq_and_howto(self):
+        json_ld_html = """<!doctype html><html><head>
+        <script type="application/ld+json">
+        {
+            "@context": "https://schema.org",
+            "@type": "FAQPage",
+            "mainEntity": [{
+                "@type": "Question",
+                "name": "How to make a website?",
+                "acceptedAnswer": {"@type": "Answer", "text": "Pick a template and customize."}
+            }]
+        }
+        </script>
+        <script type="application/ld+json">
+        {
+            "@context": "https://schema.org",
+            "@type": "HowTo",
+            "name": "Build Guide",
+            "step": [
+                {"@type": "HowToStep", "name": "Step 1", "itemListElement": {"@type": "HowToDirection", "text": "Choose name"}},
+                {"@type": "HowToStep", "name": "Step 2", "itemListElement": {"@type": "HowToDirection", "text": "Launch"}}
+            ]
+        }
+        </script>
+        </head><body><h1>Guide</h1></body></html>"""
+        acd = build_acd(url="https://example.com/guide", title="Guide", html=json_ld_html)
+        self.assertIn("json_ld", acd.framework)
+        self.assertEqual(len(acd.framework["json_ld"]), 2)
+        faq_hits = query_acd(acd, "template")
+        self.assertTrue(len(faq_hits) > 0)
+        howto_hits = query_acd(acd, "Choose name")
+        self.assertTrue(len(howto_hits) > 0)
+
 
 class ToolSurfaceTests(unittest.TestCase):
     def test_tools_include_query_slice(self):

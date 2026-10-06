@@ -98,6 +98,52 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "browser_actions",
+            "description": (
+                "List the complete action surface of a session's current page: every control "
+                "reachable, with a stable ref, its kind (navigate/submit/activate/drag/"
+                "dropzone/embed) and its target. Prefer this over browser_inspect when you "
+                "need to act: inspect refs are numbered in document order and stop at 80, "
+                "while this enumerates the whole page and reports what it omitted. Controls "
+                "with 'needs real engine' have no href and no form, so browser_click cannot "
+                "reach them; use browser_act, which routes to a real browser."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "max_actions": {"type": "integer", "default": 200},
+                },
+                "required": ["session_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_act",
+            "description": (
+                "Carry out one action from browser_actions by ref. Navigates for links, fills "
+                "and submits for form fields (pass text), and uses a real browser for activate "
+                "and drag controls. Pass dx/dy for a drag."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "ref": {"type": "string", "description": "Action ref from browser_actions"},
+                    "text": {"type": "string", "description": "Value for a form field"},
+                    "dx": {"type": "number", "description": "Horizontal drag distance in px"},
+                    "dy": {"type": "number", "description": "Vertical drag distance in px"},
+                    "max_chars": {"type": "integer", "default": 8000},
+                },
+                "required": ["session_id", "ref"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "browser_frames",
             "description": (
                 "List iframe documents loaded in isolated QuickJS contexts. Returns [fN] refs, "

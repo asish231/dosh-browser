@@ -4,9 +4,7 @@ import argparse
 import asyncio
 import sys
 
-import httpx
-
-from webresearch.fetch import client_kwargs
+from webresearch.fetch import make_client
 from webresearch.read import captcha_code, read
 from webresearch.search import search
 
@@ -58,7 +56,51 @@ def main(argv: list[str] | None = None) -> None:
     models_cmd.add_argument("--json", action="store_true")
     models_cmd.add_argument("--ping", action="store_true", help="Send a live test request")
 
+    sub.add_parser("mcp", help="Run Model Context Protocol (MCP) server over stdio")
+
+    profile_cmd = sub.add_parser("profile", help="Manage persistent profiles and cookies")
+    p_sub = profile_cmd.add_subparsers(dest="action", required=True)
+    p_sub.add_parser("list", help="List available profiles")
+    p_import = p_sub.add_parser("import", help="Import cookies from cookies.txt (Netscape format)")
+    p_import.add_argument("file", help="Path to cookies.txt file")
+    p_import.add_argument("--name", default="default", help="Profile name")
+    p_export = p_sub.add_parser("export", help="Export cookies in cookies.txt format")
+    p_export.add_argument("--name", default="default", help="Profile name")
+    p_clear = p_sub.add_parser("clear", help="Clear cookies in profile")
+    p_clear.add_argument("--name", default="default", help="Profile name")
+
     args = parser.parse_args(argv)
+
+    if args.cmd == "mcp":
+        from webresearch.mcp import run_mcp_server
+
+        run_mcp_server()
+        return
+
+    if args.cmd == "profile":
+        from webresearch.profile import Profile, list_profiles
+
+        if args.action == "list":
+            profiles = list_profiles()
+            if not profiles:
+                print("No profiles found (default directory ~/.dosh-browser/profiles)")
+            else:
+                for p in profiles:
+                    print(f"- {p}")
+            return
+        prof = Profile(name=args.name)
+        if args.action == "import":
+            with open(args.file, "r", encoding="utf-8") as f:
+                count = prof.import_netscape(f.read())
+            print(f"Imported {count} cookies into profile '{args.name}'")
+            return
+        if args.action == "export":
+            print(prof.export_netscape())
+            return
+        if args.action == "clear":
+            prof.clear()
+            print(f"Cleared cookies in profile '{args.name}'")
+            return
 
     if args.cmd == "serve":
         import uvicorn
@@ -168,7 +210,7 @@ async def _run_ask(args: argparse.Namespace) -> None:
 
 
 async def _run_cli(args: argparse.Namespace) -> None:
-    async with httpx.AsyncClient(**client_kwargs()) as client:
+    async with make_client() as client:
         if args.cmd == "read":
             page = await read(args.url, client=client, max_chars=args.max_chars, js=args.js)
             print(page.model_dump_json(indent=2) if args.json else page.view)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import time
 from urllib.parse import urlencode, urlparse, urlunparse
@@ -8,7 +9,7 @@ from urllib.parse import urlencode, urlparse, urlunparse
 import httpx
 
 from webresearch.acd import query_acd, slice_acd
-from webresearch.engine import chromium
+from webresearch.actions import Action, ActionSurface, collect
 from webresearch.engine.captcha import (
     CaptchaInspection,
     dump_captcha_code,
@@ -17,7 +18,7 @@ from webresearch.engine.captcha import (
 from webresearch.engine.frames import FrameDocument, frame_infos, load_frames
 from webresearch.engine.inspect import click_html, inspect_html, type_html
 from webresearch.engine.runtime import run_scripts
-from webresearch.fetch import client_kwargs, fetch
+from webresearch.fetch import close_impersonated, fetch, make_client
 from webresearch.parse import parse
 from webresearch.read import _decorate, read_live
 from webresearch.search import search as web_search
@@ -34,22 +35,20 @@ from webresearch.types import (
 )
 
 
-class Session:
-    """Agent session: cookies, history, live HTML, inspect/click/type."""
+from webresearch.profile import Profile
 
-    def __init__(self, client: httpx.AsyncClient, session_id: str) -> None:
-        self.id = session_id
-        self.client = client
+
+class Tab:
+    """An open tab in a Session with its own navigation history and DOM state."""
+
+    def __init__(self, tab_id: str) -> None:
+        self.id = tab_id
         self.history: list[Page] = []
-        self.index = -1
-        self.html = ""
-        self.url = ""
+        self.index: int = -1
+        self.html: str = ""
+        self.url: str = ""
         self.frame_documents: list[FrameDocument] = []
         self.captcha_inspection: CaptchaInspection | None = None
-        self.created_at = time.time()
-        self.last_used = self.created_at
-        self.proxy: str | None = None
-        self.chromium_session: chromium.ChromiumSession | None = None
 
     @property
     def page(self) -> Page | None:
@@ -57,7 +56,7 @@ class Session:
             return self.history[self.index]
         return None
 
-    def _push(self, page: Page, html: str | None = None) -> Page:
+    def push(self, page: Page, html: str | None = None) -> Page:
         if html is not None:
             self.html = html
             self.url = page.url
@@ -66,25 +65,137 @@ class Session:
         self.index = len(self.history) - 1
         return page
 
+
+class Session:
+    """Agent session: cookies, multi-tab history, live HTML, inspect/click/type."""
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        session_id: str,
+        profile: str | Profile | None = None,
+    ) -> None:
+        self.id = session_id
+        self.client = client
+        self.profile = Profile(profile) if isinstance(profile, str) else profile
+        if self.profile is not None:
+            self.profile.apply_to_client(self.client)
+
+        self._tabs: dict[str, Tab] = {}
+        initial_tab = Tab("tab_1")
+        self._tabs["tab_1"] = initial_tab
+        self.active_tab_id = "tab_1"
+
+        self.created_at = time.time()
+        self.last_used = self.created_at
+        self.proxy: str | None = None
+
+    @property
+    def current_tab(self) -> Tab:
+        if self.active_tab_id not in self._tabs:
+            self._tabs[self.active_tab_id] = Tab(self.active_tab_id)
+        return self._tabs[self.active_tab_id]
+
+    @property
+    def tabs(self) -> list[dict[str, Any]]:
+        """List all open tabs in this session."""
+        return [
+            {
+                "id": tab.id,
+                "title": tab.page.title if tab.page else "",
+                "url": tab.url,
+                "active": tab.id == self.active_tab_id,
+            }
+            for tab in self._tabs.values()
+        ]
+
+    def new_tab(self, tab_id: str | None = None) -> str:
+        """Open a new blank tab and switch to it."""
+        tid = tab_id or f"tab_{len(self._tabs) + 1}"
+        self._tabs[tid] = Tab(tid)
+        self.active_tab_id = tid
+        return tid
+
+    def switch_tab(self, tab_id: str) -> Page | None:
+        """Switch active tab to tab_id."""
+        if tab_id not in self._tabs:
+            raise ValueError(f"no tab [{tab_id}]")
+        self.active_tab_id = tab_id
+        return self.page
+
+    def close_tab(self, tab_id: str) -> None:
+        """Close an open tab."""
+        if len(self._tabs) <= 1:
+            raise ValueError("cannot close the only open tab")
+        if tab_id not in self._tabs:
+            raise ValueError(f"no tab [{tab_id}]")
+        del self._tabs[tab_id]
+        if self.active_tab_id == tab_id:
+            self.active_tab_id = next(iter(self._tabs.keys()))
+
+    @property
+    def history(self) -> list[Page]:
+        return self.current_tab.history
+
+    @history.setter
+    def history(self, val: list[Page]) -> None:
+        self.current_tab.history = val
+
+    @property
+    def index(self) -> int:
+        return self.current_tab.index
+
+    @index.setter
+    def index(self, val: int) -> None:
+        self.current_tab.index = val
+
+    @property
+    def html(self) -> str:
+        return self.current_tab.html
+
+    @html.setter
+    def html(self, val: str) -> None:
+        self.current_tab.html = val
+
+    @property
+    def url(self) -> str:
+        return self.current_tab.url
+
+    @url.setter
+    def url(self, val: str) -> None:
+        self.current_tab.url = val
+
+    @property
+    def frame_documents(self) -> list[FrameDocument]:
+        return self.current_tab.frame_documents
+
+    @frame_documents.setter
+    def frame_documents(self, val: list[FrameDocument]) -> None:
+        self.current_tab.frame_documents = val
+
+    @property
+    def captcha_inspection(self) -> CaptchaInspection | None:
+        return self.current_tab.captcha_inspection
+
+    @captcha_inspection.setter
+    def captcha_inspection(self, val: CaptchaInspection | None) -> None:
+        self.current_tab.captcha_inspection = val
+
+    @property
+    def page(self) -> Page | None:
+        return self.current_tab.page
+
+    def _push(self, page: Page, html: str | None = None) -> Page:
+        return self.current_tab.push(page, html)
+
     async def goto(self, url: str, *, max_chars: int = 8000, js: str = "auto") -> Page:
-        # Lazily create a persistent Chromium session so an escalated SPA keeps
-        # one live browser across goto/click/type/scroll.
-        if self.chromium_session is None and chromium.available():
-            self.chromium_session = chromium.ChromiumSession(
-                proxy=self.proxy, headers=dict(self.client.headers)
-            )
         page, html, frames, captcha = await read_live(
             url,
             client=self.client,
             max_chars=max_chars,
             js=js,  # type: ignore[arg-type]
             sprite_endpoint=f"/v1/sessions/{self.id}/captcha/sprite",
-            chromium_session=self.chromium_session,
         )
-        # If the page did NOT escalate, the chromium session is unused; drop it.
-        if page.engine != "chromium" and self.chromium_session is not None:
-            await self.chromium_session.close()
-            self.chromium_session = None
         self.frame_documents = frames
         self.captcha_inspection = captcha
         return self._push(page, html)
@@ -116,6 +227,29 @@ class Session:
         payload = {item.name: item.value for item in form.fields}
         if fields:
             payload.update(fields)
+        # Hidden fields are reported by name without their value so the model
+        # never sees a session blob it might try to invent or echo. A real
+        # submit still needs them, so pull the live values from the document.
+        if self.html:
+            from webresearch.parse import parse as parse_document
+            from webresearch.forms import hidden_values as read_hidden_values
+            from webresearch.types import FetchResult as _FetchResult
+
+            live = read_hidden_values(
+                parse_document(
+                    _FetchResult(
+                        url=self.url,
+                        final_url=self.url,
+                        status=current.status,
+                        content_type=current.content_type,
+                        kind=current.kind,
+                        body=self.html,
+                    )
+                ),
+                n,
+            )
+            for key, value in live.items():
+                payload.setdefault(key, value)
         payload = {k: v for k, v in payload.items() if k}
         if form.method == "GET":
             parsed = urlparse(form.action)
@@ -228,8 +362,6 @@ class Session:
         ):
             return await self.goto(target.href, max_chars=max_chars)
         # Chromium lane: real CDP click on the live page, keep browser state.
-        if self._use_cdp(target):
-            return await self._cdp_click(target, max_chars)
         return await self._apply(
             [{"kind": "click", "path": target.path}], self.html, max_chars
         )
@@ -242,79 +374,155 @@ class Session:
         if target is None:
             html = type_html(self.html, ref, text)
             return await self._apply([], html, max_chars)
-        if self._use_cdp(target):
-            return await self._cdp_type(target, text, max_chars)
         return await self._apply(
             [{"kind": "type", "path": target.path, "text": text}],
             self.html,
             max_chars,
         )
 
+    # -- action-surface driven navigation -------------------------------
+    # The `[eN]` refs above are numbered in document order and stop at 80, so
+    # an agent cannot address the rest of a real page. The action surface below
+    # uses content-addressed refs and discloses its own budget instead.
+
+    def action_surface(self, *, max_actions: int = 200) -> ActionSurface:
+        return collect(self.html, self.url, max_actions=max_actions)
+
+    async def act(
+        self,
+        ref: str,
+        *,
+        text: str = "",
+        dx: float | None = None,
+        dy: float | None = None,
+        max_chars: int = 8000,
+    ) -> Page:
+        """Carry out one action from the surface by ref.
+
+        Dispatches on the action's kind, so the caller does not need to know
+        whether a control is a link, a form field, a bare button, or a drag
+        handle. Controls that only a real engine can actuate say so rather than
+        failing obscurely.
+        """
+        surface = self.action_surface(max_actions=100_000)
+        action = next((a for a in surface.actions if a.ref == ref), None)
+        if action is None:
+            known = ", ".join(sorted(a.ref for a in surface.actions[:8]))
+            raise ValueError(
+                f"no action [{ref}]. Surface has {len(surface.actions)} action(s); "
+                f"first refs: {known}"
+            )
+
+        if action.kind == "navigate":
+            return await self.goto(action.target, max_chars=max_chars)
+
+        if action.kind == "submit":
+            if not text:
+                raise ValueError(
+                    f"[{ref}] {action.role!r} is a form field and needs text"
+                )
+            return await self._act_submit_field(action, text, max_chars)
+
+        if action.disabled:
+            raise ValueError(f"[{ref}] {action.label!r} is disabled")
+
+        if action.kind == "dropzone":
+            raise ValueError(
+                f"[{ref}] is a drag goal, not a control; drag a handle onto it"
+            )
+
+        if action.kind in {"activate", "drag", "embed"}:
+            return await self._act_engine(action, text=text, dx=dx, dy=dy, max_chars=max_chars)
+
+        raise ValueError(f"[{ref}] has unsupported kind {action.kind!r}")
+
+    async def _act_submit_field(
+        self, action: Action, text: str, max_chars: int
+    ) -> Page:
+        """Fill a named field and submit the form that owns it."""
+        match = re.match(r"form\[(\d+)\]", action.target)
+        if not match:
+            raise ValueError(f"malformed form target {action.target!r}")
+        index = int(match.group(1))
+        current = self.page
+        forms = extract_forms(
+            parse(
+                FetchResult(
+                    url=self.url,
+                    final_url=self.url,
+                    status=current.status if current else 200,
+                    content_type=current.content_type if current else "text/html",
+                    kind=current.kind if current else "html",
+                    body=self.html,
+                )
+            )
+        )
+        if not 1 <= index <= len(forms):
+            raise ValueError(f"form {index} is out of range")
+        # A field with no name cannot be addressed over HTTP: the payload would
+        # have no key to send it under. Say so rather than guessing.
+        name = action.field_name
+        if not name:
+            raise ValueError(
+                f"[{action.ref}] {action.label!r} has no name attribute, so an HTTP "
+                "submit cannot target it; use the engine lane"
+            )
+        return await self.submit(index, {name: text}, max_chars=max_chars)
+
+    async def _act_engine(
+        self,
+        action: Action,
+        *,
+        text: str,
+        dx: float | None,
+        dy: float | None,
+        max_chars: int,
+    ) -> Page:
+        """Actuate a control natively in the QuickJS mini-DOM.
+
+Actions carry a CSS selector rather than a child-index path, because the action
+surface addresses elements the way a page describes them and the mini-DOM can
+resolve a selector directly.
+"""
+        selector = action.selector or action.target
+        if action.kind == "drag":
+            return await self._apply(
+                [
+                    {
+                        "kind": "drag",
+                        "selector": selector,
+                        "dx": dx if dx is not None else 220.0,
+                        "dy": dy if dy is not None else 0.0,
+                    }
+                ],
+                self.html,
+                max_chars,
+            )
+        elif action.kind == "activate":
+            if text:
+                return await self._apply(
+                    [{"kind": "type", "selector": selector, "text": text}],
+                    self.html,
+                    max_chars,
+                )
+            return await self._apply(
+                [{"kind": "activate", "selector": selector}],
+                self.html,
+                max_chars,
+            )
+        else:  # embed
+            raise ValueError(
+                f"[{action.ref}] is embedded content at {selector!r}; "
+                "read its own document instead of acting on it"
+            )
+
     async def scroll(self, y: int = 800, x: int = 0, *, max_chars: int = 8000) -> Page:
         """Scroll the page; fires scroll event + IntersectionObserver notifications."""
         if not self.html:
             raise ValueError("no current page")
-        if self.chromium_session is not None and self.page and self.page.engine == "chromium":
-            await self.chromium_session.scroll(y)
-            return await self._rebuild_from_chromium(max_chars)
         return await self._apply(
             [{"kind": "scroll", "x": x, "y": y}], self.html, max_chars
         )
-
-    def _use_cdp(self, target: Target) -> bool:
-        return (
-            self.chromium_session is not None
-            and self.page is not None
-            and self.page.engine == "chromium"
-            and bool(target.path)
-        )
-
-    async def _cdp_click(self, target: Target, max_chars: int) -> Page:
-        ok = await self.chromium_session.click_path(target.path)  # type: ignore[union-attr]
-        if not ok:
-            return await self._apply([{"kind": "click", "path": target.path}], self.html, max_chars)
-        return await self._rebuild_from_chromium(max_chars)
-
-    async def _cdp_type(self, target: Target, text: str, max_chars: int) -> Page:
-        ok = await self.chromium_session.type_path(target.path, text)  # type: ignore[union-attr]
-        if not ok:
-            return await self._apply(
-                [{"kind": "type", "path": target.path, "text": text}], self.html, max_chars
-            )
-        return await self._rebuild_from_chromium(max_chars)
-
-    async def _rebuild_from_chromium(self, max_chars: int) -> Page:
-        """Re-read the live Chromium DOM and rebuild the page model."""
-        assert self.chromium_session is not None
-        html = await self.chromium_session.content()
-        url = self.chromium_session.url or self.url
-        self.url = url
-        result = FetchResult(
-            url=url,
-            final_url=url,
-            status=200,
-            content_type="text/html",
-            kind="html",
-            body=html,
-        )
-        frames = (
-            await load_frames(html, url, self.client) if html else self.frame_documents
-        )
-        captcha = await inspect_captcha(
-            html,
-            url,
-            self.client,
-            frames,
-            sprite_endpoint=f"/v1/sessions/{self.id}/captcha/sprite",
-        )
-        page = snapshot(parse(result), max_chars=max_chars)
-        page = _decorate(
-            page, html, True, {"engine": "chromium", "ran": True, "scripts": 1},
-            frames=frames, captcha=captcha.report,
-        )
-        self.frame_documents = frames
-        self.captcha_inspection = captcha
-        return self._push(page, html)
 
     async def _apply(
         self, actions: list[dict], html: str, max_chars: int
@@ -427,12 +635,9 @@ class Session:
         return await web_search(query, client=self.client, engine=engine)  # type: ignore[arg-type]
 
     async def close(self) -> None:
-        if self.chromium_session is not None:
-            import contextlib
-
-            with contextlib.suppress(Exception):
-                await self.chromium_session.close()
-            self.chromium_session = None
+        if self.profile is not None:
+            self.profile.save_from_client(self.client)
+        await close_impersonated(self.client)
         await self.client.aclose()
 
 
@@ -462,13 +667,19 @@ class Browser:
         self._proxy_index += 1
         return proxy
 
-    async def create(self, *, headers: dict[str, str] | None = None, proxy: str | None = None) -> Session:
+    async def create(
+        self,
+        *,
+        headers: dict[str, str] | None = None,
+        proxy: str | None = None,
+        profile: str | Profile | None = None,
+    ) -> Session:
         await self._evict()
         sid = "s_" + secrets.token_hex(4)
         # Explicit proxy wins; otherwise rotate through the pool for isolation.
         chosen = proxy if proxy is not None else self._next_proxy()
-        client = httpx.AsyncClient(**client_kwargs(headers=headers, proxy=chosen))
-        session = Session(client, sid)
+        client = make_client(headers=headers, proxy=chosen)
+        session = Session(client, sid, profile=profile)
         session.proxy = chosen
         self.sessions[sid] = session
         return session

@@ -52,6 +52,41 @@ async def invoke(http: httpx.AsyncClient, browser: Browser, name: str, args: dic
     if name == "browser_inspect":
         targets, challenges = browser.get(args["session_id"]).inspect()
         return {"targets": targets, "challenges": challenges}
+    if name == "browser_actions":
+        surface = browser.get(args["session_id"]).action_surface(
+            max_actions=int(args.get("max_actions", 200))
+        )
+        return {
+            "coverage": surface.coverage_line(),
+            "complete": surface.complete,
+            "total_found": surface.total_found,
+            "returned": len(surface.actions),
+            "truncated": surface.truncated,
+            "engine_only": surface.engine_only,
+            "actions": [
+                {
+                    "ref": a.ref,
+                    "kind": a.kind,
+                    "role": a.role,
+                    "label": a.label,
+                    "target": a.target,
+                    "field_name": a.field_name,
+                    "checked": a.checked,
+                    "disabled": a.disabled,
+                    "notes": a.notes,
+                    "http_callable": a.callable_without_engine,
+                }
+                for a in surface.actions
+            ],
+        }
+    if name == "browser_act":
+        return await browser.get(args["session_id"]).act(
+            args["ref"],
+            text=args.get("text") or "",
+            dx=args.get("dx"),
+            dy=args.get("dy"),
+            max_chars=int(args.get("max_chars", 8000)),
+        )
     if name == "browser_query":
         return browser.get(args["session_id"]).query(
             args.get("term") or "", limit=int(args.get("limit", 40))

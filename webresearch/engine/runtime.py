@@ -9,6 +9,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from quickjs import Context
 
+from webresearch import device as device_mod
 from webresearch.engine.modules import (
     extract_import_map,
     load_module_graph,
@@ -58,6 +59,35 @@ def _host_parse_html(html: str) -> str:
         if child.get("t") == "div" and (child.get("a") or {}).get("id") == "__frag":
             return json.dumps(child.get("c") or [])
     return json.dumps(tree.get("c") or [])
+
+
+def _device_block() -> dict:
+    """Real host facts injected into the mini-DOM so stubs match this device.
+
+    Only genuine OS-reported values are used; nothing is fabricated. When the
+    host is a VM we say so via 'virtual'.
+    """
+    profile = device_mod.current()
+    renderer = "unknown"
+    vendor = "unknown"
+    if profile.platform == "Darwin" and profile.gpu != "unknown":
+        chip = profile.cpu_brand if profile.cpu_brand != "unknown" else profile.gpu
+        vendor = "Google Inc. (Apple)"
+        renderer = f"ANGLE (Apple, ANGLE Metal Renderer: {chip}, Unspecified Version)"
+    elif profile.gpu != "unknown":
+        vendor = "Google Inc. (Unknown)"
+        renderer = f"ANGLE ({profile.gpu}, Unspecified Version)"
+    return {
+        "platform": profile.platform,
+        "cpu_brand": profile.cpu_brand,
+        "cpu_count": profile.cpu_count,
+        "machine_model": profile.machine_model,
+        "gpu_renderer": renderer,
+        "gpu_vendor": vendor,
+        "secure_hardware": profile.secure_hardware,
+        "is_virtual": profile.is_virtual,
+        "is_real_device": profile.is_real_device,
+    }
 
 
 def _pump_jobs(ctx: Context) -> int:
@@ -203,8 +233,21 @@ async def run_scripts(
                     "Accept": "*/*",
                 }
             status, final, ctype, text, resp_headers = do_request(method, abs_url, body, headers)
+            data_payload = None
+            if "json" in ctype.lower() or (text and text.strip().startswith(("{", "["))):
+                try:
+                    if len(text) < 100_000:
+                        data_payload = json.loads(text)
+                except Exception:
+                    pass
             info["resource_requests"].append(
-                {"url": final[:2000], "status": status, "content_type": ctype[:200]}
+                {
+                    "url": final[:2000],
+                    "status": status,
+                    "content_type": ctype[:200],
+                    "method": method,
+                    "data": data_payload,
+                }
             )
             # Enforce CORS for cross-origin reads (like a real browser).
             if (
@@ -244,6 +287,7 @@ async def run_scripts(
     ua = client.headers.get("user-agent", "")
     ctx.eval(f"globalThis.__WR_UA = {json.dumps(ua)};")
     ctx.eval("globalThis.__WR_MODS = {};")
+    ctx.eval(f"globalThis.__WR_DEVICE = {json.dumps(_device_block())};")
 
     tree = html_to_tree(html)
     payload = json.dumps(tree, ensure_ascii=False)
@@ -337,10 +381,33 @@ async def run_scripts(
         for action in actions:
             kind = (action or {}).get("kind") or "click"
             path = (action or {}).get("path") or []
+            selector = (action or {}).get("selector") or ""
             try:
                 if kind == "type":
                     text = (action or {}).get("text") or ""
-                    ok = ctx.eval(f"__typePath({_json.dumps(path)}, {_json.dumps(text)})")
+                    if selector:
+                        ok = ctx.eval(
+                            f"__activateSelector({_json.dumps(selector)}, {_json.dumps(text)})"
+                        )
+                    else:
+                        ok = ctx.eval(f"__typePath({_json.dumps(path)}, {_json.dumps(text)})")
+                elif kind == "drag":
+                    dx = (action or {}).get("dx", 220.0)
+                    dy = (action or {}).get("dy", 0.0)
+                    steps = int((action or {}).get("steps", 12))
+                    target = selector or path
+                    ok = ctx.eval(
+                        f"__dragSelector({_json.dumps(target)}, {dx}, {dy}, {steps})"
+                        if isinstance(target, str)
+                        else f"__dragPath({_json.dumps(target)}, {dx}, {dy}, {steps})"
+                    )
+                elif kind == "activate":
+                    target = selector or path
+                    ok = ctx.eval(
+                        f"__activateSelector({_json.dumps(target)})"
+                        if isinstance(target, str)
+                        else f"__clickPath({_json.dumps(target)})"
+                    )
                 elif kind == "submit":
                     ok = ctx.eval(f"__submitPath({_json.dumps(path)})")
                     info.setdefault("submit_outcome", str(ok))
@@ -360,10 +427,16 @@ async def run_scripts(
                     ok = ctx.eval(f"scrollTo({_json.dumps(x)}, {_json.dumps(y)}); true")
                 else:
                     ok = ctx.eval(f"__clickPath({_json.dumps(path)})")
-                info["actions_applied"].append({"kind": kind, "path": path, "ok": bool(ok)})
+                info["actions_applied"].append(
+                    {
+                        "kind": kind,
+                        "path": path or selector,
+                        "ok": bool(ok),
+                    }
+                )
             except Exception as exc:
                 info["actions_applied"].append(
-                    {"kind": kind, "path": path, "ok": False, "error": str(exc)[:200]}
+                    {"kind": kind, "path": path or selector, "ok": False, "error": str(exc)[:200]}
                 )
             _pump_jobs(ctx)
         for _ in range(MAX_TIMER_PASSES):

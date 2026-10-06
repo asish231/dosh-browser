@@ -4,7 +4,7 @@ from selectolax.lexbor import LexborNode as Node
 
 from webresearch.content import content_root, inside_chrome
 from webresearch.forms import forms as extract_forms
-from webresearch.links import links as extract_links
+from webresearch.links import count_all_links, links as extract_links
 from webresearch.parse import Document, meta_from
 from webresearch.types import Page
 
@@ -157,6 +157,14 @@ def snapshot(
         for link in page_links:
             label = link.text.replace("\n", " ").strip()[:80]
             link_lines.append(f"[{link.n}] {label} → {link.url}")
+        # Say plainly when the list is a subset. An agent that sees 47 links and
+        # assumes that is all of them will conclude the page has no other exits.
+        total_links = count_all_links(doc)
+        if total_links > len(page_links):
+            link_lines.append(
+                f"[{len(page_links) + 1}] ... {total_links - len(page_links)} more link(s) "
+                "not shown; use browser_inspect or the action surface to reach them"
+            )
         parts.append("\n".join(link_lines))
     if page_forms:
         form_lines = ["Forms:"]
