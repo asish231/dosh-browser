@@ -468,6 +468,10 @@ class Session:
         self, action: Action, text: str, max_chars: int
     ) -> Page:
         """Fill a named field and submit the form that owns it."""
+        from webresearch.forms import forms as extract_forms
+        from webresearch.parse import parse
+        from webresearch.types import FetchResult
+
         match = re.match(r"form\[(\d+)\]", action.target)
         if not match:
             raise ValueError(f"malformed form target {action.target!r}")
