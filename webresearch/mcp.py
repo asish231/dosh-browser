@@ -159,6 +159,18 @@ TOOLS = [
             "required": ["token", "provider"],
         },
     },
+    {
+        "name": "browser_scroll",
+        "description": "Scroll down or up on the current page to trigger infinite scrolling, lazy loaded content, and intersection observers.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "y": {"type": "integer", "default": 800, "description": "Vertical scroll delta in pixels"},
+                "x": {"type": "integer", "default": 0, "description": "Horizontal scroll delta in pixels"},
+                "max_chars": {"type": "integer", "default": 8000, "description": "Maximum characters in returned page snapshot"},
+            },
+        },
+    },
 ]
 
 
@@ -301,6 +313,13 @@ class McpServer:
                 return {"content": [{"type": "text", "text": f"Added recaptcha token. Retry with: session.goto('{session.url}')"}]}
             else:
                 return {"content": [{"type": "text", "text": f"Token added for {provider}. Try retrying navigation."}]}
+
+        elif name == "browser_scroll":
+            y = int(args.get("y", 800))
+            x = int(args.get("x", 0))
+            max_chars = int(args.get("max_chars", 8000))
+            page = await session.scroll(y=y, x=x, max_chars=max_chars)
+            return {"content": [{"type": "text", "text": page.view}]}
 
         raise ValueError(f"unknown tool: {name}")
 
