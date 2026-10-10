@@ -1,4 +1,6 @@
 import asyncio
+from pathlib import Path
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -157,10 +159,42 @@ class CategoryATests(unittest.TestCase):
             self.assertIn("cf_clearance", waf_tokens)
             self.assertEqual(waf_tokens["cf_clearance"], "test_token_12345")
 
-            # Local storage persistence
+            # Local storage persistence in SQLite & JSON
             prof.save_storage("https://example.com", "user_pref", "dark_mode")
             storage = prof.load_storage("https://example.com")
             self.assertEqual(storage.get("user_pref"), "dark_mode")
+
+            # Verify SQLite database table storage contains it directly
+            with sqlite3.connect(prof.db_file) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT value FROM storage WHERE origin = ? AND key = ?", ("https://example.com", "user_pref"))
+                row = cur.fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row[0], "dark_mode")
+
+            # Test import_browser_sqlite from simulated Chrome and Firefox sqlite files
+            chrome_db = Path(tmp) / "chrome_cookies.sqlite"
+            with sqlite3.connect(chrome_db) as conn:
+                conn.execute("""
+                    CREATE TABLE cookies (
+                        name TEXT, value TEXT, host_key TEXT, path TEXT, is_secure INTEGER, expires_utc INTEGER
+                    )
+                """)
+                conn.execute(
+                    "INSERT INTO cookies VALUES (?, ?, ?, ?, ?, ?)",
+                    ("sessionid", "ig_session_998877", ".instagram.com", "/", 1, 0)
+                )
+                conn.commit()
+
+            imported_count = prof.import_browser_sqlite(chrome_db)
+            self.assertEqual(imported_count, 1)
+            ig_cookies = prof.get_domain_cookies("instagram.com")
+            self.assertTrue(any(c["name"] == "sessionid" and c["value"] == "ig_session_998877" for c in ig_cookies))
+
+            # Test clear() clears both files and SQLite records
+            prof.clear()
+            self.assertEqual(len(prof.load_cookies()), 0)
+            self.assertEqual(len(prof.load_storage("https://example.com")), 0)
 
     def test_cross_origin_postmessage_handshake(self):
         # 1. Parent posting to iframe window

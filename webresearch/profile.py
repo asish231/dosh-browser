@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import time
 from typing import Any
 
@@ -42,7 +43,7 @@ WAF_TOKEN_NAMES = {
 
 
 class Profile:
-    """Manages persistent browser profile data (cookies and storage)."""
+    """Manages persistent browser profile data (cookies and storage) via SQLite and JSON."""
 
     def __init__(self, name: str = "default", base_dir: Path | str | None = None) -> None:
         self.name = re.sub(r"[^\w\.-]", "_", name)
@@ -50,13 +51,69 @@ class Profile:
         self.profile_dir = self.base_dir / self.name
         self.cookies_file = self.profile_dir / "cookies.json"
         self.storage_file = self.profile_dir / "storage.json"
+        self.db_file = self.profile_dir / "profile.sqlite"
         self._ensure_dir()
+        self._init_sqlite()
 
     def _ensure_dir(self) -> None:
         self.profile_dir.mkdir(parents=True, exist_ok=True)
 
+    def _init_sqlite(self) -> None:
+        """Initialize the SQLite schema for cookies and session storage."""
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cookies (
+                        name TEXT NOT NULL,
+                        value TEXT NOT NULL,
+                        domain TEXT NOT NULL,
+                        path TEXT NOT NULL DEFAULT '/',
+                        secure INTEGER NOT NULL DEFAULT 0,
+                        expires REAL,
+                        created_at REAL NOT NULL,
+                        PRIMARY KEY(name, domain, path)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS storage (
+                        origin TEXT NOT NULL,
+                        key TEXT NOT NULL,
+                        value TEXT NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY(origin, key)
+                    )
+                    """
+                )
+                conn.commit()
+        except Exception:
+            pass
+
     def load_cookies(self) -> list[dict[str, Any]]:
-        """Load cookies list from disk."""
+        """Load cookies list from SQLite database, with JSON fallback."""
+        if self.db_file.exists():
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT name, value, domain, path, secure, expires FROM cookies")
+                    rows = cur.fetchall()
+                    if rows:
+                        return [
+                            {
+                                "name": r[0],
+                                "value": r[1],
+                                "domain": r[2],
+                                "path": r[3],
+                                "secure": bool(r[4]),
+                                "expires": r[5],
+                            }
+                            for r in rows
+                        ]
+            except Exception:
+                pass
+
         if not self.cookies_file.exists():
             return []
         try:
@@ -69,7 +126,7 @@ class Profile:
         return []
 
     def save_cookies(self, cookies: list[dict[str, Any]] | httpx.Cookies | Any) -> None:
-        """Save a list of cookie dicts or an httpx.Cookies instance to disk."""
+        """Save a list of cookie dicts or an httpx.Cookies instance to SQLite and disk."""
         out: list[dict[str, Any]] = []
         if isinstance(cookies, list):
             out = cookies
@@ -86,6 +143,31 @@ class Profile:
                     }
                 )
         self._ensure_dir()
+        # 1. Sync to SQLite database
+        now = time.time()
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                for c in out:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO cookies (name, value, domain, path, secure, expires, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            c.get("name", ""),
+                            c.get("value", ""),
+                            c.get("domain", ""),
+                            c.get("path", "/"),
+                            1 if c.get("secure") else 0,
+                            c.get("expires"),
+                            now,
+                        ),
+                    )
+                conn.commit()
+        except Exception:
+            pass
+
+        # 2. Sync to JSON file
         temp_file = self.cookies_file.with_suffix(".tmp")
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=2)
@@ -160,7 +242,18 @@ class Profile:
         return False
 
     def load_storage(self, origin: str) -> dict[str, str]:
-        """Load persistent localStorage key-value pairs for origin."""
+        """Load persistent localStorage key-value pairs for origin from SQLite or JSON."""
+        if self.db_file.exists():
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT key, value FROM storage WHERE origin = ?", (origin,))
+                    rows = cur.fetchall()
+                    if rows:
+                        return {r[0]: r[1] for r in rows}
+            except Exception:
+                pass
+
         if not self.storage_file.exists():
             return {}
         try:
@@ -173,7 +266,24 @@ class Profile:
         return {}
 
     def save_storage(self, origin: str, key: str, value: str) -> None:
-        """Save a key-value pair to origin localStorage."""
+        """Save a key-value pair to origin localStorage in SQLite and JSON."""
+        self._ensure_dir()
+        now = time.time()
+        # 1. Sync to SQLite
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO storage (origin, key, value, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (origin, key, str(value), now),
+                )
+                conn.commit()
+        except Exception:
+            pass
+
+        # 2. Sync to JSON file
         data: dict[str, dict[str, str]] = {}
         if self.storage_file.exists():
             try:
@@ -184,11 +294,68 @@ class Profile:
             except Exception:
                 pass
         data.setdefault(origin, {})[key] = str(value)
-        self._ensure_dir()
         temp_file = self.storage_file.with_suffix(".tmp")
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         temp_file.replace(self.storage_file)
+
+    def import_browser_sqlite(self, sqlite_path: str | Path) -> int:
+        """Import cookies from external browser SQLite database (Firefox or Chrome/Chromium)."""
+        p = Path(sqlite_path)
+        if not p.exists():
+            return 0
+        cookies: list[dict[str, Any]] = []
+        try:
+            with sqlite3.connect(p) as conn:
+                cur = conn.cursor()
+                # Check available tables
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = {r[0].lower() for r in cur.fetchall()}
+
+                if "moz_cookies" in tables:
+                    # Firefox format
+                    cur.execute("SELECT name, value, host, path, isSecure, expiry FROM moz_cookies")
+                    for name, val, host, path, sec, exp in cur.fetchall():
+                        if name and val:
+                            cookies.append({
+                                "name": name,
+                                "value": val,
+                                "domain": host.lstrip("."),
+                                "path": path or "/",
+                                "secure": bool(sec),
+                                "expires": exp,
+                            })
+                elif "cookies" in tables:
+                    # Chrome / Chromium format
+                    cur.execute("PRAGMA table_info(cookies)")
+                    col_names = [col[1].lower() for col in cur.fetchall()]
+                    host_col = "host_key" if "host_key" in col_names else "domain"
+                    sec_col = "is_secure" if "is_secure" in col_names else "secure"
+                    exp_col = "expires_utc" if "expires_utc" in col_names else "expires"
+                    query = f"SELECT name, value, {host_col}, path, {sec_col}, {exp_col} FROM cookies"
+                    cur.execute(query)
+                    for name, val, host, path, sec, exp in cur.fetchall():
+                        if name and val:
+                            # Convert Chrome Windows Epoch (microseconds since 1601) if applicable
+                            exp_ts = None
+                            if exp and exp > 11644473600000000:
+                                exp_ts = (exp - 11644473600000000) / 1000000.0
+                            elif exp:
+                                exp_ts = exp
+                            cookies.append({
+                                "name": name,
+                                "value": val,
+                                "domain": (host or "").lstrip("."),
+                                "path": path or "/",
+                                "secure": bool(sec),
+                                "expires": exp_ts,
+                            })
+        except Exception:
+            return 0
+
+        if cookies:
+            self.save_cookies(cookies)
+        return len(cookies)
 
     def import_netscape(self, content: str) -> int:
         """Import cookies in Netscape format (standard 'cookies.txt' export)."""
@@ -235,9 +402,19 @@ class Profile:
         return "\n".join(lines) + "\n"
 
     def clear(self) -> None:
-        """Clear all stored cookies in this profile."""
+        """Clear all stored cookies and storage in this profile."""
         if self.cookies_file.exists():
             self.cookies_file.unlink()
+        if self.storage_file.exists():
+            self.storage_file.unlink()
+        if self.db_file.exists():
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    conn.execute("DELETE FROM cookies")
+                    conn.execute("DELETE FROM storage")
+                    conn.commit()
+            except Exception:
+                pass
 
 
 def get_profile(name: str = "default") -> Profile:
