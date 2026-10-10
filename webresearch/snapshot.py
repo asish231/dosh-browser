@@ -211,6 +211,7 @@ def snapshot(
     full_view = "\n\n".join(p for p in parts if p).strip()
     return Page(
         url=doc.url,
+        final_url=doc.url,
         status=doc.status,
         content_type=doc.content_type,
         kind=doc.kind,

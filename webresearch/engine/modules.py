@@ -24,6 +24,125 @@ from webresearch.engine.security import mixed_content_blocked, verify_integrity
 SPECIFIER_RE = re.compile(r"[\"']([^\"']+)[\"']")
 
 
+def _mask_literals(code: str) -> str:
+    """Blank out string, template, comment and regex literals, preserving length.
+
+    Rewriting ``import``/``export`` with plain regexes corrupts real bundles:
+    path segments live inside template literals (``() => "/new/import"``), and
+    the negated character class in ``import\\s*["']([^"']+)["']`` then runs to
+    the *next* quote in the file, swallowing the whole module and replacing it
+    with a ``__require`` call. Masking literals first means every rewrite below
+    only ever sees real code positions. Indices line up with the original, so a
+    match on the mask maps straight back to the source text.
+    """
+    out = list(code)
+    i, n = 0, len(code)
+    prev = ""
+    while i < n:
+        ch = code[i]
+        nxt = code[i + 1] if i + 1 < n else ""
+        if ch == "/" and nxt == "/":
+            j = code.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = "\x00"
+            i = j
+            continue
+        if ch == "/" and nxt == "*":
+            j = code.find("*/", i)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                out[k] = "\x00"
+            i = j
+            continue
+        if ch == "`":
+            # Template literals may contain interpolation, nested quotes, and
+            # eventually new code, so hide the complete literal. Missing a
+            # dynamic import/export embedded in a template is preferable to
+            # matching a non-statement inside text.
+            j = i + 1
+            while j < n:
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == ch:
+                    j += 1
+                    break
+                j += 1
+            for k in range(i, min(j, n)):
+                out[k] = "\x00"
+            i = j
+            prev = "`"
+            continue
+        if ch in "\"'":
+            # Keep ordinary quote delimiters visible so specifier patterns can
+            # still match the literal, while replacing the literal contents.
+            j = i + 1
+            while j < n:
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == ch:
+                    j += 1
+                    break
+                j += 1
+            for k in range(i + 1, j - 1 if j <= n and code[j - 1] == ch else min(j, n)):
+                out[k] = "\x00"
+            i = j
+            prev = ch
+            continue
+        if ch == "/" and prev not in ")]}" and not (prev.isalnum() or prev in "_$"):
+            # regex literal: '/' after a value is division, after anything else it opens
+            j = i + 1
+            in_class = False
+            while j < n:
+                c = code[j]
+                if c == "\\":
+                    j += 2
+                    continue
+                if c == "[":
+                    in_class = True
+                elif c == "]":
+                    in_class = False
+                elif c == "/" and not in_class:
+                    j += 1
+                    break
+                elif c == "\n":
+                    break
+                j += 1
+            while j < n and code[j].isalpha():
+                j += 1
+            for k in range(i, j):
+                out[k] = "\x00"
+            i = j
+            prev = "/"
+            continue
+        if not ch.isspace():
+            prev = ch
+        i += 1
+    return "".join(out)
+
+
+def _sub_code(code: str, pattern: str, repl, flags: int = 0):
+    """``re.sub`` restricted to real code positions.
+
+    ``repl`` receives the match (against the masked text, so captured groups are
+    blank) and the original matched text, and returns the replacement. Matches
+    inside literals never happen, because the pattern is applied to the mask.
+    """
+    masked = _mask_literals(code)
+    out: list[str] = []
+    last = 0
+    for match in re.finditer(pattern, masked, flags):
+        original = code[match.start():match.end()]
+        out.append(code[last:match.start()])
+        replacement = repl(match, original)
+        out.append(original if replacement is None else replacement)
+        last = match.end()
+    out.append(code[last:])
+    return "".join(out)
+
+
 @dataclass(slots=True)
 class ModuleSource:
     url: str
@@ -44,12 +163,15 @@ class ModuleGraph:
 def _iter_imports(code: str) -> list[str]:
     """Return raw specifier strings from static import/re-export statements."""
     specs: list[str] = []
+    masked = _mask_literals(code)
     for match in re.finditer(
-        r"\b(?:import|export)\b[\s\S]*?\bfrom\s*[\"']([^\"']+)[\"']", code
+        r"\b(?:import|export)\b[\s\S]*?\bfrom\s*[\"']([^\"']+)[\"']", masked
     ):
-        specs.append(match.group(1))
-    for match in re.finditer(r"\bimport\s*[\"']([^\"']+)[\"']", code):
-        specs.append(match.group(1))
+        quote = code[match.start(1):match.end(1)]
+        specs.append(quote)
+    for match in re.finditer(r"\bimport\s*[\"']([^\"']+)[\"']", masked):
+        quote = code[match.start(1):match.end(1)]
+        specs.append(quote)
     return specs
 
 
@@ -72,23 +194,36 @@ def _rewrite_imports(code: str, module_url: str, import_map: dict[str, str]) -> 
     def resolve_id(spec: str) -> str:
         return _resolve(spec, module_url, import_map) or spec
 
+    def _original_text(match: re.Match[str], original: str, group: int | None = None) -> str:
+        if group is None:
+            return original
+        base = match.start()
+        return original[match.start(group) - base:match.end(group) - base]
+
+    def _spec_from(match: re.Match[str], group: int, original: str) -> str:
+        """The specifier text, taken from the original (the mask blanks it)."""
+        m = re.search(SPECIFIER_RE, _original_text(match, original, group))
+        return m.group(1) if m else ""
+
     # import defaultName, { a as b } from "spec"
-    def repl_binding(match: re.Match[str]) -> str:
+    def repl_binding(match: re.Match[str], original: str) -> str:
         default = match.group(1)
         named = match.group(2)
         star = match.group(3)
-        spec = match.group(4)
+        spec = _spec_from(match, 4, original)
         mid = resolve_id(spec)
         out: list[str] = []
         if default:
             out.append(f"var {default} = __mods[{mid!r}].default;")
         if named:
-            for part in named.split(","):
+            named_text = _original_text(match, original, 2)
+            for part in named_text.split(","):
                 part = part.strip()
                 if not part:
                     continue
-                if " as " in part:
-                    orig, alias = [p.strip() for p in part.split(" as ", 1)]
+                alias_match = re.match(r"^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$", part)
+                if alias_match:
+                    orig, alias = alias_match.group(1), alias_match.group(2)
                 else:
                     orig = alias = part
                 out.append(f"var {alias} = __mods[{mid!r}][{orig!r}];")
@@ -96,34 +231,47 @@ def _rewrite_imports(code: str, module_url: str, import_map: dict[str, str]) -> 
             out.append(f"var {star} = __mods[{mid!r}];")
         return " ".join(out)
 
-    code = re.sub(
-        r"\bimport\s+(?:([A-Za-z_$][\w$]*)\s*,?\s*)?"
-        r"(?:\{([^}]*)\}|\*\s*as\s+([A-Za-z_$][\w$]*))\s*from\s*"
-        r"[\"']([^\"']+)[\"'];?",
-        repl_binding,
+    # ``\s*`` rather than ``\s+``: minified modules emit ``import{a as b}from"./x.js"``
+    # with no whitespace at all, and a missed match leaves a raw ``import``
+    # statement inside a classic script, which QuickJS rejects as a syntax error
+    # and the whole module is lost.
+    code = _sub_code(
         code,
+        r"\bimport\s*(?:([A-Za-z_$][\w$]*)\s*,?\s*)?"
+        r"(?:\{([^}]*)\}|\*\s*as\s*([A-Za-z_$][\w$]*))\s*from\s*"
+        r"([\"']\x00*[\"']);?",
+        repl_binding,
+    )
+    # ``import.meta`` is only legal inside module code, and every module here is
+    # evaluated as a classic script, so a surviving ``import.meta`` is a hard
+    # syntax error. Point it at the module's own id.
+    code = _sub_code(
+        code, r"\bimport\s*\.\s*meta\s*\.\s*(?:url|filename)\b", lambda m, o: repr(module_url)
+    )
+    code = _sub_code(
+        code, r"\bimport\s*\.\s*meta\b", lambda m, o: "{ url: " + repr(module_url) + " }"
     )
     # import "spec";  (side effect)
-    code = re.sub(
-        r"\bimport\s*[\"']([^\"']+)[\"'];?",
-        lambda m: f"__require({resolve_id(m.group(1))!r});",
+    code = _sub_code(
         code,
+        r"\bimport\s*([\"']\x00*[\"']);?",
+        lambda m, o: f"__require({resolve_id(_spec_from(m, 1, o))!r});",
     )
     # export { a, b as c } from "spec";
-    code = re.sub(
-        r"\bexport\s*\{([^}]*)\}\s*from\s*[\"']([^\"']+)[\"'];?",
-        lambda m: _repl_reexport(m, resolve_id(m.group(2))),
+    code = _sub_code(
         code,
+        r"\bexport\s*\{([^}]*)\}\s*from\s*([\"']\x00*[\"']);?",
+        lambda m, o: _repl_reexport(resolve_id(_spec_from(m, 2, o)), _original_text(m, o, 1)),
     )
     # export * from "spec";
-    code = re.sub(
-        r"\bexport\s*\*\s*from\s*[\"']([^\"']+)[\"'];?",
-        lambda m: (
-            f"Object.keys(__mods[{resolve_id(m.group(1))!r}] || {{}}).forEach("
-            f"function (k) {{ if (k !== 'default') __exports[k] = "
-            f"__mods[{resolve_id(m.group(1))!r}][k]; }});"
-        ),
+    code = _sub_code(
         code,
+        r"\bexport\s*\*\s*from\s*([\"']\x00*[\"']);?",
+        lambda m, o: (
+            f"Object.keys(__mods[{resolve_id(_spec_from(m, 1, o))!r}] || {{}}).forEach("
+            f"function (k) {{ if (k !== 'default') __exports[k] = "
+            f"__mods[{resolve_id(_spec_from(m, 1, o))!r}][k]; }});"
+        ),
     )
     return code
 
@@ -133,12 +281,13 @@ def _capture(names: list[str], kind: str, name: str) -> str:
     return f"{kind} {name}"
 
 
-def _repl_reexport(match: re.Match[str], module_id: str) -> str:
-    parts = [p.strip() for p in match.group(1).split(",") if p.strip()]
+def _repl_reexport(module_id: str, list_text: str) -> str:
+    parts = [p.strip() for p in list_text.split(",") if p.strip()]
     out: list[str] = []
     for part in parts:
-        if " as " in part:
-            orig, alias = [p.strip() for p in part.split(" as ", 1)]
+        alias_match = re.match(r"^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$", part)
+        if alias_match:
+            orig, alias = alias_match.group(1), alias_match.group(2)
         else:
             orig = alias = part
         out.append(f"__exports[{alias!r}] = __mods[{module_id!r}][{orig!r}];")
@@ -147,55 +296,60 @@ def _repl_reexport(match: re.Match[str], module_id: str) -> str:
 
 def _rewrite_exports(code: str) -> str:
     """Rewrite export declarations to assignments on ``__exports``."""
+    def _text(match: re.Match[str], original: str, group: int) -> str:
+        base = match.start()
+        return original[match.start(group) - base:match.end(group) - base]
+
     # export default function/class name(...) {}
-    code = re.sub(
-        r"\bexport\s+default\s+(function|class)\s+([A-Za-z_$][\w$]*)",
-        lambda m: f"__exports.default = {m.group(1)} {m.group(2)}",
+    code = _sub_code(
         code,
+        r"\bexport\s+default\s+(function|class)\s+([A-Za-z_$][\w$]*)",
+        lambda m, o: f"__exports.default = {m.group(1)} {m.group(2)}",
     )
     # export default <expr>;
-    code = re.sub(
-        r"\bexport\s+default\s+",
-        "__exports.default = ",
+    code = _sub_code(
         code,
+        r"\bexport\s+default\s+",
+        lambda m, o: "__exports.default = ",
     )
     # export const/let/var NAME = ...
     export_names: list[str] = []
 
-    def decl_capture(match: re.Match[str]) -> str:
+    def decl_capture(match: re.Match[str], original: str) -> str:
         kind, name = match.group(1), match.group(2)
         export_names.append(name)
         return f"{kind} {name}"
 
-    code = re.sub(
+    code = _sub_code(
+        code,
         r"\bexport\s+(const|let|var)\s+([A-Za-z_$][\w$]*)",
         decl_capture,
-        code,
     )
     # export function/class name
-    code = re.sub(
-        r"\bexport\s+(function|class)\s+([A-Za-z_$][\w$]*)",
-        lambda m: _capture(export_names, m.group(1), m.group(2)),
+    code = _sub_code(
         code,
+        r"\bexport\s+(function|class)\s+([A-Za-z_$][\w$]*)",
+        lambda m, o: _capture(export_names, m.group(1), m.group(2)),
     )
     if export_names:
         assigns = " ".join(f"__exports[{n!r}] = {n};" for n in export_names)
         code = f"{code}\n{assigns}"
     # export { a, b as c };
-    code = re.sub(
-        r"\bexport\s*\{([^}]*)\}\s*;?",
-        lambda m: _repl_export_list(m, "__exports"),
+    code = _sub_code(
         code,
+        r"\bexport\s*\{([^}]*)\}\s*;?",
+        lambda m, o: _repl_export_list("__exports", _text(m, o, 1)),
     )
     return code
 
 
-def _repl_export_list(match: re.Match[str], target: str) -> str:
-    parts = [p.strip() for p in match.group(1).split(",") if p.strip()]
+def _repl_export_list(target: str, list_text: str) -> str:
+    parts = [p.strip() for p in list_text.split(",") if p.strip()]
     out: list[str] = []
     for part in parts:
-        if " as " in part:
-            orig, alias = [p.strip() for p in part.split(" as ", 1)]
+        alias_match = re.match(r"^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$", part)
+        if alias_match:
+            orig, alias = alias_match.group(1), alias_match.group(2)
         else:
             orig = alias = part
         out.append(f"{target}[{alias!r}] = {orig};")

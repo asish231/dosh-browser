@@ -1889,6 +1889,35 @@
     global.Text = Text;
     global.Document = Document;
     global.SVGElement = Element;
+
+    var htmlElements = [
+      "HTMLAnchorElement", "HTMLAreaElement", "HTMLAudioElement", "HTMLBaseElement",
+      "HTMLBodyElement", "HTMLBRElement", "HTMLButtonElement", "HTMLCanvasElement",
+      "HTMLDataElement", "HTMLDataListElement", "HTMLDetailsElement", "HTMLDialogElement",
+      "HTMLDivElement", "HTMLDListElement", "HTMLEmbedElement", "HTMLFieldSetElement",
+      "HTMLFormElement", "HTMLHeadingElement", "HTMLHeadElement", "HTMLHRElement",
+      "HTMLHtmlElement", "HTMLIFrameElement", "HTMLImageElement", "HTMLInputElement",
+      "HTMLLabelElement", "HTMLLegendElement", "HTMLLIElement", "HTMLLinkElement",
+      "HTMLMapElement", "HTMLMetaElement", "HTMLMeterElement", "HTMLModElement",
+      "HTMLObjectElement", "HTMLOListElement", "HTMLOptGroupElement", "HTMLOptionElement",
+      "HTMLOutputElement", "HTMLParagraphElement", "HTMLParamElement", "HTMLPictureElement",
+      "HTMLPreElement", "HTMLProgressElement", "HTMLQuoteElement", "HTMLScriptElement",
+      "HTMLSelectElement", "HTMLSlotElement", "HTMLSourceElement", "HTMLSpanElement",
+      "HTMLStyleElement", "HTMLTableCaptionElement", "HTMLTableCellElement", "HTMLTableColElement",
+      "HTMLTableElement", "HTMLTableRowElement", "HTMLTableSectionElement", "HTMLTemplateElement",
+      "HTMLTextAreaElement", "HTMLTimeElement", "HTMLTitleElement", "HTMLTrackElement",
+      "HTMLUListElement", "HTMLVideoElement", "HTMLUnknownElement"
+    ];
+    for (var i = 0; i < htmlElements.length; i++) {
+      (function (name) {
+        function HtmlSubElement(tag, attrs, children) {
+          Element.call(this, tag, attrs, children);
+        }
+        HtmlSubElement.prototype = Object.create(Element.prototype);
+        HtmlSubElement.prototype.constructor = HtmlSubElement;
+        global[name] = HtmlSubElement;
+      })(htmlElements[i]);
+    }
     global.Event = function (type, init) {
       this.type = type;
       this.bubbles = !!(init && init.bubbles);

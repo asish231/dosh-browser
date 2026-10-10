@@ -3,17 +3,50 @@ from __future__ import annotations
 from selectolax.lexbor import LexborHTMLParser as HTMLParser
 from selectolax.lexbor import LexborNode as Node
 
-CONTENT_SELECTORS = (
+SITE_ROOT_SELECTORS = (
     "#mw-content-text .mw-parser-output",
     "#mw-content-text",
-    "article",
+)
+
+GENERIC_ROOT_SELECTORS = (
     "main",
     "[role='main']",
+    "article",
     ".post-content",
     ".entry-content",
     ".post-body",
     "#content",
     "body",
+)
+
+CONTENT_SELECTORS = SITE_ROOT_SELECTORS + GENERIC_ROOT_SELECTORS
+
+# Selectors in the order used to break ties when two containers carry the same
+# projected reading content. ``main`` is a whole-document landmark; an ``article``
+# can be one card inside it, so prefer the landmark when their scores tie.
+ROOT_SELECTOR_PRIORITY = {
+    "main": 6,
+    "[role='main']": 5,
+    "#content": 4,
+    ".post-content": 3,
+    ".entry-content": 3,
+    ".post-body": 3,
+    "article": 2,
+    "body": 1,
+}
+
+_SCORABLE_BLOCK_TAGS = (
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "p",
+    "li",
+    "pre",
+    "blockquote",
+    "table",
 )
 
 # Only real page chrome inside the article. Do NOT skip <header>:
@@ -63,11 +96,78 @@ SKIP_CLASS_TOKENS = {
 }
 
 
+def _candidate_score(candidate: Node) -> tuple[int, int, int]:
+    """Score a reading container by its projected non-chrome content."""
+    words = 0
+    blocks = 0
+    headings = 0
+    for node in candidate.css(",".join(_SCORABLE_BLOCK_TAGS)):
+        if inside_chrome(node, stop=candidate):
+            continue
+        text = " ".join(node.text(separator=" ", strip=True).split())
+        if not text:
+            continue
+        words += len(text.split())
+        blocks += 1
+        if (node.tag or "").lower().startswith("h"):
+            headings += 1
+    return (words, headings, blocks)
+
+
+def _ancestor_of(node: Node, ancestor: Node) -> bool:
+    """True when ``ancestor`` is a strict ancestor of ``node``."""
+    current: Node | None = node.parent
+    while current is not None:
+        if _same_node(current, ancestor):
+            return True
+        current = current.parent
+    return False
+
+
 def content_root(tree: HTMLParser) -> Node | None:
-    for sel in CONTENT_SELECTORS:
-        node = tree.css_first(sel)
+    """Return the container most likely to hold the page's main reading content.
+
+    A page can contain several plausible landmarks: DeepMind's model-card page,
+    for example, places a small promotional ``article`` for another model before
+    the document's much larger ``main`` element. Returning the first ``article``
+    therefore yields only the card. Site-specific selectors still win outright;
+    otherwise, choose whichever generic landmark projects the most non-chrome
+    reading content.
+
+    Containment is subtracted first. ``<body>`` wraps ``<main>`` and every card
+    in it, so on raw wrapped text it always outranks the article that actually
+    holds the content; scoring a landmark on what is *its own* — its content
+    minus the content of the landmarks nested inside it — is what makes the
+    distinction real.
+    """
+    for selector in SITE_ROOT_SELECTORS:
+        node = tree.css_first(selector)
         if node is not None:
             return node
+
+    candidates: list[tuple[int, Node, tuple[int, int, int]]] = []
+    for selector in GENERIC_ROOT_SELECTORS:
+        for candidate in tree.css(selector):
+            candidates.append(
+                (ROOT_SELECTOR_PRIORITY[selector], candidate, _candidate_score(candidate))
+            )
+
+    best: Node | None = None
+    best_key: tuple[int, int, int, int] | None = None
+    for priority, candidate, (words, headings, blocks) in candidates:
+        for other_priority, other, other_score in candidates:
+            if _same_node(other, candidate):
+                continue
+            if _ancestor_of(other, candidate):
+                words = max(0, words - other_score[0])
+                headings = max(0, headings - other_score[1])
+                blocks = max(0, blocks - other_score[2])
+        key = (words, headings, blocks, priority)
+        if best is None or (best_key is not None and key > best_key):
+            best = candidate
+            best_key = key
+    if best is not None:
+        return best
     return tree.root
 
 

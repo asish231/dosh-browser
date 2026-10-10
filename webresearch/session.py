@@ -400,6 +400,22 @@ class Session:
     def action_surface(self, *, max_actions: int = 200) -> ActionSurface:
         return collect(self.html, self.url, max_actions=max_actions)
 
+    def actions(self, *, max_actions: int = 200) -> list[Action]:
+        """Convenience alias returning the list of Action objects on the current surface."""
+        return self.action_surface(max_actions=max_actions).actions
+
+    def network_log(self) -> list[dict]:
+        """Network Tab: Returns all API and subresource requests observed on current page."""
+        if self.page and self.page.acd and self.page.acd.api:
+            return [api.model_dump() for api in self.page.acd.api]
+        return []
+
+    def error_log(self) -> list[str]:
+        """Console Tab: Returns all JavaScript errors and exceptions observed on current page."""
+        if self.page and self.page.acd and self.page.acd.errors:
+            return list(self.page.acd.errors)
+        return []
+
     async def act(
         self,
         ref: str,
@@ -683,6 +699,10 @@ resolve a selector directly.
 
 class Browser:
     """Isolated agent sessions (cookie jars). Bounded + TTL-evicted."""
+
+    def __await__(self):
+        """Allow ``session = await Browser()`` as shorthand for creating one session."""
+        return self.create().__await__()
 
     def __init__(
         self,

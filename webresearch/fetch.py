@@ -157,6 +157,43 @@ def _build_result(
     )
 
 
+def response_to_result(
+    response: httpx.Response,
+    *,
+    url: str | None = None,
+    final_url: str | None = None,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+) -> FetchResult:
+    """Convert an already-read ``httpx.Response`` into a ``FetchResult``.
+
+    This is a pure adapter: it does not record cookies, HSTS state, or cache
+    entries, all of which belong to an actual network fetch. It exists so a
+    response supplied by a caller or a test transport can enter the normal
+    parse pipeline without reconstructing a ``FetchResult`` by hand.
+    """
+    request_url: str | None = None
+    request = getattr(response, "request", None)
+    if request is not None:
+        try:
+            request_url = str(request.url)
+        except Exception:
+            request_url = None
+    response_url = str(response.url) if getattr(response, "url", None) is not None else ""
+    raw = response.content or b""
+    truncated = len(raw) > max_bytes
+    if truncated:
+        raw = raw[:max_bytes]
+    return _build_result(
+        url=request_url or url or response_url,
+        final_url=final_url or response_url or request_url or url or "",
+        status=response.status_code,
+        content_type=response.headers.get("content-type", ""),
+        headers=dict(response.headers),
+        raw=raw,
+        truncated=truncated,
+    )
+
+
 def make_client(
     *,
     timeout: float = DEFAULT_TIMEOUT,

@@ -184,6 +184,7 @@ class Acd(BaseModel):
 
 class Page(BaseModel):
     url: str
+    final_url: str = ""
     status: int
     content_type: str = ""
     kind: Kind = "html"

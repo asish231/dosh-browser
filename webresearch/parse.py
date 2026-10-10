@@ -4,6 +4,9 @@ from dataclasses import dataclass
 
 from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
+import httpx
+
+from webresearch.fetch import response_to_result
 from webresearch.types import FetchResult, Kind, Meta
 
 NOISE_TAGS = {
@@ -29,8 +32,10 @@ class Document:
     truncated: bool = False
 
 
-def parse(result: FetchResult) -> Document:
+def parse(result: FetchResult | httpx.Response) -> Document:
     """Turn a fetch result into a DOM (HTML/XML) or a raw document."""
+    if isinstance(result, httpx.Response):
+        result = response_to_result(result)
     tree = None
     if result.kind in {"html", "xml"}:
         tree = HTMLParser(result.body)

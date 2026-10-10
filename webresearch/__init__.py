@@ -3,7 +3,7 @@
 from webresearch.agent import ask
 from webresearch.client import Client
 from webresearch.extract import extract
-from webresearch.fetch import fetch
+from webresearch.fetch import fetch, response_to_result
 from webresearch.forms import forms
 from webresearch.links import links
 from webresearch.parse import parse
@@ -25,6 +25,7 @@ __all__ = [
     "links",
     "parse",
     "read",
+    "response_to_result",
     "search",
     "snapshot",
 ]
