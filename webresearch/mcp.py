@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from typing import Any
 
@@ -183,7 +184,8 @@ class McpServer:
 
     async def _get_session(self) -> Session:
         if self.session is None:
-            self.session = await self.browser.create()
+            profile_name = os.environ.get("WR_PROFILE", "default")
+            self.session = await self.browser.create(profile=profile_name)
         return self.session
 
     async def handle_call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
