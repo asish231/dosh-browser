@@ -87,6 +87,8 @@ ALIASES: dict[str, str] = {
     "pool-auto-code": "pool-auto-code",
     "openai": "pool-auto",
     "openai-compat": "pool-auto",
+    "tokenmaxxing": "pool-auto",
+    "tokenmax": "pool-auto",
 }
 
 DEFAULT_MODEL = "glm-4.7-flash"
