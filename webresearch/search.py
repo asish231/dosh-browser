@@ -10,7 +10,7 @@ from webresearch.parse import Document, parse
 from webresearch.types import FetchResult, SearchHit, SearchResult
 
 DDG_URL = "https://html.duckduckgo.com/html/"
-GOOGLE_HTML = "https://www.google.com/search?hl=en&gbv=1&num=10&q={q}"
+GOOGLE_HTML = "https://www.google.com/search?q={q}&hl=en&gl=us&num=10"
 
 Engine = Literal["google", "ddg", "auto"]
 
@@ -67,7 +67,9 @@ def _blocked_google(result: FetchResult) -> bool:
         return True
     if "/sorry" in url or "unusual traffic" in body or "detected unusual" in body:
         return True
-    if "our systems have detected" in body:
+    if "our systems have detected" in body or "recaptcha" in body:
+        return True
+    if "enablejs" in body and "display:none" in body:
         return True
     return False
 
@@ -159,7 +161,17 @@ async def _ddg(query: str, *, client: httpx.AsyncClient, max_hits: int) -> Searc
 
 async def _google_http(query: str, *, client: httpx.AsyncClient, max_hits: int) -> tuple[SearchResult | None, bool]:
     url = GOOGLE_HTML.format(q=quote_plus(query))
-    result = await fetch(url, client=client, headers={"Referer": "https://www.google.com/"})
+    headers = {
+        "Referer": "https://www.google.com/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-user": "?1",
+        "upgrade-insecure-requests": "1",
+    }
+    result = await fetch(url, client=client, headers=headers)
     if _blocked_google(result):
         return None, True
     hits = _parse_google(parse(result), max_hits=max_hits)

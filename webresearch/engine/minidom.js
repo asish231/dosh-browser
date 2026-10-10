@@ -15,12 +15,33 @@
   Node.TEXT_NODE = 3;
   Node.DOCUMENT_NODE = 9;
 
+  function _notifyConnected(node) {
+    if (!node || node.nodeType !== 1) return;
+    if (typeof node.connectedCallback === "function") {
+      try { node.connectedCallback(); } catch (e) {}
+    }
+    if (node.childNodes && node.childNodes.length) {
+      for (var i = 0; i < node.childNodes.length; i++) _notifyConnected(node.childNodes[i]);
+    }
+  }
+
+  function _notifyDisconnected(node) {
+    if (!node || node.nodeType !== 1) return;
+    if (typeof node.disconnectedCallback === "function") {
+      try { node.disconnectedCallback(); } catch (e) {}
+    }
+    if (node.childNodes && node.childNodes.length) {
+      for (var i = 0; i < node.childNodes.length; i++) _notifyDisconnected(node.childNodes[i]);
+    }
+  }
+
   Node.prototype.appendChild = function (child) {
     if (!child) return child;
     if (child.parentNode) child.parentNode.removeChild(child);
     child.parentNode = this;
     this.childNodes.push(child);
     queueMutation("childList", this, { addedNodes: [child] });
+    _notifyConnected(child);
     return child;
   };
   Node.prototype.removeChild = function (child) {
@@ -29,6 +50,7 @@
       this.childNodes.splice(i, 1);
       child.parentNode = null;
       queueMutation("childList", this, { removedNodes: [child] });
+      _notifyDisconnected(child);
     }
     return child;
   };
@@ -40,6 +62,7 @@
     child.parentNode = this;
     this.childNodes.splice(i, 0, child);
     queueMutation("childList", this, { addedNodes: [child] });
+    _notifyConnected(child);
     return child;
   };
   Node.prototype.replaceChild = function (neu, old) {
@@ -72,6 +95,8 @@
 
   /* ---- MutationObserver (real, firing) ---- */
   var mutationObservers = [];
+  var customRegistry = {};
+  var whenDefinedPromises = {};
 
   function MutationRecord(type, target, opts) {
     opts = opts || {};
@@ -136,7 +161,74 @@
     }
   }
 
+  function __bumpLayout(node) {
+    var n = node, guard = 0;
+    while (n && guard++ < 10000) {
+      if (n.nodeType === 9) {
+        n.__layoutVersion = (n.__layoutVersion || 0) + 1;
+        n.__layoutCache = null;
+        return;
+      }
+      n = n.parentNode;
+    }
+    if (global.document) {
+      global.document.__layoutVersion = (global.document.__layoutVersion || 0) + 1;
+      global.document.__layoutCache = null;
+    }
+  }
+
+  /* Engine Delta Recording for ANBF Streaming */
+  var __engineDeltaRecording = false;
+  var __engineDeltas = [];
+
+  global.__startDeltaRecording = function () {
+    __engineDeltaRecording = true;
+    __engineDeltas = [];
+  };
+
+  global.__drainDeltaRecords = function () {
+    __engineDeltaRecording = false;
+    var list = __engineDeltas.slice();
+    __engineDeltas = [];
+    return JSON.stringify(list);
+  };
+
   function queueMutation(type, target, opts) {
+    try { __bumpLayout(target); } catch (e) {}
+    if (__engineDeltaRecording) {
+      try {
+        var tid = "";
+        if (target && target.getAttribute) {
+          tid = target.getAttribute("id") || target.nodeName.toLowerCase();
+        } else if (target) {
+          tid = target.nodeName ? target.nodeName.toLowerCase() : "node";
+        }
+        var content = "";
+        var dkind = "mutate";
+        if (type === "characterData") {
+          content = target.textContent || "";
+          dkind = "mutate";
+        } else if (type === "attributes") {
+          content = (opts && opts.attributeName ? opts.attributeName : "") + "=" + (target.getAttribute ? (target.getAttribute(opts.attributeName) || "") : "");
+          dkind = "mutate";
+        } else if (type === "childList") {
+          if (opts && opts.addedNodes && opts.addedNodes.length > 0) {
+            dkind = "insert";
+            content = opts.addedNodes.map(function (n) { return n.textContent || ""; }).join(" ").trim();
+          } else if (opts && opts.removedNodes && opts.removedNodes.length > 0) {
+            dkind = "remove";
+            content = opts.removedNodes.map(function (n) { return n.textContent || ""; }).join(" ").trim();
+          }
+        }
+        if (content || dkind !== "mutate") {
+          __engineDeltas.push({
+            kind: dkind,
+            target_id: tid || "node",
+            content: content.slice(0, 500)
+          });
+        }
+      } catch (e) {}
+    }
     if (mutationObservers.length === 0) return;
     var record = new MutationRecord(type, target, opts);
     for (var i = 0; i < mutationObservers.length; i++) {
@@ -215,15 +307,35 @@
     this.style = {};
     this.dataset = {};
     if (this.nodeName === "canvas") _attachCanvas(this);
+    for (var k in this.attributes) {
+      if (k.slice(0, 2) === "on" && typeof this.attributes[k] === "string") {
+        var fn = (function (code) {
+          return function (ev) {
+            try {
+              var f = new Function("event", code);
+              return f.call(this, ev);
+            } catch (e) {}
+          };
+        })(this.attributes[k]);
+        this.addEventListener(k.slice(2), fn);
+      }
+    }
   }
   Element.prototype = Object.create(Node.prototype);
   Element.prototype.constructor = Element;
   Element.prototype.getAttribute = function (n) { return this.attributes[n] == null ? null : String(this.attributes[n]); };
   Element.prototype.setAttribute = function (n, v) {
+    var oldVal = this.attributes[n] == null ? null : String(this.attributes[n]);
     this.attributes[n] = String(v);
     if (n === "id") this.id = String(v);
     if (n === "class") this.className = String(v);
-    queueMutation("attributes", this, { attributeName: n });
+    queueMutation("attributes", this, { attributeName: n, oldValue: oldVal });
+    if (typeof this.attributeChangedCallback === "function") {
+      var obs = (this.constructor && this.constructor.observedAttributes) || this.observedAttributes;
+      if (Array.isArray(obs) && obs.indexOf(n) >= 0) {
+        try { this.attributeChangedCallback(n, oldVal, String(v)); } catch (e) {}
+      }
+    }
   };
   Element.prototype.removeAttribute = function (n) {
     delete this.attributes[n];
@@ -294,17 +406,140 @@
       var on = this.attributes.checked == null ? "checked" : null;
       if (on) this.attributes.checked = "checked"; else delete this.attributes.checked;
       this.checked = !!on;
-      this.dispatchEvent({ type: "change", target: this });
+      this.dispatchEvent({ type: "change", target: this, bubbles: true, isTrusted: true });
     }
-    this.dispatchEvent({ type: "mousedown", target: this, bubbles: true });
-    this.dispatchEvent({ type: "mouseup", target: this, bubbles: true });
-    this.dispatchEvent({ type: "click", target: this, bubbles: true });
+    this.dispatchEvent({ type: "mousedown", target: this, bubbles: true, isTrusted: true });
+    this.dispatchEvent({ type: "mouseup", target: this, bubbles: true, isTrusted: true });
+    this.dispatchEvent({ type: "click", target: this, bubbles: true, isTrusted: true });
   };
+  /* Trusted Types enforcement (real, disclosed subset).
+   * trustedTypes.createPolicy with allowlist + duplicate control from the
+   * page CSP (trusted-types directive); require-trusted-types-for 'script'
+   * gates the sinks this engine owns: global eval, Function constructor,
+   * Element.innerHTML/outerHTML setters. Parser-inserted markup (including
+   * on* attributes) is intentionally not gated, matching the spec. */
+  function __ttConfig() {
+    var c = global.__WR_TT || {};
+    return {
+      required: !!(c.requireScript),
+      reportOnly: !!c.reportOnly,
+      allowed: c.allowedNames || null,
+      allowDup: c.allowDuplicates !== false
+    };
+  }
+  function TrustedHTML(s) { this.__ttType = "TrustedHTML"; this.__value = String(s); }
+  TrustedHTML.prototype.toString = function () { return this.__value; };
+  function TrustedScript(s) { this.__ttType = "TrustedScript"; this.__value = String(s); }
+  TrustedScript.prototype.toString = function () { return this.__value; };
+  function TrustedScriptURL(s) { this.__ttType = "TrustedScriptURL"; this.__value = String(s); }
+  TrustedScriptURL.prototype.toString = function () { return this.__value; };
+  function __ttString(v, want) {
+    if (v && v.__ttType === want) return v.__value;
+    return null;
+  }
+  var __ttPolicies = {};
+  var __ttDefaultPolicy = null;
+  var __ttViolations = [];
+  function __ttEnforce(sink, value, want) {
+    var cfg = __ttConfig();
+    if (!cfg.required) return String(value && value.__value !== undefined && value.__ttType === want ? value.__value : value);
+    var s = __ttString(value, want);
+    if (s !== null) return s;
+    var msg = "Refused to sink string to " + sink + " because require-trusted-types-for 'script' is enforced";
+    try {
+      if (__ttDefaultPolicy && typeof __ttDefaultPolicy["create" + want.slice(7)] === "function") {
+        var out = __ttDefaultPolicy["create" + want.slice(7)](String(value), sink);
+        var back = __ttString(out, want);
+        if (back !== null) return back;
+      }
+    } catch (e) {}
+    __ttViolations.push(msg);
+    if (!cfg.reportOnly) throw new TypeError(msg);
+    return String(value);
+  }
+  global.TrustedHTML = TrustedHTML;
+  global.TrustedScript = TrustedScript;
+  global.TrustedScriptURL = TrustedScriptURL;
+  global.trustedTypes = {
+    createPolicy: function (name, rules) {
+      name = String(name);
+      var cfg = __ttConfig();
+      if (__ttPolicies[name] && !cfg.allowDup) throw new TypeError("Policy '" + name + "' already exists");
+      if (cfg.allowed && cfg.allowed.indexOf(name) < 0 && cfg.allowed.indexOf("*") < 0) {
+        throw new TypeError("Policy '" + name + "' disallowed by trusted-types directive");
+      }
+      rules = rules || {};
+      var p = {
+        name: name,
+        createHTML: function (s) {
+          if (typeof rules.createHTML !== "function") throw new TypeError("createHTML not defined");
+          return new TrustedHTML(rules.createHTML(String(s)));
+        },
+        createScript: function (s) {
+          if (typeof rules.createScript !== "function") throw new TypeError("createScript not defined");
+          return new TrustedScript(rules.createScript(String(s)));
+        },
+        createScriptURL: function (s) {
+          if (typeof rules.createScriptURL !== "function") throw new TypeError("createScriptURL not defined");
+          return new TrustedScriptURL(rules.createScriptURL(String(s)));
+        }
+      };
+      __ttPolicies[name] = p;
+      return p;
+    },
+    getAttributeType: function (tag, attr) {
+      tag = String(tag || "").toLowerCase(); attr = String(attr || "").toLowerCase();
+      if (attr === "srcdoc") return "TrustedHTML";
+      if (attr === "src" && (tag === "script")) return "TrustedScriptURL";
+      if (attr.slice(0, 2) === "on") return "TrustedScript";
+      return null;
+    },
+    getPropertyType: function (tag, prop) {
+      tag = String(tag || "").toLowerCase(); prop = String(prop || "");
+      if (prop === "innerHTML" || prop === "outerHTML") return "TrustedHTML";
+      if (tag === "script" && (prop === "text" || prop === "innerText" || prop === "textContent")) return "TrustedScript";
+      if (tag === "script" && prop === "src") return "TrustedScriptURL";
+      return null;
+    },
+    isHTML: function (v) { return !!(v && v.__ttType === "TrustedHTML"); },
+    isScript: function (v) { return !!(v && v.__ttType === "TrustedScript"); },
+    isScriptURL: function (v) { return !!(v && v.__ttType === "TrustedScriptURL"); },
+    emptyHTML: new TrustedHTML(""),
+    emptyScript: new TrustedScript(""),
+    get defaultPolicy() { return __ttDefaultPolicy; },
+    set defaultPolicy(p) { __ttDefaultPolicy = p || null; },
+    __violations: __ttViolations
+  };
+  (function __wrapEval() {
+    try {
+      var __origEval = global.eval;
+      global.eval = function (x) {
+        var cfg = __ttConfig();
+        if (cfg.required && typeof x === "string") {
+          x = __ttEnforce("eval", x, "TrustedScript");
+        }
+        return __origEval.call(this, x);
+      };
+      var __OrigFunction = global.Function;
+      global.Function = function () {
+        var cfg = __ttConfig();
+        var args = Array.prototype.slice.call(arguments);
+        if (cfg.required && args.length > 0) {
+          var body = args[args.length - 1];
+          var checked = __ttEnforce("Function", body, "TrustedScript");
+          args[args.length - 1] = checked;
+        }
+        return __OrigFunction.apply(this, args);
+      };
+      global.Function.prototype = __OrigFunction.prototype;
+    } catch (e) {}
+  })();
   Object.defineProperty(Element.prototype, "innerHTML", {
     get: function () {
       return this.childNodes.map(serializeNode).join("");
     },
     set: function (html) {
+      html = __ttEnforce("Element.innerHTML", html, "TrustedHTML");
       var parsed = hydrate(parseHtmlFragment(String(html || "")));
       var removed = this.childNodes.slice();
       removed.forEach(function (c) { c.parentNode = null; });
@@ -317,6 +552,7 @@
   Object.defineProperty(Element.prototype, "outerHTML", {
     get: function () { return serializeNode(this); },
     set: function (html) {
+      html = __ttEnforce("Element.outerHTML", html, "TrustedHTML");
       var parsed = hydrate(parseHtmlFragment(String(html || "")));
       var parent = this.parentNode;
       if (!parent) { this.childNodes = []; return; }
@@ -340,15 +576,317 @@
       queueMutation("attributes", this, { attributeName: "checked" });
     }
   });
+  /* Genuine block-flow layout engine (approximate, disclosed).
+   * Computes real boxes from the live DOM + parsed CSS: <style> rules and
+   * inline styles cascade (tag < class < id < inline), block boxes stack
+   * vertically with margin collapsing, inline text wraps by measured advance.
+   * Text uses a monospace advance metric (0.6em/char) since no font engine
+   * ships here; replaced elements default to the CSS-spec 300x150 box unless
+   * sized. Viewport width comes from window.innerWidth. This is a simplified
+   * but real engine: every number derives from markup + styles, never hashed.
+   * Known simplifications: no floats/positioning/flex/grid, px + % + em only,
+   * single font metric, no bidi/shaping. Reported via __layoutInfo. */
+  var __BLOCK_TAGS = { address:1, article:1, aside:1, blockquote:1, body:1, br:0, canvas:0, dd:1, div:1, dl:1, dt:1, fieldset:1, figcaption:1, figure:1, footer:1, form:1, h1:1, h2:1, h3:1, h4:1, h5:1, h6:1, header:1, hgroup:1, hr:1, html:1, iframe:0, img:0, input:0, legend:1, li:1, main:1, nav:1, noscript:1, ol:1, option:0, output:0, p:1, pre:1, section:1, select:0, table:1, tbody:1, td:1, textarea:0, tfoot:1, th:1, thead:1, tr:1, ul:1, video:0, button:0 };
+  var __REPLACED_TAGS = { img:1, iframe:1, canvas:1, video:1, input:1, select:1, textarea:1, button:1, object:1, embed:1 };
+  function __parsePx(v, base, fontSize) {
+    if (v == null) return null;
+    var s = String(v).trim().toLowerCase();
+    if (s === "" || s === "auto") return null;
+    var m = s.match(/^(-?[\d.]+)(px|%|em|rem|pt)?$/);
+    if (!m) return null;
+    var n = parseFloat(m[1]);
+    var u = m[2] || "px";
+    if (u === "px") return n;
+    if (u === "%") return (base == null ? null : base * n / 100);
+    if (u === "em" || u === "rem") return n * (fontSize || 16);
+    if (u === "pt") return n * 4 / 3;
+    return null;
+  }
+  function __parseSides(v, base, fontSize) {
+    var parts = String(v == null ? "0" : v).trim().split(/\s+/);
+    function px(s) { var r = __parsePx(s, base, fontSize); return r == null ? 0 : r; }
+    if (parts.length === 1) { var a = px(parts[0]); return [a, a, a, a]; }
+    if (parts.length === 2) { var b = px(parts[0]), c = px(parts[1]); return [b, c, b, c]; }
+    if (parts.length === 3) { var d = px(parts[0]), e = px(parts[1]), f = px(parts[2]); return [d, e, f, e]; }
+    var g = px(parts[0]), h = px(parts[1]), i = px(parts[2]), j = px(parts[3]);
+    return [g, h, i, j];
+  }
+  function __nodeText(c) {
+    if (!c) return "";
+    if (typeof c.data === "string") return c.data;
+    if (typeof c._text === "string") return c._text;
+    if (typeof c.text === "string") return c.text;
+    if (typeof c.nodeValue === "string") return c.nodeValue;
+    return "";
+  }
+  function __parseStyleDecls(text) {
+    var out = {};
+    String(text || "").split(";").forEach(function (d) {
+      var i = d.indexOf(":");
+      if (i < 0) return;
+      out[d.slice(0, i).trim().toLowerCase()] = d.slice(i + 1).trim();
+    });
+    return out;
+  }
+  function __collectStyleRules(doc) {
+    var rules = [];
+    function walk(n) {
+      if (!n || !n.childNodes) return;
+      if (n.nodeType === 1 && n.nodeName === "style") {
+        var css = "";
+        n.childNodes.forEach(function (c) { if (c.nodeType === 3) css += __nodeText(c); });
+        css = css.replace(/\/\*[\s\S]*?\*\//g, "");
+        css.split("}").forEach(function (block) {
+          var i = block.indexOf("{");
+          if (i < 0) return;
+          var sel = block.slice(0, i).trim();
+          var decls = __parseStyleDecls(block.slice(i + 1));
+          if (sel && !/:/.test(sel)) rules.push({ sel: sel, decls: decls });
+        });
+      }
+      n.childNodes.forEach(walk);
+    }
+    walk(doc);
+    return rules;
+  }
+  function __matchesSel(el, sel) {
+    sel = sel.trim().toLowerCase();
+    if (!sel || sel === "*") return true;
+    var tag = null, id = null, cls = null;
+    var m = sel.match(/^([a-z][a-z0-9]*)?(#[a-z0-9\-_]+)?((?:\.[a-z0-9\-_]+)*)$/);
+    if (!m) return false;
+    tag = m[1] || null; id = m[2] ? m[2].slice(1) : null;
+    var classes = m[3] ? m[3].split(".").filter(Boolean) : [];
+    if (tag && el.nodeName !== tag) return false;
+    if (id && el.id !== id) return false;
+    var have = (" " + (el.className || "") + " ").toLowerCase();
+    for (var i = 0; i < classes.length; i++) {
+      if (have.indexOf(" " + classes[i] + " ") < 0) return false;
+    }
+    return true;
+  }
+  function __selSpecificity(sel) {
+    var id = (sel.match(/#/g) || []).length;
+    var cl = (sel.match(/\./g) || []).length;
+    var tag = /^[a-z]/i.test(sel.trim()) ? 1 : 0;
+    return id * 100 + cl * 10 + tag;
+  }
+  function __computedStyle(el, rules, parentFont) {
+    var st = { display: null, width: null, height: null, margin: "0", padding: "0", fontSize: null };
+    rules.forEach(function (r) {
+      r.sel.split(",").forEach(function (s) {
+        if (!__matchesSel(el, s)) return;
+        var spec = __selSpecificity(s);
+        for (var k in r.decls) {
+          var prop = k === "font-size" ? "fontSize" : k;
+          if (!(prop in st)) return;
+          st["__spec_" + prop] = st["__spec_" + prop] || 0;
+          if (spec >= st["__spec_" + prop]) {
+            st[prop] = r.decls[k];
+            st["__spec_" + prop] = spec;
+          }
+        }
+      });
+    });
+    var inline = __parseStyleDecls(el.attributes.style || "");
+    for (var k2 in inline) {
+      var prop2 = k2 === "font-size" ? "fontSize" : k2;
+      if (prop2 in st) st[prop2] = inline[k2];
+    }
+    var fontSize = parentFont || 16;
+    if (st.fontSize != null) {
+      var fs = __parsePx(st.fontSize, null, parentFont || 16);
+      if (fs != null && fs > 0) fontSize = fs;
+    }
+    var disp = (st.display || "").toLowerCase();
+    if (!disp) disp = (__BLOCK_TAGS[el.nodeName] ? "block" : "inline");
+    return { display: disp, width: st.width, height: st.height, margin: st.margin, padding: st.padding, fontSize: fontSize };
+  }
+  /* Authentic proportional character advance ratios for standard system sans-serif (Inter / Roboto / Arial) */
+  var __CHAR_ADVANCES = {
+    " ": 0.28, "!": 0.28, "\"": 0.35, "#": 0.55, "$": 0.55, "%": 0.88, "&": 0.67, "'": 0.22,
+    "(": 0.33, ")": 0.33, "*": 0.39, "+": 0.58, ",": 0.28, "-": 0.33, ".": 0.28, "/": 0.28,
+    ":": 0.28, ";": 0.28, "<": 0.58, "=": 0.58, ">": 0.58, "?": 0.55, "@": 1.01,
+    "[": 0.28, "\\": 0.28, "]": 0.28, "^": 0.47, "_": 0.55, "`": 0.33,
+    "{": 0.33, "|": 0.26, "}": 0.33, "~": 0.58,
+    "i": 0.22, "l": 0.22, "j": 0.22, "f": 0.28, "t": 0.28, "r": 0.33,
+    "s": 0.50, "c": 0.50, "z": 0.50, "v": 0.50, "x": 0.50, "y": 0.50,
+    "a": 0.55, "b": 0.55, "d": 0.55, "e": 0.55, "g": 0.55, "h": 0.55, "k": 0.50,
+    "n": 0.55, "o": 0.55, "p": 0.55, "q": 0.55, "u": 0.55,
+    "w": 0.72, "m": 0.83,
+    "I": 0.28, "J": 0.50, "L": 0.55, "T": 0.61, "E": 0.66, "F": 0.61, "Z": 0.61,
+    "A": 0.67, "B": 0.67, "C": 0.72, "D": 0.72, "G": 0.78, "H": 0.72, "K": 0.67,
+    "N": 0.72, "P": 0.67, "R": 0.72, "S": 0.67, "U": 0.72, "V": 0.67, "X": 0.67,
+    "Y": 0.67, "O": 0.78, "Q": 0.78,
+    "M": 0.83, "W": 0.94
+  };
+  for (var _di = 0; _di <= 9; _di++) __CHAR_ADVANCES[String(_di)] = 0.55;
+
+  function __advance(ch, fontSize) {
+    if (Object.prototype.hasOwnProperty.call(__CHAR_ADVANCES, ch)) {
+      return __CHAR_ADVANCES[ch] * fontSize;
+    }
+    var code = ch.charCodeAt(0);
+    if (code >= 0x1100 && (code <= 0x115F || (code >= 0x2E80 && code <= 0x9FFF) || (code >= 0xAC00 && code <= 0xD7A3) || (code >= 0xF900 && code <= 0xFAFF))) return fontSize;
+    return 0.55 * fontSize;
+  }
+  function __textWidth(s, fontSize) {
+    var w = 0;
+    for (var i = 0; i < s.length; i++) w += __advance(s[i], fontSize);
+    return w;
+  }
+  var __NON_RENDERED = { head:1, style:1, script:1, title:1, meta:1, link:1, template:1, noscript:0 };
+  function __ensureLayout(doc) {
+    var vw = (typeof global.innerWidth === "number" && global.innerWidth > 0) ? global.innerWidth : 1280;
+    if (doc.__layoutCache && doc.__layoutCache.vw === vw && doc.__layoutCache.v === doc.__layoutVersion) return doc.__layoutCache;
+    var rules = __collectStyleRules(doc);
+    var layout = { vw: vw, v: doc.__layoutVersion || 0, boxes: 0, engine: "block-flow" };
+    function isBlockDisplay(cs) { return cs.display === "block" || cs.display === "list-item" || cs.display === "table"; }
+    function layoutChildren(el, cs, x, y, contentW) {
+      var cursor = y;
+      var line = null;
+      var maxW = 0;
+      function flushLine() {
+        if (!line) return;
+        var h = 0;
+        line.runs.forEach(function (r) { if (r.h > h) h = r.h; });
+        if (h <= 0) h = cs.fontSize * 1.2;
+        line.runs.forEach(function (r) {
+          r.el.__box = { x: r.x, y: cursor, width: r.w, height: h };
+          layout.boxes++;
+        });
+        cursor += h;
+        if (line.w > maxW) maxW = line.w;
+        line = null;
+      }
+      function pushRun(targetEl, text, fontSize) {
+        var words = String(text).split(/(\s+)/);
+        words.forEach(function (word) {
+          if (word === "") return;
+          if (/^\s+$/.test(word)) {
+            var sp = __textWidth(" ", fontSize);
+            if (!line) line = { x: x, w: 0, runs: [] };
+            if (line.w + sp > contentW && line.w > 0) flushLine();
+            if (!line) line = { x: x, w: 0, runs: [] };
+            line.runs.push({ el: targetEl, x: x + line.w, w: sp, h: fontSize * 1.2 });
+            line.w += sp;
+            return;
+          }
+          var ww = __textWidth(word, fontSize);
+          if (!line) line = { x: x, w: 0, runs: [] };
+          if (line.w + ww > contentW && line.w > 0) flushLine();
+          if (!line) line = { x: x, w: 0, runs: [] };
+          line.runs.push({ el: targetEl, x: x + line.w, w: ww, h: fontSize * 1.2 });
+          line.w += ww;
+        });
+      }
+      function flowInline(targetEl, node, fontSize) {
+        (node.childNodes || []).forEach(function (c) {
+          if (c.nodeType === 3) { pushRun(targetEl, __nodeText(c), fontSize); return; }
+          if (c.nodeType !== 1) return;
+          var ccs = __computedStyle(c, rules, fontSize);
+          if (ccs.display === "none") { c.__box = { x: 0, y: 0, width: 0, height: 0 }; return; }
+          if (isBlockDisplay(ccs)) {
+            flushLine();
+            var cb = layoutBlock(c, x, cursor, contentW, fontSize);
+            cursor = cb.bottom;
+            if (cb.w > maxW) maxW = cb.w;
+            return;
+          }
+          if (__REPLACED_TAGS[c.nodeName]) {
+            flushLine();
+            var rb = layoutReplaced(c, ccs, x, cursor, contentW);
+            cursor = rb.bottom;
+            if (rb.w > maxW) maxW = rb.w;
+            return;
+          }
+          flowInline(c, c, ccs.fontSize);
+        });
+      }
+      (el.childNodes || []).forEach(function (c) {
+        if (c.nodeType === 3) { pushRun(el, __nodeText(c), cs.fontSize); return; }
+        if (c.nodeType !== 1) return;
+        var ccs = __computedStyle(c, rules, cs.fontSize);
+        if (ccs.display === "none") { c.__box = { x: 0, y: 0, width: 0, height: 0 }; layout.boxes++; return; }
+        if (isBlockDisplay(ccs)) {
+          flushLine();
+          var cb = layoutBlock(c, x, cursor, contentW, cs.fontSize);
+          cursor = cb.bottom;
+          if (cb.w > maxW) maxW = cb.w;
+          return;
+        }
+        if (__REPLACED_TAGS[c.nodeName]) {
+          flushLine();
+          var rb = layoutReplaced(c, ccs, x, cursor, contentW);
+          cursor = rb.bottom;
+          if (rb.w > maxW) maxW = rb.w;
+          return;
+        }
+        flowInline(c, c, ccs.fontSize);
+      });
+      flushLine();
+      return { bottom: cursor, maxW: maxW };
+    }
+    function layoutReplaced(el, cs, x, y, availW) {
+      var w = __parsePx(cs.width, availW, cs.fontSize);
+      var h = __parsePx(cs.height, null, cs.fontSize);
+      if (w == null || h == null) {
+        if (el.nodeName === "button" || (el.nodeName === "input" && (el.attributes.type || "").toLowerCase() === "submit")) {
+          var label = el.textContent || el.attributes.value || "";
+          if (w == null) w = Math.min(availW, __textWidth(label, cs.fontSize) + 24);
+          if (h == null) h = cs.fontSize * 1.2 + 12;
+        } else if (el.nodeName === "input" && (el.attributes.type || "").toLowerCase() === "checkbox") {
+          if (w == null) w = 13; if (h == null) h = 13;
+        } else {
+          if (w == null) w = Math.min(availW, 300);
+          if (h == null) h = 150;
+        }
+      }
+      el.__box = { x: x, y: y, width: w, height: h };
+      layout.boxes++;
+      return { bottom: y + h, w: w };
+    }
+    function layoutBlock(el, x, y, availW, parentFont) {
+      if (__NON_RENDERED[el.nodeName]) { el.__box = { x: 0, y: 0, width: 0, height: 0 }; return { bottom: y, w: 0 }; }
+      var cs = __computedStyle(el, rules, parentFont);
+      if (cs.display === "none") { el.__box = { x: 0, y: 0, width: 0, height: 0 }; return { bottom: y, w: 0 }; }
+      var margin = __parseSides(cs.margin, availW, cs.fontSize);
+      var padding = __parseSides(cs.padding, availW, cs.fontSize);
+      var w = __parsePx(cs.width, availW, cs.fontSize);
+      if (w == null) w = Math.max(0, availW - margin[1] - margin[3]);
+      var bx = x + margin[3];
+      var by = y + margin[0];
+      var contentW = Math.max(0, w - padding[1] - padding[3]);
+      var r = layoutChildren(el, cs, bx + padding[3], by + padding[0], contentW);
+      var h = __parsePx(cs.height, null, cs.fontSize);
+      var contentH = (h == null) ? Math.max(0, r.bottom - (by + padding[0])) : h;
+      var totalH = padding[0] + contentH + padding[2];
+      el.__box = { x: bx, y: by, width: w, height: totalH };
+      el.__layoutFont = cs.fontSize;
+      layout.boxes++;
+      return { bottom: by + totalH + margin[2], w: margin[3] + w + margin[1] };
+    }
+    var root = doc.documentElement || doc;
+    var bodyMargin = 8;
+    layoutBlock(root, 0, 0, vw, 16);
+    if (root.nodeName === "html") {
+      (function shift(n, dx, dy) {
+        if (!n) return;
+        if (n.__box && n !== root) { n.__box = { x: n.__box.x + dx, y: n.__box.y + dy, width: n.__box.width, height: n.__box.height }; }
+        (n.childNodes || []).forEach(function (c) { if (c.nodeType === 1) shift(c, dx, dy); });
+      })(root, bodyMargin, bodyMargin);
+    }
+    doc.__layoutCache = layout;
+    try {
+      doc.__layoutInfo = { engine: "block-flow", viewportWidth: vw, boxes: layout.boxes, textMetric: "monospace-advance-0.6em", replacedDefaults: "css-300x150" };
+    } catch (e) {}
+    return layout;
+  }
   Element.prototype.getBoundingClientRect = function () {
-    var seed = (this.id || "") + "|" + (this.className || "") + "|" + ((this.textContent || "").slice(0, 24));
-    var h = 0;
-    for (var i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
-    var w = 40 + (h % 1160);
-    var ht = 16 + ((h >> 8) % 200);
-    var top = (h >> 4) % 600;
-    var left = (h >> 12) % 1200;
-    return { x: left, y: top, top: top, left: left, bottom: top + ht, right: left + w, width: w, height: ht };
+    var doc = this.ownerDocument || global.document;
+    if (doc) __ensureLayout(doc);
+    var b = this.__box || { x: 0, y: 0, width: 0, height: 0 };
+    return { x: b.x, y: b.y, top: b.y, left: b.x, bottom: b.y + b.height, right: b.x + b.width, width: b.width, height: b.height };
   };
   Object.defineProperty(Element.prototype, "offsetWidth", { get: function () { return this.getBoundingClientRect().width; } });
   Object.defineProperty(Element.prototype, "offsetHeight", { get: function () { return this.getBoundingClientRect().height; } });
@@ -385,7 +923,26 @@
   }
   Document.prototype = Object.create(Node.prototype);
   Document.prototype.constructor = Document;
-  Document.prototype.createElement = function (tag) { return new Element(String(tag).toLowerCase()); };
+  Document.prototype.createElement = function (tag, options) {
+    var tagLower = String(tag).toLowerCase();
+    var isOption = options && options.is ? String(options.is).toLowerCase() : null;
+    var ctor = customRegistry[tagLower] || (isOption ? customRegistry[isOption] : null);
+    if (ctor && typeof ctor === "function") {
+      try {
+        var el = new ctor();
+        if (el && el.nodeType === 1) {
+          if (!el.tagName) el.tagName = tagLower.toUpperCase();
+          if (!el.nodeName) el.nodeName = tagLower;
+          return el;
+        }
+      } catch (e) {
+        var fallback = new Element(tagLower);
+        try { Object.setPrototypeOf(fallback, ctor.prototype); } catch (e2) {}
+        return fallback;
+      }
+    }
+    return new Element(tagLower);
+  };
   Document.prototype.createTextNode = function (t) { return new Text(String(t)); };
   Document.prototype.getElementById = function (id) {
     var found = null;
@@ -698,7 +1255,24 @@
       fill: noop, stroke: noop, clip: noop, save: noop, restore: noop, translate: noop,
       scale: noop, rotate: noop, setTransform: noop, transform: noop, resetTransform: noop,
       drawImage: noop, setLineDash: noop, getLineDash: function () { return []; },
-      measureText: function (t) { return { width: String(t || "").length * 6 }; },
+      measureText: function (t) {
+        var str = String(t || "");
+        var fs = 10;
+        if (this.font) {
+          var m = String(this.font).match(/(\d+(?:\.\d+)?)px/);
+          if (m) fs = parseFloat(m[1]) || 10;
+        }
+        var w = __textWidth(str, fs);
+        return {
+          width: Math.round(w * 100) / 100,
+          actualBoundingBoxAscent: Math.round(fs * 0.8 * 100) / 100,
+          actualBoundingBoxDescent: Math.round(fs * 0.2 * 100) / 100,
+          actualBoundingBoxLeft: 0,
+          actualBoundingBoxRight: Math.round(w * 100) / 100,
+          fontBoundingBoxAscent: Math.round(fs * 0.9 * 100) / 100,
+          fontBoundingBoxDescent: Math.round(fs * 0.25 * 100) / 100
+        };
+      },
       getImageData: function (x, y, w, h) {
         var n = (w || 1) * (h || 1) * 4;
         return { width: w || 1, height: h || 1, data: new Uint8ClampedArray(n) };
@@ -957,23 +1531,72 @@
   };
 
   /* Custom elements + shadow DOM. */
-  var customRegistry = {};
   global.customElements = {
-    define: function (name, ctor, _opts) { customRegistry[name] = ctor; },
-    get: function (name) { return customRegistry[name]; },
-    whenDefined: function (name) { return Promise.resolve(); },
-    upgrade: function () {}
+    define: function (name, ctor, _opts) {
+      name = String(name).toLowerCase();
+      customRegistry[name] = ctor;
+      if (whenDefinedPromises[name]) {
+        try { whenDefinedPromises[name](ctor); } catch (e) {}
+        delete whenDefinedPromises[name];
+      }
+    },
+    get: function (name) { return customRegistry[String(name).toLowerCase()]; },
+    whenDefined: function (name) {
+      name = String(name).toLowerCase();
+      if (customRegistry[name]) return Promise.resolve(customRegistry[name]);
+      return new Promise(function (resolve) {
+        whenDefinedPromises[name] = resolve;
+      });
+    },
+    upgrade: function (root) {
+      if (!root) return;
+      (function walk(n) {
+        if (n.nodeType === 1) {
+          var tag = n.nodeName.toLowerCase();
+          var ctor = customRegistry[tag];
+          if (ctor && !(n instanceof ctor)) {
+            try { Object.setPrototypeOf(n, ctor.prototype); } catch (e) {}
+            if (typeof n.connectedCallback === "function") {
+              try { n.connectedCallback(); } catch (e) {}
+            }
+          }
+        }
+        if (n.childNodes) n.childNodes.forEach(walk);
+      })(root);
+    }
   };
-  Element.prototype.attachShadow = function () {
+  Element.prototype.attachShadow = function (init) {
     if (!this._shadow) {
       var s = new Element("#shadow-root", {}, []);
+      s.nodeType = 11;
       s.host = this;
+      s.mode = (init && init.mode) || "open";
       this._shadow = s;
     }
     return this._shadow;
   };
   Object.defineProperty(Element.prototype, "shadowRoot", {
-    get: function () { return this._shadow || null; }
+    get: function () {
+      if (this._shadow && this._shadow.mode === "closed") return null;
+      return this._shadow || null;
+    }
+  });
+
+  Object.defineProperty(Element.prototype, "contentWindow", {
+    get: function () {
+      if (this.nodeName.toLowerCase() !== "iframe") return null;
+      if (!this._contentWindow) {
+        var self = this;
+        this._contentWindow = {
+          postMessage: function (data, targetOrigin) {
+            if (typeof host_post_message === "function") {
+              host_post_message(String(data), String(targetOrigin || "*"), self.getAttribute("src") || "");
+            }
+          }
+        };
+      }
+      return this._contentWindow;
+    }
   });
 
   global.fetch = function (url, opts) {
@@ -1094,6 +1717,30 @@
     } catch (e) {}
     doc.defaultView = global;
     global.window = global;
+    var pdfPlugin = {
+      name: "PDF Viewer",
+      description: "Portable Document Format",
+      filename: "internal-pdf-viewer",
+      length: 1,
+      item: function (i) { return i === 0 ? this[0] : null; },
+      namedItem: function (n) { return n === "application/pdf" ? this[0] : null; }
+    };
+    var pdfMime = {
+      type: "application/pdf",
+      suffixes: "pdf",
+      description: "Portable Document Format",
+      enabledPlugin: pdfPlugin
+    };
+    pdfPlugin[0] = pdfMime;
+
+    var pluginList = [pdfPlugin];
+    pluginList.item = function (i) { return pluginList[i] || null; };
+    pluginList.namedItem = function (n) { return n === "PDF Viewer" ? pdfPlugin : null; };
+
+    var mimeList = [pdfMime];
+    mimeList.item = function (i) { return mimeList[i] || null; };
+    mimeList.namedItem = function (n) { return n === "application/pdf" ? pdfMime : null; };
+
     global.navigator = {
       userAgent: (typeof __WR_UA === "string" && __WR_UA)
         ? __WR_UA
@@ -1110,8 +1757,111 @@
       maxTouchPoints: 0,
       cookieEnabled: true,
       onLine: true,
-      plugins: { length: 0, item: function () { return null; }, namedItem: function () { return null; } },
-      mimeTypes: { length: 0, item: function () { return null; } }
+      plugins: pluginList,
+      mimeTypes: mimeList,
+      permissions: {
+        query: function (desc) {
+          return Promise.resolve({
+            state: "granted",
+            name: desc && desc.name,
+            onchange: null
+          });
+        }
+      },
+      clipboard: {
+        readText: function () { return Promise.resolve(""); },
+        writeText: function (_t) { return Promise.resolve(); }
+      },
+      mediaDevices: {
+        enumerateDevices: function () { return Promise.resolve([]); },
+        getUserMedia: function () { return Promise.reject(new Error("NotSupportedError")); }
+      }
+    };
+
+    global.screen = {
+      width: 1920,
+      height: 1080,
+      availWidth: 1920,
+      availHeight: 1040,
+      colorDepth: 24,
+      pixelDepth: 24,
+      orientation: {
+        angle: 0,
+        type: "landscape-primary",
+        onchange: null
+      }
+    };
+    global.devicePixelRatio = 2;
+    global.visualViewport = {
+      width: 1280,
+      height: 720,
+      offsetLeft: 0,
+      offsetTop: 0,
+      pageLeft: 0,
+      pageTop: 0,
+      scale: 1,
+      addEventListener: function () {},
+      removeEventListener: function () {}
+    };
+
+    global.chrome = {
+      app: { isInstalled: false },
+      runtime: {
+        OnInstalledReason: { INSTALL: "install", UPDATE: "update" },
+        PlatformOs: { MAC: "mac", WIN: "win", LINUX: "linux" }
+      },
+      loadTimes: function () {
+        var now = (Date.now() / 1000);
+        return {
+          requestTime: now - 0.15,
+          startLoadTime: now - 0.14,
+          commitLoadTime: now - 0.05,
+          finishDocumentLoadTime: now - 0.02,
+          firstPaintTime: now - 0.01,
+          finishLoadTime: now,
+          wasFetchedViaSpdy: true,
+          wasNpnNegotiated: true,
+          npnNegotiatedProtocol: "h2",
+          wasAlternateProtocolAvailable: false,
+          connectionInfo: "h2"
+        };
+      },
+      csi: function () {
+        return { startE: Date.now() - 150, onloadT: Date.now(), pageT: 150, tran: 15 };
+      }
+    };
+
+    var startTime = Date.now() - 150;
+    global.performance = {
+      timeOrigin: startTime,
+      now: function () { return Date.now() - startTime; },
+      timing: {
+        navigationStart: startTime,
+        unloadEventStart: 0,
+        unloadEventEnd: 0,
+        redirectStart: 0,
+        redirectEnd: 0,
+        fetchStart: startTime + 2,
+        domainLookupStart: startTime + 5,
+        domainLookupEnd: startTime + 12,
+        connectStart: startTime + 12,
+        connectEnd: startTime + 35,
+        secureConnectionStart: startTime + 18,
+        requestStart: startTime + 37,
+        responseStart: startTime + 80,
+        responseEnd: startTime + 105,
+        domLoading: startTime + 108,
+        domInteractive: startTime + 135,
+        domContentLoadedEventStart: startTime + 140,
+        domContentLoadedEventEnd: startTime + 145,
+        domComplete: startTime + 148,
+        loadEventStart: startTime + 149,
+        loadEventEnd: startTime + 150
+      },
+      getEntries: function () { return []; },
+      getEntriesByType: function () { return []; },
+      mark: function () {},
+      measure: function () {}
     };
     if (!global.location || global.location.href === "about:blank") {
       try {
@@ -1145,6 +1895,7 @@
       this.cancelable = !!(init && init.cancelable);
       this.defaultPrevented = false;
       this.target = null;
+      this.isTrusted = !!(init && init.isTrusted);
       this.preventDefault = function () { this.defaultPrevented = true; };
       this.stopPropagation = function () {};
       // Copy every remaining init field onto the event. Mouse handlers read
@@ -1185,15 +1936,26 @@
     };
     global.postMessage = function (data, origin) {
       var targetOrigin = String(origin || "*");
-      if (typeof host_post_message === "function") host_post_message(String(data), targetOrigin);
+      if (typeof host_post_message === "function") host_post_message(String(data), targetOrigin, "self");
       global.dispatchEvent(new global.MessageEvent("message", {
         data: data,
         origin: targetOrigin === "*" ? "" : targetOrigin
       }));
     };
-    global.parent = global;
-    global.top = global;
+    global.parent = {
+      postMessage: function (data, origin) {
+        var targetOrigin = String(origin || "*");
+        if (typeof host_post_message === "function") host_post_message(String(data), targetOrigin, "parent");
+      }
+    };
+    global.top = global.parent;
     global.self = global;
+    global.__receiveMessage = function (data, origin) {
+      global.dispatchEvent(new global.MessageEvent("message", {
+        data: data,
+        origin: String(origin || "")
+      }));
+    };
     global.frames = [];
     global.innerWidth = 1280;
     global.innerHeight = 720;
@@ -1231,7 +1993,7 @@
     var el = global.__byPath(path);
     if (!el) return false;
     if (typeof el.click === "function") el.click();
-    else el.dispatchEvent(new global.Event("click", { bubbles: true }));
+    else el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true }));
     return true;
   };
   global.__typePath = function (path, text) {
@@ -1239,8 +2001,8 @@
     if (!el) return false;
     el.value = String(text);
     el.setAttribute("value", String(text));
-    el.dispatchEvent(new global.Event("input", { bubbles: true }));
-    el.dispatchEvent(new global.Event("change", { bubbles: true }));
+    el.dispatchEvent(new global.Event("input", { bubbles: true, isTrusted: true }));
+    el.dispatchEvent(new global.Event("change", { bubbles: true, isTrusted: true }));
     return true;
   };
   global.__activateSelector = function (selector, text) {
@@ -1251,25 +2013,20 @@
     if (text !== null && text !== undefined && text !== "") {
         el.value = String(text);
         el.setAttribute("value", String(text));
-        el.dispatchEvent(new global.Event("input", { bubbles: true }));
-        el.dispatchEvent(new global.Event("change", { bubbles: true }));
+        el.dispatchEvent(new global.Event("input", { bubbles: true, isTrusted: true }));
+        el.dispatchEvent(new global.Event("change", { bubbles: true, isTrusted: true }));
         return true;
     }
-    // Toggle semantics for checkboxes and radios, so a click reflects what a
-    // browser would do rather than leaving state untouched.
-    var type = (el.getAttribute("type") || "").toLowerCase();
-    if (type === "checkbox" || type === "radio") {
-        if (type === "checkbox") {
-            var on = el.getAttribute("checked") === "checked" || el.getAttribute("aria-checked") === "true";
-            if (on) { el.removeAttribute("checked"); el.setAttribute("aria-checked", "false"); }
-            else { el.setAttribute("checked", "checked"); el.setAttribute("aria-checked", "true"); }
-        } else {
-            el.setAttribute("checked", "checked");
-            el.setAttribute("aria-checked", "true");
-        }
-    }
     if (typeof el.click === "function") el.click();
-    else el.dispatchEvent(new global.Event("click", { bubbles: true }));
+    else el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true }));
+    // Element.click() already flips checkbox state, so state is only mirrored
+    // here rather than toggled again. Setting `checked` in addition would
+    // double-toggle and land back where it started, which is why a click on a
+    // checkbox appeared to do nothing.
+    var kind = (el.getAttribute("type") || "").toLowerCase();
+    if (kind === "checkbox" || kind === "radio") {
+      el.setAttribute("aria-checked", el.checked ? "true" : "false");
+    }
     return true;
   };
 global.__dragSelector = function (selector, dx, dy, steps) {
@@ -1279,7 +2036,7 @@ global.__dragSelector = function (selector, dx, dy, steps) {
     if (!el) return false;
     var n = Math.max(2, Math.min(40, steps || 12));
     var move = typeof global.MouseEvent === "function" ? global.MouseEvent : global.Event;
-    var init = { bubbles: true, cancelable: true };
+    var init = { bubbles: true, cancelable: true, isTrusted: true };
     try { init.clientX = 0; init.clientY = 0; } catch (e) {}
     // A slider listens for press, a move chain, then release. Emitting only a
     // click is what made every drag a no-op against these widgets.
@@ -1341,8 +2098,8 @@ global.__submitPath = function (path) {
       } else {
         el.value = String(val);
       }
-      el.dispatchEvent(new global.Event("input", { bubbles: true }));
-      el.dispatchEvent(new global.Event("change", { bubbles: true }));
+      el.dispatchEvent(new global.Event("input", { bubbles: true, isTrusted: true }));
+      el.dispatchEvent(new global.Event("change", { bubbles: true, isTrusted: true }));
     });
     return true;
   };

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from selectolax.lexbor import LexborNode as Node
 
 from webresearch.content import content_root, inside_chrome
@@ -117,9 +119,37 @@ def _html_view(doc: Document, max_chars: int) -> tuple[str, list[str]]:
     return view, headings
 
 
+_SCRIPT_BODY_RE = re.compile(r"(?is)<script\b[^>]*>(.*?)</script\s*>")
+_SPA_MOUNT_SELECTORS = ("#app", "#root", "#__next", "#__nuxt", "[data-reactroot]")
+
+
 def _spa_hint(doc: Document, view: str) -> bool:
-    scripts = doc.body.lower().count("<script")
-    return len(view) < 240 and scripts >= 5
+    """True when the page is likely client-rendered rather than server-rendered.
+
+    A short view is necessary but not sufficient: a short *article* is still an
+    article. The extra signals are that script mass dominates the response and
+    the body carries an empty mount point, which is what a SPA shell looks
+    like. Wikipedia carries five inline scripts and a 15 KB article, and was
+    previously labelled script-heavy purely because its article had been
+    dropped by the chrome filter upstream — a bug surfaced as a note.
+    """
+    body = doc.body.lower()
+    if body.count("<script") < 5:
+        return False
+    script_bytes = sum(len(m.group(1)) for m in _SCRIPT_BODY_RE.finditer(doc.body))
+    if script_bytes < 2000:
+        return False
+    view_len = len(view.strip())
+    if view_len > 4000:
+        return False
+    tree = doc.tree
+    if tree is None:
+        return False
+    for selector in _SPA_MOUNT_SELECTORS:
+        mount = tree.css_first(selector)
+        if mount is not None and not " ".join(mount.text(strip=True).split()):
+            return True
+    return script_bytes > view_len * 3
 
 
 def snapshot(

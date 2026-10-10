@@ -50,15 +50,6 @@ _WIDGET_NEEDLES = (
 
 _SKIP_CODE_TAGS = {"document", "html", "head", "body", "style", "#text"}
 
-_PROVIDERS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("recaptcha", ("recaptcha", "g-recaptcha", "grecaptcha")),
-    ("hcaptcha", ("hcaptcha", "h-captcha")),
-    ("turnstile", ("cf-turnstile", "challenges.cloudflare.com")),
-    ("datadome", ("datadome",)),
-    ("google_sorry", ("google.com/sorry", "unusual traffic")),
-    ("cloudflare", ("cf-challenge", "checking your browser", "just a moment")),
-)
-
 _BUTTON_NAMES = {
     "recaptcha-reload-button": "reload",
     "recaptcha-audio-button": "audio",
@@ -92,12 +83,93 @@ def _descendants(node: dict):
             yield from _descendants(child)
 
 
-def _provider(documents: list[tuple[str, str]]) -> str:
-    blob = " ".join(f"{url} {html}" for url, html in documents).lower()
-    for provider, needles in _PROVIDERS:
-        if any(needle in blob for needle in needles):
-            return provider
+_SCRIPT_BLOCK_RE = re.compile(r"(?is)<(script|style|noscript)\b([^>]*)>(.*?)</\1\s*>")
+
+
+def _markup_only(html: str) -> str:
+    """Page markup with the *contents* of script/style elements removed.
+
+    The tags and their attributes survive — ``<script src="https://www.google.com/
+    recaptcha/api.js">`` is genuine evidence of a widget — but the inline code does
+    not. A provider name that appears only inside inline JavaScript is page
+    configuration, not a challenge rendered on the page. Wikipedia ships
+    ``wgConfirmEditHCaptchaSiteKey`` in its config blob to gate *anonymous edits*;
+    matching that string flagged every article as an hCaptcha challenge.
+    """
+    return _SCRIPT_BLOCK_RE.sub(lambda m: f"<{m.group(1)}{m.group(2) or ''}></{m.group(1)}>", html)
+
+
+# A provider is only reported present when the markup carries structural
+# evidence: a widget element, a provider asset URL in an attribute, a provider
+# iframe, or an interstitial whose *visible text* says so.
+_WIDGET_CLASS_TOKENS: dict[str, set[str]] = {
+    "recaptcha": {"g-recaptcha", "grecaptcha", "recaptcha", "rc-anchor", "rc-imageselect"},
+    "hcaptcha": {"h-captcha", "hcaptcha"},
+    "turnstile": {"cf-turnstile", "turnstile"},
+}
+
+_ASSET_NEEDLES: dict[str, tuple[str, ...]] = {
+    "recaptcha": ("recaptcha", "grecaptcha"),
+    "hcaptcha": ("hcaptcha",),
+    "turnstile": ("challenges.cloudflare.com",),
+    "datadome": ("captcha-delivery.com", "datadome"),
+}
+
+_INTERSTITIAL_NEEDLES: dict[str, tuple[str, ...]] = {
+    "google_sorry": ("google.com/sorry", "unusual traffic", "our systems have detected"),
+    "cloudflare": ("just a moment", "checking your browser", "cf-challenge"),
+}
+
+_URL_ATTRS = ("src", "href", "action", "data-src")
+
+
+def _class_tokens_of(attrs: dict) -> set[str]:
+    raw = attrs.get("class") or ""
+    if isinstance(raw, (list, tuple)):
+        raw = " ".join(str(x) for x in raw)
+    return {tok for tok in str(raw).lower().split() if tok}
+
+
+def _structural_kind(documents: list[tuple[str, str]]) -> str:
+    """Return the provider with structural evidence in the markup, else ''."""
+    found: dict[str, bool] = {}
+    for url, html in documents:
+        markup = _markup_only(html)
+        tree = html_to_tree(markup)
+        for node in walk(tree):
+            attrs = node.get("a") or {}
+            tokens = _class_tokens_of(attrs)
+            for provider, widget_tokens in _WIDGET_CLASS_TOKENS.items():
+                if tokens & widget_tokens:
+                    found.setdefault(provider, True)
+            for attr in _URL_ATTRS:
+                value = str(attrs.get(attr) or "").lower()
+                if not value:
+                    continue
+                for provider, needles in _ASSET_NEEDLES.items():
+                    if any(needle in value for needle in needles):
+                        found.setdefault(provider, True)
+        blob = _text_of(tree).lower()
+        for provider, needles in _INTERSTITIAL_NEEDLES.items():
+            if any(needle in blob for needle in needles):
+                found.setdefault(provider, True)
+    if "recaptcha" in found:
+        return "recaptcha"
+    if "hcaptcha" in found:
+        return "hcaptcha"
+    if "turnstile" in found:
+        return "turnstile"
+    if "datadome" in found:
+        return "datadome"
+    if "cloudflare" in found:
+        return "cloudflare"
+    if "google_sorry" in found:
+        return "google_sorry"
     return ""
+
+
+def _provider(documents: list[tuple[str, str]]) -> str:
+    return _structural_kind(documents)
 
 
 def _frame_kind(url: str, html: str) -> str:

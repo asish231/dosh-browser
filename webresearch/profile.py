@@ -7,10 +7,12 @@ hostel Wi-Fi rate limits) by reusing trusted credentials.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
 import re
+import time
 from typing import Any
 
 import httpx
@@ -18,6 +20,25 @@ import httpx
 DEFAULT_PROFILES_DIR = Path(
     os.environ.get("WR_PROFILES_DIR", Path.home() / ".dosh-browser" / "profiles")
 )
+
+WAF_TOKEN_NAMES = {
+    "cf_clearance",
+    "__cf_bm",
+    "cf_chl_2",
+    "cf_chl_rc_m",
+    "datadome",
+    "_abck",
+    "bm_sz",
+    "bm_sv",
+    "ak_bmsc",
+    "incap_ses",
+    "visid_incap",
+    "nlbi",
+    "_px3",
+    "_pxhd",
+    "_pxde",
+    "aws-waf-token",
+}
 
 
 class Profile:
@@ -28,6 +49,7 @@ class Profile:
         self.base_dir = Path(base_dir) if base_dir else DEFAULT_PROFILES_DIR
         self.profile_dir = self.base_dir / self.name
         self.cookies_file = self.profile_dir / "cookies.json"
+        self.storage_file = self.profile_dir / "storage.json"
         self._ensure_dir()
 
     def _ensure_dir(self) -> None:
@@ -72,18 +94,101 @@ class Profile:
     def apply_to_client(self, client: httpx.AsyncClient) -> int:
         """Apply stored cookies into an httpx.AsyncClient cookie jar."""
         cookies = self.load_cookies()
-        from webresearch.engine.chromium import sync_cookies_to_client
-
-        sync_cookies_to_client(cookies, client)
+        for c in cookies:
+            name = c.get("name")
+            value = c.get("value")
+            domain = (c.get("domain") or "").lstrip(".")
+            path = c.get("path") or "/"
+            if name and value:
+                with contextlib.suppress(Exception):
+                    client.cookies.set(name, value, domain=domain or None, path=path)
         return len(cookies)
 
     def save_from_client(self, client: httpx.AsyncClient) -> int:
         """Extract cookies from an httpx.AsyncClient and persist them."""
-        from webresearch.engine.chromium import extract_cookies_for_chromium
+        out: list[dict[str, Any]] = []
+        if hasattr(client, "cookies") and hasattr(client.cookies, "jar"):
+            for cookie in client.cookies.jar:
+                out.append(
+                    {
+                        "name": cookie.name,
+                        "value": cookie.value,
+                        "domain": cookie.domain or "",
+                        "path": cookie.path or "/",
+                        "secure": bool(cookie.secure),
+                        "expires": cookie.expires if hasattr(cookie, "expires") else None,
+                    }
+                )
+        self.save_cookies(out)
+        return len(out)
 
-        cookies = extract_cookies_for_chromium(client)
-        self.save_cookies(cookies)
-        return len(cookies)
+    def get_domain_cookies(self, domain: str) -> list[dict[str, Any]]:
+        """Return all stored cookies matching the given host/domain."""
+        d = domain.lower().lstrip(".")
+        matched = []
+        for c in self.load_cookies():
+            cd = (c.get("domain") or "").lower().lstrip(".")
+            if not cd or cd == d or d.endswith("." + cd) or cd.endswith("." + d):
+                matched.append(c)
+        return matched
+
+    def get_waf_tokens(self, domain: str) -> dict[str, str]:
+        """Detect and return anti-bot / WAF clearance tokens for domain."""
+        tokens: dict[str, str] = {}
+        for c in self.get_domain_cookies(domain):
+            name = c.get("name", "")
+            val = c.get("value", "")
+            if not name or not val:
+                continue
+            low = name.lower()
+            if any(low == marker or low.startswith(marker + "_") for marker in WAF_TOKEN_NAMES):
+                tokens[name] = val
+        return tokens
+
+    def is_warmed(self, domain: str) -> bool:
+        """Check if profile contains unexpired anti-bot clearance for domain."""
+        waf = self.get_waf_tokens(domain)
+        if not waf:
+            return False
+        now = time.time()
+        for c in self.get_domain_cookies(domain):
+            if c.get("name") in waf:
+                exp = c.get("expires")
+                if exp is not None and isinstance(exp, (int, float)) and exp > 0 and exp < now:
+                    continue
+                return True
+        return False
+
+    def load_storage(self, origin: str) -> dict[str, str]:
+        """Load persistent localStorage key-value pairs for origin."""
+        if not self.storage_file.exists():
+            return {}
+        try:
+            with open(self.storage_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data.get(origin, {})
+        except Exception:
+            pass
+        return {}
+
+    def save_storage(self, origin: str, key: str, value: str) -> None:
+        """Save a key-value pair to origin localStorage."""
+        data: dict[str, dict[str, str]] = {}
+        if self.storage_file.exists():
+            try:
+                with open(self.storage_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        data = loaded
+            except Exception:
+                pass
+        data.setdefault(origin, {})[key] = str(value)
+        self._ensure_dir()
+        temp_file = self.storage_file.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        temp_file.replace(self.storage_file)
 
     def import_netscape(self, content: str) -> int:
         """Import cookies in Netscape format (standard 'cookies.txt' export)."""

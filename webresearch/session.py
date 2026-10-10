@@ -47,6 +47,7 @@ class Tab:
         self.index: int = -1
         self.html: str = ""
         self.url: str = ""
+        self.headers: dict = {}
         self.frame_documents: list[FrameDocument] = []
         self.captcha_inspection: CaptchaInspection | None = None
 
@@ -56,10 +57,12 @@ class Tab:
             return self.history[self.index]
         return None
 
-    def push(self, page: Page, html: str | None = None) -> Page:
+    def push(self, page: Page, html: str | None = None, headers: dict | None = None) -> Page:
         if html is not None:
             self.html = html
             self.url = page.url
+        if headers is not None:
+            self.headers = dict(headers)
         self.history = self.history[: self.index + 1]
         self.history.append(page)
         self.index = len(self.history) - 1
@@ -186,7 +189,7 @@ class Session:
         return self.current_tab.page
 
     def _push(self, page: Page, html: str | None = None) -> Page:
-        return self.current_tab.push(page, html)
+        return self.current_tab.push(page, html, headers=getattr(page, "headers", None))
 
     async def goto(self, url: str, *, max_chars: int = 8000, js: str = "auto") -> Page:
         page, html, frames, captcha = await read_live(
@@ -198,6 +201,8 @@ class Session:
         )
         self.frame_documents = frames
         self.captcha_inspection = captcha
+        if self.profile is not None:
+            self.profile.save_from_client(self.client)
         return self._push(page, html)
 
     async def open(self, n: int, *, max_chars: int = 8000) -> Page:
@@ -265,11 +270,12 @@ class Session:
                 html,
                 result.final_url or form.action,
                 self.client,
+                headers=result.headers,
             )
             js_ran = bool(js_info.get("ran"))
             result = result.model_copy(update={"body": html})
         frames = (
-            await load_frames(html, result.final_url or form.action, self.client)
+            await load_frames(html, result.final_url or form.action, self.client, parent_headers=result.headers)
             if result.kind == "html"
             else []
         )
@@ -325,7 +331,13 @@ class Session:
                 body=new_html,
             )
             frames = (
-                await load_frames(new_html, self.url, self.client)
+                await load_frames(
+                    new_html,
+                    self.url,
+                    self.client,
+                    parent_headers=self.current_tab.headers,
+                    parent_messages=js_info.get("post_messages"),
+                )
                 if new_html
                 else self.frame_documents
             )
@@ -541,7 +553,13 @@ resolve a selector directly.
             body=new_html,
         )
         frames = (
-            await load_frames(new_html, self.url, self.client)
+            await load_frames(
+                new_html,
+                self.url,
+                self.client,
+                parent_headers=self.current_tab.headers,
+                parent_messages=js_info.get("post_messages"),
+            )
             if new_html
             else self.frame_documents
         )
@@ -563,7 +581,29 @@ resolve a selector directly.
         )
         self.frame_documents = frames
         self.captcha_inspection = captcha
+        self._last_deltas = js_info.get("deltas", [])
+        if self.profile is not None:
+            self.profile.save_from_client(self.client)
         return self._push(page, new_html)
+
+    @property
+    def last_deltas(self) -> list[dict]:
+        """Return raw DOM mutation deltas captured during the most recent action."""
+        return getattr(self, "_last_deltas", [])
+
+    def get_last_delta_patch(self) -> bytes:
+        """Encode the most recent mutation deltas as an ANBF binary delta patch."""
+        from webresearch.engine.binary import AnbDelta, pack_delta_patch
+
+        anb_deltas = [
+            AnbDelta(
+                kind=d.get("kind", "mutate"),
+                target_id=d.get("target_id", "node"),
+                content=d.get("content", ""),
+            )
+            for d in self.last_deltas
+        ]
+        return pack_delta_patch(anb_deltas)
 
     def inspect(self) -> tuple[list[Target], list[Challenge]]:
         if not self.html:

@@ -187,10 +187,31 @@ def build_acd(
     for target in targets:
         if target.challenge:
             kind = "click"
+        elif target.role == "link":
+            kind = "navigate"
         elif target.role in {"textbox", "select"}:
             kind = "type"
+        elif target.role == "slider":
+            kind = "drag"
+        elif target.role == "iframe":
+            kind = "embed"
+        elif target.role == "button" and target.name.strip().lower() in {"submit", "search"}:
+            kind = "submit"
+        elif target.role == "button":
+            kind = "activate"
+        elif target.role in {"checkbox", "label"}:
+            kind = "activate"
         else:
-            kind = "click"
+            kind = "activate"
+        routing = ""
+        if kind == "navigate" and target.href:
+            routing = target.href
+        elif kind == "submit":
+            routing = target.name or target.ref
+        elif kind == "drag":
+            routing = "drag:path=" + ",".join(str(i) for i in target.path)
+        elif kind == "embed":
+            routing = target.href
         actions.append(
             AcdAction(
                 ref=target.ref,
@@ -198,6 +219,8 @@ def build_acd(
                 role=target.role,
                 label=(target.text or target.name or target.href)[:160],
                 name=target.name,
+                href=target.href,
+                run=routing or target.ref,
             )
         )
 
@@ -218,15 +241,31 @@ def build_acd(
         framework["json_ld"] = json_ld_data
     errors = list(js_info.get("error_messages") or [])
 
+    try:
+        from webresearch.engine.inspect import count_interactive
+        controls_total = count_interactive(html or "")
+    except Exception:
+        controls_total = len(targets)
+
     counts = {
         "blocks": len(blocks),
         "actions": len(actions),
+        "actions_total": controls_total,
         "links": len(links),
         "api": len(api),
         "frames": len(frames),
         "framework_keys": len(framework),
         "errors": len(errors),
     }
+    unavailable: list[str] = []
+    if any(a.kind == "drag" for a in actions):
+        unavailable.append("drag: numeric deltas are heuristic without a layout engine")
+    if any(a.kind == "embed" for a in actions):
+        unavailable.append("embed: iframe pixels/postMessage not available in mini-DOM")
+    if controls_total > len(actions):
+        unavailable.append(
+            f"actions: {controls_total - len(actions)} interactive controls beyond the 80-ref budget did not receive refs"
+        )
     return Acd(
         url=url,
         title=title,
@@ -238,7 +277,30 @@ def build_acd(
         framework=framework,
         errors=errors,
         counts=counts,
+        unavailable=unavailable,
     )
+
+
+def error_summary(errors: list[str], *, limit: int = 3, width: int = 160) -> str:
+    """Compact inline summary of distinct Mini-DOM error classes.
+
+    A count alone tells an agent nothing: 25 errors on GitHub could be one
+    missing API repeated or 25 unrelated breakages, and only the second means
+    the rendered view is untrustworthy. Group by message so the agent can see
+    which capability the Mini-DOM is missing without a second round trip.
+    """
+    if not errors:
+        return ""
+    counts: dict[str, int] = {}
+    for err in errors:
+        msg = " ".join(str(err).split())[:width]
+        counts[msg] = counts.get(msg, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    parts = [f"{msg} (x{count})" if count > 1 else msg for msg, count in ranked[:limit]]
+    hidden = len(ranked) - len(parts)
+    suffix = f" ; +{hidden} more distinct" if hidden > 0 else ""
+    distinct = f"{len(ranked)} distinct" if len(ranked) > 1 else "1 distinct"
+    return f"JS_ERRORS: {len(errors)} error(s), {distinct} — " + "; ".join(parts) + suffix
 
 
 def acd_view(acd: Acd, *, limit: int = 60) -> str:
@@ -249,7 +311,11 @@ def acd_view(acd: Acd, *, limit: int = 60) -> str:
     if acd.framework:
         lines.append("FRAMEWORK_DATA: " + ", ".join(sorted(acd.framework.keys())))
     if acd.errors:
-        lines.append(f"JS_ERRORS: {len(acd.errors)} (see acd.errors)")
+        lines.append(error_summary(acd.errors))
+    if acd.unavailable:
+        lines.append("UNAVAILABLE: " + "; ".join(acd.unavailable[:5]))
+    if acd.counts.get("actions_total", 0) > acd.counts.get("actions", 0):
+        lines.append(f"ACTIONS: {acd.counts['actions']} of {acd.counts['actions_total']} (budget-truncated)")
     for block in acd.blocks[:limit]:
         if block.type == "table":
             lines.append(f"[{block.id}] table {len(block.rows)}x{len(block.rows[0]) if block.rows else 0}")

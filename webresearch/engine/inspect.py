@@ -80,6 +80,8 @@ def _role(node: dict) -> str:
         return "button"
     if typ == "checkbox" or role == "checkbox":
         return "checkbox"
+    if typ == "range" or role == "slider":
+        return "slider"
     if tag in {"input", "textarea"} or role == "textbox":
         return "textbox"
     if tag == "select":
@@ -87,6 +89,14 @@ def _role(node: dict) -> str:
     if tag == "label":
         return "label"
     return tag or "element"
+
+
+def count_interactive(html: str) -> int:
+    from webresearch.engine.tree import html_to_tree
+    tree = html_to_tree(html)
+    nodes: list[tuple[dict, list[int]]] = []
+    _collect_interactive(tree, nodes)
+    return len(nodes)
 
 
 def detect_challenges(html: str, url: str = "", targets: list[Target] | None = None) -> list[Challenge]:
@@ -123,6 +133,7 @@ def inspect_html(html: str, url: str = "") -> tuple[list[Target], list[Challenge
     nodes: list[tuple[dict, list[int]]] = []
     _collect_interactive(tree, nodes)
     targets: list[Target] = []
+    seen_refs: dict[str, int] = {}
     for i, (node, path) in enumerate(nodes[:80], start=1):
         attrs = node.get("a") or {}
         role = _role(node)
@@ -132,9 +143,18 @@ def inspect_html(html: str, url: str = "") -> tuple[list[Target], list[Challenge
         if role == "checkbox" or (attrs.get("type") or "").lower() == "checkbox":
             checked = attrs.get("checked") is not None and str(attrs.get("checked")).lower() != "false"
         challenge = role in {"recaptcha", "hcaptcha", "turnstile"} or "robot" in text.lower()
+        import hashlib
+        digest = hashlib.sha1(
+            "|".join([role, node.get("t") or "", attrs.get("name") or attrs.get("id") or "", text.strip()[:40], href]).encode("utf-8", "ignore")
+        ).hexdigest()[:8]
+        base_ref = f"e{digest}"
+        n = seen_refs.get(base_ref, 0) + 1
+        seen_refs[base_ref] = n
+        ref = base_ref if n == 1 else f"{base_ref}-{n}"
+        _ = path  # path retained in Target
         targets.append(
             Target(
-                ref=f"e{i}",
+                ref=ref,
                 role=role,
                 text=text.strip(),
                 tag=node.get("t") or "",
@@ -148,17 +168,39 @@ def inspect_html(html: str, url: str = "") -> tuple[list[Target], list[Challenge
     return targets, detect_challenges(html, url, targets)
 
 
-def click_html(html: str, url: str, ref: str) -> tuple[str, str | None]:
-    """Toggle/activate inspect ref. Returns (html, navigate_url or None)."""
-    if not ref or ref[0] != "e" or not ref[1:].isdigit():
-        raise ValueError(f"bad ref: {ref}")
-    idx = int(ref[1:]) - 1
+def _iter_refs(nodes: list[tuple[dict, list[int]]]):
+    import hashlib
+    seen: dict[str, int] = {}
+    for i, (node, path) in enumerate(nodes, start=1):
+        attrs = node.get("a") or {}
+        role = _role(node)
+        text = _text_of(node)[:120] or attrs.get("value") or attrs.get("title") or attrs.get("name") or attrs.get("aria-label") or ""
+        href = attrs.get("href") or attrs.get("src") or ""
+        digest = hashlib.sha1(
+            "|".join([role, node.get("t") or "", attrs.get("name") or attrs.get("id") or "", text.strip()[:40], href]).encode("utf-8", "ignore")
+        ).hexdigest()[:8]
+        base = f"e{digest}"
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        ref = base if n == 1 else f"{base}-{n}"
+        yield node, path, ref
+
+
+def _node_by_ref(html: str, ref: str) -> tuple[dict, list[int], object]:
     tree = html_to_tree(html)
     nodes: list[tuple[dict, list[int]]] = []
     _collect_interactive(tree, nodes)
-    if idx < 0 or idx >= len(nodes):
-        raise ValueError(f"no target [{ref}]")
-    node, _path = nodes[idx]
+    for node, path, r in _iter_refs(nodes):
+        if r == ref:
+            return node, path, tree
+    raise ValueError(f"no target [{ref}]")
+
+
+def click_html(html: str, url: str, ref: str) -> tuple[str, str | None]:
+    """Toggle/activate inspect ref. Returns (html, navigate_url or None)."""
+    if not ref or ref[0] != "e" or not ref[1:].replace("-", "").isalnum():
+        raise ValueError(f"bad ref: {ref}")
+    node, _path, tree = _node_by_ref(html, ref)
     tag = node.get("t") or ""
     attrs = node.setdefault("a", {})
     typ = (attrs.get("type") or "").lower()
@@ -190,15 +232,9 @@ def click_html(html: str, url: str, ref: str) -> tuple[str, str | None]:
 
 
 def type_html(html: str, ref: str, text: str) -> str:
-    if not ref or ref[0] != "e" or not ref[1:].isdigit():
+    if not ref or ref[0] != "e" or not ref[1:].replace("-", "").isalnum():
         raise ValueError(f"bad ref: {ref}")
-    idx = int(ref[1:]) - 1
-    tree = html_to_tree(html)
-    nodes: list[tuple[dict, list[int]]] = []
-    _collect_interactive(tree, nodes)
-    if idx < 0 or idx >= len(nodes):
-        raise ValueError(f"no target [{ref}]")
-    node, _path = nodes[idx]
+    node, _path, tree = _node_by_ref(html, ref)
     tag = node.get("t") or ""
     attrs = node.setdefault("a", {})
     if tag not in {"input", "textarea", "select"} and (attrs.get("role") or "") != "textbox":

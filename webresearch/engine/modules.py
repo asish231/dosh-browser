@@ -18,6 +18,9 @@ from urllib.parse import urljoin
 
 import httpx
 
+from webresearch.engine.csp import script_source_allowed
+from webresearch.engine.security import mixed_content_blocked, verify_integrity
+
 SPECIFIER_RE = re.compile(r"[\"']([^\"']+)[\"']")
 
 
@@ -32,6 +35,7 @@ class ModuleSource:
 class ModuleGraph:
     order: list[ModuleSource] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
+    blocked: list[dict] = field(default_factory=list)
 
     def urls(self) -> list[str]:
         return [item.url for item in self.order]
@@ -236,6 +240,8 @@ async def load_module_graph(
     *,
     import_map: dict[str, str] | None = None,
     max_modules: int = 60,
+    csp: str | None = None,
+    headers: dict | None = None,
 ) -> ModuleGraph:
     """Fetch and topologically order the module graph for inline/src modules."""
     import_map = import_map or {}
@@ -253,21 +259,44 @@ async def load_module_graph(
             except Exception:
                 return None
         try:
+            from webresearch.engine.trackers import GRAPH as _TRACKER_GRAPH
+            decision = _TRACKER_GRAPH.evaluate(url, base_url)
+            if decision.status == "BLOCKED":
+                if decision.surrogate:
+                    return decision.surrogate
+                return None
             resp = await client.get(url)
             if resp.status_code >= 400:
+                return None
+            from webresearch.engine.cross_origin import check_subresource as _check_xo
+            xo_reason, _ = _check_xo(resp.headers, url, base_url, headers)
+            if xo_reason is not None:
+                graph.blocked.append({"url": url, "reason": xo_reason})
                 return None
             return resp.text
         except Exception:
             return None
 
-    async def visit(url: str, inline: str | None) -> None:
+    async def visit(url: str, inline: str | None, integrity: str = "") -> None:
         if len(graph.order) >= max_modules:
             return
         if url in seen:
             return
         seen.add(url)
+        if url and mixed_content_blocked(base_url, url):
+            graph.missing.append(url)
+            return
+        if csp and url and not script_source_allowed(csp, external_url=url, page_url=base_url):
+            graph.missing.append(url)
+            return
+        if csp and inline is not None and not script_source_allowed(csp, inline_code=inline):
+            graph.missing.append(url or "inline")
+            return
         code = inline if inline is not None else await fetch_code(url)
         if code is None:
+            graph.missing.append(url)
+            return
+        if integrity and not verify_integrity(code, integrity):
             graph.missing.append(url)
             return
         resolved_map: dict[str, str] = {}
@@ -282,7 +311,7 @@ async def load_module_graph(
         src = script.get("src") or ""
         code = script.get("code") or ""
         if src:
-            await visit(urljoin(base_url, src), None)
+            await visit(urljoin(base_url, src), None, script.get("integrity", ""))
         elif code.strip():
             await visit("", code)
     return graph

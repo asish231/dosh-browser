@@ -56,6 +56,10 @@ class FrameDocument:
         blob = f"{self.url} {self.title} {self.html}".lower()
         return any(needle in blob for needle in _CHALLENGE_NEEDLES)
 
+    @property
+    def post_messages(self) -> list[dict]:
+        return list(self.js_info.get("post_messages") or [])
+
     def to_info(self) -> FrameInfo:
         return FrameInfo(
             ref=self.ref,
@@ -71,6 +75,7 @@ class FrameDocument:
             challenge=self.challenge,
             error=self.error,
             html_excerpt=_compact_excerpt(self.html),
+            post_messages=self.post_messages,
         )
 
 
@@ -199,6 +204,8 @@ async def load_frames(
     max_frames: int = MAX_FRAMES,
     max_depth: int = MAX_FRAME_DEPTH,
     synthetic_captcha: bool = True,
+    parent_headers: dict | None = None,
+    parent_messages: list[dict] | None = None,
 ) -> list[FrameDocument]:
     """Fetch a bounded, flat frame tree with parent refs."""
     queue = _discover_seeds(
@@ -229,6 +236,7 @@ async def load_frames(
             depth=seed.depth,
         )
         try:
+            frame_headers: dict | None = None
             if seed.srcdoc:
                 document.status = 200
                 document.content_type = "text/html"
@@ -250,16 +258,42 @@ async def load_frames(
                 document.status = result.status
                 document.content_type = result.content_type
                 document.html = result.body
+                frame_headers = result.headers
+                from webresearch.engine.framing import check_frame_embedding
+                block_reason, policy_notes = check_frame_embedding(
+                    result.headers, seed.parent_url, document.url
+                )
+                from webresearch.engine.cross_origin import check_subresource as _check_xo
+                xo_reason, xo_notes = _check_xo(
+                    result.headers, document.url, seed.parent_url, parent_headers
+                )
+                policy_notes = list(policy_notes) + list(xo_notes)
+                if block_reason is None:
+                    block_reason = xo_reason
+                if policy_notes:
+                    document.js_info["frame_policies"] = policy_notes
+                if block_reason is not None:
+                    document.error = block_reason
+                    document.html = ""
             else:
                 document.error = f"unsupported frame URL scheme: {urlparse(frame_url).scheme}"
 
             if document.html and "html" in document.content_type.lower() and js != "never":
-                document.html, document.js_info = await run_scripts(
+                frame_inbox = [
+                    m
+                    for m in (parent_messages or [])
+                    if m.get("target") in {"*", "", document.url}
+                    or document.url.startswith(m.get("target", ""))
+                ]
+                document.html, frame_js = await run_scripts(
                     document.html,
                     document.url,
                     client,
                     force=(js == "always"),
+                    headers=frame_headers,
+                    messages=frame_inbox,
                 )
+                document.js_info.update(frame_js)
         except Exception as exc:
             document.error = f"{type(exc).__name__}: {exc}"[:500]
 

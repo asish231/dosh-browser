@@ -124,3 +124,44 @@ class ToolSurfaceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AcdProtocolTests(unittest.TestCase):
+    def test_actions_carry_explicit_kinds_routing_and_honest_coverage(self):
+        html = (
+            '<main><a href="/search">Search</a>'
+            '<input type="range" id="vol" name="vol">'
+            '<button name="submit">Go</button>'
+            '<button id="x">Flash</button>'
+            '<iframe src="https://e.com/f"></iframe></main>'
+        )
+        doc = _doc(html)
+        page = snapshot(doc)
+        from webresearch.engine.inspect import inspect_html
+        targets, _ = inspect_html(html, page.url)
+        acd = build_acd(url=page.url, title="", html=html, targets=targets)
+        kinds = {a.role: a.kind for a in acd.actions}
+        self.assertEqual(kinds.get("link"), "navigate")
+        self.assertEqual(kinds.get("slider"), "drag")
+        self.assertEqual(kinds.get("iframe"), "embed")
+        self.assertTrue(any(a.run.startswith("/search") or a.run.startswith("https") for a in acd.actions if a.kind == "navigate"))
+        self.assertGreaterEqual(acd.counts["actions_total"], len(acd.actions))
+        self.assertTrue(any("embed" in u for u in acd.unavailable))
+        self.assertTrue(any("drag" in u for u in acd.unavailable))
+
+    def test_acd_on_captured_markup(self):
+        from pathlib import Path
+        from webresearch.engine.inspect import inspect_html
+        from webresearch.acd import acd_view
+
+        html = Path("testhtml/test1.html").read_text(errors="replace")
+        doc = _doc(html)
+        page = snapshot(doc)
+        targets, _ = inspect_html(html, page.url)
+        acd = build_acd(url=page.url, title=page.title, html=html, targets=targets, links=page.links)
+        self.assertGreater(acd.counts["actions_total"], acd.counts["actions"])
+        targets2, _ = inspect_html(html, page.url)
+        self.assertEqual([t.ref for t in targets], [t.ref for t in targets2])
+        view = acd_view(acd)
+        self.assertIn("budget-truncated", view)
+        self.assertIn("UNAVAILABLE", view)

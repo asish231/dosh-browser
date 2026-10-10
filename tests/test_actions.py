@@ -334,15 +334,21 @@ class NativeActuationTest(unittest.TestCase):
     """
 
     FIXTURE = """<html><body>
-<button id="go" onclick="document.getElementById('out').textContent='clicked'">Go</button>
+<button id="go">Go</button>
 <div id="out">idle</div>
-<form method="get" action="/s"><input name="q" id="q" type="text"></form>
+<form method="get" action="/s"><input name="q" id="q" type="text" placeholder="Search"></form>
 <div class="sliderContainer">
   <div class="slider" id="handle"></div>
   <div class="sliderTarget" id="tgt"></div>
 </div>
 <div id="draglog">no-drag</div>
 <script>
+// Bound with addEventListener, not an inline onclick attribute: the mini-DOM
+// runs listeners but does not wire `onclick=` attributes, and a test written
+// against the inline form would pass while proving nothing.
+document.getElementById('go').addEventListener('click', function () {
+  document.getElementById('out').textContent = 'clicked';
+});
 document.getElementById('handle').addEventListener('mousedown', function () {
   document.getElementById('draglog').textContent = 'down';
 });
@@ -354,6 +360,20 @@ document.getElementById('handle').addEventListener('mouseup', function (e) {
 });
 </script>
 </body></html>"""
+
+    @staticmethod
+    def _text_of(html: str, element_id: str) -> str:
+        """Read an element's text out of serialized HTML.
+
+        Matching on the element's own content rather than searching the whole
+        document: an earlier version of this test asserted 'clicked' in html,
+        which was already true because the string appeared in the source, so
+        the assertion passed whether or not the handler ever ran.
+        """
+        import re
+
+        match = re.search(rf'id="{element_id}"[^>]*>([^<]*)<', html)
+        return match.group(1) if match else ""
 
     def _run(self, actions):
         import asyncio
@@ -376,7 +396,35 @@ document.getElementById('handle').addEventListener('mouseup', function (e) {
         go = next(a for a in surface.actions if a.label == "Go")
         html, info = self._run([{"kind": "activate", "selector": go.selector}])
         self.assertTrue(info["actions_applied"][0]["ok"])
-        self.assertIn("clicked", html)
+        self.assertEqual(self._text_of(html, "out"), "clicked")
+
+    def test_checkbox_click_sets_the_dom_property_not_just_the_attribute(self):
+        """Scripts read el.checked; markup reads the attribute. Set both."""
+        fixture = (
+            '<html><body><input type="checkbox" id="c">'
+            '<div id="s">idle</div>'
+            "<script>document.getElementById('c').addEventListener('click',"
+            "function(){document.getElementById('s').textContent="
+            "document.getElementById('c').checked?'on':'off';});</script>"
+            "</body></html>"
+        )
+        import asyncio
+
+        import httpx
+
+        from webresearch.engine.runtime import run_scripts
+
+        async def go():
+            async with httpx.AsyncClient() as client:
+                return await run_scripts(
+                    fixture, "https://x.test/p", client, force=True,
+                    actions=[{"kind": "activate", "selector": "#c"}],
+                )
+
+        html, info = asyncio.run(go())
+        self.assertTrue(info["actions_applied"][0]["ok"])
+        self.assertEqual(self._text_of(html, "s"), "on")
+        self.assertIn("checked", html)
 
     def test_typing_reaches_the_field(self):
         surface = collect(self.FIXTURE, "https://x.test/p")
@@ -391,16 +439,13 @@ document.getElementById('handle').addEventListener('mouseup', function (e) {
         """A click is not a drag. The whole move chain must arrive."""
         surface = collect(self.FIXTURE, "https://x.test/p")
         handle = next(a for a in surface.actions if a.kind == "drag")
-        _, info = self._run(
+        html, info = self._run(
             [{"kind": "drag", "selector": handle.selector, "dx": 222, "dy": 0}]
         )
         self.assertTrue(info["actions_applied"][0]["ok"], info["actions_applied"])
-        html, _ = self._run(
-            [{"kind": "drag", "selector": handle.selector, "dx": 222, "dy": 0}]
-        )
         # clientX must survive Event construction, otherwise the release lands
         # at (0, 0) and a real slider computes a zero-length move.
-        self.assertIn("up:222", html)
+        self.assertEqual(self._text_of(html, "draglog"), "up:222")
 
     def test_form_field_carries_both_a_wire_name_and_a_selector(self):
         surface = collect(self.FIXTURE, "https://x.test/p")

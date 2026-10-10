@@ -4,7 +4,7 @@ from typing import Literal
 
 import httpx
 
-from webresearch.acd import build_acd
+from webresearch.acd import build_acd, error_summary
 from webresearch.engine.captcha import (
     CaptchaInspection,
     dump_captcha_code,
@@ -51,7 +51,7 @@ def _decorate(
     if info.get("framework_data"):
         extra += "\nFRAMEWORK_DATA: " + ", ".join(sorted(info["framework_data"].keys()))
     if info.get("error_messages"):
-        extra += f"\nJS_ERRORS: {len(info['error_messages'])} (see acd.errors)"
+        extra += "\n" + error_summary(list(info["error_messages"]))
     if infos:
         challenge_count = sum(1 for frame in infos if frame.challenge)
         extra += f"\nFRAMES: {len(infos)} loaded, {challenge_count} challenge frame(s)"
@@ -98,7 +98,7 @@ async def read_live(
     js_info: dict | None = None
     js_ran = False
     if result.kind == "html" and js != "never":
-        html, js_info = await run_scripts(html, result.final_url or url, client, force=(js == "always"))
+        html, js_info = await run_scripts(html, result.final_url or url, client, force=(js == "always"), headers=result.headers)
         js_ran = bool(js_info.get("ran"))
         result = result.model_copy(update={"body": html, "kind": "html", "content_type": "text/html"})
 
@@ -111,7 +111,14 @@ async def read_live(
             result = result.model_copy(update={"body": html})
 
     frames = (
-        await load_frames(html, result.final_url or url, client, js=js)
+        await load_frames(
+            html,
+            result.final_url or url,
+            client,
+            js=js,
+            parent_headers=result.headers,
+            parent_messages=(js_info.get("post_messages") if js_info else None),
+        )
         if result.kind == "html"
         else []
     )
@@ -123,6 +130,7 @@ async def read_live(
         sprite_endpoint=sprite_endpoint,
     )
     page = snapshot(parse(result), max_chars=max_chars, max_links=max_links)
+    page = page.model_copy(update={"headers": dict(result.headers or {})})
     return (
         _decorate(
             page,

@@ -100,7 +100,7 @@ def extract_scripts(html: str) -> tuple[list[dict[str, str]], str]:
             body = "".join(
                 c.get("x") or "" for c in (node.get("c") or []) if c.get("t") == "#text"
             )
-            scripts.append({"src": src, "code": body, "type": attrs.get("type") or ""})
+            scripts.append({"src": src, "code": body, "type": attrs.get("type") or "", "integrity": attrs.get("integrity") or ""})
         for child in node.get("c") or []:
             if isinstance(child, dict):
                 walk(child)

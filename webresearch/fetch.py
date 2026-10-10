@@ -29,6 +29,12 @@ except Exception:  # pragma: no cover - optional dependency
     _curl_requests = None
 
 
+def _enforce_cookies(client, url, set_cookies):
+    from webresearch.engine.security import enforce_cookie_policy
+
+    return enforce_cookie_policy(client, url, set_cookies)
+
+
 def browser_client_hints(ua: str = DEFAULT_UA, platform: str = "macOS") -> dict[str, str]:
     """Client hints consistent with a Chrome desktop User-Agent."""
     version = "128"
@@ -137,6 +143,7 @@ def _build_result(
     body = decode_body(raw, content_type)
     if kind == "json":
         body = pretty_json(body)
+    stored_raw = b"" if truncated else bytes(raw)
     return FetchResult(
         url=url,
         final_url=final_url,
@@ -146,6 +153,7 @@ def _build_result(
         kind=kind,
         body=body,
         truncated=truncated,
+        raw=stored_raw,
     )
 
 
@@ -246,8 +254,10 @@ async def _fetch_impersonated(
     truncated = len(raw) > max_bytes
     if truncated:
         raw = raw[:max_bytes]
+    _note_response(method, url, merged, response.status_code, dict(response.headers), raw, truncated)
     for key, value in session.cookies.items():
         client.cookies.set(key, value)
+    _enforce_cookies(client, str(response.url), response.headers.get_list("set-cookie"))
     return _build_result(
         url=url,
         final_url=str(response.url),
@@ -292,6 +302,8 @@ async def _fetch_httpx(
                 break
             chunks.append(chunk)
         raw = b"".join(chunks)
+        _note_response(method, url, req_headers, response.status_code, dict(response.headers), raw, truncated)
+        _enforce_cookies(client, str(response.url), response.headers.get_list("set-cookie"))
         return _build_result(
             url=url,
             final_url=str(response.url),
@@ -303,6 +315,9 @@ async def _fetch_httpx(
         )
 
 
+_plain_fetch = _fetch_httpx
+
+
 def _impersonation_allowed(client: httpx.AsyncClient) -> bool:
     """Skip impersonation for in-memory test transports."""
     transport = getattr(client, "_transport", None)
@@ -310,6 +325,85 @@ def _impersonation_allowed(client: httpx.AsyncClient) -> bool:
         return True
     name = type(transport).__name__
     return name not in {"MockTransport", "ASGITransport", "WSGITransport"}
+
+
+def _note_response(
+    method: str,
+    url: str,
+    req_headers: dict[str, str],
+    status: int,
+    resp_headers: dict,
+    raw: bytes,
+    truncated: bool = False,
+) -> None:
+    from urllib.parse import urlparse as _up
+    from webresearch.cache import CACHE
+    from webresearch.engine.hsts import STATE as _HSTS
+    if status == 304 or truncated:
+        return
+    lowered = {k.lower(): v for k, v in (resp_headers or {}).items()}
+    if _up(url).scheme == "https" and "strict-transport-security" in lowered:
+        _HSTS.observe(_up(url).hostname or "", lowered["strict-transport-security"], secure=True)
+    CACHE.store(method, url, req_headers or {}, status, dict(resp_headers or {}), raw or b"")
+
+
+async def _finalize_package(result: FetchResult, url: str, client) -> FetchResult:
+    ctype = (result.headers.get("content-type") or "").lower()
+    try:
+        if "application/signed-exchange" in ctype:
+            from webresearch.engine.sxg import validate_sxg
+            import json as _json
+            report = await validate_sxg(url, result.headers, result.raw or b"", client)
+            return result.model_copy(update={"headers": {
+                **result.headers, "x-webresearch-sxg": _json.dumps(report)[:2000]}})
+        if "application/webbundle" in ctype:
+            from webresearch.engine.sxg import inspect_webbundle
+            import json as _json
+            report = inspect_webbundle(result.raw or b"")
+            return result.model_copy(update={"headers": {
+                **result.headers, "x-webresearch-bundle": _json.dumps(report)[:2000]}})
+    except Exception:
+        pass
+    return result
+
+
+async def _finalize(result: FetchResult, method: str, url: str, use_headers: dict,
+                    entry, upgraded_from: str | None, client) -> FetchResult:
+    result = _after_fetch(result, method, url, use_headers, entry)
+    result = await _finalize_package(result, url, client)
+    return _mark_upgraded(result, upgraded_from)
+
+
+def _mark_upgraded(result: FetchResult, upgraded_from: str | None) -> FetchResult:
+    if upgraded_from:
+        return result.model_copy(
+            update={"headers": {**result.headers, "x-webresearch-upgraded": f"hsts:{upgraded_from}"}}
+        )
+    return result
+
+
+def _after_fetch(
+    result: FetchResult,
+    method: str,
+    url: str,
+    req_headers: dict[str, str],
+    entry,
+) -> FetchResult:
+    from webresearch.cache import CACHE
+    if result.status == 304 and entry is not None:
+        CACHE.update_on_304(entry, result.headers)
+        cached = dict(entry.resp_headers)
+        cached["x-webresearch-cache"] = "revalidated"
+        return _build_result(
+            url=url,
+            final_url=result.final_url or url,
+            status=entry.status,
+            content_type=cached.get("content-type", ""),
+            headers=cached,
+            raw=entry.body,
+            truncated=False,
+        )
+    return result
 
 
 async def fetch(
@@ -334,29 +428,127 @@ async def fetch(
     if parsed.scheme not in {"http", "https"}:
         raise ValueError(f"unsupported url scheme: {parsed.scheme or 'missing'}")
 
+    upgraded_from: str | None = None
+    if parsed.scheme == "http":
+        from webresearch.engine.hsts import STATE as _HSTS_STATE
+        upgraded = _HSTS_STATE.upgrade_url(url)
+        if upgraded is not None:
+            upgraded_from = url
+            url = upgraded
+            parsed = urlparse(url)
+
+    if (parsed.hostname or "").lower().endswith(".onion"):
+        from webresearch.engine.onion import onion_refusal
+        status, reason = onion_refusal(parsed.hostname or "")
+        return FetchResult(
+            url=url,
+            final_url=url,
+            status=status,
+            content_type="text/plain",
+            kind="other",
+            body=reason,
+            headers={"x-webresearch-blocked": "onion"},
+        )
+
+    from webresearch.engine.safebrowsing import is_blocked_host, blocked_result
+    if is_blocked_host(parsed.hostname or ""):
+        return blocked_result(url)
+
+    from webresearch.engine.throttles import REGISTRY
+    verdict = REGISTRY.evaluate(url)
+    if not verdict.proceed:
+        return FetchResult(
+            url=url,
+            final_url=url,
+            status=403,
+            content_type="text/plain",
+            kind="other",
+            body=f"blocked by navigation throttle: {verdict.reason}",
+            headers={"x-webresearch-blocked": "throttle"},
+        )
+
+    from webresearch.cache import CACHE
+    req_headers = dict(navigate_headers(url))
+    if headers:
+        req_headers.update(headers)
+    entry = CACHE.lookup(method, url, req_headers)
+    if entry is not None and entry.is_fresh():
+        cached = dict(entry.resp_headers)
+        cached["x-webresearch-cache"] = "hit"
+        return _mark_upgraded(_build_result(
+            url=url,
+            final_url=url,
+            status=entry.status,
+            content_type=cached.get("content-type", ""),
+            headers=cached,
+            raw=entry.body,
+            truncated=False,
+        ), upgraded_from)
+    use_headers = dict(headers or {})
+    if entry is not None and entry.has_validator():
+        for k, v in entry.conditional_headers().items():
+            use_headers.setdefault(k, v)
+
     choice = DEFAULT_IMPERSONATE if impersonate is None else impersonate
-    if choice and _curl_requests is not None and _impersonation_allowed(client):
-        try:
-            return await _fetch_impersonated(
+    try:
+        if choice and _curl_requests is not None and _impersonation_allowed(client):
+            try:
+                result = await _fetch_impersonated(
+                    url,
+                    client=client,
+                    method=method,
+                    data=data,
+                    json_body=json_body,
+                    headers=use_headers or None,
+                    max_bytes=max_bytes,
+                    impersonate=choice,
+                    timeout=timeout,
+                )
+                return await _finalize(result, method, url, use_headers, entry, upgraded_from, client)
+            except Exception:
+                # Fall back to httpx rather than failing the whole navigation.
+                pass
+        result = await _fetch_httpx(
+            url,
+            client=client,
+            method=method,
+            data=data,
+            json_body=json_body,
+            headers=use_headers or None,
+            max_bytes=max_bytes,
+        )
+        return await _finalize(result, method, url, use_headers, entry, upgraded_from, client)
+    except Exception as exc:
+        from webresearch.engine.tls_policy import handle_tls_error
+        interstitial = handle_tls_error(parsed.hostname or "", exc)
+        if interstitial is None:
+            raise
+        if interstitial.decision == "deny":
+            return _mark_upgraded(FetchResult(
+                url=url,
+                final_url=url,
+                status=525,
+                content_type="text/plain",
+                kind="other",
+                body=f"TLS interstitial: {interstitial.kind} for {interstitial.host} (overridable={interstitial.overridable}); decision=deny",
+                headers={"x-webresearch-tls": f"denied:{interstitial.kind}"},
+            ), upgraded_from)
+        async with httpx.AsyncClient(cookies=client.cookies, verify=False) as plain:
+            result = await _plain_fetch(
                 url,
-                client=client,
+                client=plain,
                 method=method,
                 data=data,
                 json_body=json_body,
-                headers=headers,
+                headers=use_headers or None,
                 max_bytes=max_bytes,
-                impersonate=choice,
-                timeout=timeout,
             )
-        except Exception:
-            # Fall back to httpx rather than failing the whole navigation.
-            pass
-    return await _fetch_httpx(
-        url,
-        client=client,
-        method=method,
-        data=data,
-        json_body=json_body,
-        headers=headers,
-        max_bytes=max_bytes,
-    )
+        for key, value in plain.cookies.items():
+            try:
+                client.cookies.set(key, value)
+            except Exception:
+                pass
+        result = result.model_copy(
+            update={"headers": {**result.headers, "x-webresearch-tls": f"proceeded-unverified:{interstitial.kind}"}}
+        )
+        return await _finalize(result, method, url, use_headers, entry, upgraded_from, plain)

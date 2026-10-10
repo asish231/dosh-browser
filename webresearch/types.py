@@ -78,6 +78,7 @@ class FrameInfo(BaseModel):
     challenge: bool = False
     error: str = ""
     html_excerpt: str = ""
+    post_messages: list[dict] = Field(default_factory=list)
 
 
 class CaptchaFrame(FrameInfo):
@@ -153,6 +154,8 @@ class AcdAction(BaseModel):
     role: str = ""
     label: str = ""
     name: str = ""
+    href: str = ""
+    run: str = ""
 
 
 class AcdApi(BaseModel):
@@ -176,6 +179,7 @@ class Acd(BaseModel):
     framework: dict[str, Any] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
+    unavailable: list[str] = Field(default_factory=list)
 
 
 class Page(BaseModel):
@@ -198,6 +202,7 @@ class Page(BaseModel):
     acd: Acd | None = None
     engine: str = ""
     chars: int = 0
+    headers: dict[str, str] = Field(default_factory=dict)
 
 
 class FetchResult(BaseModel):
@@ -209,6 +214,7 @@ class FetchResult(BaseModel):
     kind: Kind = "other"
     body: str = ""
     truncated: bool = False
+    raw: bytes = b""
 
 
 class ExtractResult(BaseModel):
