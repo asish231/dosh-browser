@@ -203,8 +203,9 @@ async def _run_ask(args: argparse.Namespace) -> None:
     print(result.answer)
     if not args.quiet:
         print(
-            f"\n[{result.model} · {result.rounds} round(s) · "
-            f"{result.usage.total_tokens} tokens]",
+            f"\n[Tokens burned for this task: {result.usage.total_tokens:,} "
+            f"(prompt: {result.usage.prompt_tokens:,}, completion: {result.usage.completion_tokens:,}) · "
+            f"{result.model} · {result.rounds} round(s)]",
             file=sys.stderr,
         )
 
@@ -213,23 +214,35 @@ async def _run_cli(args: argparse.Namespace) -> None:
     async with make_client() as client:
         if args.cmd == "read":
             page = await read(args.url, client=client, max_chars=args.max_chars, js=args.js)
-            print(page.model_dump_json(indent=2) if args.json else page.view)
+            out = page.model_dump_json(indent=2) if args.json else page.view
+            print(out)
+            tokens = (len(out) + 3) // 4
+            print(f"\n[Tokens burned for this task: ~{tokens:,} tokens ({len(out):,} chars)]", file=sys.stderr)
             return
         if args.cmd == "search":
             result = await search(args.query, client=client, engine=args.engine)
-            print(result.model_dump_json(indent=2) if args.json else result.view)
+            out = result.model_dump_json(indent=2) if args.json else result.view
+            print(out)
+            tokens = (len(out) + 3) // 4
+            print(f"\n[Tokens burned for this task: ~{tokens:,} tokens ({len(out):,} chars)]", file=sys.stderr)
             return
         if args.cmd == "captcha":
             if args.code:
                 dump = await captcha_code(args.url, client=client, js=args.js)
-                print(dump.model_dump_json(indent=2) if args.json else dump.code)
+                out = dump.model_dump_json(indent=2) if args.json else dump.code
+                print(out)
+                tokens = (len(out) + 3) // 4
+                print(f"\n[Tokens burned for this task: ~{tokens:,} tokens ({len(out):,} chars)]", file=sys.stderr)
                 return
             page = await read(args.url, client=client, js=args.js)
             report = page.captcha
             if report is None:
-                print("CAPTCHA: not detected")
+                out = "CAPTCHA: not detected"
             else:
-                print(report.model_dump_json(indent=2) if args.json else report.view)
+                out = report.model_dump_json(indent=2) if args.json else report.view
+            print(out)
+            tokens = (len(out) + 3) // 4
+            print(f"\n[Tokens burned for this task: ~{tokens:,} tokens ({len(out):,} chars)]", file=sys.stderr)
             return
     sys.exit(1)
 

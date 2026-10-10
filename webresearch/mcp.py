@@ -172,7 +172,22 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "browser_token_usage",
+        "description": "Report total tokens burned by dosh-browser during this session across all web navigation, scraping, and reading tasks.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]
+
+
+def estimate_tokens(text: str) -> int:
+    """Accurate token estimate (~4 characters per token)."""
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
 
 
 class McpServer:
@@ -181,6 +196,23 @@ class McpServer:
     def __init__(self) -> None:
         self.browser = Browser()
         self.session: Session | None = None
+        self.total_tokens_burned: int = 0
+        self.total_tool_calls: int = 0
+
+    def _format_result(self, text: str) -> dict[str, Any]:
+        self.total_tool_calls += 1
+        burned = estimate_tokens(text)
+        self.total_tokens_burned += burned
+        footer = f"\n\n[Tokens burned for this task: ~{burned:,} tokens ({len(text):,} chars) | Session total: ~{self.total_tokens_burned:,} tokens]"
+        return {
+            "content": [{"type": "text", "text": text + footer}],
+            "_meta": {
+                "tokens": burned,
+                "session_total_tokens": self.total_tokens_burned,
+                "chars": len(text),
+                "tool_calls": self.total_tool_calls,
+            },
+        }
 
     async def _get_session(self) -> Session:
         if self.session is None:
@@ -196,40 +228,40 @@ class McpServer:
             max_hits = int(args.get("max_hits", 8))
             engine = args.get("engine", "auto")
             res = await session.search(query, engine=engine)
-            return {"content": [{"type": "text", "text": res.view}]}
+            return self._format_result(res.view)
 
         elif name == "browser_navigate":
             url = args.get("url", "")
             js = args.get("js", "auto")
             max_chars = int(args.get("max_chars", 8000))
             page = await session.goto(url, js=js, max_chars=max_chars)
-            return {"content": [{"type": "text", "text": page.view}]}
+            return self._format_result(page.view)
 
         elif name == "browser_click":
             ref = args.get("ref", "")
             max_chars = int(args.get("max_chars", 8000))
             page = await session.click(ref, max_chars=max_chars)
-            return {"content": [{"type": "text", "text": page.view}]}
+            return self._format_result(page.view)
 
         elif name == "browser_type":
             ref = args.get("ref", "")
             text = args.get("text", "")
             max_chars = int(args.get("max_chars", 8000))
             page = await session.type(ref, text, max_chars=max_chars)
-            return {"content": [{"type": "text", "text": page.view}]}
+            return self._format_result(page.view)
 
         elif name == "browser_query":
             term = args.get("term", "")
             limit = int(args.get("limit", 40))
             blocks = session.query(term, limit=limit)
-            return {"content": [{"type": "text", "text": json.dumps(blocks, indent=2)}]}
+            return self._format_result(json.dumps(blocks, indent=2))
 
         elif name == "browser_slice":
             start = args.get("start", "")
             end = args.get("end", "")
             limit = int(args.get("limit", 120))
             blocks = session.slice(start, end, limit=limit)
-            return {"content": [{"type": "text", "text": json.dumps(blocks, indent=2)}]}
+            return self._format_result(json.dumps(blocks, indent=2))
 
         elif name == "browser_actions":
             max_actions = int(args.get("max_actions", 200))
@@ -257,7 +289,7 @@ class McpServer:
                     for a in surface.actions
                 ],
             }
-            return {"content": [{"type": "text", "text": json.dumps(payload, indent=2)}]}
+            return self._format_result(json.dumps(payload, indent=2))
 
         elif name == "browser_act":
             ref = args.get("ref", "")
@@ -274,54 +306,65 @@ class McpServer:
                     max_chars=max_chars,
                 )
             except ValueError as exc:
-                return {"content": [{"type": "text", "text": f"browser_act failed: {exc}"}]}
-            return {"content": [{"type": "text", "text": page.view}]}
+                return self._format_result(f"browser_act failed: {exc}")
+            return self._format_result(page.view)
 
         elif name == "browser_tabs":
             action = args.get("action", "list")
             if action == "list":
-                return {"content": [{"type": "text", "text": json.dumps(session.tabs, indent=2)}]}
+                return self._format_result(json.dumps(session.tabs, indent=2))
             elif action == "new":
                 tid = session.new_tab()
                 url = args.get("url")
                 if url:
                     page = await session.goto(url)
-                    return {"content": [{"type": "text", "text": f"Created tab {tid}\n{page.view}"}]}
-                return {"content": [{"type": "text", "text": f"Created blank tab {tid}"}]}
+                    return self._format_result(f"Created tab {tid}\n{page.view}")
+                return self._format_result(f"Created blank tab {tid}")
             elif action == "switch":
                 tid = args.get("tab_id", "")
                 page = session.switch_tab(tid)
                 view = page.view if page else f"Switched to {tid} (empty)"
-                return {"content": [{"type": "text", "text": view}]}
+                return self._format_result(view)
             elif action == "close":
                 tid = args.get("tab_id", "")
                 session.close_tab(tid)
-                return {"content": [{"type": "text", "text": f"Closed tab {tid}"}]}
+                return self._format_result(f"Closed tab {tid}")
             raise ValueError(f"unknown tab action: {action}")
 
         elif name == "browser_captcha":
             if session.captcha_inspection is None:
-                return {"content": [{"type": "text", "text": "No captcha detected on current page."}]}
-            return {"content": [{"type": "text", "text": session.captcha_inspection.report.view}]}
+                return self._format_result("No captcha detected on current page.")
+            return self._format_result(session.captcha_inspection.report.view)
 
         elif name == "browser_add_captcha_token":
             token = args.get("token", "")
             provider = args.get("provider", "datadome")
             if provider == "datadome":
                 session.client.cookies.set("_datadome", token, domain=".tripadvisor.com")
-                return {"content": [{"type": "text", "text": f"Added datadome token. Retry with: session.goto('{session.url}')"}]}
+                return self._format_result(f"Added datadome token. Retry with: session.goto('{session.url}')")
             elif provider == "recaptcha":
                 session.client.cookies.set("g-recaptcha-response", token, domain=".tripadvisor.com")
-                return {"content": [{"type": "text", "text": f"Added recaptcha token. Retry with: session.goto('{session.url}')"}]}
+                return self._format_result(f"Added recaptcha token. Retry with: session.goto('{session.url}')")
             else:
-                return {"content": [{"type": "text", "text": f"Token added for {provider}. Try retrying navigation."}]}
+                return self._format_result(f"Token added for {provider}. Try retrying navigation.")
 
         elif name == "browser_scroll":
             y = int(args.get("y", 800))
             x = int(args.get("x", 0))
             max_chars = int(args.get("max_chars", 8000))
             page = await session.scroll(y=y, x=x, max_chars=max_chars)
-            return {"content": [{"type": "text", "text": page.view}]}
+            return self._format_result(page.view)
+
+        elif name == "browser_token_usage":
+            prof_name = session.profile.name if hasattr(session.profile, "name") else (session.profile or "default")
+            report = (
+                f"Session Token Usage Summary:\n"
+                f"- Total Tool Calls: {self.total_tool_calls}\n"
+                f"- Cumulative Tokens Burned: ~{self.total_tokens_burned:,} tokens\n"
+                f"- Current Page: {session.url or 'blank'}\n"
+                f"- Profile: {prof_name}"
+            )
+            return self._format_result(report)
 
         raise ValueError(f"unknown tool: {name}")
 
