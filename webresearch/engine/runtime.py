@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -126,12 +127,23 @@ async def run_scripts(
     ctx.eval(MINIDOM_JS)
     ctx.add_callable("host_log", lambda *_a: None)
     ctx.add_callable("host_parse_html", _host_parse_html)
-    ctx.add_callable(
-        "host_post_message",
-        lambda data, origin="*", target="parent": info["post_messages"].append(
-            {"data": str(data)[:4000], "origin": str(origin)[:500], "target": str(target)}
-        ),
-    )
+    def host_post_message_handler(data, origin="*", target="parent") -> None:
+        data_str = str(data)[:4000]
+        info["post_messages"].append(
+            {"data": data_str, "origin": str(origin)[:500], "target": str(target)}
+        )
+        if "cookie" in data_str and "datadome=" in data_str:
+            try:
+                parsed = json.loads(data_str)
+                if isinstance(parsed, dict) and parsed.get("cookie"):
+                    c_pair = str(parsed["cookie"]).split(";", 1)[0]
+                    if "=" in c_pair:
+                        cn, _, cv = c_pair.partition("=")
+                        client.cookies.set(cn.strip(), cv.strip())
+            except Exception:
+                pass
+
+    ctx.add_callable("host_post_message", host_post_message_handler)
 
     def host_get_cookie() -> str:
         try:
@@ -237,7 +249,7 @@ async def run_scripts(
             return False
         return True
 
-    def host_fetch(req_url: str, method: str, body: str) -> str:
+    def host_fetch(req_url: str, method: str, body: str, headers_json: str = "{}") -> str:
         try:
             abs_url = urljoin(url, req_url)
             parsed = urlparse(abs_url)
@@ -250,6 +262,13 @@ async def run_scripts(
                     "Origin": target_origin if target_origin == page_origin else page_origin,
                     "Accept": "*/*",
                 }
+            if headers_json:
+                try:
+                    custom_hdrs = json.loads(headers_json)
+                    if isinstance(custom_hdrs, dict):
+                        headers.update(custom_hdrs)
+                except Exception:
+                    pass
             # Service-worker fetch interception by declared strategy.
             sw_rec = sw_for_url(sw_records, abs_url) if (method or "GET").upper() == "GET" else None
             sw_tag = f"{sw_strategy(sw_rec)}:{sw_rec['url']}" if sw_rec is not None else ""
@@ -294,6 +313,17 @@ async def run_scripts(
                         data_payload = json.loads(text)
                 except Exception:
                     pass
+            if isinstance(data_payload, dict) and data_payload.get("cookie"):
+                c_raw = str(data_payload["cookie"]).split(";", 1)[0]
+                if "=" in c_raw:
+                    ck, _, cv = c_raw.partition("=")
+                    client.cookies.set(ck.strip(), cv.strip())
+            set_cookie_hdr = resp_headers.get("set-cookie")
+            if set_cookie_hdr:
+                c_raw = str(set_cookie_hdr).split(";", 1)[0]
+                if "=" in c_raw:
+                    ck, _, cv = c_raw.partition("=")
+                    client.cookies.set(ck.strip(), cv.strip())
             info["resource_requests"].append(
                 {
                     "url": final[:2000],
@@ -301,6 +331,7 @@ async def run_scripts(
                     "content_type": ctype[:200],
                     "method": method,
                     "data": data_payload,
+                    "body": body[:50000] if body else "",
                     **({"sw": sw_tag} if sw_tag else {}),
                 }
             )
@@ -408,6 +439,7 @@ async def run_scripts(
 
     scripts, _ = extract_scripts(html)
     classic: list[dict[str, str]] = []
+    deferred: list[dict[str, str]] = []
     module_scripts: list[dict[str, str]] = []
     for script in scripts:
         stype = (script.get("type") or "").lower()
@@ -415,6 +447,8 @@ async def run_scripts(
             continue
         if "module" in stype:
             module_scripts.append(script)
+        elif script.get("defer"):
+            deferred.append(script)
         else:
             classic.append(script)
 
@@ -431,7 +465,7 @@ async def run_scripts(
     sw_revalidate_queue: list[str] = []
     try:
         _sw_static_codes: list[str] = []
-        for _s in classic:
+        for _s in classic + deferred:
             if _s.get("code"):
                 _sw_static_codes.append(_s["code"])
         for _s in module_scripts:
@@ -442,9 +476,9 @@ async def run_scripts(
     except Exception as exc:
         record_error(exc)
 
-    # Classic scripts first (many bundles register before modules run).
+    # Immediate scripts first, then deferred scripts (per HTML script ordering spec).
     ran = 0
-    for script in classic:
+    for script in (classic + deferred):
         if ran >= MAX_SCRIPTS:
             break
         code = script.get("code") or ""
@@ -501,12 +535,23 @@ async def run_scripts(
             info.setdefault("blocked_csp", 0)
             info["blocked_csp"] += 1
             continue
+        code = re.sub(r"\bstatic\s*\{([^{}]*)\}", r"static _ = (() => { \1 })();", code)
         try:
+            if src:
+                sel = f'script[src="{src}"]'
+                ctx.eval(f"if (typeof document !== 'undefined') document.currentScript = document.querySelector({json.dumps(sel)});")
+            else:
+                ctx.eval("if (typeof document !== 'undefined') document.currentScript = null;")
             ctx.eval(code)
             ran += 1
             _pump_jobs(ctx)
         except Exception as exc:
             record_error(exc)
+        finally:
+            try:
+                ctx.eval("if (typeof document !== 'undefined') document.currentScript = null;")
+            except Exception:
+                pass
 
     # ES modules via the registry translator.
     if module_scripts:
@@ -539,6 +584,18 @@ async def run_scripts(
             info["error_messages"].append(
                 "unresolved module(s): " + ", ".join(graph.missing[:5])
             )
+
+    try:
+        ctx.eval(
+            "if (typeof document !== 'undefined' && document && document.dispatchEvent) {"
+            "  document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true, cancelable: true }));"
+            "}"
+            "if (typeof window !== 'undefined' && window && window.dispatchEvent) {"
+            "  window.dispatchEvent(new Event('load'));"
+            "}"
+        )
+    except Exception as exc:
+        record_error(exc)
 
     for _ in range(MAX_TIMER_PASSES):
         try:
@@ -671,6 +728,18 @@ async def run_scripts(
         out = html
 
     info["framework_data"] = _extract_framework_data(ctx, html)
+    try:
+        nav = ctx.eval("globalThis.__WR_NAVIGATED || ''")
+        if nav:
+            info["navigated"] = str(nav)
+    except Exception:
+        pass
+    try:
+        form_sub = ctx.eval("JSON.stringify(globalThis.__WR_FORM_SUBMIT || null)")
+        if form_sub and str(form_sub) != "null":
+            info["form_submit"] = json.loads(str(form_sub))
+    except Exception:
+        pass
 
     client.cookies.update(sync.cookies)
     sync.close()

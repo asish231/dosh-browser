@@ -1,5 +1,43 @@
 /* webresearch mini-DOM — ES subset for QuickJS. Not Chromium. */
 (function (global) {
+  var _NativePromise = global.Promise;
+  var _nativePromiseResolve = _NativePromise ? _NativePromise.resolve.bind(_NativePromise) : null;
+  /* ECMAScript Integer-Indexed Exotic Objects [[Set]]: out-of-bounds writes are no-ops returning true */
+  (function () {
+    var typedArrayClasses = [
+      Uint8Array, Int8Array, Uint8ClampedArray,
+      Int16Array, Uint16Array, Int32Array, Uint32Array,
+      Float32Array, Float64Array
+    ];
+    for (var i = 0; i < typedArrayClasses.length; i++) {
+      var Cls = typedArrayClasses[i];
+      if (!Cls) continue;
+      (function (Original, name) {
+        var Handler = function () {
+          var args = Array.prototype.slice.call(arguments);
+          var target = new (Function.prototype.bind.apply(Original, [null].concat(args)))();
+          return new Proxy(target, {
+            get: function (obj, prop, receiver) {
+              var val = Reflect.get(obj, prop, obj);
+              return typeof val === "function" ? val.bind(obj) : val;
+            },
+            set: function (obj, prop, val, receiver) {
+              var idx = typeof prop === "symbol" ? NaN : Number(prop);
+              if (Number.isInteger(idx) && (idx < 0 || idx >= obj.length)) {
+                return true;
+              }
+              return Reflect.set(obj, prop, val, obj);
+            }
+          });
+        };
+        Handler.prototype = Original.prototype;
+        Object.setPrototypeOf(Handler, Original);
+        try { global[name] = Handler; } catch (e) {}
+        try { if (typeof window !== "undefined") window[name] = Handler; } catch (e) {}
+      })(Cls, Cls.name);
+    }
+  })();
+
   function Node(type, name, attrs, kids) {
     this.nodeType = type;
     this.nodeName = name;
@@ -316,11 +354,41 @@
   Text.prototype = Object.create(Node.prototype);
   Text.prototype.constructor = Text;
 
+  function CSSStyleDeclaration(el) {
+    this._el = el;
+  }
+  CSSStyleDeclaration.prototype.setProperty = function (prop, val, priority) {
+    var camel = String(prop).replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
+    this[camel] = String(val);
+    this[prop] = String(val);
+  };
+  CSSStyleDeclaration.prototype.getPropertyValue = function (prop) {
+    var camel = String(prop).replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
+    return this[camel] != null ? this[camel] : (this[prop] != null ? this[prop] : "");
+  };
+  CSSStyleDeclaration.prototype.removeProperty = function (prop) {
+    var camel = String(prop).replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
+    var old = this.getPropertyValue(prop);
+    delete this[camel];
+    delete this[prop];
+    return old;
+  };
+  global.CSSStyleDeclaration = CSSStyleDeclaration;
+
   function Element(tag, attrs, kids) {
     Node.call(this, 1, tag, attrs || {}, kids || []);
     this.id = (this.attributes.id || "");
     this.className = (this.attributes["class"] || "");
-    this.style = {};
+    this.style = new CSSStyleDeclaration(this);
+    if (this.attributes.style) {
+      var sParts = String(this.attributes.style).split(";");
+      for (var sIdx = 0; sIdx < sParts.length; sIdx++) {
+        var sP = sParts[sIdx].trim();
+        if (!sP) continue;
+        var sCol = sP.indexOf(":");
+        if (sCol > 0) this.style.setProperty(sP.slice(0, sCol).trim(), sP.slice(sCol + 1).trim());
+      }
+    }
     this.dataset = {};
     if (this.nodeName === "canvas") _attachCanvas(this);
     for (var k in this.attributes) {
@@ -405,6 +473,7 @@
     if (ev.target == null) ev.target = this;
     var node = this;
     while (node) {
+      ev.currentTarget = node;
       var list = (node._listeners && node._listeners[type]) ? node._listeners[type].slice() : [];
       for (var i = 0; i < list.length; i++) {
         try { list[i].call(node, ev); } catch (e) {}
@@ -422,11 +491,87 @@
       var on = this.attributes.checked == null ? "checked" : null;
       if (on) this.attributes.checked = "checked"; else delete this.attributes.checked;
       this.checked = !!on;
-      this.dispatchEvent({ type: "change", target: this, bubbles: true, isTrusted: true });
+      var chgEv = (typeof global.Event === "function")
+        ? new global.Event("change", { bubbles: true, isTrusted: true })
+        : { type: "change", target: this, bubbles: true, isTrusted: true };
+      this.dispatchEvent(chgEv);
     }
-    this.dispatchEvent({ type: "mousedown", target: this, bubbles: true, isTrusted: true });
-    this.dispatchEvent({ type: "mouseup", target: this, bubbles: true, isTrusted: true });
-    this.dispatchEvent({ type: "click", target: this, bubbles: true, isTrusted: true });
+    var mdEv = (typeof global.Event === "function")
+      ? new global.Event("mousedown", { bubbles: true, cancelable: true, isTrusted: true })
+      : { type: "mousedown", target: this, bubbles: true, isTrusted: true };
+    this.dispatchEvent(mdEv);
+    var muEv = (typeof global.Event === "function")
+      ? new global.Event("mouseup", { bubbles: true, cancelable: true, isTrusted: true })
+      : { type: "mouseup", target: this, bubbles: true, isTrusted: true };
+    this.dispatchEvent(muEv);
+    var clkEv = (typeof global.Event === "function")
+      ? new global.Event("click", { bubbles: true, cancelable: true, isTrusted: true })
+      : { type: "click", target: this, bubbles: true, cancelable: true, isTrusted: true };
+    var notPrevented = this.dispatchEvent(clkEv);
+    if (notPrevented && !clkEv.defaultPrevented) {
+      var typ = (this.attributes.type || "").toLowerCase();
+      var isSubmit = (this.nodeName === "button" && (!typ || typ === "submit")) ||
+                     (this.nodeName === "input" && typ === "submit");
+      if (isSubmit) {
+        var form = this.parentNode;
+        while (form && form.nodeName !== "form") form = form.parentNode;
+        if (form) {
+          var subEv = (typeof global.Event === "function")
+            ? new global.Event("submit", { bubbles: true, cancelable: true, isTrusted: true })
+            : { type: "submit", target: form, bubbles: true, cancelable: true, isTrusted: true };
+          form.dispatchEvent(subEv);
+          if (!subEv.defaultPrevented && typeof form.submit === "function") {
+            try { form.submit(); } catch (e) {}
+          }
+        }
+      }
+    }
+  };
+  Element.prototype.submit = function () {
+    if (this.nodeName !== "form") return;
+    var action = this.getAttribute("action") || (global.location ? global.location.href : "");
+    var method = (this.getAttribute("method") || "GET").toUpperCase();
+    var fields = {};
+    var inputs = this.querySelectorAll("input, textarea, select");
+    for (var i = 0; i < inputs.length; i++) {
+      var inp = inputs[i];
+      var name = inp.getAttribute("name");
+      if (!name) continue;
+      var type = (inp.getAttribute("type") || "").toLowerCase();
+      if ((type === "checkbox" || type === "radio") && !inp.checked) continue;
+      fields[name] = inp.value != null ? inp.value : (inp.getAttribute("value") || "");
+    }
+    if (method === "GET") {
+      try {
+        var base = (global.location && global.location.href) ? global.location.href : "about:blank";
+        var u = new URL(action, base);
+        for (var k in fields) {
+          u.searchParams.set(k, fields[k]);
+        }
+        if (global.location && typeof global.location.assign === "function") {
+          global.location.assign(u.href);
+        } else {
+          global.__WR_NAVIGATED = u.href;
+        }
+      } catch (e) {}
+    } else {
+      global.__WR_FORM_SUBMIT = {
+        action: action,
+        method: method,
+        fields: fields
+      };
+    }
+  };
+  Element.prototype.requestSubmit = function (submitter) {
+    if (this.nodeName !== "form") return;
+    var ev = (typeof global.Event === "function")
+      ? new global.Event("submit", { bubbles: true, cancelable: true, isTrusted: true })
+      : { type: "submit", target: this, bubbles: true, cancelable: true, isTrusted: true };
+    if (submitter) ev.submitter = submitter;
+    this.dispatchEvent(ev);
+    if (!ev.defaultPrevented) {
+      this.submit();
+    }
   };
   /* Trusted Types enforcement (real, disclosed subset).
    * trustedTypes.createPolicy with allowlist + duplicate control from the
@@ -552,7 +697,8 @@
   })();
   Object.defineProperty(Element.prototype, "innerHTML", {
     get: function () {
-      return this.childNodes.map(serializeNode).join("");
+      var self = this;
+      return this.childNodes.map(function (c) { return serializeNode(c, self.nodeName); }).join("");
     },
     set: function (html) {
       html = __ttEnforce("Element.innerHTML", html, "TrustedHTML");
@@ -590,6 +736,13 @@
     set: function (v) {
       if (v) this.attributes.checked = "checked"; else delete this.attributes.checked;
       queueMutation("attributes", this, { attributeName: "checked" });
+    }
+  });
+  Object.defineProperty(Element.prototype, "src", {
+    get: function () { return this.attributes.src == null ? "" : String(this.attributes.src); },
+    set: function (v) {
+      this.attributes.src = String(v);
+      queueMutation("attributes", this, { attributeName: "src" });
     }
   });
   /* Genuine block-flow layout engine (approximate, disclosed).
@@ -941,6 +1094,11 @@
   }
   Document.prototype = Object.create(Node.prototype);
   Document.prototype.constructor = Document;
+  Object.defineProperty(Document.prototype, "currentScript", {
+    get: function () { return this._currentScript || null; },
+    set: function (v) { this._currentScript = v; },
+    configurable: true
+  });
   Document.prototype.createElement = function (tag, options) {
     var tagLower = String(tag).toLowerCase();
     var isOption = options && options.is ? String(options.is).toLowerCase() : null;
@@ -1014,7 +1172,7 @@
     if (tok === "*") return true;
     if (tok.charAt(0) === "#") return el.id === tok.slice(1) || el.attributes.id === tok.slice(1);
     if (tok.charAt(0) === ".") return (el.className || "").split(/\s+/).indexOf(tok.slice(1)) >= 0;
-    var m = tok.match(/^([a-z0-9-]+)?(?:#([a-zA-Z0-9_-]+))?(?:\.([a-zA-Z0-9_-]+))?(?:\[([a-zA-Z0-9_-]+)(?:="([^"]*)")?\])?$/i);
+    var m = tok.match(/^([a-z0-9-]+)?(?:#([a-zA-Z0-9_-]+))?(?:\.([a-zA-Z0-9_-]+))?(?:\[([a-zA-Z0-9_-]+)(?:=["']?([^"'\]]*)["']?)?\])?$/i);
     if (!m) return el.nodeName === tok.toLowerCase();
     if (m[1] && el.nodeName !== m[1].toLowerCase()) return false;
     if (m[2] && el.id !== m[2] && el.attributes.id !== m[2]) return false;
@@ -1052,15 +1210,18 @@
     var kids = (j.c || []).map(hydrateOne).filter(Boolean);
     return new Element(j.t, j.a || {}, kids);
   }
-  function serializeNode(n) {
+  function serializeNode(n, parentTag) {
     if (!n) return "";
-    if (n.nodeType === 3) return escapeHtml(n._text || "");
+    if (n.nodeType === 3) {
+      if (parentTag === "script" || parentTag === "style") return n._text || "";
+      return escapeHtml(n._text || "");
+    }
     var attrs = "";
     Object.keys(n.attributes || {}).forEach(function (k) {
       attrs += " " + k + "=\"" + escapeHtml(String(n.attributes[k])) + "\"";
     });
     var voidTags = { area:1,base:1,br:1,col:1,embed:1,hr:1,img:1,input:1,link:1,meta:1,param:1,source:1,track:1,wbr:1 };
-    var inner = n.childNodes.map(serializeNode).join("");
+    var inner = n.childNodes.map(function (c) { return serializeNode(c, n.nodeName); }).join("");
     if (voidTags[n.nodeName]) return "<" + n.nodeName + attrs + ">";
     return "<" + n.nodeName + attrs + ">" + inner + "</" + n.nodeName + ">";
   }
@@ -1088,7 +1249,13 @@
   global.clearInterval = function () {};
   global.requestAnimationFrame = function (fn) { return global.setTimeout(fn, 16); };
   global.cancelAnimationFrame = function () {};
-  global.queueMicrotask = function (fn) { Promise.resolve().then(fn); };
+  global.queueMicrotask = function (fn) {
+    if (_nativePromiseResolve) {
+      _nativePromiseResolve().then(fn);
+    } else {
+      global.setTimeout(fn, 0);
+    }
+  };
   global.__drainTimers = function () {
     var q = timers.slice(); timers = [];
     q.sort(function (a, b) { return a.ms - b.ms; });
@@ -1128,20 +1295,21 @@
     var self = this;
     this.toString = function () { return self.href; };
     this.searchParams = new URLSearchParamsImpl(this.search);
-    this.assign = function () {};
-    this.replace = function () {};
+    this.assign = function (u) { try { global.__WR_NAVIGATED = String(u || ""); } catch (e) {} };
+    this.replace = function (u) { try { global.__WR_NAVIGATED = String(u || ""); } catch (e) {} };
     this.reload = function () {};
   }
   function URLSearchParamsImpl(query) {
     var raw = String(query || "").replace(/^\?/, "");
     this._p = {};
+    var self = this;
     raw.split("&").forEach(function (pair) {
       if (!pair) return;
       var eq = pair.indexOf("=");
       var k = eq >= 0 ? pair.slice(0, eq) : pair;
       var v = eq >= 0 ? pair.slice(eq + 1) : "";
       try { k = decodeURIComponent(k.replace(/\+/g, " ")); v = decodeURIComponent(v.replace(/\+/g, " ")); } catch (e) {}
-      self_append(this._p, k, v);
+      self_append(self._p, k, v);
     });
     function self_append(obj, k, v) {
       if (obj[k] == null) obj[k] = v; else if (Array.isArray(obj[k])) obj[k].push(v); else obj[k] = [obj[k], v];
@@ -1443,13 +1611,18 @@
   };
   global.atob = function (input) {
     var s = String(input).replace(/[^A-Za-z0-9+/=]/g, "");
+    while (s.length % 4 !== 0) s += "=";
     var out = "";
     for (var i = 0; i < s.length; i += 4) {
-      var e1 = B64.indexOf(s.charAt(i)), e2 = B64.indexOf(s.charAt(i + 1));
-      var e3 = B64.indexOf(s.charAt(i + 2)), e4 = B64.indexOf(s.charAt(i + 3));
+      var c1 = s.charAt(i), c2 = s.charAt(i + 1), c3 = s.charAt(i + 2), c4 = s.charAt(i + 3);
+      var e1 = B64.indexOf(c1);
+      var e2 = B64.indexOf(c2);
+      var e3 = c3 === "=" ? -1 : B64.indexOf(c3);
+      var e4 = c4 === "=" ? -1 : B64.indexOf(c4);
+      if (e1 < 0 || e2 < 0) break;
       out += String.fromCharCode((e1 << 2) | (e2 >> 4));
-      if (e3 !== 64 && s.charAt(i + 2) !== "=") out += String.fromCharCode(((e2 & 15) << 4) | (e3 >> 2));
-      if (e4 !== 64 && s.charAt(i + 3) !== "=") out += String.fromCharCode(((e3 & 3) << 6) | e4);
+      if (e3 >= 0) out += String.fromCharCode(((e2 & 15) << 4) | (e3 >> 2));
+      if (e4 >= 0) out += String.fromCharCode(((e3 & 3) << 6) | e4);
     }
     return out;
   };
@@ -1570,8 +1743,21 @@
     length: 1,
     state: null,
     _stack: [],
-    pushState: function (state, title, url) { this.state = state; this._stack.push(url); if (url) global.location.href = String(url); },
-    replaceState: function (state, title, url) { this.state = state; if (url) global.location.href = String(url); },
+    pushState: function (state, title, url) {
+      this.state = state;
+      this._stack.push(url);
+      if (url) {
+        if (typeof global._updateLocationQuietly === "function") global._updateLocationQuietly(url);
+        else if (global.location) global.location.href = String(url);
+      }
+    },
+    replaceState: function (state, title, url) {
+      this.state = state;
+      if (url) {
+        if (typeof global._updateLocationQuietly === "function") global._updateLocationQuietly(url);
+        else if (global.location) global.location.href = String(url);
+      }
+    },
     back: function () {}, forward: function () {}, go: function () {}
   };
   function _doScroll(x, y) {
@@ -1927,6 +2113,7 @@
     this.withCredentials = false;
     this._method = "GET";
     this._url = "";
+    this._headers = {};
     this._listeners = {};
   }
   XMLHttpRequest.UNSENT = 0;
@@ -1937,10 +2124,13 @@
   XMLHttpRequest.prototype.open = function (method, url) {
     this._method = String(method || "GET");
     this._url = String(url || "");
+    this._headers = {};
     this.readyState = 1;
     if (typeof this.onreadystatechange === "function") this.onreadystatechange();
   };
-  XMLHttpRequest.prototype.setRequestHeader = function () {};
+  XMLHttpRequest.prototype.setRequestHeader = function (header, value) {
+    if (header) this._headers[String(header)] = String(value);
+  };
   XMLHttpRequest.prototype.getResponseHeader = function () { return null; };
   XMLHttpRequest.prototype.getAllResponseHeaders = function () { return ""; };
   XMLHttpRequest.prototype.addEventListener = function (type, fn) {
@@ -1956,7 +2146,7 @@
   XMLHttpRequest.prototype.send = function (body) {
     try {
       var raw = typeof host_fetch === "function"
-        ? host_fetch(this._url, this._method, body == null ? "" : String(body))
+        ? host_fetch(this._url, this._method, body == null ? "" : String(body), JSON.stringify(this._headers))
         : "{\"status\":599,\"body\":\"\"}";
       var res = typeof raw === "string" ? JSON.parse(raw) : raw;
       this.status = res.status || 0;
@@ -2162,22 +2352,60 @@
     };
     if (!global.location || global.location.href === "about:blank") {
       try {
-        var parsed = new URL(href || "about:blank");
-        global.location = {
-          href: parsed.href,
-          origin: parsed.origin,
-          protocol: parsed.protocol,
-          host: parsed.host,
-          hostname: parsed.hostname,
-          port: parsed.port,
-          pathname: parsed.pathname,
-          search: parsed.search,
-          hash: parsed.hash,
-          toString: function () { return this.href; },
-          assign: function (u) { this.href = String(u); },
-          replace: function (u) { this.href = String(u); },
-          reload: function () {}
+        var initialParsed = new URL(href || "about:blank");
+        var _loc = {};
+        var _locHref = initialParsed.href;
+        function _updateLocationProps(p) {
+          _locHref = p.href;
+          _loc.origin = p.origin;
+          _loc.protocol = p.protocol;
+          _loc.host = p.host;
+          _loc.hostname = p.hostname;
+          _loc.port = p.port;
+          _loc.pathname = p.pathname;
+          _loc.search = p.search;
+          _loc.hash = p.hash;
+          _loc.searchParams = p.searchParams;
+        }
+        function _navigate(target) {
+          if (!target) return;
+          var targetStr = String(target);
+          try {
+            var res = new URL(targetStr, _locHref || href || "about:blank");
+            _updateLocationProps(res);
+            global.__WR_NAVIGATED = res.href;
+          } catch (e) {
+            _locHref = targetStr;
+            global.__WR_NAVIGATED = targetStr;
+          }
+        }
+        _updateLocationProps(initialParsed);
+        _loc.toString = function () { return _locHref; };
+        _loc.assign = function (u) { _navigate(u); };
+        _loc.replace = function (u) { _navigate(u); };
+        _loc.reload = function () { _navigate(_locHref); };
+        Object.defineProperty(_loc, "href", {
+          get: function () { return _locHref; },
+          set: function (u) { _navigate(u); },
+          configurable: true,
+          enumerable: true
+        });
+        global._updateLocationQuietly = function (u) {
+          try {
+            var p = new URL(String(u || ""), _locHref || href || "about:blank");
+            _updateLocationProps(p);
+          } catch (e) {}
         };
+        Object.defineProperty(global, "location", {
+          get: function () { return _loc; },
+          set: function (u) {
+            if (typeof u === "string") _navigate(u);
+            else if (u && typeof u === "object") _loc = u;
+          },
+          configurable: true,
+          enumerable: true
+        });
+        doc.location = _loc;
       } catch (e) {}
     }
     global.Node = Node;
@@ -2217,6 +2445,59 @@
         global[name] = HtmlSubElement;
       })(htmlElements[i]);
     }
+    function DOMParser() {}
+    DOMParser.prototype.parseFromString = function (str, mime) {
+      var doc = new Document();
+      var decoded = String(str || "")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&apos;/g, "'");
+      var htmlNode = new Element("html");
+      var body = new Element("body");
+      htmlNode.appendChild(body);
+      body.appendChild(new Text(decoded));
+      doc.appendChild(htmlNode);
+      doc.documentElement = htmlNode;
+      doc.body = body;
+      return doc;
+    };
+    function FormData(form) {
+      this._data = [];
+      if (form && form.querySelectorAll) {
+        var inputs = form.querySelectorAll("input, select, textarea");
+        for (var i = 0; i < inputs.length; i++) {
+          var el = inputs[i];
+          var name = el.getAttribute("name");
+          if (!name) continue;
+          var typ = (el.getAttribute("type") || "").toLowerCase();
+          if ((typ === "checkbox" || typ === "radio") && !el.checked) continue;
+          this._data.push([name, el.value || ""]);
+        }
+      }
+    }
+    FormData.prototype.append = function (k, v) { this._data.push([String(k), String(v)]); };
+    FormData.prototype.get = function (k) {
+      for (var i = 0; i < this._data.length; i++) {
+        if (this._data[i][0] === String(k)) return this._data[i][1];
+      }
+      return null;
+    };
+    FormData.prototype.getAll = function (k) {
+      var res = [];
+      for (var i = 0; i < this._data.length; i++) {
+        if (this._data[i][0] === String(k)) res.push(this._data[i][1]);
+      }
+      return res;
+    };
+    FormData.prototype.has = function (k) { return this.get(k) !== null; };
+    FormData.prototype.delete = function (k) {
+      this._data = this._data.filter(function (x) { return x[0] !== String(k); });
+    };
+    global.FormData = FormData;
+    global.DOMParser = DOMParser;
     global.Event = function (type, init) {
       this.type = type;
       this.bubbles = !!(init && init.bubbles);

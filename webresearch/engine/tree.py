@@ -45,16 +45,18 @@ def html_to_tree(html: str) -> dict[str, Any]:
     return builder.root
 
 
-def tree_to_html(node: dict[str, Any]) -> str:
+def tree_to_html(node: dict[str, Any], parent_tag: str = "") -> str:
     tag = node.get("t") or ""
     if tag == "#text":
+        if parent_tag in ("script", "style"):
+            return node.get("x") or ""
         return _escape(node.get("x") or "")
     if tag == "document":
-        return "".join(tree_to_html(c) for c in node.get("c") or [])
+        return "".join(tree_to_html(c, tag) for c in node.get("c") or [])
     attrs = "".join(
         f' {k}="{_escape(str(v))}"' for k, v in (node.get("a") or {}).items() if k
     )
-    children = "".join(tree_to_html(c) for c in node.get("c") or [])
+    children = "".join(tree_to_html(c, tag) for c in node.get("c") or [])
     if tag in VOID:
         return f"<{tag}{attrs}>"
     return f"<{tag}{attrs}>{children}</{tag}>"
@@ -100,7 +102,14 @@ def extract_scripts(html: str) -> tuple[list[dict[str, str]], str]:
             body = "".join(
                 c.get("x") or "" for c in (node.get("c") or []) if c.get("t") == "#text"
             )
-            scripts.append({"src": src, "code": body, "type": attrs.get("type") or "", "integrity": attrs.get("integrity") or ""})
+            defer = ("defer" in attrs) or ("async" in attrs)
+            scripts.append({
+                "src": src,
+                "code": body,
+                "type": attrs.get("type") or "",
+                "integrity": attrs.get("integrity") or "",
+                "defer": defer,
+            })
         for child in node.get("c") or []:
             if isinstance(child, dict):
                 walk(child)

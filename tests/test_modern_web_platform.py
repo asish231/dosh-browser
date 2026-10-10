@@ -120,5 +120,41 @@ class ModernWebPlatformTests(unittest.TestCase):
             self.assertIn('data-has-scroll-h="true"', out)
         asyncio.run(run())
 
+    def test_client_navigation_location_assign_and_href(self):
+        html = """
+        <html><body>
+        <script>
+            window.location.assign("/dashboard");
+        </script>
+        </body></html>
+        """
+        async def run():
+            async with httpx.AsyncClient() as client:
+                _, info = await run_scripts(html, "https://example.com/login", client, force=True)
+                self.assertEqual(info.get("navigated"), "https://example.com/dashboard")
+        asyncio.run(run())
+
+    def test_form_submit_button_click_redirects(self):
+        html = """
+        <html><body>
+        <form id="login">
+            <input name="user" value="admin">
+            <button id="btn" type="submit">Log in</button>
+        </form>
+        <script>
+            document.getElementById("login").addEventListener("submit", function(e) {
+                e.preventDefault();
+                window.location.href = "/admin/panel";
+            });
+        </script>
+        </body></html>
+        """
+        async def run():
+            async with httpx.AsyncClient() as client:
+                actions = [{"kind": "activate", "selector": "#btn"}]
+                _, info = await run_scripts(html, "https://example.com/login", client, force=True, actions=actions)
+                self.assertEqual(info.get("navigated"), "https://example.com/admin/panel")
+        asyncio.run(run())
+
 if __name__ == "__main__":
     unittest.main()

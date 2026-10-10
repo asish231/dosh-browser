@@ -4,7 +4,7 @@ import os
 import re
 import secrets
 import time
-from urllib.parse import urlencode, urlparse, urlunparse
+from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 
@@ -319,6 +319,10 @@ class Session:
             self.html, self.url, self.client, force=True, actions=actions
         )
         outcome = str(js_info.get("submit_outcome") or "submitted")
+        if js_info.get("navigated"):
+            nav_url = urljoin(self.url, js_info["navigated"])
+            await self.goto(nav_url, max_chars=max_chars)
+            return "prevented"
         if outcome == "prevented":
             # JS handled submission (validation or SPA). Rebuild page from JS state.
             js_ran = bool(js_info.get("ran"))
@@ -350,8 +354,6 @@ class Session:
             )
             page = snapshot(parse(result), max_chars=max_chars)
             page = _decorate(page, new_html, js_ran, js_info, frames=frames, captcha=captcha.report)
-            self.frame_documents = frames
-            self.captcha_inspection = captcha
             self._push(page, new_html)
         return outcome
 
@@ -446,6 +448,8 @@ class Session:
 
         if action.kind == "submit":
             if not text:
+                if action.role == "button" or action.tag == "button" or (action.tag == "input" and not action.field_name):
+                    return await self._act_engine(action, text="", dx=dx, dy=dy, max_chars=max_chars)
                 raise ValueError(
                     f"[{ref}] {action.role!r} is a form field and needs text"
                 )
@@ -530,7 +534,7 @@ resolve a selector directly.
                 self.html,
                 max_chars,
             )
-        elif action.kind == "activate":
+        elif action.kind in {"activate", "submit"}:
             if text:
                 return await self._apply(
                     [{"kind": "type", "selector": selector, "text": text}],
@@ -604,6 +608,36 @@ resolve a selector directly.
         self._last_deltas = js_info.get("deltas", [])
         if self.profile is not None:
             self.profile.save_from_client(self.client)
+        if js_info.get("navigated"):
+            nav_url = urljoin(self.url, js_info["navigated"])
+            return await self.goto(nav_url, max_chars=max_chars)
+        if js_info.get("form_submit"):
+            fs = js_info["form_submit"]
+            act_url = urljoin(self.url, fs.get("action") or "")
+            method = fs.get("method", "POST").upper()
+            fields = fs.get("fields", {})
+            if method == "GET":
+                parsed = urlparse(act_url)
+                target = urlunparse(parsed._replace(query=urlencode(fields)))
+                return await self.goto(target, max_chars=max_chars)
+            else:
+                result = await fetch(act_url, client=self.client, method="POST", data=fields)
+                dest_url = result.final_url or act_url
+                res_html = result.body
+                js_info_post: dict = {}
+                if result.kind == "html":
+                    res_html, js_info_post = await run_scripts(
+                        res_html, dest_url, self.client, headers=result.headers
+                    )
+                    result = result.model_copy(update={"body": res_html})
+                page = snapshot(parse(result), max_chars=max_chars)
+                page = _decorate(
+                    page,
+                    res_html,
+                    bool(js_info_post.get("ran")) if result.kind == "html" else False,
+                    js_info_post if result.kind == "html" else None,
+                )
+                return self._push(page, res_html)
         return self._push(page, new_html)
 
     @property
