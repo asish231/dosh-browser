@@ -105,6 +105,7 @@ async def run_scripts(
     actions: list[dict] | None = None,
     headers: dict | None = None,
     messages: list[dict] | None = None,
+    ctx: Context | None = None,
 ) -> tuple[str, dict]:
     """Execute page scripts against mini-DOM. Returns (html, info)."""
     info: dict = {
@@ -123,10 +124,23 @@ async def run_scripts(
     if not force and not _wants_js(html):
         return html, info
 
-    ctx = Context()
-    ctx.eval(MINIDOM_JS)
-    ctx.add_callable("host_log", lambda *_a: None)
-    ctx.add_callable("host_parse_html", _host_parse_html)
+    reusing_ctx = False
+    if ctx is None:
+        ctx = Context()
+        ctx.eval(MINIDOM_JS)
+        ctx.add_callable("host_log", lambda *_a: None)
+        ctx.add_callable("host_parse_html", _host_parse_html)
+    else:
+        reusing_ctx = True
+
+    def record_error(exc: Exception) -> None:
+        info["errors"] += 1
+        if len(info["error_messages"]) < 25:
+            info["error_messages"].append(f"{type(exc).__name__}: {exc}"[:300])
+
+    sw_records: list[dict] = []
+    sw_revalidate_queue: list[str] = []
+
     def host_post_message_handler(data, origin="*", target="parent") -> None:
         data_str = str(data)[:4000]
         info["post_messages"].append(
@@ -381,250 +395,257 @@ async def run_scripts(
 
     ctx.add_callable("host_fetch", host_fetch)
 
-    ua = client.headers.get("user-agent", "")
-    ctx.eval(f"globalThis.__WR_UA = {json.dumps(ua)};")
-    ctx.eval("globalThis.__WR_MODS = {};")
-    ctx.eval(f"globalThis.__WR_DEVICE = {json.dumps(_device_block())};")
-    try:
-        from webresearch.engine.csp import trusted_types_config
-        _tt = trusted_types_config(
-            (headers or {}).get("content-security-policy") or (headers or {}).get("Content-Security-Policy"),
-            (headers or {}).get("content-security-policy-report-only"),
-        )
-        ctx.eval(f"globalThis.__WR_TT = {json.dumps(_tt)};")
-    except Exception:
-        pass
+    if reusing_ctx:
+        ran = 1
+        try:
+            ctx.eval("globalThis.__WR_NAVIGATED = ''; globalThis.__WR_FORM_SUBMIT = null;")
+        except Exception:
+            pass
+    else:
+        ua = client.headers.get("user-agent", "")
+        ctx.eval(f"globalThis.__WR_UA = {json.dumps(ua)};")
+        ctx.eval("globalThis.__WR_MODS = {};")
+        ctx.eval(f"globalThis.__WR_DEVICE = {json.dumps(_device_block())};")
+        try:
+            from webresearch.engine.csp import trusted_types_config
+            _tt = trusted_types_config(
+                (headers or {}).get("content-security-policy") or (headers or {}).get("Content-Security-Policy"),
+                (headers or {}).get("content-security-policy-report-only"),
+            )
+            ctx.eval(f"globalThis.__WR_TT = {json.dumps(_tt)};")
+        except Exception:
+            pass
 
-    tree = html_to_tree(html)
-    csp_header = (headers or {}).get("content-security-policy") or (headers or {}).get("Content-Security-Policy")
-    try:
-        from webresearch.engine.styles import (
-            collect_stylesheet_links,
-            inject_stylesheets,
-            load_stylesheets,
-        )
-        sheet_links = collect_stylesheet_links(html, url)
-        applied_sheets, blocked_sheets = await load_stylesheets(
-            sheet_links, url, client, headers
-        )
-        inject_stylesheets(tree, applied_sheets)
-        info["stylesheets"] = {
-            "applied": [s["href"] for s in applied_sheets],
-            "blocked": blocked_sheets,
-        }
-    except Exception as exc:
-        info["errors"] = info.get("errors", 0) + 1
-        info.setdefault("stylesheets", {"applied": [], "blocked": []})
-    if csp_header:
-        from webresearch.engine.csp import style_source_allowed
-        from webresearch.engine.tree import walk as _walk
-        for node in list(_walk(tree)):
-            if node.get("t") == "style":
-                css = "".join(c.get("x") or "" for c in node.get("c") or [] if c.get("t") == "#text")
-                if css and not style_source_allowed(csp_header, inline_css=css):
-                    node["c"] = []
-                    info.setdefault("blocked_csp_style", 0)
-                    info["blocked_csp_style"] += 1
-            elif node.get("t") == "link":
-                rel = (node.get("a") or {}).get("rel", "")
-                href = (node.get("a") or {}).get("href", "")
-                if "stylesheet" in rel.lower() and href:
-                    from urllib.parse import urljoin as _uj
-                    if not style_source_allowed(csp_header, external_url=_uj(url, href), page_url=url):
-                        node["a"] = {**(node.get("a") or {}), "rel": "blocked-stylesheet"}
+        tree = html_to_tree(html)
+        csp_header = (headers or {}).get("content-security-policy") or (headers or {}).get("Content-Security-Policy")
+        try:
+            from webresearch.engine.styles import (
+                collect_stylesheet_links,
+                inject_stylesheets,
+                load_stylesheets,
+            )
+            sheet_links = collect_stylesheet_links(html, url)
+            applied_sheets, blocked_sheets = await load_stylesheets(
+                sheet_links, url, client, headers
+            )
+            inject_stylesheets(tree, applied_sheets)
+            info["stylesheets"] = {
+                "applied": [s["href"] for s in applied_sheets],
+                "blocked": blocked_sheets,
+            }
+        except Exception as exc:
+            info["errors"] = info.get("errors", 0) + 1
+            info.setdefault("stylesheets", {"applied": [], "blocked": []})
+        if csp_header:
+            from webresearch.engine.csp import style_source_allowed
+            from webresearch.engine.tree import walk as _walk
+            for node in list(_walk(tree)):
+                if node.get("t") == "style":
+                    css = "".join(c.get("x") or "" for c in node.get("c") or [] if c.get("t") == "#text")
+                    if css and not style_source_allowed(csp_header, inline_css=css):
+                        node["c"] = []
                         info.setdefault("blocked_csp_style", 0)
                         info["blocked_csp_style"] += 1
-    payload = json.dumps(tree, ensure_ascii=False)
-    ctx.eval(f"__load({payload}, {json.dumps(url)})")
-
-    scripts, _ = extract_scripts(html)
-    classic: list[dict[str, str]] = []
-    deferred: list[dict[str, str]] = []
-    module_scripts: list[dict[str, str]] = []
-    for script in scripts:
-        stype = (script.get("type") or "").lower()
-        if stype in {"application/ld+json", "application/json", "text/html", "importmap", "speculationrules"}:
-            continue
-        if "module" in stype:
-            module_scripts.append(script)
-        elif script.get("defer"):
-            deferred.append(script)
-        else:
-            classic.append(script)
-
-    def record_error(exc: Exception) -> None:
-        info["errors"] += 1
-        if len(info["error_messages"]) < 25:
-            info["error_messages"].append(f"{type(exc).__name__}: {exc}"[:300])
-
-    # Service workers install before any page script runs, so in-page
-    # fetch/XHR (host_fetch) passes through their fetch handlers.
-    from webresearch.engine.sw import install_service_workers, sw_for_url, sw_strategy
-    from webresearch.cache import CACHE as _SW_CACHE
-    sw_records: list[dict] = []
-    sw_revalidate_queue: list[str] = []
-    try:
-        _sw_static_codes: list[str] = []
-        for _s in classic + deferred:
-            if _s.get("code"):
-                _sw_static_codes.append(_s["code"])
-        for _s in module_scripts:
-            if _s.get("code"):
-                _sw_static_codes.append(_s["code"])
-        sw_records = await install_service_workers(_sw_static_codes, url, client)
-        info["service_workers"] = sw_records
-    except Exception as exc:
-        record_error(exc)
-
-    # Immediate scripts first, then deferred scripts (per HTML script ordering spec).
-    ran = 0
-    for script in (classic + deferred):
-        if ran >= MAX_SCRIPTS:
-            break
-        code = script.get("code") or ""
-        src = script.get("src") or ""
-        csp = (headers or {}).get("content-security-policy") or (headers or {}).get("Content-Security-Policy")
-        if src:
-            try:
-                abs_src = urljoin(url, src)
-                if mixed_content_blocked(url, abs_src):
-                    info.setdefault("blocked_mixed_content", 0)
-                    info["blocked_mixed_content"] += 1
-                    continue
-                from webresearch.engine.trackers import GRAPH as _TRACKER_GRAPH
-                decision = _TRACKER_GRAPH.evaluate(abs_src, url)
-                if decision.status == "BLOCKED":
-                    info.setdefault("blocked_trackers", []).append(
-                        {"url": abs_src, "entity": decision.entity,
-                         "surrogate": bool(decision.surrogate)}
-                    )
-                    if decision.surrogate:
-                        code = decision.surrogate
-                    else:
-                        continue
-                if not code:
-                    if csp and not script_source_allowed(csp, external_url=abs_src, page_url=url):
-                        info.setdefault("blocked_csp", 0)
-                        info["blocked_csp"] += 1
-                        continue
-                    resp = await client.get(abs_src)
-                    from webresearch.engine.cross_origin import check_subresource as _check_xo
-                    xo_reason, _ = _check_xo(resp.headers, abs_src, url, headers)
-                    if xo_reason is not None:
-                        info.setdefault("blocked_corp_coep", []).append({"url": abs_src, "reason": xo_reason})
-                        continue
-                    if resp.status_code >= 400:
-                        info.setdefault("script_fetch_errors", []).append({"url": abs_src, "status": resp.status_code})
-                        continue
-                    ctype = (resp.headers.get("content-type") or "").lower()
-                    if "text/html" in ctype:
-                        info.setdefault("script_mime_errors", []).append({"url": abs_src, "content_type": ctype})
-                        continue
-                    code = resp.text
-                    if not verify_integrity(code, script.get("integrity")):
-                        info.setdefault("blocked_sri_failures", 0)
-                        info["blocked_sri_failures"] += 1
-                        continue
-            except Exception as exc:
-                record_error(exc)
+                elif node.get("t") == "link":
+                    rel = (node.get("a") or {}).get("rel", "")
+                    href = (node.get("a") or {}).get("href", "")
+                    if "stylesheet" in rel.lower() and href:
+                        from urllib.parse import urljoin as _uj
+                        if not style_source_allowed(csp_header, external_url=_uj(url, href), page_url=url):
+                            node["a"] = {**(node.get("a") or {}), "rel": "blocked-stylesheet"}
+                            info.setdefault("blocked_csp_style", 0)
+                            info["blocked_csp_style"] += 1
+        payload = json.dumps(tree, ensure_ascii=False)
+        ctx.eval(f"__load({payload}, {json.dumps(url)})")
+    
+        scripts, _ = extract_scripts(html)
+        classic: list[dict[str, str]] = []
+        deferred: list[dict[str, str]] = []
+        module_scripts: list[dict[str, str]] = []
+        for script in scripts:
+            stype = (script.get("type") or "").lower()
+            if stype in {"application/ld+json", "application/json", "text/html", "importmap", "speculationrules"}:
                 continue
-        code = code.strip()
-        if not code or len(code.encode()) > MAX_SCRIPT_BYTES:
-            continue
-        if csp and not src and not script_source_allowed(csp, inline_code=code):
-            info.setdefault("blocked_csp", 0)
-            info["blocked_csp"] += 1
-            continue
-        code = re.sub(r"\bstatic\s*\{([^{}]*)\}", r"static _ = (() => { \1 })();", code)
-        try:
-            if src:
-                sel = f'script[src="{src}"]'
-                ctx.eval(f"if (typeof document !== 'undefined') document.currentScript = document.querySelector({json.dumps(sel)});")
+            if "module" in stype:
+                module_scripts.append(script)
+            elif script.get("defer"):
+                deferred.append(script)
             else:
-                ctx.eval("if (typeof document !== 'undefined') document.currentScript = null;")
-            ctx.eval(code)
-            ran += 1
-            _pump_jobs(ctx)
+                classic.append(script)
+    
+        def record_error(exc: Exception) -> None:
+            info["errors"] += 1
+            if len(info["error_messages"]) < 25:
+                info["error_messages"].append(f"{type(exc).__name__}: {exc}"[:300])
+    
+        # Service workers install before any page script runs, so in-page
+        # fetch/XHR (host_fetch) passes through their fetch handlers.
+        from webresearch.engine.sw import install_service_workers, sw_for_url, sw_strategy
+        from webresearch.cache import CACHE as _SW_CACHE
+        sw_records: list[dict] = []
+        sw_revalidate_queue: list[str] = []
+        try:
+            _sw_static_codes: list[str] = []
+            for _s in classic + deferred:
+                if _s.get("code"):
+                    _sw_static_codes.append(_s["code"])
+            for _s in module_scripts:
+                if _s.get("code"):
+                    _sw_static_codes.append(_s["code"])
+            sw_records = await install_service_workers(_sw_static_codes, url, client)
+            info["service_workers"] = sw_records
         except Exception as exc:
             record_error(exc)
-        finally:
+    
+        # Immediate scripts first, then deferred scripts (per HTML script ordering spec).
+        ran = 0
+        for script in (classic + deferred):
+            if ran >= MAX_SCRIPTS:
+                break
+            code = script.get("code") or ""
+            src = script.get("src") or ""
+            csp = (headers or {}).get("content-security-policy") or (headers or {}).get("Content-Security-Policy")
+            if src:
+                try:
+                    abs_src = urljoin(url, src)
+                    if mixed_content_blocked(url, abs_src):
+                        info.setdefault("blocked_mixed_content", 0)
+                        info["blocked_mixed_content"] += 1
+                        continue
+                    from webresearch.engine.trackers import GRAPH as _TRACKER_GRAPH
+                    decision = _TRACKER_GRAPH.evaluate(abs_src, url)
+                    if decision.status == "BLOCKED":
+                        info.setdefault("blocked_trackers", []).append(
+                            {"url": abs_src, "entity": decision.entity,
+                             "surrogate": bool(decision.surrogate)}
+                        )
+                        if decision.surrogate:
+                            code = decision.surrogate
+                        else:
+                            continue
+                    if not code:
+                        if csp and not script_source_allowed(csp, external_url=abs_src, page_url=url):
+                            info.setdefault("blocked_csp", 0)
+                            info["blocked_csp"] += 1
+                            continue
+                        resp = await client.get(abs_src)
+                        from webresearch.engine.cross_origin import check_subresource as _check_xo
+                        xo_reason, _ = _check_xo(resp.headers, abs_src, url, headers)
+                        if xo_reason is not None:
+                            info.setdefault("blocked_corp_coep", []).append({"url": abs_src, "reason": xo_reason})
+                            continue
+                        if resp.status_code >= 400:
+                            info.setdefault("script_fetch_errors", []).append({"url": abs_src, "status": resp.status_code})
+                            continue
+                        ctype = (resp.headers.get("content-type") or "").lower()
+                        if "text/html" in ctype:
+                            info.setdefault("script_mime_errors", []).append({"url": abs_src, "content_type": ctype})
+                            continue
+                        code = resp.text
+                        if not verify_integrity(code, script.get("integrity")):
+                            info.setdefault("blocked_sri_failures", 0)
+                            info["blocked_sri_failures"] += 1
+                            continue
+                except Exception as exc:
+                    record_error(exc)
+                    continue
+            code = code.strip()
+            if not code or len(code.encode()) > MAX_SCRIPT_BYTES:
+                continue
+            if csp and not src and not script_source_allowed(csp, inline_code=code):
+                info.setdefault("blocked_csp", 0)
+                info["blocked_csp"] += 1
+                continue
+            code = re.sub(r"\bstatic\s*\{([^{}]*)\}", r"static _ = (() => { \1 })();", code)
             try:
-                ctx.eval("if (typeof document !== 'undefined') document.currentScript = null;")
-            except Exception:
-                pass
-
-    # ES modules via the registry translator.
-    if module_scripts:
-        import_map = extract_import_map(html)
-        graph = await load_module_graph(
-            module_scripts,
-            url,
-            client,
-            import_map=import_map,
-            max_modules=MAX_MODULES,
-            headers=headers,
-            csp=(headers or {}).get("content-security-policy") or (headers or {}).get("Content-Security-Policy"),
-        )
-        info["skipped_modules"] = len(graph.missing)
-        if graph.blocked:
-            info.setdefault("blocked_corp_coep", []).extend(graph.blocked)
-        for item in graph.order:
-            module_id = item.url or f"inline:{ran}"
-            try:
-                code = transform_module(item.code, module_id, item.imports)
+                if src:
+                    sel = f'script[src="{src}"]'
+                    ctx.eval(f"if (typeof document !== 'undefined') document.currentScript = document.querySelector({json.dumps(sel)});")
+                else:
+                    ctx.eval("if (typeof document !== 'undefined') document.currentScript = null;")
                 ctx.eval(code)
-                info["modules"] += 1
                 ran += 1
                 _pump_jobs(ctx)
             except Exception as exc:
                 record_error(exc)
-            if ran >= MAX_SCRIPTS + MAX_MODULES:
-                break
-        if graph.missing and len(info["error_messages"]) < 25:
-            info["error_messages"].append(
-                "unresolved module(s): " + ", ".join(graph.missing[:5])
+            finally:
+                try:
+                    ctx.eval("if (typeof document !== 'undefined') document.currentScript = null;")
+                except Exception:
+                    pass
+    
+        # ES modules via the registry translator.
+        if module_scripts:
+            import_map = extract_import_map(html)
+            graph = await load_module_graph(
+                module_scripts,
+                url,
+                client,
+                import_map=import_map,
+                max_modules=MAX_MODULES,
+                headers=headers,
+                csp=(headers or {}).get("content-security-policy") or (headers or {}).get("Content-Security-Policy"),
             )
-
-    try:
-        ctx.eval(
-            "if (typeof document !== 'undefined' && document && document.dispatchEvent) {"
-            "  document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true, cancelable: true }));"
-            "}"
-            "if (typeof window !== 'undefined' && window && window.dispatchEvent) {"
-            "  window.dispatchEvent(new Event('load'));"
-            "}"
-        )
-    except Exception as exc:
-        record_error(exc)
-
-    for _ in range(MAX_TIMER_PASSES):
+            info["skipped_modules"] = len(graph.missing)
+            if graph.blocked:
+                info.setdefault("blocked_corp_coep", []).extend(graph.blocked)
+            for item in graph.order:
+                module_id = item.url or f"inline:{ran}"
+                try:
+                    code = transform_module(item.code, module_id, item.imports)
+                    ctx.eval(code)
+                    info["modules"] += 1
+                    ran += 1
+                    _pump_jobs(ctx)
+                except Exception as exc:
+                    record_error(exc)
+                if ran >= MAX_SCRIPTS + MAX_MODULES:
+                    break
+            if graph.missing and len(info["error_messages"]) < 25:
+                info["error_messages"].append(
+                    "unresolved module(s): " + ", ".join(graph.missing[:5])
+                )
+    
         try:
-            left = ctx.eval("__drainTimers()")
-        except Exception:
-            break
-        _pump_jobs(ctx)
-        if not left:
-            break
-
-    # Drain service-worker StaleWhileRevalidate revalidations.
-    for _reval_url in sw_revalidate_queue:
+            ctx.eval(
+                "if (typeof document !== 'undefined' && document && document.dispatchEvent) {"
+                "  document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true, cancelable: true }));"
+                "}"
+                "if (typeof window !== 'undefined' && window && window.dispatchEvent) {"
+                "  window.dispatchEvent(new Event('load'));"
+                "}"
+            )
+        except Exception as exc:
+            record_error(exc)
+    
+        for _ in range(MAX_TIMER_PASSES):
+            try:
+                left = ctx.eval("__drainTimers()")
+            except Exception:
+                break
+            _pump_jobs(ctx)
+            if not left:
+                break
+    
+        # Drain service-worker StaleWhileRevalidate revalidations.
+        for _reval_url in sw_revalidate_queue:
+            try:
+                _r = await client.get(_reval_url)
+                if _r.status_code == 200:
+                    _SW_CACHE.store("GET", _reval_url, {}, _r.status_code, dict(_r.headers), _r.content)
+                    info.setdefault("sw_revalidated", []).append(_reval_url)
+            except Exception:
+                continue
+    
         try:
-            _r = await client.get(_reval_url)
-            if _r.status_code == 200:
-                _SW_CACHE.store("GET", _reval_url, {}, _r.status_code, dict(_r.headers), _r.content)
-                info.setdefault("sw_revalidated", []).append(_reval_url)
+            tt_json = ctx.eval(
+                "JSON.stringify((globalThis.trustedTypes && globalThis.trustedTypes.__violations) || [])"
+            )
+            tt_violations = json.loads(str(tt_json)) if tt_json else []
+            if tt_violations:
+                info["trusted_types_violations"] = [str(v)[:300] for v in tt_violations[:10]]
         except Exception:
-            continue
-
-    try:
-        tt_json = ctx.eval(
-            "JSON.stringify((globalThis.trustedTypes && globalThis.trustedTypes.__violations) || [])"
-        )
-        tt_violations = json.loads(str(tt_json)) if tt_json else []
-        if tt_violations:
-            info["trusted_types_violations"] = [str(v)[:300] for v in tt_violations[:10]]
-    except Exception:
-        pass
+            pass
 
     if messages:
         for msg in messages:
@@ -752,6 +773,7 @@ async def run_scripts(
             pass
     info["ran"] = ran > 0
     info["scripts"] = ran
+    info["ctx"] = ctx
     return out, info
 
 

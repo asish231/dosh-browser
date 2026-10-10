@@ -50,6 +50,7 @@ class Tab:
         self.headers: dict = {}
         self.frame_documents: list[FrameDocument] = []
         self.captcha_inspection: CaptchaInspection | None = None
+        self.ctx: Any | None = None
 
     @property
     def page(self) -> Page | None:
@@ -132,6 +133,7 @@ class Session:
             raise ValueError("cannot close the only open tab")
         if tab_id not in self._tabs:
             raise ValueError(f"no tab [{tab_id}]")
+        self._tabs[tab_id].ctx = None
         del self._tabs[tab_id]
         if self.active_tab_id == tab_id:
             self.active_tab_id = next(iter(self._tabs.keys()))
@@ -192,15 +194,17 @@ class Session:
         return self.current_tab.push(page, html, headers=getattr(page, "headers", None))
 
     async def goto(self, url: str, *, max_chars: int = 8000, js: str = "auto") -> Page:
-        page, html, frames, captcha = await read_live(
+        page, html, frames, captcha, js_info = await read_live(
             url,
             client=self.client,
             max_chars=max_chars,
             js=js,  # type: ignore[arg-type]
             sprite_endpoint=f"/v1/sessions/{self.id}/captcha/sprite",
+            return_js_info=True,
         )
         self.frame_documents = frames
         self.captcha_inspection = captcha
+        self.current_tab.ctx = js_info.get("ctx") if js_info else None
         if self.profile is not None:
             self.profile.save_from_client(self.client)
         return self._push(page, html)
@@ -316,8 +320,9 @@ class Session:
             actions.append({"kind": "set_form_fields", "index": index, "fields": fields})
         actions.append({"kind": "submit_form", "index": index})
         new_html, js_info = await run_scripts(
-            self.html, self.url, self.client, force=True, actions=actions
+            self.html, self.url, self.client, force=True, actions=actions, ctx=self.current_tab.ctx
         )
+        self.current_tab.ctx = js_info.get("ctx") or self.current_tab.ctx
         outcome = str(js_info.get("submit_outcome") or "submitted")
         if js_info.get("navigated"):
             nav_url = urljoin(self.url, js_info["navigated"])
@@ -345,6 +350,22 @@ class Session:
                 if new_html
                 else self.frame_documents
             )
+            child_msgs = [
+                pm
+                for f in frames
+                for pm in f.post_messages
+                if pm.get("target") in {"parent", "top", "*"}
+            ]
+            if child_msgs and js_ran:
+                pumped_html, extra_js = await run_scripts(
+                    new_html, self.url, self.client, force=True, messages=child_msgs
+                )
+                if extra_js.get("navigated"):
+                    js_info["navigated"] = extra_js["navigated"]
+                if extra_js.get("form_submit"):
+                    js_info["form_submit"] = extra_js["form_submit"]
+                new_html = pumped_html
+                result.body = new_html
             captcha = await inspect_captcha(
                 new_html,
                 self.url,
@@ -355,6 +376,9 @@ class Session:
             page = snapshot(parse(result), max_chars=max_chars)
             page = _decorate(page, new_html, js_ran, js_info, frames=frames, captcha=captcha.report)
             self._push(page, new_html)
+            if js_info.get("navigated"):
+                nav_url = urljoin(self.url, js_info["navigated"])
+                return await self.goto(nav_url, max_chars=max_chars)
         return outcome
 
     async def click(self, ref: str, *, max_chars: int = 8000) -> Page:
@@ -453,6 +477,8 @@ class Session:
                 raise ValueError(
                     f"[{ref}] {action.role!r} is a form field and needs text"
                 )
+            if action.selector and (action.role in {"textbox", "searchbox"} or action.tag in {"input", "textarea"}):
+                return await self._act_engine(action, text=text, dx=dx, dy=dy, max_chars=max_chars)
             return await self._act_submit_field(action, text, max_chars)
 
         if action.disabled:
@@ -565,8 +591,9 @@ resolve a selector directly.
     ) -> Page:
         """Re-run page JS with agent interactions, then rebuild the page model."""
         new_html, js_info = await run_scripts(
-            html, self.url, self.client, force=True, actions=actions
+            html, self.url, self.client, force=True, actions=actions, ctx=self.current_tab.ctx
         )
+        self.current_tab.ctx = js_info.get("ctx") or self.current_tab.ctx
         js_ran = bool(js_info.get("ran"))
         result = FetchResult(
             url=self.url,
@@ -587,6 +614,23 @@ resolve a selector directly.
             if new_html
             else self.frame_documents
         )
+        child_msgs = [
+            pm
+            for f in frames
+            for pm in f.post_messages
+            if pm.get("target") in {"parent", "top", "*"}
+        ]
+        if child_msgs and js_ran:
+            pumped_html, extra_js = await run_scripts(
+                new_html, self.url, self.client, force=True, messages=child_msgs, ctx=self.current_tab.ctx
+            )
+            self.current_tab.ctx = extra_js.get("ctx") or self.current_tab.ctx
+            if extra_js.get("navigated"):
+                js_info["navigated"] = extra_js["navigated"]
+            if extra_js.get("form_submit"):
+                js_info["form_submit"] = extra_js["form_submit"]
+            new_html = pumped_html
+            result.body = new_html
         captcha = await inspect_captcha(
             new_html,
             self.url,

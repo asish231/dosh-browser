@@ -487,6 +487,10 @@
     return !ev.defaultPrevented;
   };
   Element.prototype.click = function () {
+    var tag = this.nodeName.toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select" || tag === "button" || tag === "a" || this.hasAttribute("tabindex")) {
+      this.focus();
+    }
     if (this.nodeName === "input" && (this.attributes.type || "") === "checkbox") {
       var on = this.attributes.checked == null ? "checked" : null;
       if (on) this.attributes.checked = "checked"; else delete this.attributes.checked;
@@ -572,6 +576,45 @@
     if (!ev.defaultPrevented) {
       this.submit();
     }
+  };
+  Element.prototype.focus = function () {
+    var doc = this.ownerDocument || global.document;
+    if (!doc) return;
+    var prev = doc._activeElement || doc.body || doc.documentElement;
+    if (prev === this) return;
+    if (prev && typeof prev.dispatchEvent === "function") {
+      var blurEv = (typeof global.FocusEvent === "function")
+        ? new global.FocusEvent("blur", { bubbles: false, cancelable: false, relatedTarget: this })
+        : (typeof global.Event === "function" ? new global.Event("blur", { bubbles: false, cancelable: false }) : { type: "blur", target: prev });
+      prev.dispatchEvent(blurEv);
+      var outEv = (typeof global.FocusEvent === "function")
+        ? new global.FocusEvent("focusout", { bubbles: true, cancelable: false, relatedTarget: this })
+        : (typeof global.Event === "function" ? new global.Event("focusout", { bubbles: true, cancelable: false }) : { type: "focusout", target: prev, bubbles: true });
+      prev.dispatchEvent(outEv);
+    }
+    doc._activeElement = this;
+    var inEv = (typeof global.FocusEvent === "function")
+      ? new global.FocusEvent("focusin", { bubbles: true, cancelable: false, relatedTarget: prev })
+      : (typeof global.Event === "function" ? new global.Event("focusin", { bubbles: true, cancelable: false }) : { type: "focusin", target: this, bubbles: true });
+    this.dispatchEvent(inEv);
+    var focusEv = (typeof global.FocusEvent === "function")
+      ? new global.FocusEvent("focus", { bubbles: false, cancelable: false, relatedTarget: prev })
+      : (typeof global.Event === "function" ? new global.Event("focus", { bubbles: false, cancelable: false }) : { type: "focus", target: this });
+    this.dispatchEvent(focusEv);
+  };
+  Element.prototype.blur = function () {
+    var doc = this.ownerDocument || global.document;
+    if (!doc || doc._activeElement !== this) return;
+    var next = doc.body || doc.documentElement || null;
+    var blurEv = (typeof global.FocusEvent === "function")
+      ? new global.FocusEvent("blur", { bubbles: false, cancelable: false, relatedTarget: next })
+      : (typeof global.Event === "function" ? new global.Event("blur", { bubbles: false, cancelable: false }) : { type: "blur", target: this });
+    this.dispatchEvent(blurEv);
+    var outEv = (typeof global.FocusEvent === "function")
+      ? new global.FocusEvent("focusout", { bubbles: true, cancelable: false, relatedTarget: next })
+      : (typeof global.Event === "function" ? new global.Event("focusout", { bubbles: true, cancelable: false }) : { type: "focusout", target: this, bubbles: true });
+    this.dispatchEvent(outEv);
+    doc._activeElement = next;
   };
   /* Trusted Types enforcement (real, disclosed subset).
    * trustedTypes.createPolicy with allowlist + duplicate control from the
@@ -840,14 +883,35 @@
     var tag = /^[a-z]/i.test(sel.trim()) ? 1 : 0;
     return id * 100 + cl * 10 + tag;
   }
+  function __normalizeProp(k) {
+    if (k === "font-size") return "fontSize";
+    if (k === "flex-direction") return "flexDirection";
+    if (k === "justify-content") return "justifyContent";
+    if (k === "align-items") return "alignItems";
+    return k;
+  }
   function __computedStyle(el, rules, parentFont) {
-    var st = { display: null, width: null, height: null, margin: "0", padding: "0", fontSize: null };
+    var st = {
+      display: null,
+      position: null,
+      top: null,
+      left: null,
+      bottom: null,
+      right: null,
+      flexDirection: null,
+      gap: null,
+      width: null,
+      height: null,
+      margin: "0",
+      padding: "0",
+      fontSize: null
+    };
     rules.forEach(function (r) {
       r.sel.split(",").forEach(function (s) {
         if (!__matchesSel(el, s)) return;
         var spec = __selSpecificity(s);
         for (var k in r.decls) {
-          var prop = k === "font-size" ? "fontSize" : k;
+          var prop = __normalizeProp(k);
           if (!(prop in st)) return;
           st["__spec_" + prop] = st["__spec_" + prop] || 0;
           if (spec >= st["__spec_" + prop]) {
@@ -859,7 +923,7 @@
     });
     var inline = __parseStyleDecls(el.attributes.style || "");
     for (var k2 in inline) {
-      var prop2 = k2 === "font-size" ? "fontSize" : k2;
+      var prop2 = __normalizeProp(k2);
       if (prop2 in st) st[prop2] = inline[k2];
     }
     var fontSize = parentFont || 16;
@@ -869,7 +933,23 @@
     }
     var disp = (st.display || "").toLowerCase();
     if (!disp) disp = (__BLOCK_TAGS[el.nodeName] ? "block" : "inline");
-    return { display: disp, width: st.width, height: st.height, margin: st.margin, padding: st.padding, fontSize: fontSize };
+    var pos = (st.position || "").toLowerCase();
+    var flexDir = (st.flexDirection || "row").toLowerCase();
+    return {
+      display: disp,
+      position: pos,
+      top: st.top,
+      left: st.left,
+      bottom: st.bottom,
+      right: st.right,
+      flexDirection: flexDir,
+      gap: st.gap,
+      width: st.width,
+      height: st.height,
+      margin: st.margin,
+      padding: st.padding,
+      fontSize: fontSize
+    };
   }
   /* Authentic proportional character advance ratios for standard system sans-serif (Inter / Roboto / Arial) */
   var __CHAR_ADVANCES = {
@@ -909,9 +989,98 @@
     var vw = (typeof global.innerWidth === "number" && global.innerWidth > 0) ? global.innerWidth : 1280;
     if (doc.__layoutCache && doc.__layoutCache.vw === vw && doc.__layoutCache.v === doc.__layoutVersion) return doc.__layoutCache;
     var rules = __collectStyleRules(doc);
-    var layout = { vw: vw, v: doc.__layoutVersion || 0, boxes: 0, engine: "block-flow" };
-    function isBlockDisplay(cs) { return cs.display === "block" || cs.display === "list-item" || cs.display === "table"; }
+    var layout = { vw: vw, v: doc.__layoutVersion || 0, boxes: 0, engine: "block-flow+flex+positioned" };
+    function isBlockDisplay(cs) {
+      return cs.display === "block" || cs.display === "list-item" || cs.display === "table" || cs.display === "flex";
+    }
+    function layoutAbsolute(c, ccs, cx, cy, cw, ch) {
+      var isFixed = (ccs.position === "fixed");
+      var rx = isFixed ? 0 : cx;
+      var ry = isFixed ? 0 : cy;
+      var rw = isFixed ? vw : (cw || vw);
+      var rh = isFixed ? 720 : (ch || 720);
+      var w = __parsePx(ccs.width, rw, ccs.fontSize);
+      var h = __parsePx(ccs.height, rh, ccs.fontSize);
+      if (w == null) {
+        if (__REPLACED_TAGS[c.nodeName]) w = 150;
+        else {
+          var tw = __textWidth(c.textContent || "", ccs.fontSize);
+          w = Math.max(20, Math.min(rw, tw + 20));
+        }
+      }
+      if (h == null) h = ccs.fontSize * 1.5;
+      var xBox = rx;
+      var yBox = ry;
+      var left = __parsePx(ccs.left, rw, ccs.fontSize);
+      var right = __parsePx(ccs.right, rw, ccs.fontSize);
+      var top = __parsePx(ccs.top, rh, ccs.fontSize);
+      var bottom = __parsePx(ccs.bottom, rh, ccs.fontSize);
+      if (left != null) xBox = rx + left;
+      else if (right != null) xBox = rx + rw - w - right;
+      if (top != null) yBox = ry + top;
+      else if (bottom != null) yBox = ry + rh - h - bottom;
+      c.__box = { x: xBox, y: yBox, width: w, height: h };
+      layout.boxes++;
+      layoutChildren(c, ccs, xBox, yBox, w);
+    }
     function layoutChildren(el, cs, x, y, contentW) {
+      if (cs.display === "flex" || cs.display === "inline-flex") {
+        var gap = __parsePx(cs.gap, contentW, cs.fontSize) || 0;
+        var curX = x;
+        var curY = y;
+        var maxRowH = 0;
+        var totalColW = 0;
+        var isCol = (cs.flexDirection === "column");
+        var children = (el.childNodes || []).filter(function (c) {
+          return c.nodeType === 1 && !__NON_RENDERED[c.nodeName];
+        });
+        children.forEach(function (c, idx) {
+          var ccs = __computedStyle(c, rules, cs.fontSize);
+          if (ccs.display === "none") {
+            c.__box = { x: 0, y: 0, width: 0, height: 0 };
+            layout.boxes++;
+            return;
+          }
+          if (ccs.position === "absolute" || ccs.position === "fixed") {
+            layoutAbsolute(c, ccs, x, y, contentW, 0);
+            return;
+          }
+          var margin = __parseSides(ccs.margin, contentW, ccs.fontSize);
+          var padding = __parseSides(ccs.padding, contentW, ccs.fontSize);
+          var w = __parsePx(ccs.width, contentW, ccs.fontSize);
+          var h = __parsePx(ccs.height, null, ccs.fontSize);
+          if (isCol) {
+            if (w == null) w = Math.max(0, contentW - margin[1] - margin[3]);
+            var itemContentW = Math.max(0, w - padding[1] - padding[3]);
+            var r = layoutChildren(c, ccs, x + margin[3] + padding[3], curY + margin[0] + padding[0], itemContentW);
+            var itemH = (h == null) ? Math.max(0, r.bottom - (curY + margin[0] + padding[0])) : h;
+            var boxH = padding[0] + itemH + padding[2];
+            c.__box = { x: x + margin[3], y: curY + margin[0], width: w, height: boxH };
+            layout.boxes++;
+            curY += margin[0] + boxH + margin[2] + (idx < children.length - 1 ? gap : 0);
+            if (w + margin[1] + margin[3] > totalColW) totalColW = w + margin[1] + margin[3];
+          } else {
+            if (w == null) {
+              if (__REPLACED_TAGS[c.nodeName]) {
+                w = 100;
+              } else {
+                var tw = __textWidth(c.textContent || "", ccs.fontSize);
+                w = Math.max(30, Math.min(contentW, tw + padding[1] + padding[3] + 20));
+              }
+            }
+            var itemContentW = Math.max(0, w - padding[1] - padding[3]);
+            var r = layoutChildren(c, ccs, curX + margin[3] + padding[3], y + margin[0] + padding[0], itemContentW);
+            var itemH = (h == null) ? Math.max(0, r.bottom - (y + margin[0] + padding[0])) : h;
+            var boxH = padding[0] + itemH + padding[2];
+            c.__box = { x: curX + margin[3], y: y + margin[0], width: w, height: boxH };
+            layout.boxes++;
+            var fullItemW = margin[3] + w + margin[1];
+            curX += fullItemW + (idx < children.length - 1 ? gap : 0);
+            if (boxH + margin[0] + margin[2] > maxRowH) maxRowH = boxH + margin[0] + margin[2];
+          }
+        });
+        return { bottom: isCol ? curY : (y + maxRowH), maxW: isCol ? totalColW : (curX - x) };
+      }
       var cursor = y;
       var line = null;
       var maxW = 0;
@@ -955,6 +1124,10 @@
           if (c.nodeType !== 1) return;
           var ccs = __computedStyle(c, rules, fontSize);
           if (ccs.display === "none") { c.__box = { x: 0, y: 0, width: 0, height: 0 }; return; }
+          if (ccs.position === "absolute" || ccs.position === "fixed") {
+            layoutAbsolute(c, ccs, x, cursor, contentW, 0);
+            return;
+          }
           if (isBlockDisplay(ccs)) {
             flushLine();
             var cb = layoutBlock(c, x, cursor, contentW, fontSize);
@@ -977,6 +1150,10 @@
         if (c.nodeType !== 1) return;
         var ccs = __computedStyle(c, rules, cs.fontSize);
         if (ccs.display === "none") { c.__box = { x: 0, y: 0, width: 0, height: 0 }; layout.boxes++; return; }
+        if (ccs.position === "absolute" || ccs.position === "fixed") {
+          layoutAbsolute(c, ccs, x, cursor, contentW, 0);
+          return;
+        }
         if (isBlockDisplay(ccs)) {
           flushLine();
           var cb = layoutBlock(c, x, cursor, contentW, cs.fontSize);
@@ -1032,6 +1209,16 @@
       var totalH = padding[0] + contentH + padding[2];
       el.__box = { x: bx, y: by, width: w, height: totalH };
       el.__layoutFont = cs.fontSize;
+      if (cs.position === "relative") {
+        var relLeft = __parsePx(cs.left, availW, cs.fontSize);
+        var relRight = __parsePx(cs.right, availW, cs.fontSize);
+        var relTop = __parsePx(cs.top, null, cs.fontSize);
+        var relBottom = __parsePx(cs.bottom, null, cs.fontSize);
+        if (relLeft != null) el.__box.x += relLeft;
+        else if (relRight != null) el.__box.x -= relRight;
+        if (relTop != null) el.__box.y += relTop;
+        else if (relBottom != null) el.__box.y -= relBottom;
+      }
       layout.boxes++;
       return { bottom: by + totalH + margin[2], w: margin[3] + w + margin[1] };
     }
@@ -1047,7 +1234,7 @@
     }
     doc.__layoutCache = layout;
     try {
-      doc.__layoutInfo = { engine: "block-flow", viewportWidth: vw, boxes: layout.boxes, textMetric: "monospace-advance-0.6em", replacedDefaults: "css-300x150" };
+      doc.__layoutInfo = { engine: "block-flow+flex+positioned", viewportWidth: vw, boxes: layout.boxes, textMetric: "monospace-advance-0.6em", replacedDefaults: "css-300x150" };
     } catch (e) {}
     return layout;
   }
@@ -1139,6 +1326,24 @@
   Document.prototype.querySelector = Element.prototype.querySelector;
   Document.prototype.addEventListener = Element.prototype.addEventListener;
   Document.prototype.dispatchEvent = Element.prototype.dispatchEvent;
+  Object.defineProperty(Document.prototype, "activeElement", {
+    get: function () {
+      return this._activeElement || this.body || this.documentElement || null;
+    },
+    set: function (v) {
+      this._activeElement = v;
+    },
+    configurable: true
+  });
+  Document.prototype.createRange = function () {
+    var r = new global.Range();
+    r.startContainer = this.body || this.documentElement || this;
+    r.endContainer = r.startContainer;
+    return r;
+  };
+  Document.prototype.getSelection = function () {
+    return (typeof global.getSelection === "function") ? global.getSelection() : null;
+  };
 
   function cssSelect(root, selector) {
     selector = String(selector || "").trim();
@@ -1816,6 +2021,326 @@
     get length() { return Object.keys(sessionStorageStore).length; }
   };
 
+  /* In-memory IndexedDB subsystem (zero external dependencies, zero RAM bloat). */
+  (function () {
+    var idbDatabases = {};
+
+    function IDBRequest() {
+      this.result = undefined;
+      this.error = null;
+      this.source = null;
+      this.transaction = null;
+      this.readyState = "pending";
+      this.onsuccess = null;
+      this.onerror = null;
+      this._listeners = {};
+    }
+    IDBRequest.prototype.addEventListener = function (type, fn) {
+      if (!this._listeners[type]) this._listeners[type] = [];
+      this._listeners[type].push(fn);
+    };
+    IDBRequest.prototype.removeEventListener = function (type, fn) {
+      if (!this._listeners[type]) return;
+      var idx = this._listeners[type].indexOf(fn);
+      if (idx >= 0) this._listeners[type].splice(idx, 1);
+    };
+    IDBRequest.prototype.dispatchEvent = function (ev) {
+      ev.target = this;
+      if (typeof this["on" + ev.type] === "function") {
+        try { this["on" + ev.type](ev); } catch (e) {}
+      }
+      var list = (this._listeners[ev.type] || []).slice();
+      for (var i = 0; i < list.length; i++) {
+        try { list[i].call(this, ev); } catch (e) {}
+      }
+      return true;
+    };
+
+    function IDBOpenDBRequest() {
+      IDBRequest.call(this);
+      this.onupgradeneeded = null;
+      this.onblocked = null;
+    }
+    IDBOpenDBRequest.prototype = Object.create(IDBRequest.prototype);
+    IDBOpenDBRequest.prototype.constructor = IDBOpenDBRequest;
+
+    function DOMStringList(arr) {
+      var self = this;
+      this.length = arr.length;
+      for (var i = 0; i < arr.length; i++) {
+        this[i] = arr[i];
+      }
+      this.contains = function (str) { return arr.indexOf(str) >= 0; };
+      this.item = function (i) { return arr[i] || null; };
+    }
+
+    function IDBDatabase(name, version) {
+      this.name = name;
+      this.version = version || 1;
+      this.onclose = null;
+      this.onerror = null;
+      this.onversionchange = null;
+    }
+    Object.defineProperty(IDBDatabase.prototype, "objectStoreNames", {
+      get: function () {
+        var dbData = idbDatabases[this.name];
+        var names = dbData ? Object.keys(dbData.stores) : [];
+        return new DOMStringList(names);
+      }
+    });
+    IDBDatabase.prototype.createObjectStore = function (name, options) {
+      options = options || {};
+      var dbData = idbDatabases[this.name];
+      if (!dbData) {
+        dbData = idbDatabases[this.name] = { version: this.version, stores: {} };
+      }
+      dbData.stores[name] = {
+        name: name,
+        keyPath: options.keyPath || null,
+        autoIncrement: !!options.autoIncrement,
+        records: {},
+        keys: [],
+        autoId: 1,
+        indices: {}
+      };
+      return new IDBObjectStore(name, dbData.stores[name], null);
+    };
+    IDBDatabase.prototype.deleteObjectStore = function (name) {
+      var dbData = idbDatabases[this.name];
+      if (dbData && dbData.stores[name]) delete dbData.stores[name];
+    };
+    IDBDatabase.prototype.transaction = function (storeNames, mode) {
+      mode = mode || "readonly";
+      var names = Array.isArray(storeNames) ? storeNames : [storeNames];
+      return new IDBTransaction(this, names, mode);
+    };
+    IDBDatabase.prototype.close = function () {};
+
+    function IDBTransaction(db, storeNames, mode) {
+      this.db = db;
+      this.mode = mode || "readonly";
+      this.objectStoreNames = new DOMStringList(storeNames);
+      this.oncomplete = null;
+      this.onerror = null;
+      this.onabort = null;
+      this.error = null;
+      var self = this;
+      Promise.resolve().then(function () {
+        if (typeof self.oncomplete === "function") {
+          try { self.oncomplete({ type: "complete", target: self }); } catch (e) {}
+        }
+      });
+    }
+    IDBTransaction.prototype.objectStore = function (name) {
+      var dbData = idbDatabases[this.db.name];
+      if (!dbData || !dbData.stores[name]) {
+        throw new Error("NotFoundError: The specified object store was not found: " + name);
+      }
+      return new IDBObjectStore(name, dbData.stores[name], this);
+    };
+    IDBTransaction.prototype.abort = function () {};
+    IDBTransaction.prototype.commit = function () {};
+
+    function IDBObjectStore(name, storeData, tx) {
+      this.name = name;
+      this._data = storeData;
+      this.transaction = tx;
+      this.keyPath = storeData.keyPath;
+      this.autoIncrement = storeData.autoIncrement;
+    }
+    Object.defineProperty(IDBObjectStore.prototype, "indexNames", {
+      get: function () {
+        return new DOMStringList(Object.keys(this._data.indices || {}));
+      }
+    });
+    IDBObjectStore.prototype.put = function (val, key) {
+      var req = new IDBRequest();
+      req.source = this;
+      req.transaction = this.transaction;
+      var data = this._data;
+      if (key === undefined && data.keyPath && typeof val === "object" && val !== null) {
+        key = val[data.keyPath];
+      }
+      if (key === undefined && data.autoIncrement) {
+        key = data.autoId++;
+      }
+      var kStr = String(key !== undefined ? key : data.autoId++);
+      if (data.keys.indexOf(kStr) < 0) data.keys.push(kStr);
+      data.records[kStr] = (typeof val === "object" && val !== null) ? JSON.parse(JSON.stringify(val)) : val;
+      Promise.resolve().then(function () {
+        req.readyState = "done";
+        req.result = key !== undefined ? key : kStr;
+        req.dispatchEvent({ type: "success" });
+      });
+      return req;
+    };
+    IDBObjectStore.prototype.add = function (val, key) {
+      return this.put(val, key);
+    };
+    IDBObjectStore.prototype.get = function (key) {
+      var req = new IDBRequest();
+      req.source = this;
+      req.transaction = this.transaction;
+      var data = this._data;
+      var kStr = String(key);
+      var record = Object.prototype.hasOwnProperty.call(data.records, kStr) ? data.records[kStr] : undefined;
+      var copy = (typeof record === "object" && record !== null) ? JSON.parse(JSON.stringify(record)) : record;
+      Promise.resolve().then(function () {
+        req.readyState = "done";
+        req.result = copy;
+        req.dispatchEvent({ type: "success" });
+      });
+      return req;
+    };
+    IDBObjectStore.prototype.getAll = function () {
+      var req = new IDBRequest();
+      req.source = this;
+      req.transaction = this.transaction;
+      var data = this._data;
+      var res = [];
+      for (var i = 0; i < data.keys.length; i++) {
+        var k = data.keys[i];
+        var rec = data.records[k];
+        res.push((typeof rec === "object" && rec !== null) ? JSON.parse(JSON.stringify(rec)) : rec);
+      }
+      Promise.resolve().then(function () {
+        req.readyState = "done";
+        req.result = res;
+        req.dispatchEvent({ type: "success" });
+      });
+      return req;
+    };
+    IDBObjectStore.prototype.delete = function (key) {
+      var req = new IDBRequest();
+      req.source = this;
+      req.transaction = this.transaction;
+      var data = this._data;
+      var kStr = String(key);
+      delete data.records[kStr];
+      var idx = data.keys.indexOf(kStr);
+      if (idx >= 0) data.keys.splice(idx, 1);
+      Promise.resolve().then(function () {
+        req.readyState = "done";
+        req.result = undefined;
+        req.dispatchEvent({ type: "success" });
+      });
+      return req;
+    };
+    IDBObjectStore.prototype.clear = function () {
+      var req = new IDBRequest();
+      req.source = this;
+      req.transaction = this.transaction;
+      this._data.records = {};
+      this._data.keys = [];
+      Promise.resolve().then(function () {
+        req.readyState = "done";
+        req.result = undefined;
+        req.dispatchEvent({ type: "success" });
+      });
+      return req;
+    };
+    IDBObjectStore.prototype.count = function () {
+      var req = new IDBRequest();
+      req.source = this;
+      req.transaction = this.transaction;
+      var c = this._data.keys.length;
+      Promise.resolve().then(function () {
+        req.readyState = "done";
+        req.result = c;
+        req.dispatchEvent({ type: "success" });
+      });
+      return req;
+    };
+    IDBObjectStore.prototype.createIndex = function (name, keyPath, options) {
+      this._data.indices[name] = { name: name, keyPath: keyPath, options: options || {} };
+      return this.index(name);
+    };
+    IDBObjectStore.prototype.index = function (name) {
+      var self = this;
+      return {
+        name: name,
+        get: function (k) { return self.get(k); },
+        getAll: function () { return self.getAll(); },
+        count: function () { return self.count(); }
+      };
+    };
+
+    var IDBFactory = {
+      open: function (name, version) {
+        var req = new IDBOpenDBRequest();
+        var existing = idbDatabases[name];
+        var oldVer = existing ? existing.version : 0;
+        var newVer = version || (existing ? existing.version : 1);
+        if (!existing) {
+          idbDatabases[name] = { version: newVer, stores: {} };
+        } else if (version && version > existing.version) {
+          existing.version = version;
+        }
+        var db = new IDBDatabase(name, newVer);
+        Promise.resolve().then(function () {
+          if (newVer > oldVer || oldVer === 0) {
+            req.readyState = "done";
+            req.result = db;
+            var tx = new IDBTransaction(db, Object.keys(idbDatabases[name].stores), "versionchange");
+            req.transaction = tx;
+            req.dispatchEvent({ type: "upgradeneeded", oldVersion: oldVer, newVersion: newVer });
+          }
+          Promise.resolve().then(function () {
+            req.readyState = "done";
+            req.result = db;
+            req.transaction = null;
+            req.dispatchEvent({ type: "success" });
+          });
+        });
+        return req;
+      },
+      deleteDatabase: function (name) {
+        var req = new IDBOpenDBRequest();
+        delete idbDatabases[name];
+        Promise.resolve().then(function () {
+          req.readyState = "done";
+          req.result = undefined;
+          req.dispatchEvent({ type: "success" });
+        });
+        return req;
+      },
+      cmp: function (a, b) {
+        if (a < b) return -1;
+        if (a > b) return 1;
+        return 0;
+      }
+    };
+
+    function IDBKeyRange(lower, upper, lowerOpen, upperOpen) {
+      this.lower = lower;
+      this.upper = upper;
+      this.lowerOpen = !!lowerOpen;
+      this.upperOpen = !!upperOpen;
+    }
+    IDBKeyRange.only = function (val) { return new IDBKeyRange(val, val, false, false); };
+    IDBKeyRange.lowerBound = function (lower, open) { return new IDBKeyRange(lower, undefined, !!open, true); };
+    IDBKeyRange.upperBound = function (upper, open) { return new IDBKeyRange(undefined, upper, true, !!open); };
+    IDBKeyRange.bound = function (l, u, lo, uo) { return new IDBKeyRange(l, u, !!lo, !!uo); };
+    IDBKeyRange.prototype.includes = function (key) {
+      if (this.lower !== undefined) {
+        if (this.lowerOpen ? key <= this.lower : key < this.lower) return false;
+      }
+      if (this.upper !== undefined) {
+        if (this.upperOpen ? key >= this.upper : key > this.upper) return false;
+      }
+      return true;
+    };
+
+    global.IDBRequest = IDBRequest;
+    global.IDBOpenDBRequest = IDBOpenDBRequest;
+    global.IDBDatabase = IDBDatabase;
+    global.IDBTransaction = IDBTransaction;
+    global.IDBObjectStore = IDBObjectStore;
+    global.IDBFactory = IDBFactory;
+    global.IDBKeyRange = IDBKeyRange;
+    global.indexedDB = IDBFactory;
+  })();
+
   /* Custom elements + shadow DOM. */
   global.customElements = {
     define: function (name, ctor, _opts) {
@@ -2246,6 +2771,10 @@
       onLine: true,
       plugins: pluginList,
       mimeTypes: mimeList,
+      userActivation: {
+        hasBeenActive: true,
+        isActive: true
+      },
       permissions: {
         query: function (desc) {
           return Promise.resolve({
@@ -2520,11 +3049,158 @@
       }
     };
     global.CustomEvent = global.Event;
+
+    global.UIEvent = function (type, init) {
+      global.Event.call(this, type, init);
+      this.detail = (init && init.detail) || 0;
+      this.view = (init && init.view) || global;
+    };
+    global.UIEvent.prototype = Object.create(global.Event.prototype);
+
+    global.MouseEvent = function (type, init) {
+      global.UIEvent.call(this, type, init);
+      init = init || {};
+      this.screenX = init.screenX || 0;
+      this.screenY = init.screenY || 0;
+      this.clientX = init.clientX || 0;
+      this.clientY = init.clientY || 0;
+      this.pageX = init.pageX || this.clientX;
+      this.pageY = init.pageY || this.clientY;
+      this.ctrlKey = !!init.ctrlKey;
+      this.shiftKey = !!init.shiftKey;
+      this.altKey = !!init.altKey;
+      this.metaKey = !!init.metaKey;
+      this.button = init.button || 0;
+      this.buttons = init.buttons !== undefined ? init.buttons : (type === "mousedown" ? 1 : 0);
+      this.relatedTarget = init.relatedTarget || null;
+    };
+    global.MouseEvent.prototype = Object.create(global.UIEvent.prototype);
+
+    global.FocusEvent = function (type, init) {
+      global.UIEvent.call(this, type, init);
+      init = init || {};
+      this.relatedTarget = init.relatedTarget || null;
+    };
+    global.FocusEvent.prototype = Object.create(global.UIEvent.prototype);
+
+    global.KeyboardEvent = function (type, init) {
+      global.UIEvent.call(this, type, init);
+      init = init || {};
+      this.key = init.key || "";
+      this.code = init.code || "";
+      this.location = init.location || 0;
+      this.ctrlKey = !!init.ctrlKey;
+      this.shiftKey = !!init.shiftKey;
+      this.altKey = !!init.altKey;
+      this.metaKey = !!init.metaKey;
+      this.repeat = !!init.repeat;
+      this.isComposing = !!init.isComposing;
+      var kc = init.keyCode || (this.key ? this.key.charCodeAt(0) : 0);
+      this.keyCode = kc;
+      this.which = init.which || kc;
+      this.charCode = init.charCode || (type === "keypress" ? kc : 0);
+    };
+    global.KeyboardEvent.prototype = Object.create(global.UIEvent.prototype);
+
     global.MessageEvent = function (type, init) {
+      global.Event.call(this, type, init);
       this.type = type || "message";
       this.data = init && init.data;
       this.origin = (init && init.origin) || "";
+      this.lastEventId = (init && init.lastEventId) || "";
+      this.source = (init && init.source) || global.parent || global;
+      this.ports = (init && init.ports) || [];
     };
+    global.MessageEvent.prototype = Object.create(global.Event.prototype);
+
+    function Range() {
+      this.startContainer = null;
+      this.startOffset = 0;
+      this.endContainer = null;
+      this.endOffset = 0;
+      this.collapsed = true;
+      this.commonAncestorContainer = null;
+    }
+    Range.prototype.setStart = function (node, offset) {
+      this.startContainer = node;
+      this.startOffset = offset || 0;
+      if (!this.endContainer) { this.endContainer = node; this.endOffset = this.startOffset; }
+      this.collapsed = (this.startContainer === this.endContainer && this.startOffset === this.endOffset);
+      this.commonAncestorContainer = node;
+    };
+    Range.prototype.setEnd = function (node, offset) {
+      this.endContainer = node;
+      this.endOffset = offset || 0;
+      if (!this.startContainer) { this.startContainer = node; this.startOffset = this.endOffset; }
+      this.collapsed = (this.startContainer === this.endContainer && this.startOffset === this.endOffset);
+    };
+    Range.prototype.selectNode = function (node) {
+      this.startContainer = node.parentNode || node;
+      this.startOffset = 0;
+      this.endContainer = node.parentNode || node;
+      this.endOffset = 1;
+      this.collapsed = false;
+      this.commonAncestorContainer = this.startContainer;
+    };
+    Range.prototype.selectNodeContents = function (node) {
+      this.startContainer = node;
+      this.startOffset = 0;
+      this.endContainer = node;
+      this.endOffset = (node.childNodes ? node.childNodes.length : 0);
+      this.collapsed = false;
+      this.commonAncestorContainer = node;
+    };
+    Range.prototype.collapse = function (toStart) {
+      if (toStart) { this.endContainer = this.startContainer; this.endOffset = this.startOffset; }
+      else { this.startContainer = this.endContainer; this.startOffset = this.endOffset; }
+      this.collapsed = true;
+    };
+    Range.prototype.cloneRange = function () {
+      var r = new Range();
+      r.startContainer = this.startContainer;
+      r.startOffset = this.startOffset;
+      r.endContainer = this.endContainer;
+      r.endOffset = this.endOffset;
+      r.collapsed = this.collapsed;
+      r.commonAncestorContainer = this.commonAncestorContainer;
+      return r;
+    };
+    Range.prototype.getBoundingClientRect = function () {
+      if (this.startContainer && typeof this.startContainer.getBoundingClientRect === "function") {
+        return this.startContainer.getBoundingClientRect();
+      }
+      return { x: 0, y: 0, top: 0, left: 0, bottom: 0, right: 0, width: 0, height: 0 };
+    };
+    Range.prototype.getClientRects = function () {
+      return [this.getBoundingClientRect()];
+    };
+    global.Range = Range;
+
+    function Selection() {
+      this._ranges = [];
+    }
+    Object.defineProperty(Selection.prototype, "rangeCount", {
+      get: function () { return this._ranges.length; }
+    });
+    Selection.prototype.getRangeAt = function (i) { return this._ranges[i] || null; };
+    Selection.prototype.addRange = function (r) { if (this._ranges.indexOf(r) < 0) this._ranges.push(r); };
+    Selection.prototype.removeRange = function (r) {
+      var idx = this._ranges.indexOf(r);
+      if (idx >= 0) this._ranges.splice(idx, 1);
+    };
+    Selection.prototype.removeAllRanges = function () { this._ranges = []; };
+    Selection.prototype.collapse = function () { this._ranges = []; };
+    Selection.prototype.selectAllChildren = function (node) {
+      this._ranges = [];
+      var r = new Range();
+      r.selectNodeContents(node);
+      this._ranges.push(r);
+    };
+    Selection.prototype.toString = function () { return ""; };
+    var currentSelection = new Selection();
+    global.Selection = Selection;
+    global.getSelection = function () { return currentSelection; };
+
     global.EventTarget = function () {};
     var windowListeners = {};
     global.addEventListener = function (type, fn) {
@@ -2548,7 +3224,8 @@
       if (typeof host_post_message === "function") host_post_message(String(data), targetOrigin, "self");
       global.dispatchEvent(new global.MessageEvent("message", {
         data: data,
-        origin: targetOrigin === "*" ? "" : targetOrigin
+        origin: targetOrigin === "*" ? "" : targetOrigin,
+        source: global
       }));
     };
     global.parent = {
@@ -2560,9 +3237,16 @@
     global.top = global.parent;
     global.self = global;
     global.__receiveMessage = function (data, origin) {
+      var sourceProxy = {
+        postMessage: function (replyData, replyOrigin) {
+          var targetOrigin = String(replyOrigin || "*");
+          if (typeof host_post_message === "function") host_post_message(String(replyData), targetOrigin, "reply");
+        }
+      };
       global.dispatchEvent(new global.MessageEvent("message", {
         data: data,
-        origin: String(origin || "")
+        origin: String(origin || ""),
+        source: sourceProxy
       }));
     };
     global.frames = [];
@@ -2602,14 +3286,50 @@
     else el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true }));
     return true;
   };
+  function __dispatchTypeSequence(el, text) {
+    if (!el) return false;
+    if (typeof el.focus === "function") el.focus();
+    text = String(text != null ? text : "");
+    var curVal = el.value || "";
+    for (var i = 0; i < text.length; i++) {
+      var ch = text[i];
+      var code = "Key" + ch.toUpperCase();
+      if (ch >= "0" && ch <= "9") code = "Digit" + ch;
+      else if (ch === " ") code = "Space";
+      else if (ch === "\n") code = "Enter";
+      var kc = (ch === "\n") ? 13 : ch.charCodeAt(0);
+
+      var kd = (typeof global.KeyboardEvent === "function")
+        ? new global.KeyboardEvent("keydown", { key: ch, code: code, keyCode: kc, which: kc, bubbles: true, cancelable: true, isTrusted: true })
+        : new global.Event("keydown", { bubbles: true, cancelable: true, isTrusted: true });
+      el.dispatchEvent(kd);
+
+      var kp = (typeof global.KeyboardEvent === "function")
+        ? new global.KeyboardEvent("keypress", { key: ch, code: code, keyCode: kc, which: kc, charCode: kc, bubbles: true, cancelable: true, isTrusted: true })
+        : new global.Event("keypress", { bubbles: true, cancelable: true, isTrusted: true });
+      el.dispatchEvent(kp);
+
+      curVal += ch;
+      el.value = curVal;
+
+      var inp = new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true });
+      inp.data = ch;
+      inp.inputType = "insertText";
+      el.dispatchEvent(inp);
+
+      var ku = (typeof global.KeyboardEvent === "function")
+        ? new global.KeyboardEvent("keyup", { key: ch, code: code, keyCode: kc, which: kc, bubbles: true, cancelable: true, isTrusted: true })
+        : new global.Event("keyup", { bubbles: true, cancelable: true, isTrusted: true });
+      el.dispatchEvent(ku);
+    }
+    el.setAttribute("value", curVal);
+    el.dispatchEvent(new global.Event("change", { bubbles: true, cancelable: false, isTrusted: true }));
+    return true;
+  }
   global.__typePath = function (path, text) {
     var el = global.__byPath(path);
     if (!el) return false;
-    el.value = String(text);
-    el.setAttribute("value", String(text));
-    el.dispatchEvent(new global.Event("input", { bubbles: true, isTrusted: true }));
-    el.dispatchEvent(new global.Event("change", { bubbles: true, isTrusted: true }));
-    return true;
+    return __dispatchTypeSequence(el, text);
   };
   global.__activateSelector = function (selector, text) {
     var el = null;
@@ -2617,11 +3337,11 @@
     else el = global.document.querySelector(selector);
     if (!el) return false;
     if (text !== null && text !== undefined && text !== "") {
-        el.value = String(text);
-        el.setAttribute("value", String(text));
-        el.dispatchEvent(new global.Event("input", { bubbles: true, isTrusted: true }));
-        el.dispatchEvent(new global.Event("change", { bubbles: true, isTrusted: true }));
-        return true;
+      return __dispatchTypeSequence(el, text);
+    }
+    var tag = el.nodeName.toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select" || tag === "button" || tag === "a" || el.hasAttribute("tabindex")) {
+      if (typeof el.focus === "function") el.focus();
     }
     if (typeof el.click === "function") el.click();
     else el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true }));

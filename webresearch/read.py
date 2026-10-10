@@ -91,7 +91,8 @@ async def read_live(
     js: JsMode = "auto",
     sprite_endpoint: str = "",
     chromium_session: object | None = None,
-) -> tuple[Page, str, list[FrameDocument], CaptchaInspection]:
+    return_js_info: bool = False,
+) -> tuple:
     """Fetch (+ QuickJS + frames) → page model and live agent state. Pure from-scratch engine, no Chromium."""
     result = await fetch(url, client=client)
     html = result.body
@@ -131,15 +132,18 @@ async def read_live(
     )
     page = snapshot(parse(result), max_chars=max_chars, max_links=max_links)
     page = page.model_copy(update={"headers": dict(result.headers or {})})
+    decorated = _decorate(
+        page,
+        html,
+        js_ran,
+        js_info,
+        frames=frames,
+        captcha=captcha.report,
+    )
+    if return_js_info:
+        return (decorated, html, frames, captcha, js_info)
     return (
-        _decorate(
-            page,
-            html,
-            js_ran,
-            js_info,
-            frames=frames,
-            captcha=captcha.report,
-        ),
+        decorated,
         html,
         frames,
         captcha,
