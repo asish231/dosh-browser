@@ -151,6 +151,27 @@ async def run_scripts(
     ctx.add_callable("host_get_cookie", host_get_cookie)
     ctx.add_callable("host_set_cookie", host_set_cookie)
 
+    def host_crypto_digest(algo: str, data_hex: str) -> str:
+        try:
+            import hashlib
+            data = bytes.fromhex(data_hex) if data_hex else b""
+            norm = (algo or "").upper().replace("-", "")
+            if norm == "SHA256":
+                return hashlib.sha256(data).hexdigest()
+            elif norm == "SHA1":
+                return hashlib.sha1(data).hexdigest()
+            elif norm == "SHA384":
+                return hashlib.sha384(data).hexdigest()
+            elif norm == "SHA512":
+                return hashlib.sha512(data).hexdigest()
+            elif norm == "MD5":
+                return hashlib.md5(data).hexdigest()
+            return hashlib.sha256(data).hexdigest()
+        except Exception:
+            return ""
+
+    ctx.add_callable("host_crypto_digest", host_crypto_digest)
+
     sync_kwargs: dict = {
         "timeout": 12.0,
         "follow_redirects": True,
@@ -457,6 +478,13 @@ async def run_scripts(
                     xo_reason, _ = _check_xo(resp.headers, abs_src, url, headers)
                     if xo_reason is not None:
                         info.setdefault("blocked_corp_coep", []).append({"url": abs_src, "reason": xo_reason})
+                        continue
+                    if resp.status_code >= 400:
+                        info.setdefault("script_fetch_errors", []).append({"url": abs_src, "status": resp.status_code})
+                        continue
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    if "text/html" in ctype:
+                        info.setdefault("script_mime_errors", []).append({"url": abs_src, "content_type": ctype})
                         continue
                     code = resp.text
                     if not verify_integrity(code, script.get("integrity")):

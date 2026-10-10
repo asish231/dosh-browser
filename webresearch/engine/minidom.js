@@ -1464,6 +1464,79 @@
       });
     }
   };
+  global.crypto.subtle = {
+    digest: function (algorithm, data) {
+      return new Promise(function (resolve, reject) {
+        try {
+          var algoName = typeof algorithm === "string" ? algorithm : (algorithm && algorithm.name) || "SHA-256";
+          var bytes;
+          if (data instanceof ArrayBuffer) {
+            bytes = new Uint8Array(data);
+          } else if (data && data.buffer instanceof ArrayBuffer) {
+            bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+          } else if (typeof data === "string") {
+            var enc = new TextEncoder();
+            bytes = enc.encode(data);
+          } else {
+            bytes = new Uint8Array(0);
+          }
+          var hex = "";
+          for (var i = 0; i < bytes.length; i++) {
+            var b = bytes[i].toString(16);
+            hex += (b.length === 1 ? "0" : "") + b;
+          }
+          var resHex = typeof host_crypto_digest === "function" ? host_crypto_digest(algoName, hex) : "";
+          var outBuf = new ArrayBuffer(resHex.length / 2);
+          var outView = new Uint8Array(outBuf);
+          for (var j = 0; j < resHex.length; j += 2) {
+            outView[j / 2] = parseInt(resHex.substr(j, 2), 16);
+          }
+          resolve(outBuf);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    },
+    importKey: function () { return Promise.resolve({}); },
+    exportKey: function () { return Promise.resolve(new ArrayBuffer(0)); },
+    encrypt: function () { return Promise.resolve(new ArrayBuffer(0)); },
+    decrypt: function () { return Promise.resolve(new ArrayBuffer(0)); }
+  };
+
+  /* MessageChannel & MessagePort for macro-task scheduling (React Scheduler) */
+  function MessagePort() {
+    this._other = null;
+    this.onmessage = null;
+    this._listeners = [];
+  }
+  MessagePort.prototype.postMessage = function (data) {
+    var other = this._other;
+    if (!other) return;
+    setTimeout(function () {
+      var evt = new MessageEvent("message", { data: data });
+      if (typeof other.onmessage === "function") other.onmessage(evt);
+      other._listeners.forEach(function (l) {
+        try { l(evt); } catch (e) {}
+      });
+    }, 0);
+  };
+  MessagePort.prototype.addEventListener = function (type, fn) {
+    if (type === "message") this._listeners.push(fn);
+  };
+  MessagePort.prototype.removeEventListener = function (type, fn) {
+    this._listeners = this._listeners.filter(function (l) { return l !== fn; });
+  };
+  MessagePort.prototype.start = function () {};
+  MessagePort.prototype.close = function () {};
+
+  function MessageChannel() {
+    this.port1 = new MessagePort();
+    this.port2 = new MessagePort();
+    this.port1._other = this.port2;
+    this.port2._other = this.port1;
+  }
+  global.MessagePort = MessagePort;
+  global.MessageChannel = MessageChannel;
 
   /* History API for SPA routers. */
   global.history = {
@@ -1599,22 +1672,219 @@
     }
   });
 
+  /* Standard Headers implementation */
+  function Headers(init) {
+    this._headers = {};
+    var self = this;
+    if (init) {
+      if (typeof init.forEach === "function") {
+        init.forEach(function (v, k) { self.set(k, v); });
+      } else if (Array.isArray(init)) {
+        init.forEach(function (pair) { self.set(pair[0], pair[1]); });
+      } else if (typeof init === "object") {
+        for (var k in init) {
+          if (Object.prototype.hasOwnProperty.call(init, k)) self.set(k, init[k]);
+        }
+      }
+    }
+  }
+  Headers.prototype.set = function (name, value) {
+    this._headers[String(name).toLowerCase()] = String(value);
+  };
+  Headers.prototype.get = function (name) {
+    var v = this._headers[String(name).toLowerCase()];
+    return v !== undefined ? v : null;
+  };
+  Headers.prototype.has = function (name) {
+    return Object.prototype.hasOwnProperty.call(this._headers, String(name).toLowerCase());
+  };
+  Headers.prototype.delete = function (name) {
+    delete this._headers[String(name).toLowerCase()];
+  };
+  Headers.prototype.append = function (name, value) {
+    var key = String(name).toLowerCase();
+    if (this.has(key)) {
+      this._headers[key] = this._headers[key] + ", " + String(value);
+    } else {
+      this._headers[key] = String(value);
+    }
+  };
+  Headers.prototype.forEach = function (cb, thisArg) {
+    for (var k in this._headers) {
+      if (Object.prototype.hasOwnProperty.call(this._headers, k)) {
+        cb.call(thisArg, this._headers[k], k, this);
+      }
+    }
+  };
+  Headers.prototype.entries = function () {
+    var arr = [];
+    for (var k in this._headers) {
+      if (Object.prototype.hasOwnProperty.call(this._headers, k)) arr.push([k, this._headers[k]]);
+    }
+    return arr[Symbol.iterator] ? arr[Symbol.iterator]() : arr;
+  };
+  global.Headers = Headers;
+
+  /* Standard ReadableStream & DefaultReader for streaming chunk reads */
+  function ReadableStreamDefaultReader(stream) {
+    this._stream = stream;
+    this._chunks = stream._chunks ? stream._chunks.slice() : [];
+    this._index = 0;
+  }
+  ReadableStreamDefaultReader.prototype.read = function () {
+    if (this._index < this._chunks.length) {
+      var chunk = this._chunks[this._index++];
+      return Promise.resolve({ value: chunk, done: false });
+    }
+    return Promise.resolve({ value: undefined, done: true });
+  };
+  ReadableStreamDefaultReader.prototype.releaseLock = function () {};
+  ReadableStreamDefaultReader.prototype.cancel = function () {
+    return Promise.resolve();
+  };
+
+  function ReadableStream(source) {
+    this._chunks = [];
+    if (source && Array.isArray(source.chunks)) {
+      this._chunks = source.chunks;
+    } else if (typeof source === "string") {
+      var enc = new TextEncoder();
+      this._chunks = [enc.encode(source)];
+    } else if (source instanceof Uint8Array) {
+      this._chunks = [source];
+    }
+  }
+  ReadableStream.prototype.getReader = function () {
+    return new ReadableStreamDefaultReader(this);
+  };
+  global.ReadableStream = ReadableStream;
+
+  /* Standard Response implementation */
+  function Response(body, init) {
+    init = init || {};
+    this.status = init.status !== undefined && init.status !== null ? Number(init.status) : 200;
+    this.statusText = String(init.statusText || (this.status === 200 ? "OK" : ""));
+    this.ok = this.status >= 200 && this.status < 300;
+    this.url = String(init.url || "");
+    this.type = "basic";
+    this.headers = new Headers(init.headers || {});
+    this._text = typeof body === "string" ? body : "";
+    var enc = new TextEncoder();
+    this.body = new ReadableStream(enc.encode(this._text));
+  }
+  Response.prototype.text = function () { return Promise.resolve(this._text); };
+  Response.prototype.json = function () {
+    try {
+      return Promise.resolve(JSON.parse(this._text || "null"));
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  };
+  Response.prototype.arrayBuffer = function () {
+    var enc = new TextEncoder();
+    return Promise.resolve(enc.encode(this._text).buffer);
+  };
+  Response.prototype.clone = function () {
+    return new Response(this._text, {
+      status: this.status,
+      statusText: this.statusText,
+      headers: this.headers,
+      url: this.url
+    });
+  };
+  global.Response = Response;
+
+  /* Standard Request implementation */
+  function Request(input, init) {
+    init = init || {};
+    this.url = typeof input === "string" ? input : (input && input.url) || "";
+    this.method = String(init.method || (input && input.method) || "GET").toUpperCase();
+    this.headers = new Headers(init.headers || (input && input.headers) || {});
+    this.body = init.body || null;
+  }
+  global.Request = Request;
+
+  /* Upgraded fetch with live Headers and ReadableStream body */
   global.fetch = function (url, opts) {
     opts = opts || {};
     var method = String(opts.method || "GET");
     var body = opts.body == null ? "" : String(opts.body);
     var raw = typeof host_fetch === "function" ? host_fetch(String(url), method, body) : "{\"status\":599,\"body\":\"\"}";
     var res = typeof raw === "string" ? JSON.parse(raw) : raw;
-    var text = res.body || "";
-    return Promise.resolve({
-      ok: res.status >= 200 && res.status < 300,
+    var respHeaders = new Headers();
+    if (res.content_type) respHeaders.set("content-type", res.content_type);
+    return Promise.resolve(new Response(res.body || "", {
       status: res.status || 0,
       url: res.url || String(url),
-      type: "basic",
-      text: function () { return Promise.resolve(text); },
-      json: function () { return Promise.resolve(JSON.parse(text || "null")); }
+      headers: respHeaders
+    }));
+  };
+
+  /* EventSource for Server-Sent Events (SSE text/event-stream) */
+  function EventSource(url, dict) {
+    this.url = String(url || "");
+    this.readyState = 0; // CONNECTING
+    this.onopen = null;
+    this.onmessage = null;
+    this.onerror = null;
+    this._listeners = {};
+    var self = this;
+
+    setTimeout(function () {
+      try {
+        if (typeof host_fetch === "function") {
+          var raw = host_fetch(self.url, "GET", "");
+          var res = typeof raw === "string" ? JSON.parse(raw) : raw;
+          if (res.status >= 200 && res.status < 300) {
+            self.readyState = 1; // OPEN
+            if (typeof self.onopen === "function") self.onopen(new Event("open"));
+            self._dispatch("open", new Event("open"));
+
+            var lines = (res.body || "").split(/\r?\n/);
+            var buffer = [];
+            for (var i = 0; i < lines.length; i++) {
+              var line = lines[i];
+              if (line.indexOf("data:") === 0) {
+                buffer.push(line.substring(5).trim());
+              } else if (line.trim() === "" && buffer.length > 0) {
+                var msgData = buffer.join("\n");
+                buffer = [];
+                var msgEvt = new MessageEvent("message", { data: msgData, origin: self.url });
+                if (typeof self.onmessage === "function") self.onmessage(msgEvt);
+                self._dispatch("message", msgEvt);
+              }
+            }
+          } else {
+            self.readyState = 2; // CLOSED
+            if (typeof self.onerror === "function") self.onerror(new Event("error"));
+            self._dispatch("error", new Event("error"));
+          }
+        }
+      } catch (err) {
+        self.readyState = 2;
+        if (typeof self.onerror === "function") self.onerror(new Event("error"));
+        self._dispatch("error", new Event("error"));
+      }
+    }, 0);
+  }
+  EventSource.CONNECTING = 0;
+  EventSource.OPEN = 1;
+  EventSource.CLOSED = 2;
+  EventSource.prototype.close = function () { this.readyState = 2; };
+  EventSource.prototype.addEventListener = function (type, fn) {
+    if (!this._listeners[type]) this._listeners[type] = [];
+    this._listeners[type].push(fn);
+  };
+  EventSource.prototype.removeEventListener = function (type, fn) {
+    if (!this._listeners[type]) return;
+    this._listeners[type] = this._listeners[type].filter(function (l) { return l !== fn; });
+  };
+  EventSource.prototype._dispatch = function (type, evt) {
+    (this._listeners[type] || []).forEach(function (fn) {
+      try { fn(evt); } catch (e) {}
     });
   };
+  global.EventSource = EventSource;
 
   function XMLHttpRequest() {
     this.readyState = 0;
@@ -1892,21 +2162,23 @@
 
     var htmlElements = [
       "HTMLAnchorElement", "HTMLAreaElement", "HTMLAudioElement", "HTMLBaseElement",
-      "HTMLBodyElement", "HTMLBRElement", "HTMLButtonElement", "HTMLCanvasElement",
-      "HTMLDataElement", "HTMLDataListElement", "HTMLDetailsElement", "HTMLDialogElement",
-      "HTMLDivElement", "HTMLDListElement", "HTMLEmbedElement", "HTMLFieldSetElement",
-      "HTMLFormElement", "HTMLHeadingElement", "HTMLHeadElement", "HTMLHRElement",
-      "HTMLHtmlElement", "HTMLIFrameElement", "HTMLImageElement", "HTMLInputElement",
-      "HTMLLabelElement", "HTMLLegendElement", "HTMLLIElement", "HTMLLinkElement",
-      "HTMLMapElement", "HTMLMetaElement", "HTMLMeterElement", "HTMLModElement",
-      "HTMLObjectElement", "HTMLOListElement", "HTMLOptGroupElement", "HTMLOptionElement",
-      "HTMLOutputElement", "HTMLParagraphElement", "HTMLParamElement", "HTMLPictureElement",
-      "HTMLPreElement", "HTMLProgressElement", "HTMLQuoteElement", "HTMLScriptElement",
-      "HTMLSelectElement", "HTMLSlotElement", "HTMLSourceElement", "HTMLSpanElement",
-      "HTMLStyleElement", "HTMLTableCaptionElement", "HTMLTableCellElement", "HTMLTableColElement",
-      "HTMLTableElement", "HTMLTableRowElement", "HTMLTableSectionElement", "HTMLTemplateElement",
-      "HTMLTextAreaElement", "HTMLTimeElement", "HTMLTitleElement", "HTMLTrackElement",
-      "HTMLUListElement", "HTMLVideoElement", "HTMLUnknownElement"
+      "HTMLBaseFontElement", "HTMLBodyElement", "HTMLBRElement", "HTMLButtonElement",
+      "HTMLCanvasElement", "HTMLDataElement", "HTMLDataListElement", "HTMLDetailsElement",
+      "HTMLDialogElement", "HTMLDirectoryElement", "HTMLDivElement", "HTMLDListElement",
+      "HTMLEmbedElement", "HTMLFieldSetElement", "HTMLFontElement", "HTMLFormElement",
+      "HTMLFrameElement", "HTMLFrameSetElement", "HTMLHeadingElement", "HTMLHeadElement",
+      "HTMLHRElement", "HTMLHtmlElement", "HTMLIFrameElement", "HTMLImageElement",
+      "HTMLInputElement", "HTMLLabelElement", "HTMLLegendElement", "HTMLLIElement",
+      "HTMLLinkElement", "HTMLMapElement", "HTMLMarqueeElement", "HTMLMetaElement",
+      "HTMLMeterElement", "HTMLModElement", "HTMLObjectElement", "HTMLOListElement",
+      "HTMLOptGroupElement", "HTMLOptionElement", "HTMLOutputElement",
+      "HTMLParagraphElement", "HTMLParamElement", "HTMLPictureElement", "HTMLPreElement",
+      "HTMLProgressElement", "HTMLQuoteElement", "HTMLScriptElement", "HTMLSelectElement",
+      "HTMLSlotElement", "HTMLSourceElement", "HTMLSpanElement", "HTMLStyleElement",
+      "HTMLTableCaptionElement", "HTMLTableCellElement", "HTMLTableColElement",
+      "HTMLTableElement", "HTMLTableRowElement", "HTMLTableSectionElement",
+      "HTMLTemplateElement", "HTMLTextAreaElement", "HTMLTimeElement", "HTMLTitleElement",
+      "HTMLTrackElement", "HTMLUListElement", "HTMLVideoElement", "HTMLUnknownElement"
     ];
     for (var i = 0; i < htmlElements.length; i++) {
       (function (name) {
@@ -1988,9 +2260,6 @@
     global.frames = [];
     global.innerWidth = 1280;
     global.innerHeight = 720;
-    global.atob = function (s) { return s; };
-    global.btoa = function (s) { return s; };
-    global.TextEncoder = function () { this.encode = function (t) { return t; }; };
     return true;
   };
   global.__serialize = function () {

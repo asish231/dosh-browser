@@ -50,7 +50,15 @@ def _mask_literals(code: str) -> str:
             continue
         if ch == "/" and nxt == "*":
             j = code.find("*/", i)
-            j = n if j < 0 else j + 2
+            unterminated = j < 0
+            if unterminated:
+                # A scanner desync, not real code: an unterminated construct is
+                # invalid JavaScript. Masking from here to EOF would silently
+                # swallow every real statement that follows, so fall through and
+                # keep reading code.
+                j = min(n, i + 2)
+            else:
+                j = j + 2
             for k in range(i, j):
                 out[k] = "\x00"
             i = j
@@ -69,6 +77,13 @@ def _mask_literals(code: str) -> str:
                     j += 1
                     break
                 j += 1
+            if j >= n:
+                # Desync: treat the backtick as an ordinary character and keep
+                # reading code, so real statements after it are still rewritten.
+                out[i] = "\x00"
+                i = i + 1
+                prev = "`"
+                continue
             for k in range(i, min(j, n)):
                 out[k] = "\x00"
             i = j
@@ -86,12 +101,22 @@ def _mask_literals(code: str) -> str:
                     j += 1
                     break
                 j += 1
+            if j >= n:
+                out[i] = "\x00"
+                i = i + 1
+                prev = ch
+                continue
             for k in range(i + 1, j - 1 if j <= n and code[j - 1] == ch else min(j, n)):
                 out[k] = "\x00"
             i = j
             prev = ch
             continue
-        if ch == "/" and prev not in ")]}" and not (prev.isalnum() or prev in "_$"):
+        if ch == "/" and prev not in ")]}\"'`" and not (prev.isalnum() or prev in "_$"):
+            # A '/' opens a regex only when the previous token cannot end an
+            # expression. A string or template delimiter *is* value-ending, so
+            # the '/' after `"path:"` is division, not a regex: treating it as a
+            # regex scans forward for a closing '/' that never arrives and masks
+            # the rest of the file, which silently swallows real statements.
             # regex literal: '/' after a value is division, after anything else it opens
             j = i + 1
             in_class = False
@@ -112,6 +137,13 @@ def _mask_literals(code: str) -> str:
                 j += 1
             while j < n and code[j].isalpha():
                 j += 1
+            if j >= n or code[j - 1] != "/":
+                # Not a terminated regex: desync. Skip the opener only, so the
+                # code after it is still visible to the rewrites.
+                out[i] = "\x00"
+                i = i + 1
+                prev = "/"
+                continue
             for k in range(i, j):
                 out[k] = "\x00"
             i = j
