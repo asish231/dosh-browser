@@ -97,5 +97,28 @@ class ModernWebPlatformTests(unittest.TestCase):
             self.assertIn('data-es-url="https://example.com/events"', out)
         asyncio.run(run())
 
+    def test_owner_document_and_window_and_scroll_dimensions(self):
+        html = """
+        <html><body>
+        <div id="test-root"></div>
+        <script>
+            var root = document.getElementById("test-root");
+            var isDoc = root.ownerDocument === document;
+            document.body.setAttribute("data-owner-doc", String(isDoc));
+            document.body.setAttribute("data-window-instance", String(window instanceof Window));
+            document.body.setAttribute("data-has-scroll-w", String(typeof root.scrollWidth === "number"));
+            document.body.setAttribute("data-has-scroll-h", String(typeof root.scrollHeight === "number"));
+        </script>
+        </body></html>
+        """
+        async def run():
+            client = httpx.AsyncClient()
+            out, info = await run_scripts(html, "https://example.com/", client, force=True)
+            self.assertIn('data-owner-doc="true"', out)
+            self.assertIn('data-window-instance="true"', out)
+            self.assertIn('data-has-scroll-w="true"', out)
+            self.assertIn('data-has-scroll-h="true"', out)
+        asyncio.run(run())
+
 if __name__ == "__main__":
     unittest.main()

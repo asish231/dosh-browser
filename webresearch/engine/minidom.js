@@ -70,6 +70,22 @@
     this.removeChild(old);
     return old;
   };
+  Object.defineProperty(Node.prototype, "ownerDocument", {
+    get: function () {
+      if (this.nodeType === 9) return null;
+      if (this._ownerDoc) return this._ownerDoc;
+      var p = this.parentNode;
+      while (p) {
+        if (p.nodeType === 9) return p;
+        p = p.parentNode;
+      }
+      return global.document || null;
+    },
+    set: function (d) {
+      this._ownerDoc = d;
+    },
+    configurable: true
+  });
   Object.defineProperty(Node.prototype, "textContent", {
     get: function () {
       if (this.nodeType === 3) return this._text || "";
@@ -892,6 +908,8 @@
   Object.defineProperty(Element.prototype, "offsetHeight", { get: function () { return this.getBoundingClientRect().height; } });
   Object.defineProperty(Element.prototype, "clientWidth", { get: function () { return this.getBoundingClientRect().width; } });
   Object.defineProperty(Element.prototype, "clientHeight", { get: function () { return this.getBoundingClientRect().height; } });
+  Object.defineProperty(Element.prototype, "scrollWidth", { get: function () { return this.clientWidth || 0; }, configurable: true });
+  Object.defineProperty(Element.prototype, "scrollHeight", { get: function () { return this.clientHeight || 0; }, configurable: true });
   Object.defineProperty(Element.prototype, "classList", {
     get: function () {
       var el = this;
@@ -1537,6 +1555,15 @@
   }
   global.MessagePort = MessagePort;
   global.MessageChannel = MessageChannel;
+
+  function Window() {}
+  Object.defineProperty(Window, Symbol.hasInstance, {
+    value: function (inst) {
+      return inst === global || (inst && inst.window === inst) || inst instanceof Window;
+    }
+  });
+  global.Window = Window;
+  global.window = global;
 
   /* History API for SPA routers. */
   global.history = {
