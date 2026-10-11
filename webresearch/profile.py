@@ -8,6 +8,7 @@ hostel Wi-Fi rate limits) by reusing trusted credentials.
 from __future__ import annotations
 
 import contextlib
+import http.cookiejar
 import json
 import os
 from pathlib import Path
@@ -42,6 +43,44 @@ WAF_TOKEN_NAMES = {
 }
 
 
+def _cookie_to_dict(c: Any) -> dict[str, Any]:
+    """Convert an http.cookiejar.Cookie or dictionary into a normalized cookie dict."""
+    if isinstance(c, dict):
+        return {
+            "name": c.get("name", ""),
+            "value": c.get("value", ""),
+            "domain": c.get("domain", "") or "",
+            "path": c.get("path", "/") or "/",
+            "secure": bool(c.get("secure")),
+            "expires": c.get("expires"),
+            "http_only": bool(c.get("http_only")),
+            "same_site": c.get("same_site"),
+            "host_only": bool(c.get("host_only")),
+            "partition_key": c.get("partition_key"),
+        }
+    rest_lower = {str(k).lower(): v for k, v in getattr(c, "_rest", {}).items()}
+    http_only = "httponly" in rest_lower
+    same_site = rest_lower.get("samesite")
+    if same_site is not None:
+        same_site = str(same_site)
+    partition_key = rest_lower.get("partitionkey")
+    if not partition_key and "partitioned" in rest_lower:
+        partition_key = "true"
+    host_only = not getattr(c, "domain_specified", True)
+    return {
+        "name": getattr(c, "name", ""),
+        "value": getattr(c, "value", ""),
+        "domain": getattr(c, "domain", "") or "",
+        "path": getattr(c, "path", "/") or "/",
+        "secure": bool(getattr(c, "secure", False)),
+        "expires": getattr(c, "expires", None),
+        "http_only": http_only,
+        "same_site": same_site,
+        "host_only": host_only,
+        "partition_key": partition_key,
+    }
+
+
 class Profile:
     """Manages persistent browser profile data (cookies and storage) via SQLite and JSON."""
 
@@ -71,11 +110,26 @@ class Profile:
                         path TEXT NOT NULL DEFAULT '/',
                         secure INTEGER NOT NULL DEFAULT 0,
                         expires REAL,
+                        http_only INTEGER NOT NULL DEFAULT 0,
+                        same_site TEXT,
+                        host_only INTEGER NOT NULL DEFAULT 0,
+                        partition_key TEXT,
                         created_at REAL NOT NULL,
                         PRIMARY KEY(name, domain, path)
                     )
                     """
                 )
+                cur = conn.cursor()
+                cur.execute("PRAGMA table_info(cookies)")
+                existing_cols = {row[1].lower() for row in cur.fetchall()}
+                for col_name, col_type in [
+                    ("http_only", "INTEGER NOT NULL DEFAULT 0"),
+                    ("same_site", "TEXT"),
+                    ("host_only", "INTEGER NOT NULL DEFAULT 0"),
+                    ("partition_key", "TEXT"),
+                ]:
+                    if col_name not in existing_cols:
+                        conn.execute(f"ALTER TABLE cookies ADD COLUMN {col_name} {col_type}")
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS storage (
@@ -92,25 +146,52 @@ class Profile:
             pass
 
     def load_cookies(self) -> list[dict[str, Any]]:
-        """Load cookies list from SQLite database, with JSON fallback."""
+        """Load cookies list from SQLite database, with JSON fallback.
+        
+        Filters expired entries and maintains strict synchronization with disk.
+        """
+        now = time.time()
         if self.db_file.exists():
             try:
                 with sqlite3.connect(self.db_file) as conn:
                     cur = conn.cursor()
-                    cur.execute("SELECT name, value, domain, path, secure, expires FROM cookies")
+                    cur.execute(
+                        """
+                        SELECT name, value, domain, path, secure, expires,
+                               http_only, same_site, host_only, partition_key
+                        FROM cookies
+                        """
+                    )
                     rows = cur.fetchall()
-                    if rows:
-                        return [
+                    valid_cookies = []
+                    expired_names = []
+                    for r in rows:
+                        exp = r[5]
+                        if exp is not None and isinstance(exp, (int, float)) and exp > 0 and exp < now:
+                            expired_names.append((r[0], r[2], r[3]))
+                            continue
+                        valid_cookies.append(
                             {
                                 "name": r[0],
                                 "value": r[1],
                                 "domain": r[2],
                                 "path": r[3],
                                 "secure": bool(r[4]),
-                                "expires": r[5],
+                                "expires": exp,
+                                "http_only": bool(r[6]),
+                                "same_site": r[7],
+                                "host_only": bool(r[8]),
+                                "partition_key": r[9],
                             }
-                            for r in rows
-                        ]
+                        )
+                    if expired_names:
+                        for n, d, p in expired_names:
+                            conn.execute(
+                                "DELETE FROM cookies WHERE name = ? AND domain = ? AND path = ?",
+                                (n, d, p),
+                            )
+                        conn.commit()
+                    return valid_cookies
             except Exception:
                 pass
 
@@ -120,38 +201,56 @@ class Profile:
             with open(self.cookies_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, list):
-                    return data
+                    res = []
+                    for c in data:
+                        exp = c.get("expires")
+                        if exp is not None and isinstance(exp, (int, float)) and exp > 0 and exp < now:
+                            continue
+                        res.append(_cookie_to_dict(c))
+                    return res
         except Exception:
             pass
         return []
 
     def save_cookies(self, cookies: list[dict[str, Any]] | httpx.Cookies | Any) -> None:
-        """Save a list of cookie dicts or an httpx.Cookies instance to SQLite and disk."""
+        """Save a list of cookie dicts or an httpx.Cookies instance to SQLite and disk.
+        
+        Synchronizes deletions: cookies absent in input are removed from SQLite.
+        """
         out: list[dict[str, Any]] = []
         if isinstance(cookies, list):
-            out = cookies
+            out = [_cookie_to_dict(c) for c in cookies]
         elif hasattr(cookies, "jar"):
             for c in cookies.jar:
-                out.append(
-                    {
-                        "name": c.name,
-                        "value": c.value,
-                        "domain": c.domain or "",
-                        "path": c.path or "/",
-                        "secure": bool(c.secure),
-                        "expires": c.expires if hasattr(c, "expires") else None,
-                    }
-                )
-        self._ensure_dir()
-        # 1. Sync to SQLite database
+                out.append(_cookie_to_dict(c))
+        elif hasattr(cookies, "__iter__"):
+            for c in cookies:
+                out.append(_cookie_to_dict(c))
+
         now = time.time()
+        active_cookies = [
+            c for c in out
+            if not (
+                c.get("expires")
+                and isinstance(c.get("expires"), (int, float))
+                and c["expires"] > 0
+                and c["expires"] < now
+            )
+        ]
+
+        self._ensure_dir()
+        # 1. Sync to SQLite database atomically: wipe old active rows so deletions persist
         try:
             with sqlite3.connect(self.db_file) as conn:
-                for c in out:
+                conn.execute("DELETE FROM cookies")
+                for c in active_cookies:
                     conn.execute(
                         """
-                        INSERT OR REPLACE INTO cookies (name, value, domain, path, secure, expires, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        INSERT OR REPLACE INTO cookies (
+                            name, value, domain, path, secure, expires,
+                            http_only, same_site, host_only, partition_key, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             c.get("name", ""),
@@ -160,6 +259,10 @@ class Profile:
                             c.get("path", "/"),
                             1 if c.get("secure") else 0,
                             c.get("expires"),
+                            1 if c.get("http_only") else 0,
+                            c.get("same_site"),
+                            1 if c.get("host_only") else 0,
+                            c.get("partition_key"),
                             now,
                         ),
                     )
@@ -170,48 +273,110 @@ class Profile:
         # 2. Sync to JSON file
         temp_file = self.cookies_file.with_suffix(".tmp")
         with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(out, f, indent=2)
+            json.dump(active_cookies, f, indent=2)
         temp_file.replace(self.cookies_file)
 
-    def apply_to_client(self, client: httpx.AsyncClient) -> int:
-        """Apply stored cookies into an httpx.AsyncClient cookie jar."""
+    def delete_cookie(self, name: str, domain: str = "", path: str = "/") -> bool:
+        """Explicitly delete a cookie by name, domain, and path."""
         cookies = self.load_cookies()
+        d = domain.lower().lstrip(".")
+        p = path or "/"
+        new_cookies = [
+            c for c in cookies
+            if not (
+                c.get("name") == name
+                and (not d or (c.get("domain") or "").lower().lstrip(".") == d)
+                and (p == "/" or c.get("path") == p)
+            )
+        ]
+        self.save_cookies(new_cookies)
+        return len(new_cookies) < len(cookies)
+
+    def apply_to_client(self, client: httpx.AsyncClient) -> int:
+        """Apply stored cookies into an httpx.AsyncClient cookie jar with full security attributes."""
+        cookies = self.load_cookies()
+        restored = 0
         for c in cookies:
             name = c.get("name")
             value = c.get("value")
-            domain = (c.get("domain") or "").lstrip(".")
+            if not name or value is None:
+                continue
+
+            rest: dict[str, Any] = {}
+            if c.get("http_only"):
+                rest["HttpOnly"] = None
+            if c.get("same_site"):
+                rest["SameSite"] = str(c.get("same_site"))
+            if c.get("partition_key"):
+                rest["Partitioned"] = None
+                rest["PartitionKey"] = str(c.get("partition_key"))
+
+            domain = c.get("domain") or ""
+            host_only = bool(c.get("host_only"))
+            domain_specified = bool(domain) and not host_only
+            domain_initial_dot = domain.startswith(".")
             path = c.get("path") or "/"
-            if name and value:
+
+            try:
+                cookie_obj = http.cookiejar.Cookie(
+                    version=0,
+                    name=name,
+                    value=str(value),
+                    port=None,
+                    port_specified=False,
+                    domain=domain,
+                    domain_specified=domain_specified,
+                    domain_initial_dot=domain_initial_dot,
+                    path=path,
+                    path_specified=bool(c.get("path")),
+                    secure=bool(c.get("secure")),
+                    expires=c.get("expires"),
+                    discard=False,
+                    comment=None,
+                    comment_url=None,
+                    rest=rest,
+                    rfc2109=False,
+                )
+                client.cookies.jar.set_cookie(cookie_obj)
+                restored += 1
+            except Exception:
                 with contextlib.suppress(Exception):
-                    client.cookies.set(name, value, domain=domain or None, path=path)
-        return len(cookies)
+                    client.cookies.set(name, str(value), domain=domain.lstrip(".") or None, path=path)
+                    restored += 1
+        return restored
 
     def save_from_client(self, client: httpx.AsyncClient) -> int:
         """Extract cookies from an httpx.AsyncClient and persist them."""
         out: list[dict[str, Any]] = []
         if hasattr(client, "cookies") and hasattr(client.cookies, "jar"):
             for cookie in client.cookies.jar:
-                out.append(
-                    {
-                        "name": cookie.name,
-                        "value": cookie.value,
-                        "domain": cookie.domain or "",
-                        "path": cookie.path or "/",
-                        "secure": bool(cookie.secure),
-                        "expires": cookie.expires if hasattr(cookie, "expires") else None,
-                    }
-                )
+                out.append(_cookie_to_dict(cookie))
         self.save_cookies(out)
         return len(out)
 
-    def get_domain_cookies(self, domain: str) -> list[dict[str, Any]]:
-        """Return all stored cookies matching the given host/domain."""
+    def get_domain_cookies(self, domain: str, secure: bool | None = None) -> list[dict[str, Any]]:
+        """Return stored cookies matching the given host/domain without subdomain leakage."""
         d = domain.lower().lstrip(".")
+        now = time.time()
         matched = []
         for c in self.load_cookies():
+            exp = c.get("expires")
+            if exp is not None and isinstance(exp, (int, float)) and exp > 0 and exp < now:
+                continue
+            if secure is False and c.get("secure"):
+                continue
+
             cd = (c.get("domain") or "").lower().lstrip(".")
-            if not cd or cd == d or d.endswith("." + cd) or cd.endswith("." + d):
-                matched.append(c)
+            is_host_only = bool(c.get("host_only"))
+
+            if is_host_only or not cd:
+                if cd == d:
+                    matched.append(c)
+            else:
+                # Domain-scoped: matches exact domain or subdomains of cd.
+                # Subdomain cookies never leak to parent domain.
+                if cd == d or d.endswith("." + cd):
+                    matched.append(c)
         return matched
 
     def get_waf_tokens(self, domain: str) -> dict[str, str]:
