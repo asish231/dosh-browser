@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextvars
+import json
 import os
 from contextlib import asynccontextmanager
 from typing import Any
@@ -145,14 +147,23 @@ class AskBody(BaseModel):
     thinking: bool = False
 
 
+_current_tenant_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_tenant_id", default="default"
+)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     browser = Browser()
-    async with httpx.AsyncClient(**client_kwargs()) as http:
-        app.state.http = http
-        app.state.browser = browser
-        yield
-        await browser.close_all()
+    app.state.browser = browser
+    app.state.tenant_clients = {}
+    default_client = httpx.AsyncClient(**client_kwargs())
+    app.state.tenant_clients["default"] = default_client
+    app.state.http = default_client
+    yield
+    await browser.close_all()
+    for client in list(app.state.tenant_clients.values()):
+        await client.aclose()
 
 
 def create_app() -> FastAPI:
@@ -168,29 +179,70 @@ def create_app() -> FastAPI:
     )
 
     api_token = os.environ.get("WR_API_TOKEN", "")
+    tenant_tokens_raw = os.environ.get("WR_TENANT_TOKENS", "").strip()
+    tenant_tokens: dict[str, str] = {}
+    if tenant_tokens_raw:
+        try:
+            parsed = json.loads(tenant_tokens_raw)
+            if isinstance(parsed, dict):
+                tenant_tokens = {str(k): str(v) for k, v in parsed.items()}
+        except Exception:
+            for pair in tenant_tokens_raw.split(","):
+                if ":" in pair:
+                    tok, tid = pair.split(":", 1)
+                    tenant_tokens[tok.strip()] = tid.strip()
 
     @app.middleware("http")
-    async def require_token(request: Request, call_next):
-        if api_token and request.url.path.startswith("/v1"):
-            supplied = request.headers.get("x-api-token", "")
-            auth = request.headers.get("authorization", "")
-            if auth.lower().startswith("bearer "):
-                supplied = supplied or auth.split(" ", 1)[1]
-            if supplied != api_token:
+    async def tenant_isolation_middleware(request: Request, call_next):
+        supplied = request.headers.get("x-api-token", "").strip()
+        auth = request.headers.get("authorization", "").strip()
+        if auth.lower().startswith("bearer "):
+            supplied = supplied or auth.split(" ", 1)[1].strip()
+
+        if (api_token or tenant_tokens) and request.url.path.startswith("/v1"):
+            authenticated = False
+            if tenant_tokens and supplied in tenant_tokens:
+                authenticated = True
+            elif api_token and supplied == api_token:
+                authenticated = True
+            if not authenticated:
                 return JSONResponse({"detail": "unauthorized"}, status_code=401)
-        return await call_next(request)
+
+        header_tenant = request.headers.get("x-tenant-id", "").strip()
+        if header_tenant:
+            tenant_id = header_tenant
+        elif supplied and supplied in tenant_tokens:
+            tenant_id = tenant_tokens[supplied]
+        elif supplied and api_token:
+            tenant_id = "default"
+        else:
+            tenant_id = "default"
+
+        c_token = _current_tenant_id.set(tenant_id)
+        try:
+            return await call_next(request)
+        finally:
+            _current_tenant_id.reset(c_token)
+
+    def get_tenant_http(tenant_id: str = "default") -> httpx.AsyncClient:
+        clients: dict[str, httpx.AsyncClient] = getattr(app.state, "tenant_clients", {})
+        if tenant_id not in clients:
+            clients[tenant_id] = httpx.AsyncClient(**client_kwargs())
+        return clients[tenant_id]
 
     def http() -> httpx.AsyncClient:
-        return app.state.http
+        return get_tenant_http(_current_tenant_id.get())
 
     def browser() -> Browser:
         return app.state.browser
 
     def session_or_404(sid: str):
         try:
-            return browser().get(sid)
+            return browser().get(sid, tenant_id=_current_tenant_id.get())
         except KeyError:
             raise HTTPException(404, f"session {sid} not found") from None
+        except PermissionError:
+            raise HTTPException(403, f"access denied to session {sid}") from None
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def home():
@@ -298,7 +350,11 @@ def create_app() -> FastAPI:
     @app.post("/v1/sessions", tags=["session"])
     async def api_create_session(body: SessionCreate | None = None):
         body = body or SessionCreate()
-        session = await browser().create(headers=body.headers, proxy=body.proxy)
+        session = await browser().create(
+            headers=body.headers,
+            proxy=body.proxy,
+            tenant_id=_current_tenant_id.get(),
+        )
         return {"id": session.id}
 
     @app.get("/v1/sessions/{sid}/page", response_model=Page, tags=["session"])
