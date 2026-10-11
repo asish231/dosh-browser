@@ -6,7 +6,7 @@ import sys
 
 from webresearch.fetch import make_client
 from webresearch.read import captcha_code, read
-from webresearch.search import search
+from webresearch.search import search, search_images
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -26,10 +26,16 @@ def main(argv: list[str] | None = None) -> None:
     read_cmd.add_argument("--max-chars", type=int, default=8000)
     read_cmd.add_argument("--js", choices=["auto", "always", "never"], default="auto")
 
-    search_cmd = sub.add_parser("search", help="Google search (DuckDuckGo fallback)")
+    search_cmd = sub.add_parser("search", help="Web search with waterfall fallback (Google -> Bing -> DuckDuckGo -> Yahoo)")
     search_cmd.add_argument("query")
     search_cmd.add_argument("--json", action="store_true")
-    search_cmd.add_argument("--engine", choices=["auto", "google", "ddg"], default="auto")
+    search_cmd.add_argument("--engine", choices=["auto", "google", "bing", "ddg", "yahoo", "lite"], default="auto")
+
+    images_cmd = sub.add_parser("images", help="Image search over HTTP, no Chromium (brave -> bing -> ddg -> google)")
+    images_cmd.add_argument("query")
+    images_cmd.add_argument("--json", action="store_true")
+    images_cmd.add_argument("--engine", choices=["auto", "brave", "bing-images", "ddg-images", "google-images"], default="auto")
+    images_cmd.add_argument("--max-hits", type=int, default=8)
 
     captcha_cmd = sub.add_parser(
         "captcha",
@@ -221,6 +227,13 @@ async def _run_cli(args: argparse.Namespace) -> None:
             return
         if args.cmd == "search":
             result = await search(args.query, client=client, engine=args.engine)
+            out = result.model_dump_json(indent=2) if args.json else result.view
+            print(out)
+            tokens = (len(out) + 3) // 4
+            print(f"\n[Tokens burned for this task: ~{tokens:,} tokens ({len(out):,} chars)]", file=sys.stderr)
+            return
+        if args.cmd == "images":
+            result = await search_images(args.query, client=client, engine=args.engine, max_hits=args.max_hits)
             out = result.model_dump_json(indent=2) if args.json else result.view
             print(out)
             tokens = (len(out) + 3) // 4

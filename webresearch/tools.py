@@ -25,6 +25,26 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "browser_images",
+            "description": (
+                "Image search over HTTP (no Chromium). Waterfall brave-images -> bing-images -> "
+                "ddg-images -> google-images. Returns numbered hits with title [source], direct "
+                "image url, and proxy snippet. Google/DDG may report blocked with reason."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "q": {"type": "string"},
+                    "max_hits": {"type": "integer", "default": 8},
+                    "engine": {"type": "string", "enum": ["auto", "brave", "bing-images", "ddg-images", "google-images"], "default": "auto"},
+                },
+                "required": ["q"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "browser_read",
             "description": (
                 "Open a URL. Runs page JS in the built-in QuickJS mini-DOM (not Chromium). "
