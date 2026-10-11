@@ -80,6 +80,26 @@
     this.childNodes.push(child);
     queueMutation("childList", this, { addedNodes: [child] });
     _notifyConnected(child);
+    /* Runtime-injected scripts (document.createElement('script')) can't be seen
+       by the static extractor. Push them onto a queue that the host drains after
+       each pump pass so LinkedIn-style dynamically-loaded ESM bundles execute. */
+    if (child && (child.nodeName === "SCRIPT" || (child.nodeName === "#document-fragment" && child.querySelectorAll))) {
+      var scripts = [];
+      if (child.nodeName === "SCRIPT") scripts = [child];
+      else scripts = child.querySelectorAll("script");
+      for (var s = 0; s < scripts.length; s++) {
+        var el = scripts[s];
+        var info = {
+          src: el.getAttribute("src") || "",
+          text: el.textContent || "",
+          type: (el.getAttribute("type") || "").toLowerCase()
+        };
+        if (info.src || info.text) {
+          globalThis.__WR_INJECTED_SCRIPTS = globalThis.__WR_INJECTED_SCRIPTS || [];
+          globalThis.__WR_INJECTED_SCRIPTS.push(info);
+        }
+      }
+    }
     return child;
   };
   Node.prototype.removeChild = function (child) {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import json
@@ -805,6 +806,10 @@ class Session:
         if pwd is None:
             return {"verdict": "failed", "message": "password field vanished after typing username", "url": self.url}
         await self.type(wall.password_ref, password, max_chars=max_chars)
+
+        # Small human-mimicking delay between typing and clicking submit.
+        # Sites that score keystroke-to-click intervals see a bot when it is 0.
+        await asyncio.sleep(0.3 + (hash(username + password) % 500) / 1000.0)
 
         # Submit: prefer the detected submit button; fall back to form submit.
         post: Page

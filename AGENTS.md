@@ -132,6 +132,8 @@ Be honest about these rather than working around them silently.
 | Canvas / iframe pixels | Never reach the agent. Both are decomposed at parse time (`parse.py`). |
 | Trusted CDP input | Does not exist and must not be added. |
 | Cross-origin frame messaging | Frames are fetched as separate documents; there is no real `postMessage` handshake between them. |
+| Fingerprint parity | TLS JA3/JA4 matches Chrome 124 via `curl_cffi` (both page fetch and subresource `host_fetch` lanes); Sec-Fetch-* headers computed from origin relationship; Sec-CH-UA client hints; enriched `navigator.*` device block (hardwareConcurrency, deviceMemory, screen, timezone, platform); inter-submit delay in login flows mimics human timing. |
+| Injected script execution | Scripts added to the DOM at runtime via `appendChild` (SPA chunk injection) are detected and executed: `src` scripts are fetched and evaled, inline scripts evaled directly, ESM auto-detected for both. Failures are surfaced as JS console errors. |
 
 Say "this needs a real browser" plainly when it is true. Do not paper over it.
 

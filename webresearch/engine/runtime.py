@@ -126,6 +126,73 @@ def _pump_websockets(ctx: Context) -> None:
         pass
 
 
+def _drain_injected_scripts(ctx, url, client, info, curl_sync, sync, record_error):
+    """Run any script elements that were injected at runtime (createElement + appendChild).
+
+    Many SPA frameworks (React, Vue, Angular) inject chunks dynamically. The
+    static extract_scripts can never see them, so we drain this queue after
+    every pump pass to give those scripts a chance to execute.
+    """
+    import json as _json
+    try:
+        raw = ctx.eval(
+            "JSON.stringify(globalThis.__WR_INJECTED_SCRIPTS || [])"
+        )
+        scripts = _json.loads(str(raw)) if raw and str(raw) != "null" else []
+    except Exception:
+        scripts = []
+
+    for script in scripts[:40]:  # bound in-flight
+        src = str(script.get("src") or "").strip()
+        text = str(script.get("text") or "").strip()
+        stype = str(script.get("type") or "").lower()
+        if not src and not text:
+            continue
+        try:
+            if src:
+                abs_src = urljoin(url, src)
+                from webresearch.fetch import _curl_requests
+                if curl_sync is not None and _curl_requests is not None:
+                    resp = curl_sync.get(abs_src, headers={"Referer": url})
+                    code = resp.text if resp.status_code < 400 else ""
+                else:
+                    resp = sync.get(abs_src, headers={"Referer": url})
+                    code = resp.text if resp.status_code < 400 else ""
+                if code:
+                    if "module" in stype or "export " in code or "import " in code:
+                        from webresearch.engine.modules import transform_module
+                        try:
+                            code = transform_module(code, abs_src, ["__all__"])
+                            ctx.eval(code)
+                            info["modules"] = info.get("modules", 0) + 1
+                            info["scripts"] = info.get("scripts", 0) + 1
+                        except Exception as exc:
+                            record_error(exc)
+                    else:
+                        ctx.eval(code)
+                        info["scripts"] = info.get("scripts", 0) + 1
+            elif text:
+                if "module" in stype or "export " in text or "import " in text:
+                    from webresearch.engine.modules import transform_module
+                    try:
+                        code = transform_module(text, url, ["__all__"])
+                        ctx.eval(code)
+                        info["modules"] = info.get("modules", 0) + 1
+                        info["scripts"] = info.get("scripts", 0) + 1
+                    except Exception as exc:
+                        record_error(exc)
+                else:
+                    ctx.eval(text)
+                    info["scripts"] = info.get("scripts", 0) + 1
+        except Exception as exc:
+            record_error(exc)
+
+    try:
+        ctx.eval("globalThis.__WR_INJECTED_SCRIPTS = [];")
+    except Exception:
+        pass
+
+
 def _pump_jobs(ctx: Context) -> int:
     done = 0
     for _ in range(MAX_JOBS):
@@ -276,6 +343,10 @@ async def run_scripts(
         except Exception:
             curl_sync = None
 
+    def _drain_injected(ctx):
+        """Convenience: drain injected scripts with the closure's context."""
+        _drain_injected_scripts(ctx, url, client, info, curl_sync, sync, record_error)
+
     def do_request(method: str, abs_url: str, body: str, headers: dict, body_b64: str = "") -> tuple[int, str, str, str, dict, bytes]:
         # Binary request bodies (multipart uploads with real file bytes) arrive
         # base64-encoded so arbitrary bytes survive the JS->Python boundary.
@@ -335,6 +406,19 @@ async def run_scripts(
                     "Origin": target_origin if target_origin == page_origin else page_origin,
                     "Accept": "*/*",
                 }
+            # Sec-Fetch: deterministic, computed from the request-page origin
+            # relationship — the same way a real Chrome populates them.
+            # LinkedIn and other sites score these for risk assessment.
+            if target_origin == page_origin:
+                headers["Sec-Fetch-Site"] = "same-origin"
+            elif page_origin and not target_origin:
+                headers["Sec-Fetch-Site"] = "none"
+            elif page_origin and target_origin != page_origin:
+                headers["Sec-Fetch-Site"] = "cross-site"
+            else:
+                headers["Sec-Fetch-Site"] = "none"
+            headers["Sec-Fetch-Mode"] = "cors" if page_origin and target_origin != page_origin else "no-cors"
+            headers["Sec-Fetch-Dest"] = "empty"
             if headers_json:
                 try:
                     custom_hdrs = json.loads(headers_json)
@@ -629,6 +713,7 @@ async def run_scripts(
                 ctx.eval(code)
                 ran += 1
                 _pump_jobs(ctx)
+                _drain_injected(ctx)
             except Exception as exc:
                 record_error(exc)
             finally:
@@ -665,6 +750,7 @@ async def run_scripts(
                     info["modules"] += 1
                     ran += 1
                     _pump_jobs(ctx)
+                    _drain_injected(ctx)
                 except Exception as exc:
                     record_error(exc)
                 if ran >= MAX_SCRIPTS + MAX_MODULES:
@@ -692,6 +778,7 @@ async def run_scripts(
             except Exception:
                 break
             _pump_jobs(ctx)
+            _drain_injected(ctx)
             if not left:
                 break
     
@@ -727,6 +814,7 @@ async def run_scripts(
             except Exception as exc:
                 record_error(exc)
         _pump_jobs(ctx)
+        _drain_injected(ctx)
 
     # Apply agent interactions against the live (post-hydration) DOM.
     if actions:
@@ -838,12 +926,14 @@ async def run_scripts(
                     {"kind": kind, "path": path or selector, "ok": False, "error": str(exc)[:200]}
                 )
             _pump_jobs(ctx)
+            _drain_injected(ctx)
         for _ in range(MAX_TIMER_PASSES):
             try:
                 left = ctx.eval("__drainTimers()")
             except Exception:
                 break
             _pump_jobs(ctx)
+            _drain_injected(ctx)
             if not left:
                 break
         try:
