@@ -140,6 +140,21 @@ class DownloadBody(BaseModel):
     dest_dir: str | None = None
 
 
+class LoginBody(BaseModel):
+    url: str
+    username: str
+    password: str
+
+
+class SubmitOtpBody(BaseModel):
+    checkpoint: str
+    code: str
+
+
+class LoginStateBody(BaseModel):
+    url: str
+
+
 class ActionItem(BaseModel):
     """One control, with how an agent can actually actuate it."""
 
@@ -647,6 +662,30 @@ def create_app() -> FastAPI:
                 "scanned": rec.scanned,
                 "error": rec.error,
             }
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/v1/sessions/{sid}/login", tags=["session"])
+    async def api_login(sid: str, body: LoginBody):
+        try:
+            session = session_or_404(sid)
+            return await session.login(body.url, body.username, body.password)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/v1/sessions/{sid}/otp", tags=["session"])
+    async def api_submit_otp(sid: str, body: SubmitOtpBody):
+        try:
+            session = session_or_404(sid)
+            return await session.submit_otp(body.checkpoint, body.code)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/v1/sessions/{sid}/login_state", tags=["session"])
+    async def api_login_state(sid: str, body: LoginStateBody):
+        try:
+            session = session_or_404(sid)
+            return await session.login_state(body.url)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 

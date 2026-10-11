@@ -44,6 +44,7 @@ from webresearch.types import (
 
 
 from webresearch.profile import Profile
+from webresearch.engine.login import MAX_OTP_ATTEMPTS, OtpCheckpoint
 
 DOWNLOAD_CONTENT_TYPES = (
     "application/pdf",
@@ -143,6 +144,10 @@ class Session:
         self._last_dialogs: list[dict] = []
         self._last_popups: list[dict] = []
         self._popup_depth = 0
+        # Login/OTP checkpoints: memory only. The secret never touches disk.
+        self._otp_checkpoints: dict[str, OtpCheckpoint] = {}
+        self._last_login_wall: dict[str, Any] | None = None
+        self._last_login_verdict: str = ""
 
     def set_stealth(self, enabled: bool) -> bool:
         """Enable or disable humanised stealth mode (biological kinematics, typing pauses, smooth scroll)."""
@@ -391,6 +396,14 @@ class Session:
             )
             js_ran = bool(js_info.get("ran"))
             result = result.model_copy(update={"body": html})
+            # The response is a NEW document: its JS context replaces the
+            # previous page's. A script-less page has no live context at all
+            # (run_scripts returns early without one) — ctx becomes None so
+            # the next action builds fresh from this page, never driving the
+            # stale previous document (a real bug: an OTP submit re-sent
+            # the old login form's credentials).
+            if result.kind == "html":
+                self.current_tab.ctx = js_info.get("ctx") if js_info else None
         frames = (
             await load_frames(html, result.final_url or form.action, self.client, parent_headers=result.headers)
             if result.kind == "html"
@@ -709,6 +722,256 @@ class Session:
             "dialogs": self.dialogs(),
         }
 
+    # -- login / OTP ------------------------------------------------------
+    # Secrets are memory-only: never persisted, never echoed in views or
+    # results. The verdict is computed from page evidence, never assumed.
+
+    def login_wall(self) -> dict | None:
+        """Login wall detected on the current page, if any (dict for the agent)."""
+        wall = self._detect_wall()
+        if wall is None:
+            return None
+        out = {
+            "kind": wall.kind,
+            "url": wall.url,
+            "confidence": wall.confidence,
+            "detail": wall.detail,
+        }
+        if wall.kind == "form":
+            out.update({
+                "username_ref": wall.username_ref,
+                "password_ref": wall.password_ref,
+                "submit_ref": wall.submit_ref,
+            })
+        if wall.kind == "otp":
+            out.update({
+                "refs": wall.refs,
+                "expected_length": wall.expected_length,
+                "split_boxes": wall.split_boxes,
+            })
+        return out
+
+    def _detect_wall(self):
+        from webresearch.engine.login import detect_login_wall, detect_otp_page
+
+        if not self.html:
+            return None
+        targets, _ = inspect_html(self.html, self.url)
+        status = self.page.status if self.page else 200
+        wall = detect_login_wall(self.html, self.url, targets, status)
+        if wall is not None:
+            return wall
+        return detect_otp_page(self.html, self.url, targets)
+
+    async def login(self, url: str, username: str, password: str, *, max_chars: int = 4000) -> dict:
+        """Log in to a site using credentials the agent got from the user.
+
+        Fills the login form through the normal type/submit lanes, then
+        verifies the outcome from page evidence. Returns an honest verdict:
+        verified / otp_required (with a checkpoint) / failed / human_only /
+        account_locked / unknown. The password itself is never part of the
+        result.
+        """
+        from webresearch.engine.login import verify_logged_in
+
+        page = await self.goto(url, max_chars=max_chars)
+        pre_url = url
+        wall = self._detect_wall()
+
+        if wall is None or wall.kind != "form":
+            # Maybe already logged in.
+            verdict = verify_logged_in(
+                self.html, self.url, pre_url, dict(self.client.cookies),
+                page.status if page else 200,
+            )
+            if verdict == "verified":
+                self._last_login_verdict = "verified"
+                return {
+                    "verdict": "verified",
+                    "message": "already logged in; no credentials used",
+                    "url": self.url,
+                }
+            return {
+                "verdict": "failed",
+                "message": "no login form detected on this page",
+                "url": self.url,
+            }
+
+        # Fill through the engine lanes so page JS sees real typing.
+        if wall.username_ref:
+            await self.type(wall.username_ref, username, max_chars=max_chars)
+        targets, _ = inspect_html(self.html, self.url)
+        pwd = next((t for t in targets if t.ref == wall.password_ref), None)
+        if pwd is None:
+            return {"verdict": "failed", "message": "password field vanished after typing username", "url": self.url}
+        await self.type(wall.password_ref, password, max_chars=max_chars)
+
+        # Submit: prefer the detected submit button; fall back to form submit.
+        post: Page
+        if wall.submit_ref:
+            targets, _ = inspect_html(self.html, self.url)
+            btn = next((t for t in targets if t.ref == wall.submit_ref), None)
+            if btn is not None:
+                post = await self.click(wall.submit_ref, max_chars=max_chars)
+            else:
+                post = await self._submit_first_login_form(max_chars)
+        else:
+            post = await self._submit_first_login_form(max_chars)
+
+        verdict = verify_logged_in(
+            self.html, self.url, pre_url, dict(self.client.cookies),
+            post.status if post else 200,
+        )
+        self._last_login_verdict = verdict
+
+        if verdict == "otp_required":
+            checkpoint = self._create_otp_checkpoint()
+            self._last_login_wall = self.login_wall()
+            return {
+                "verdict": "otp_required",
+                "message": "credentials accepted; a verification code is required",
+                "url": self.url,
+                "checkpoint": checkpoint.id,
+                "expected_length": (self._last_login_wall or {}).get("expected_length"),
+            }
+        if verdict == "verified":
+            return {"verdict": "verified", "message": "logged in", "url": self.url}
+        if verdict in {"human_only", "account_locked"}:
+            return {
+                "verdict": verdict,
+                "message": "the page says this step needs a human (lock/identity check)",
+                "url": self.url,
+            }
+        return {
+            "verdict": "failed",
+            "message": "credentials did not lead to a logged-in page; check them and retry",
+            "url": self.url,
+        }
+
+    async def _submit_first_login_form(self, max_chars: int) -> Page:
+        current = self.page
+        if current and current.forms:
+            return await self.submit(1, max_chars=max_chars)
+        # No extracted form: click any submit-ish button.
+        targets, _ = inspect_html(self.html, self.url)
+        btn = next((t for t in targets if t.role == "button"), None)
+        if btn is not None:
+            return await self.click(btn.ref, max_chars=max_chars)
+        raise ValueError("login form has no submit control")
+
+    def _create_otp_checkpoint(self) -> OtpCheckpoint:
+
+        wall = self._detect_wall()
+        cid = secrets.token_hex(4)
+        refs = list(wall.refs) if wall and wall.kind == "otp" else []
+        checkpoint = OtpCheckpoint(
+            id=cid,
+            url=self.url,
+            refs=refs,
+            expected_length=wall.expected_length if wall else None,
+            split_boxes=wall.split_boxes if wall else False,
+        )
+        self._otp_checkpoints[cid] = checkpoint
+        return checkpoint
+
+    async def submit_otp(self, checkpoint_id: str, code: str, *, max_chars: int = 4000) -> dict:
+        """Submit a verification code the human received.
+
+        One call fills, submits, and verifies. Max 3 attempts per checkpoint,
+        ~10 minute expiry; the code is never echoed back.
+        """
+        from webresearch.engine.login import verify_logged_in
+
+        checkpoint = self._otp_checkpoints.get(checkpoint_id)
+        if checkpoint is None:
+            known = ", ".join(self._otp_checkpoints) or "none"
+            return {"verdict": "failed", "message": f"no checkpoint [{checkpoint_id}] (open: {known})"}
+        if checkpoint.expired:
+            self._otp_checkpoints.pop(checkpoint_id, None)
+            return {
+                "verdict": "failed",
+                "message": "checkpoint expired (codes live ~10 minutes); restart the login",
+            }
+        if checkpoint.attempts >= MAX_OTP_ATTEMPTS:
+            return {
+                "verdict": "failed",
+                "message": "too many wrong codes; the site may lock the account — ask the user before retrying",
+            }
+
+        code = (code or "").strip().replace(" ", "")
+        if checkpoint.expected_length and len(code) != checkpoint.expected_length:
+            checkpoint.attempts += 1
+            return {
+                "verdict": "failed",
+                "message": f"code is {len(code)} digit(s); the input expects {checkpoint.expected_length}",
+                "attempts_left": checkpoint.attempts_left,
+            }
+
+        # Fill: digit-per-box for split inputs, whole code otherwise.
+        try:
+            if checkpoint.split_boxes and len(checkpoint.refs) == len(code):
+                for ref, digit in zip(checkpoint.refs, code, strict=False):
+                    await self.type(ref, digit, max_chars=max_chars)
+            elif checkpoint.refs:
+                await self.type(checkpoint.refs[0], code, max_chars=max_chars)
+            else:
+                return {"verdict": "failed", "message": "no code input found on the checkpoint page"}
+        except ValueError as exc:
+            return {"verdict": "failed", "message": f"could not fill the code field: {exc}"}
+
+        post = await self._submit_first_login_form(max_chars)
+        verdict = verify_logged_in(
+            self.html, self.url, checkpoint.url, dict(self.client.cookies),
+            post.status if post else 200,
+        )
+
+        if verdict == "verified":
+            self._otp_checkpoints.pop(checkpoint_id, None)
+            self._last_login_verdict = "verified"
+            return {"verdict": "verified", "message": "logged in", "url": self.url}
+        if verdict == "otp_required":
+            # Same page after submit: the code was rejected. Count the attempt.
+            checkpoint.attempts += 1
+            if checkpoint.attempts >= MAX_OTP_ATTEMPTS:
+                self._otp_checkpoints.pop(checkpoint_id, None)
+                return {
+                    "verdict": "failed",
+                    "message": "code rejected 3 times; stopping before the account locks",
+                }
+            return {
+                "verdict": "rejected",
+                "message": "code rejected; ask the user for the newest code",
+                "attempts_left": checkpoint.attempts_left,
+            }
+        if verdict in {"human_only", "account_locked"}:
+            self._otp_checkpoints.pop(checkpoint_id, None)
+            return {"verdict": verdict, "message": "site requires a human step (lock/identity)", "url": self.url}
+        # Unknown post-state: assume rejection but keep the checkpoint.
+        checkpoint.attempts += 1
+        return {
+            "verdict": "unknown",
+            "message": "submit did not clearly verify or reject; ask the user before retrying",
+            "attempts_left": checkpoint.attempts_left,
+        }
+
+    async def login_state(self, url: str, *, max_chars: int = 2000) -> dict:
+        """Probe whether the current session is logged in at url.
+
+        No credentials involved: loads the page and reads the evidence.
+        """
+        from webresearch.engine.login import verify_logged_in
+
+        page = await self.goto(url, max_chars=max_chars)
+        wall = self._detect_wall()
+        verdict = verify_logged_in(
+            self.html, self.url, url, dict(self.client.cookies),
+            page.status if page else 200,
+        )
+        out = {"url": self.url, "verdict": verdict}
+        if wall is not None and wall.kind == "form":
+            out["login_wall"] = True
+        return out
+
     # -- action-surface driven navigation -------------------------------
     # The `[eN]` refs above are numbered in document order and stop at 80, so
     # an agent cannot address the rest of a real page. The action surface below
@@ -1005,6 +1268,10 @@ resolve a selector directly.
                         res_html, dest_url, self.client, headers=result.headers
                     )
                     result = result.model_copy(update={"body": res_html})
+                    # Same as submit(): the POST response is a new document —
+                    # its JS context (or None for a script-less page) replaces
+                    # the previous one, so the next action drives THIS page.
+                    self.current_tab.ctx = js_info_post.get("ctx") or None
                 page = snapshot(parse(result), max_chars=max_chars)
                 page = _decorate(
                     page,

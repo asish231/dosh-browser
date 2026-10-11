@@ -276,6 +276,67 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "browser_login",
+            "description": (
+                "Log in to a site with credentials obtained from the user. Detects the login "
+                "form, fills username/password through the page's own lanes, submits, and "
+                "returns an honest verdict: verified, otp_required (with a checkpoint id), "
+                "failed, account_locked, or human_only. If OTP is required, ask the user for "
+                "the code and call browser_submit_otp. Never invent credentials."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "url": {"type": "string", "description": "Login page URL"},
+                    "username": {"type": "string", "description": "Username/email, from the user"},
+                    "password": {"type": "string", "description": "Password, from the user; never echoed back"},
+                },
+                "required": ["session_id", "url", "username", "password"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_submit_otp",
+            "description": (
+                "Submit a verification code the user received. One call fills, submits, and "
+                "verifies. Max 3 attempts per checkpoint; ~10 minute expiry. The code comes "
+                "from the user — never guess it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "checkpoint": {"type": "string", "description": "Checkpoint id from browser_login"},
+                    "code": {"type": "string", "description": "The code the user received"},
+                },
+                "required": ["session_id", "checkpoint", "code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_login_state",
+            "description": (
+                "Probe whether the session is logged in at a URL (no credentials used). "
+                "Loads the page and reads logged-in evidence: markers, logout links, auth cookies."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "url": {"type": "string"},
+                },
+                "required": ["session_id", "url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "browser_frames",
             "description": (
                 "List iframe documents loaded in isolated QuickJS contexts. Returns [fN] refs, "

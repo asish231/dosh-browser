@@ -232,6 +232,8 @@ def _role_of(node: Node, kind: str) -> str:
             return "textarea"
         if typ == "file":
             return "file"
+        if typ == "password":
+            return "password"
         # Normalise the HTML `type` into a role name, so `type=text` reads as
         # "textbox" the way inspect.py reports it.
         return "checkbox" if typ == "checkbox" else "textbox"

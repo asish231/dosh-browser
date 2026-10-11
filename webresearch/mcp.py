@@ -234,6 +234,49 @@ TOOLS = [
         },
     },
     {
+        "name": "browser_login",
+        "description": "Log in to a site with credentials obtained from the user. Detects the login form, fills "
+        "username/password through the page's own lanes, submits, and returns an honest verdict: verified, "
+        "otp_required (with a checkpoint id), failed, account_locked, or human_only. Never invent credentials.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "url": {"type": "string", "description": "Login page URL"},
+                "username": {"type": "string", "description": "Username/email, from the user"},
+                "password": {"type": "string", "description": "Password, from the user; never echoed back"},
+            },
+            "required": ["session_id", "url", "username", "password"],
+        },
+    },
+    {
+        "name": "browser_submit_otp",
+        "description": "Submit a verification code the user received (one call fills, submits, verifies). "
+        "Max 3 attempts per checkpoint; ~10 minute expiry. The code comes from the user — never guess it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "checkpoint": {"type": "string", "description": "Checkpoint id from browser_login"},
+                "code": {"type": "string", "description": "The code the user received"},
+            },
+            "required": ["session_id", "checkpoint", "code"],
+        },
+    },
+    {
+        "name": "browser_login_state",
+        "description": "Probe whether the session is logged in at a URL (no credentials). Reads logged-in "
+        "evidence: markers, logout links, auth cookies.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "url": {"type": "string"},
+            },
+            "required": ["session_id", "url"],
+        },
+    },
+    {
         "name": "browser_tabs",
         "description": "Manage multi-tab browsing: list open tabs, open a new tab, switch tabs, or close a tab.",
         "inputSchema": {
@@ -491,6 +534,35 @@ class McpServer:
                 "error": rec.error,
             }
             return self._format_result(json.dumps(payload, indent=2))
+
+        elif name == "browser_login":
+            try:
+                result = await session.login(
+                    args["url"], args["username"], args["password"]
+                )
+            except KeyError as exc:
+                return self._format_result(f"browser_login failed: missing {exc}")
+            except ValueError as exc:
+                return self._format_result(f"browser_login failed: {exc}")
+            return self._format_result(json.dumps(result, indent=2))
+
+        elif name == "browser_submit_otp":
+            try:
+                result = await session.submit_otp(args["checkpoint"], args["code"])
+            except KeyError as exc:
+                return self._format_result(f"browser_submit_otp failed: missing {exc}")
+            except ValueError as exc:
+                return self._format_result(f"browser_submit_otp failed: {exc}")
+            return self._format_result(json.dumps(result, indent=2))
+
+        elif name == "browser_login_state":
+            try:
+                result = await session.login_state(args["url"])
+            except KeyError:
+                return self._format_result("browser_login_state failed: url is required")
+            except ValueError as exc:
+                return self._format_result(f"browser_login_state failed: {exc}")
+            return self._format_result(json.dumps(result, indent=2))
 
         elif name == "browser_tabs":
             action = args.get("action", "list")

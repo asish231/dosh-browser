@@ -133,6 +133,19 @@ async def invoke(http: httpx.AsyncClient, browser: Browser, name: str, args: dic
             "scanned": rec.scanned,
             "error": rec.error,
         }
+    if name == "browser_login":
+        return await browser.get(args["session_id"]).login(
+            args["url"], args["username"], args["password"]
+        )
+    if name == "browser_submit_otp":
+        return await browser.get(args["session_id"]).submit_otp(
+            args["checkpoint"], args["code"]
+        )
+    if name == "browser_login_state":
+        return await browser.get(args["session_id"]).login_state(args["url"])
+    if name == "browser_login_wall":
+        wall = browser.get(args["session_id"]).login_wall()
+        return {"wall": wall}
     if name == "browser_query":
         return browser.get(args["session_id"]).query(
             args.get("term") or "", limit=int(args.get("limit", 40))

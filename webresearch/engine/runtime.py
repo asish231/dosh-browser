@@ -891,6 +891,38 @@ async def run_scripts(
             ]
     except Exception:
         pass
+    # Login wall detection: surface the wall as a first-class object so the
+    # agent asks the user for credentials instead of planning page content.
+    try:
+        from webresearch.engine.inspect import inspect_html as _inspect
+        from webresearch.engine.login import detect_login_wall, detect_otp_page
+
+        targets, _ = _inspect(html, url)
+        wall = detect_login_wall(html, url, targets, status=200)
+        if wall is None:
+            wall = detect_otp_page(html, url, targets)
+        if wall is not None:
+            wall_obj = {
+                "kind": wall.kind,
+                "url": wall.url,
+                "confidence": wall.confidence,
+                "detail": wall.detail,
+            }
+            if wall.kind == "form":
+                wall_obj.update({
+                    "username_ref": wall.username_ref,
+                    "password_ref": wall.password_ref,
+                    "submit_ref": wall.submit_ref,
+                })
+            if wall.kind == "otp":
+                wall_obj.update({
+                    "refs": wall.refs,
+                    "expected_length": wall.expected_length,
+                    "split_boxes": wall.split_boxes,
+                })
+            info.setdefault("login", {})["wall"] = wall_obj
+    except Exception:
+        pass
 
     client.cookies.update(sync.cookies)
     sync.close()

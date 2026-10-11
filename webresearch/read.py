@@ -160,6 +160,26 @@ def _decorate(
         extra += "\nPOPUPS (window.open; loaded as new tabs, switch with browser_tabs):"
         for p in popups[:4]:
             extra += f"\n  {p.get('url', '')[:160]}"
+    login_info = info.get("login") or {}
+    if login_info.get("wall"):
+        wall = login_info["wall"]
+        if wall.get("kind") == "form":
+            extra += (
+                f"\nLOGIN WALL: username=[{wall.get('username_ref') or '-'}] "
+                f"password=[{wall.get('password_ref') or '-'}] submit=[{wall.get('submit_ref') or '-'}] "
+                f"confidence={wall.get('confidence')}"
+                "\n  ask the user for credentials, then call browser_login(url, username, password). Never invent credentials."
+            )
+        elif wall.get("kind") == "otp":
+            refs = ",".join(wall.get("refs") or [])
+            extra += (
+                f"\nOTP REQUIRED: code input(s) [{refs}] expected_length={wall.get('expected_length')}"
+                "\n  the code was sent to the user. Ask the user for it, then call browser_submit_otp. Never guess the code."
+            )
+        elif wall.get("kind") == "human_only":
+            extra += f"\nLOGIN HUMAN-ONLY: {wall.get('detail', '')}"
+    if login_info.get("verdict") and login_info.get("verdict_message"):
+        extra += f"\nLOGIN VERDICT: {login_info['verdict']} — {login_info['verdict_message']}"
     view = f"{page.view}\n\n{extra}".strip()
     engine = info.get("engine") or ("quickjs" if js_ran else "html")
     return page.model_copy(

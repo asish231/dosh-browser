@@ -57,6 +57,9 @@ pip install -e .
 | `browser_type` | Type into `[eN]` |
 | `browser_press_key` | Named key press on a control (enter/tab/arrows/…): Enter submits, Tab focuses, arrows drive selects |
 | `browser_respond_dialog` | List alert/confirm/prompt dialogs, or stage an answer then re-run the action |
+| `browser_login` | Log in with user-provided credentials; honest verdict incl. `otp_required` checkpoint |
+| `browser_submit_otp` | Submit the verification code the user received (max 3 tries, ~10 min expiry) |
+| `browser_login_state` | Probe whether the session is logged in at a URL, no credentials used |
 | `browser_download` | Save a file to disk with sha256 + optional hash verification; attachments on navigation are saved, not parsed |
 | `browser_submit` | Submit form `[n]` |
 | `browser_query` | Retrieve ACD blocks by substring (structured context) |

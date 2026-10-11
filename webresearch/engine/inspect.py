@@ -86,6 +86,8 @@ def _role(node: dict) -> str:
         return "slider"
     if typ == "file":
         return "file"
+    if typ == "password":
+        return "password"
     if tag in {"input", "textarea"} or role == "textbox":
         return "textbox"
     if (attrs.get("contenteditable") or "").lower() not in ("", "false"):
