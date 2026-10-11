@@ -526,14 +526,17 @@ async def _brave_images(query: str, *, client: httpx.AsyncClient, max_hits: int)
 
 
 async def _bing_images(query: str, *, client: httpx.AsyncClient, max_hits: int) -> tuple[SearchResult | None, bool]:
+    import html as _html
     import re as _re
 
     url = f"https://www.bing.com/images/search?q={quote_plus(query)}"
     result = await fetch(url, client=client, headers={"Referer": "https://www.bing.com/"})
     if result.status in {429, 403, 503}:
         return None, True
-    urls = _re.findall(r'"murl":"(.*?)"', result.body)
-    titles = _re.findall(r'"t":"(.*?)"', result.body)
+    # Bing serves JSON-like data with HTML-escaped quotes (&quot;)
+    body = _html.unescape(result.body)
+    urls = _re.findall(r'"murl":"(.*?)"', body)
+    titles = _re.findall(r'"t":"(.*?)"', body)
     hits: list[SearchHit] = []
     for i, u in enumerate(urls[:max_hits]):
         title = titles[i] if i < len(titles) else u
