@@ -27,6 +27,9 @@ class Client:
     async def search(self, q: str, *, max_hits: int = 8, engine: str = "auto") -> dict:
         return await self.invoke("browser_search", q=q, max_hits=max_hits, engine=engine)
 
+    async def images(self, q: str, *, max_hits: int = 8, engine: str = "auto") -> dict:
+        return await self.invoke("browser_images", q=q, max_hits=max_hits, engine=engine)
+
     async def click(self, session_id: str, ref: str) -> dict:
         return await self.invoke("browser_click", session_id=session_id, ref=ref)
 

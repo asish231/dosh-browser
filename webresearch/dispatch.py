@@ -12,6 +12,7 @@ from webresearch.parse import parse as parse_doc
 from webresearch.read import captcha_code as dump_url_captcha_code
 from webresearch.read import read as read_url
 from webresearch.search import search as web_search
+from webresearch.search import search_images as web_search_images
 from webresearch.session import Browser
 from webresearch.types import CaptchaReport
 
@@ -22,6 +23,13 @@ async def invoke(http: httpx.AsyncClient, browser: Browser, name: str, args: dic
         if engine not in {"auto", "google", "ddg"}:
             engine = "auto"
         return await web_search(args["q"], client=http, max_hits=int(args.get("max_hits", 8)), engine=engine)
+    if name == "browser_images":
+        return await web_search_images(
+            args.get("q") or args.get("query") or "",
+            client=http,
+            max_hits=int(args.get("max_hits", 8)),
+            engine=args.get("engine") or "auto",
+        )
     if name == "browser_read":
         js = args.get("js") or "auto"
         if js not in {"auto", "always", "never"}:

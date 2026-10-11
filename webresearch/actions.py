@@ -494,7 +494,11 @@ def collect(html: str, url: str, *, max_actions: int = 200) -> ActionSurface:
         notes = ""
         if kind in {"activate", "drag", "embed"}:
             notes = "needs real engine"
-        if tag in EMBED_TAGS:
+        if tag == "canvas":
+            notes = "canvas element: visual pixels not rendered natively; inspect AST/attributes or data-URL"
+        elif tag in {"video", "audio"}:
+            notes = "media stream: inspect audio/video source and track attributes"
+        elif tag in EMBED_TAGS:
             notes = "content is a separate document; read its source"
 
         ordered.append(

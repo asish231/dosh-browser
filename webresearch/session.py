@@ -78,8 +78,10 @@ class Session:
         client: httpx.AsyncClient,
         session_id: str,
         profile: str | Profile | None = None,
+        tenant_id: str = "default",
     ) -> None:
         self.id = session_id
+        self.tenant_id = tenant_id
         self.client = client
         self.profile = Profile(profile) if isinstance(profile, str) else profile
         if self.profile is not None:
@@ -93,6 +95,12 @@ class Session:
         self.created_at = time.time()
         self.last_used = self.created_at
         self.proxy: str | None = None
+        self.stealth: bool = False
+
+    def set_stealth(self, enabled: bool) -> bool:
+        """Enable or disable humanised stealth mode (biological kinematics, typing pauses, smooth scroll)."""
+        self.stealth = bool(enabled)
+        return self.stealth
 
     @property
     def current_tab(self) -> Tab:
@@ -381,9 +389,16 @@ class Session:
                 return await self.goto(nav_url, max_chars=max_chars)
         return outcome
 
-    async def click(self, ref: str, *, max_chars: int = 8000) -> Page:
+    async def click(
+        self,
+        ref: str,
+        *,
+        max_chars: int = 8000,
+        stealth: bool | None = None,
+    ) -> Page:
         if not self.html:
             raise ValueError("no current page")
+        is_stealth = self.stealth if stealth is None else bool(stealth)
         targets, _ = inspect_html(self.html, self.url)
         target = next((item for item in targets if item.ref == ref), None)
         if target is None:
@@ -399,21 +414,29 @@ class Session:
             and not target.href.lower().startswith("javascript:")
         ):
             return await self.goto(target.href, max_chars=max_chars)
-        # Chromium lane: real CDP click on the live page, keep browser state.
+        # Native mini-DOM actuation with optional humanised kinematics
         return await self._apply(
-            [{"kind": "click", "path": target.path}], self.html, max_chars
+            [{"kind": "click", "path": target.path, "stealth": is_stealth}], self.html, max_chars
         )
 
-    async def type(self, ref: str, text: str, *, max_chars: int = 8000) -> Page:
+    async def type(
+        self,
+        ref: str,
+        text: str,
+        *,
+        max_chars: int = 8000,
+        stealth: bool | None = None,
+    ) -> Page:
         if not self.html:
             raise ValueError("no current page")
+        is_stealth = self.stealth if stealth is None else bool(stealth)
         targets, _ = inspect_html(self.html, self.url)
         target = next((item for item in targets if item.ref == ref), None)
         if target is None:
             html = type_html(self.html, ref, text)
             return await self._apply([], html, max_chars)
         return await self._apply(
-            [{"kind": "type", "path": target.path, "text": text}],
+            [{"kind": "type", "path": target.path, "text": text, "stealth": is_stealth}],
             self.html,
             max_chars,
         )
@@ -450,6 +473,7 @@ class Session:
         dx: float | None = None,
         dy: float | None = None,
         max_chars: int = 8000,
+        stealth: bool | None = None,
     ) -> Page:
         """Carry out one action from the surface by ref.
 
@@ -467,18 +491,20 @@ class Session:
                 f"first refs: {known}"
             )
 
+        is_stealth = self.stealth if stealth is None else bool(stealth)
+
         if action.kind == "navigate":
             return await self.goto(action.target, max_chars=max_chars)
 
         if action.kind == "submit":
             if not text:
                 if action.role == "button" or action.tag == "button" or (action.tag == "input" and not action.field_name):
-                    return await self._act_engine(action, text="", dx=dx, dy=dy, max_chars=max_chars)
+                    return await self._act_engine(action, text="", dx=dx, dy=dy, max_chars=max_chars, stealth=is_stealth)
                 raise ValueError(
                     f"[{ref}] {action.role!r} is a form field and needs text"
                 )
             if action.selector and (action.role in {"textbox", "searchbox"} or action.tag in {"input", "textarea"}):
-                return await self._act_engine(action, text=text, dx=dx, dy=dy, max_chars=max_chars)
+                return await self._act_engine(action, text=text, dx=dx, dy=dy, max_chars=max_chars, stealth=is_stealth)
             return await self._act_submit_field(action, text, max_chars)
 
         if action.disabled:
@@ -490,7 +516,7 @@ class Session:
             )
 
         if action.kind in {"activate", "drag", "embed"}:
-            return await self._act_engine(action, text=text, dx=dx, dy=dy, max_chars=max_chars)
+            return await self._act_engine(action, text=text, dx=dx, dy=dy, max_chars=max_chars, stealth=is_stealth)
 
         raise ValueError(f"[{ref}] has unsupported kind {action.kind!r}")
 
@@ -539,6 +565,7 @@ class Session:
         dx: float | None,
         dy: float | None,
         max_chars: int,
+        stealth: bool = False,
     ) -> Page:
         """Actuate a control natively in the QuickJS mini-DOM.
 
@@ -555,6 +582,7 @@ resolve a selector directly.
                         "selector": selector,
                         "dx": dx if dx is not None else 220.0,
                         "dy": dy if dy is not None else 0.0,
+                        "stealth": stealth,
                     }
                 ],
                 self.html,
@@ -563,12 +591,12 @@ resolve a selector directly.
         elif action.kind in {"activate", "submit"}:
             if text:
                 return await self._apply(
-                    [{"kind": "type", "selector": selector, "text": text}],
+                    [{"kind": "type", "selector": selector, "text": text, "stealth": stealth}],
                     self.html,
                     max_chars,
                 )
             return await self._apply(
-                [{"kind": "activate", "selector": selector}],
+                [{"kind": "activate", "selector": selector, "stealth": stealth}],
                 self.html,
                 max_chars,
             )
@@ -578,12 +606,15 @@ resolve a selector directly.
                 "read its own document instead of acting on it"
             )
 
-    async def scroll(self, y: int = 800, x: int = 0, *, max_chars: int = 8000) -> Page:
+    async def scroll(
+        self, y: int = 800, x: int = 0, *, max_chars: int = 8000, stealth: bool | None = None
+    ) -> Page:
         """Scroll the page; fires scroll event + IntersectionObserver notifications."""
         if not self.html:
             raise ValueError("no current page")
+        is_stealth = self.stealth if stealth is None else bool(stealth)
         return await self._apply(
-            [{"kind": "scroll", "x": x, "y": y}], self.html, max_chars
+            [{"kind": "scroll", "x": x, "y": y, "stealth": is_stealth}], self.html, max_chars
         )
 
     async def _apply(
@@ -772,6 +803,11 @@ resolve a selector directly.
     async def search(self, query: str, *, engine: str = "auto") -> SearchResult:
         return await web_search(query, client=self.client, engine=engine)  # type: ignore[arg-type]
 
+    async def search_images(self, query: str, *, engine: str = "auto", max_hits: int = 8) -> SearchResult:
+        from webresearch.search import search_images as web_search_images
+
+        return await web_search_images(query, client=self.client, max_hits=max_hits, engine=engine)
+
     async def close(self) -> None:
         if self.profile is not None:
             self.profile.save_from_client(self.client)
@@ -815,13 +851,14 @@ class Browser:
         headers: dict[str, str] | None = None,
         proxy: str | None = None,
         profile: str | Profile | None = None,
+        tenant_id: str = "default",
     ) -> Session:
         await self._evict()
         sid = "s_" + secrets.token_hex(4)
         # Explicit proxy wins; otherwise rotate through the pool for isolation.
         chosen = proxy if proxy is not None else self._next_proxy()
         client = make_client(headers=headers, proxy=chosen)
-        session = Session(client, sid, profile=profile)
+        session = Session(client, sid, profile=profile, tenant_id=tenant_id)
         session.proxy = chosen
         self.sessions[sid] = session
         return session
@@ -841,10 +878,12 @@ class Browser:
             for sid in oldest[:overflow]:
                 await self.close(sid)
 
-    def get(self, session_id: str) -> Session:
+    def get(self, session_id: str, tenant_id: str | None = None) -> Session:
         session = self.sessions.get(session_id)
         if session is None:
             raise KeyError(session_id)
+        if tenant_id is not None and session.tenant_id != tenant_id:
+            raise PermissionError(f"session {session_id} belongs to another tenant")
         session.last_used = time.time()
         return session
 

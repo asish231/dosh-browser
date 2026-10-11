@@ -101,3 +101,35 @@ def human_keystroke_delays(text: str, mean_ms: float = 65.0, std_ms: float = 18.
             delay += random.uniform(0.05, 0.14)
         delays.append(delay)
     return delays
+
+
+def generate_human_drag_steps(
+    dx: float,
+    dy: float,
+    start_x: float = 0.0,
+    start_y: float = 0.0,
+) -> list[dict]:
+    """Generate high-fidelity human mouse drag packet sequence."""
+    pts = generate_human_trajectory((start_x, start_y), (start_x + dx, start_y + dy))
+    steps: list[dict] = []
+    prev_x, prev_y = start_x, start_y
+    for x, y in pts:
+        mx = round(x - prev_x, 2)
+        my = round(y - prev_y, 2)
+        dt = round(random.uniform(9.0, 16.0), 1)
+        steps.append({
+            "x": round(x, 2),
+            "y": round(y, 2),
+            "movementX": mx,
+            "movementY": my,
+            "dt": dt,
+        })
+        prev_x, prev_y = x, y
+    return steps
+
+
+def generate_human_typing_delays(text: str) -> list[float]:
+    """Inter-key flight delays in milliseconds."""
+    delays_sec = human_keystroke_delays(text)
+    return [round(d * 1000.0, 1) for d in delays_sec]
+

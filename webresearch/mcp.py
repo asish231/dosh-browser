@@ -22,13 +22,26 @@ from typing import Any
 TOOLS = [
     {
         "name": "browser_search",
-        "description": "Search the web with automatic engine fallback (Google -> DuckDuckGo). Returns clean markdown hits.",
+        "description": "Search the web with automatic engine waterfall fallback (Google -> Bing -> DuckDuckGo -> Yahoo). Returns clean markdown hits.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query terms"},
                 "max_hits": {"type": "integer", "description": "Maximum number of search results to return", "default": 8},
-                "engine": {"type": "string", "enum": ["auto", "google", "ddg"], "default": "auto"},
+                "engine": {"type": "string", "enum": ["auto", "google", "bing", "ddg", "yahoo", "lite"], "default": "auto"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "browser_images",
+        "description": "Image search over HTTP, no Chromium. Waterfall brave-images -> bing-images -> ddg-images -> google-images. Returns title [source] plus direct image URL.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Image search query terms"},
+                "max_hits": {"type": "integer", "default": 8},
+                "engine": {"type": "string", "enum": ["auto", "brave", "bing-images", "ddg-images", "google-images"], "default": "auto"},
             },
             "required": ["query"],
         },
@@ -54,6 +67,7 @@ TOOLS = [
             "properties": {
                 "ref": {"type": "string", "description": "The element reference marker from the page inspect list"},
                 "max_chars": {"type": "integer", "default": 8000},
+                "stealth": {"type": "boolean", "default": False, "description": "Enable biological stealth mode (humanised hover/dwell latency). Defaults to false for maximum speed."},
             },
             "required": ["ref"],
         },
@@ -67,6 +81,7 @@ TOOLS = [
                 "ref": {"type": "string", "description": "The input element reference"},
                 "text": {"type": "string", "description": "The text string to type into the field"},
                 "max_chars": {"type": "integer", "default": 8000},
+                "stealth": {"type": "boolean", "default": False, "description": "Enable biological stealth mode (humanised keystroke flight/dwell cadences). Defaults to false for maximum speed."},
             },
             "required": ["ref", "text"],
         },
@@ -123,6 +138,7 @@ TOOLS = [
                 "dx": {"type": "number", "description": "Horizontal drag distance in px"},
                 "dy": {"type": "number", "description": "Vertical drag distance in px"},
                 "max_chars": {"type": "integer", "default": 8000},
+                "stealth": {"type": "boolean", "default": False, "description": "Enable biological stealth mode (Bézier mouse trajectories with tremor, flight pauses). Defaults to false for speed."},
             },
             "required": ["session_id", "ref"],
         },
@@ -169,6 +185,20 @@ TOOLS = [
                 "y": {"type": "integer", "default": 800, "description": "Vertical scroll delta in pixels"},
                 "x": {"type": "integer", "default": 0, "description": "Horizontal scroll delta in pixels"},
                 "max_chars": {"type": "integer", "default": 8000, "description": "Maximum characters in returned page snapshot"},
+                "stealth": {"type": "boolean", "default": False, "description": "Enable biological stealth mode (smooth humanised wheel events). Defaults to false for speed."},
+            },
+        },
+    },
+    {
+        "name": "browser_stealth",
+        "description": "Configure or inspect humanised stealth mode (biological Bézier trajectories with tremor, keystroke cadences, smoothed wheel scrolling). Defaults to false for maximum speed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "True to enable humanised stealth mode, False for fast execution mode. Omit to query current state.",
+                },
             },
         },
     },
@@ -230,6 +260,13 @@ class McpServer:
             res = await session.search(query, engine=engine)
             return self._format_result(res.view)
 
+        elif name == "browser_images":
+            query = args.get("query", "")
+            max_hits = int(args.get("max_hits", 8))
+            engine = args.get("engine", "auto")
+            res = await session.search_images(query, engine=engine, max_hits=max_hits)
+            return self._format_result(res.view)
+
         elif name == "browser_navigate":
             url = args.get("url", "")
             js = args.get("js", "auto")
@@ -240,14 +277,16 @@ class McpServer:
         elif name == "browser_click":
             ref = args.get("ref", "")
             max_chars = int(args.get("max_chars", 8000))
-            page = await session.click(ref, max_chars=max_chars)
+            stealth = args.get("stealth")
+            page = await session.click(ref, max_chars=max_chars, stealth=stealth)
             return self._format_result(page.view)
 
         elif name == "browser_type":
             ref = args.get("ref", "")
             text = args.get("text", "")
             max_chars = int(args.get("max_chars", 8000))
-            page = await session.type(ref, text, max_chars=max_chars)
+            stealth = args.get("stealth")
+            page = await session.type(ref, text, max_chars=max_chars, stealth=stealth)
             return self._format_result(page.view)
 
         elif name == "browser_query":
@@ -297,6 +336,7 @@ class McpServer:
             dx = args.get("dx")
             dy = args.get("dy")
             max_chars = int(args.get("max_chars", 8000))
+            stealth = args.get("stealth")
             try:
                 page = await session.act(
                     ref,
@@ -304,6 +344,7 @@ class McpServer:
                     dx=dx,
                     dy=dy,
                     max_chars=max_chars,
+                    stealth=stealth,
                 )
             except ValueError as exc:
                 return self._format_result(f"browser_act failed: {exc}")
@@ -352,8 +393,19 @@ class McpServer:
             y = int(args.get("y", 800))
             x = int(args.get("x", 0))
             max_chars = int(args.get("max_chars", 8000))
-            page = await session.scroll(y=y, x=x, max_chars=max_chars)
+            stealth = args.get("stealth")
+            page = await session.scroll(y=y, x=x, max_chars=max_chars, stealth=stealth)
             return self._format_result(page.view)
+
+        elif name == "browser_stealth":
+            if "enabled" in args and args["enabled"] is not None:
+                enabled = bool(args["enabled"])
+                session.set_stealth(enabled)
+                status = "enabled" if enabled else "disabled"
+                msg = f"Stealth mode {status}. {'Biological Bézier trajectories and typing cadences active.' if enabled else 'Fast execution mode active.'}"
+                return self._format_result(msg)
+            status = "enabled" if session.stealth else "disabled"
+            return self._format_result(f"Stealth mode is currently {status}.")
 
         elif name == "browser_token_usage":
             prof_name = session.profile.name if hasattr(session.profile, "name") else (session.profile or "default")
