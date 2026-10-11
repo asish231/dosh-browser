@@ -106,19 +106,51 @@ async def _warm_google(client: httpx.AsyncClient) -> bool:
     return any(_jar_has(client, k) for k in ("NID", "AEC", "SOCS", "OTZ"))
 
 
+async def _ddg_plain_get(url: str, *, client: httpx.AsyncClient, headers: dict[str, str]) -> str:
+    """Plain httpx GET to DDG (bypasses curl_cffi impersonation).
+
+    curl_cffi's TLS fingerprint actually triggers DDG's botnet challenge for
+    /i.js.  Plain httpx is less detectable in this specific case.
+    """
+    async with client.stream("GET", url, headers=headers, timeout=20) as resp:
+        body = await resp.aread()
+    return body.decode("utf-8", errors="replace")
+
+
 async def _warm_ddg(client: httpx.AsyncClient, query: str) -> str | None:
     """Prime DuckDuckGo and harvest the per-query vqd token."""
     from urllib.parse import quote_plus
 
     try:
-        result = await fetch(
+        body = await _ddg_plain_get(
             f"https://duckduckgo.com/?q={quote_plus(query)}",
             client=client,
             headers={"Referer": "https://duckduckgo.com/"},
         )
     except Exception:
         return None
-    return _extract_vqd(result.body)
+    return _extract_vqd(body)
+
+
+def _set_ddg_session_cookies(client: httpx.AsyncClient) -> None:
+    """Synthesise the session cookies that DDG's JS would set via document.cookie.
+
+    DDG's main page is a Next.js SPA that never sends Set-Cookie headers.
+    Cookies like ``ddgr``, ``cfuid``, ``td``, ``k`` are set only when client-side
+    JavaScript runs.  DDG's images API (``/i.js``) checks for their presence as a
+    signal that the caller is a JS-enabled browser session.  Without them the
+    endpoint returns ``botnet_challenge`` (HTTP 202) regardless of vqd validity.
+
+    We generate realistic values — random hex / URL-safe base64 — because DDG
+    only checks cookie *presence*, not cryptographic validity, for this check.
+    """
+    import secrets
+
+    domain = ".duckduckgo.com"
+    client.cookies.set("ddgr", secrets.token_hex(16), domain=domain, path="/")
+    client.cookies.set("cfuid", secrets.token_urlsafe(48), domain=domain, path="/")
+    client.cookies.set("td", secrets.token_hex(8), domain=domain, path="/")
+    client.cookies.set("k", secrets.token_hex(16), domain=domain, path="/")
 
 
 def _parse_google(doc: Document, *, max_hits: int) -> list[SearchHit]:
@@ -375,17 +407,29 @@ async def _ddg_images(query: str, *, client: httpx.AsyncClient, max_hits: int) -
     """DuckDuckGo images via primed vqd token. Returns (result, blocked)."""
     from urllib.parse import quote_plus as _qp
 
+    _set_ddg_session_cookies(client)
     vqd = await _warm_ddg(client, query)
     if not vqd:
         return None, True
     url = f"https://duckduckgo.com/i.js?q={_qp(query)}&vqd={_qp(vqd)}&o=json&l=us-en"
-    result = await fetch(url, client=client, headers={"Referer": "https://duckduckgo.com/", "Accept": "application/json"})
-    if _blocked_ddg_challenge(result):
+    try:
+        raw = await _ddg_plain_get(
+            url,
+            client=client,
+            headers={"Referer": "https://duckduckgo.com/", "Accept": "application/json"},
+        )
+    except Exception:
         return None, True
+
+    # Quick botnet check
+    low = raw.lower()
+    if "botnet_challenge" in low or ("challenge" in low and "proof" in low):
+        return None, True
+
     try:
         import json as _json
 
-        payload = _json.loads(result.body)
+        payload = _json.loads(raw)
         hits: list[SearchHit] = []
         for item in (payload.get("results") or [])[:max_hits]:
             image = item.get("image") or ""
