@@ -48,6 +48,10 @@ def _decorate(
             f"{acd.counts['api']} api calls"
         )
     info = js_info or {}
+    cors_blocked = [r for r in (info.get("resource_requests") or []) if r.get("content_type") == "cors-blocked"]
+    if cors_blocked:
+        extra += f"\nCORS-BLOCKED: {len(cors_blocked)} cross-origin read(s) without ACAO; data not loaded (faithful, not retried): "
+        extra += ", ".join(r.get("url", "")[:120] for r in cors_blocked[:5])
     if info.get("framework_data"):
         extra += "\nFRAMEWORK_DATA: " + ", ".join(sorted(info["framework_data"].keys()))
     if info.get("error_messages"):
@@ -103,6 +107,7 @@ async def read_live(
         js_ran = bool(js_info.get("ran"))
         result = result.model_copy(update={"body": html, "kind": "html", "content_type": "text/html"})
 
+    frames = []
     if result.kind == "html":
         from webresearch.consent import dismiss_consent_dom
 
@@ -111,8 +116,7 @@ async def read_live(
             html = clean_html
             result = result.model_copy(update={"body": html})
 
-    frames = (
-        await load_frames(
+        frames = await load_frames(
             html,
             result.final_url or url,
             client,
@@ -120,9 +124,37 @@ async def read_live(
             parent_headers=result.headers,
             parent_messages=(js_info.get("post_messages") if js_info else None),
         )
-        if result.kind == "html"
-        else []
-    )
+        if js_info and js_info.get("ctx") and frames:
+            parent_ctx = js_info["ctx"]
+            child_replies = []
+            for frame in frames:
+                for msg in frame.post_messages:
+                    tgt = msg.get("target", "")
+                    if tgt in {"parent", "top", "reply", "*", ""}:
+                        child_replies.append((msg, frame.url))
+            if child_replies:
+                import json as _json
+                from webresearch.engine.frames import extract_origin
+                from webresearch.engine.runtime import _pump_jobs
+
+                for msg, frame_url in child_replies:
+                    m_data = _json.dumps(msg.get("data", ""))
+                    m_origin = _json.dumps(extract_origin(frame_url))
+                    m_target = _json.dumps(msg.get("target_origin") or msg.get("target") or "*")
+                    try:
+                        parent_ctx.eval(
+                            f"if (typeof window !== 'undefined' && typeof window.__receiveMessage === 'function') window.__receiveMessage({m_data}, {m_origin}, {m_target});"
+                        )
+                    except Exception:
+                        pass
+                _pump_jobs(parent_ctx)
+                try:
+                    updated_html = parent_ctx.eval("__serialize()")
+                    if updated_html:
+                        html = updated_html
+                        result = result.model_copy(update={"body": html})
+                except Exception:
+                    pass
     captcha = await inspect_captcha(
         html,
         result.final_url or url,

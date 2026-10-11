@@ -23,6 +23,24 @@ MAX_FRAMES = 16
 MAX_FRAME_DEPTH = 3
 MAX_EXCERPT = 4000
 
+def extract_origin(url: str) -> str:
+    """Extract normalized scheme://host[:port] origin from a URL."""
+    try:
+        p = urlparse(url)
+        scheme = p.scheme.lower()
+        if not scheme or not p.hostname:
+            return ""
+        host = p.hostname.lower()
+        port = p.port
+        if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+            port = None
+        if port:
+            return f"{scheme}://{host}:{port}"
+        return f"{scheme}://{host}"
+    except Exception:
+        return ""
+
+
 _CHALLENGE_NEEDLES = (
     "recaptcha",
     "hcaptcha",
@@ -279,12 +297,30 @@ async def load_frames(
                 document.error = f"unsupported frame URL scheme: {urlparse(frame_url).scheme}"
 
             if document.html and "html" in document.content_type.lower() and js != "never":
-                frame_inbox = [
-                    m
-                    for m in (parent_messages or [])
-                    if m.get("target") in {"*", "", document.url}
-                    or document.url.startswith(m.get("target", ""))
-                ]
+                frame_origin = extract_origin(document.url)
+                parent_origin = extract_origin(url)
+                frame_inbox = []
+                for m in (parent_messages or []):
+                    # 1. Frame recipient identity
+                    target_id = m.get("target") or "*"
+                    if target_id not in {"*", "", "self"}:
+                        if target_id in {"parent", "top", "reply"}:
+                            continue
+                        if target_id != ref and target_id != document.url:
+                            resolved_target = urljoin(url, target_id)
+                            if resolved_target != document.url:
+                                continue
+
+                    # 2. Origin constraint: exact scheme/host/port comparison
+                    target_orig = m.get("target_origin") or m.get("origin") or "*"
+                    if target_orig not in {"*", "", "/"}:
+                        expected_origin = extract_origin(target_orig)
+                        if expected_origin and expected_origin != frame_origin:
+                            continue
+
+                    msg_copy = dict(m)
+                    msg_copy["origin"] = m.get("origin") or parent_origin
+                    frame_inbox.append(msg_copy)
                 document.html, frame_js = await run_scripts(
                     document.html,
                     document.url,

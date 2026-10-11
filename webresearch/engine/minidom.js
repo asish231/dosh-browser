@@ -486,7 +486,41 @@
     }
     return !ev.defaultPrevented;
   };
-  Element.prototype.click = function () {
+  var _activePointerCaptures = {};
+
+  Element.prototype.setPointerCapture = function (pointerId) {
+    var pid = Number(pointerId);
+    if (_activePointerCaptures[pid] && _activePointerCaptures[pid] !== this) {
+      _activePointerCaptures[pid].releasePointerCapture(pid);
+    }
+    _activePointerCaptures[pid] = this;
+    this._pointerCaptures = this._pointerCaptures || {};
+    this._pointerCaptures[pid] = true;
+    var t = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : 100.0;
+    var init = { pointerId: pid, bubbles: false, cancelable: false, isTrusted: true, __trusted: true, timeStamp: t, target: this };
+    var ev = (typeof global.PointerEvent === "function")
+      ? new global.PointerEvent("gotpointercapture", init)
+      : new global.Event("gotpointercapture", init);
+    this.dispatchEvent(ev);
+  };
+  Element.prototype.releasePointerCapture = function (pointerId) {
+    var pid = Number(pointerId);
+    if (_activePointerCaptures[pid] === this) {
+      delete _activePointerCaptures[pid];
+      if (this._pointerCaptures) delete this._pointerCaptures[pid];
+      var t = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : 100.0;
+      var init = { pointerId: pid, bubbles: false, cancelable: false, isTrusted: true, __trusted: true, timeStamp: t, target: this };
+      var ev = (typeof global.PointerEvent === "function")
+        ? new global.PointerEvent("lostpointercapture", init)
+        : new global.Event("lostpointercapture", init);
+      this.dispatchEvent(ev);
+    }
+  };
+  Element.prototype.hasPointerCapture = function (pointerId) {
+    return _activePointerCaptures[Number(pointerId)] === this;
+  };
+  Element.prototype._dispatchClickSequence = function (isNative) {
+    var trusted = !!isNative;
     var tag = this.nodeName.toLowerCase();
     if (tag === "input" || tag === "textarea" || tag === "select" || tag === "button" || tag === "a" || this.hasAttribute("tabindex")) {
       this.focus();
@@ -496,21 +530,50 @@
       if (on) this.attributes.checked = "checked"; else delete this.attributes.checked;
       this.checked = !!on;
       var chgEv = (typeof global.Event === "function")
-        ? new global.Event("change", { bubbles: true, isTrusted: true })
-        : { type: "change", target: this, bubbles: true, isTrusted: true };
+        ? new global.Event("change", { bubbles: true, isTrusted: trusted, __trusted: trusted })
+        : { type: "change", target: this, bubbles: true, isTrusted: trusted };
       this.dispatchEvent(chgEv);
     }
-    var mdEv = (typeof global.Event === "function")
-      ? new global.Event("mousedown", { bubbles: true, cancelable: true, isTrusted: true })
-      : { type: "mousedown", target: this, bubbles: true, isTrusted: true };
+    var rect = (typeof this.getBoundingClientRect === "function") ? this.getBoundingClientRect() : { left: 10, top: 10, width: 20, height: 20 };
+    var cx = Math.round(rect.left + rect.width * (0.4 + 0.2 * Math.random()));
+    var cy = Math.round(rect.top + rect.height * (0.4 + 0.2 * Math.random()));
+    var t = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : 100.0;
+
+    var overInit = { clientX: cx, clientY: cy, pageX: cx, pageY: cy, screenX: cx + 50, screenY: cy + 100, bubbles: true, cancelable: true, isTrusted: trusted, __trusted: trusted, timeStamp: t };
+    if (typeof global.PointerEvent === "function") this.dispatchEvent(new global.PointerEvent("pointerover", overInit));
+    if (typeof global.MouseEvent === "function") this.dispatchEvent(new global.MouseEvent("mouseover", overInit));
+    if (typeof global.PointerEvent === "function") this.dispatchEvent(new global.PointerEvent("pointerenter", overInit));
+    if (typeof global.MouseEvent === "function") this.dispatchEvent(new global.MouseEvent("mouseenter", overInit));
+
+    if (global.__stealthMode) {
+      t += 35;
+      if (typeof global.__advanceClock === "function") global.__advanceClock(35);
+    }
+
+    var downInit = { clientX: cx, clientY: cy, pageX: cx, pageY: cy, screenX: cx + 50, screenY: cy + 100, button: 0, buttons: 1, pressure: 0.5, bubbles: true, cancelable: true, isTrusted: trusted, __trusted: trusted, timeStamp: t };
+    if (typeof global.PointerEvent === "function") this.dispatchEvent(new global.PointerEvent("pointerdown", downInit));
+    var mdEv = (typeof global.MouseEvent === "function")
+      ? new global.MouseEvent("mousedown", downInit)
+      : new global.Event("mousedown", downInit);
     this.dispatchEvent(mdEv);
-    var muEv = (typeof global.Event === "function")
-      ? new global.Event("mouseup", { bubbles: true, cancelable: true, isTrusted: true })
-      : { type: "mouseup", target: this, bubbles: true, isTrusted: true };
+
+    if (global.__stealthMode) {
+      var dwell = 45 + Math.round(Math.random() * 20);
+      t += dwell;
+      if (typeof global.__advanceClock === "function") global.__advanceClock(dwell);
+    }
+
+    var upInit = { clientX: cx, clientY: cy, pageX: cx, pageY: cy, screenX: cx + 50, screenY: cy + 100, button: 0, buttons: 0, pressure: 0, bubbles: true, cancelable: true, isTrusted: trusted, __trusted: trusted, timeStamp: t };
+    if (typeof global.PointerEvent === "function") this.dispatchEvent(new global.PointerEvent("pointerup", upInit));
+    var muEv = (typeof global.MouseEvent === "function")
+      ? new global.MouseEvent("mouseup", upInit)
+      : new global.Event("mouseup", upInit);
     this.dispatchEvent(muEv);
-    var clkEv = (typeof global.Event === "function")
-      ? new global.Event("click", { bubbles: true, cancelable: true, isTrusted: true })
-      : { type: "click", target: this, bubbles: true, cancelable: true, isTrusted: true };
+
+    var clkInit = { clientX: cx, clientY: cy, pageX: cx, pageY: cy, screenX: cx + 50, screenY: cy + 100, button: 0, buttons: 0, detail: 1, bubbles: true, cancelable: true, isTrusted: trusted, __trusted: trusted, timeStamp: t + 1 };
+    var clkEv = (typeof global.MouseEvent === "function")
+      ? new global.MouseEvent("click", clkInit)
+      : new global.Event("click", clkInit);
     var notPrevented = this.dispatchEvent(clkEv);
     if (notPrevented && !clkEv.defaultPrevented) {
       var typ = (this.attributes.type || "").toLowerCase();
@@ -521,8 +584,8 @@
         while (form && form.nodeName !== "form") form = form.parentNode;
         if (form) {
           var subEv = (typeof global.Event === "function")
-            ? new global.Event("submit", { bubbles: true, cancelable: true, isTrusted: true })
-            : { type: "submit", target: form, bubbles: true, cancelable: true, isTrusted: true };
+            ? new global.Event("submit", { bubbles: true, cancelable: true, isTrusted: trusted, __trusted: trusted })
+            : { type: "submit", target: form, bubbles: true, cancelable: true, isTrusted: trusted };
           form.dispatchEvent(subEv);
           if (!subEv.defaultPrevented && typeof form.submit === "function") {
             try { form.submit(); } catch (e) {}
@@ -530,6 +593,12 @@
         }
       }
     }
+  };
+  Element.prototype.click = function () {
+    return this._dispatchClickSequence(false);
+  };
+  Element.prototype.__nativeClick = function () {
+    return this._dispatchClickSequence(true);
   };
   Element.prototype.submit = function () {
     if (this.nodeName !== "form") return;
@@ -989,9 +1058,9 @@
     var vw = (typeof global.innerWidth === "number" && global.innerWidth > 0) ? global.innerWidth : 1280;
     if (doc.__layoutCache && doc.__layoutCache.vw === vw && doc.__layoutCache.v === doc.__layoutVersion) return doc.__layoutCache;
     var rules = __collectStyleRules(doc);
-    var layout = { vw: vw, v: doc.__layoutVersion || 0, boxes: 0, engine: "block-flow+flex+positioned" };
+    var layout = { vw: vw, v: doc.__layoutVersion || 0, boxes: 0, engine: "block-flow+flex+grid+positioned" };
     function isBlockDisplay(cs) {
-      return cs.display === "block" || cs.display === "list-item" || cs.display === "table" || cs.display === "flex";
+      return cs.display === "block" || cs.display === "list-item" || cs.display === "table" || cs.display === "flex" || cs.display === "grid" || cs.display === "inline-grid";
     }
     function layoutAbsolute(c, ccs, cx, cy, cw, ch) {
       var isFixed = (ccs.position === "fixed");
@@ -1024,6 +1093,63 @@
       layoutChildren(c, ccs, xBox, yBox, w);
     }
     function layoutChildren(el, cs, x, y, contentW) {
+      if (cs.display === "grid" || cs.display === "inline-grid") {
+        var gap = __parsePx(cs.gap, contentW, cs.fontSize) || 0;
+        var children = (el.childNodes || []).filter(function (c) {
+          return c.nodeType === 1 && !__NON_RENDERED[c.nodeName];
+        });
+        var colCount = 1;
+        var tmpl = cs.gridTemplateColumns || cs["grid-template-columns"] || "";
+        var repMatch = tmpl.match(/repeat\((\d+)/i);
+        if (repMatch) {
+          colCount = Math.max(1, parseInt(repMatch[1], 10) || 1);
+        } else if (tmpl.trim()) {
+          var parts = tmpl.trim().split(/\s+/).filter(Boolean);
+          if (parts.length > 1) colCount = parts.length;
+        } else if (children.length > 1 && contentW >= 400) {
+          colCount = 2;
+        }
+        var totalGaps = (colCount - 1) * gap;
+        var colW = Math.max(20, Math.floor((contentW - totalGaps) / colCount));
+        var curY = y;
+        var rowH = 0;
+        var colIdx = 0;
+
+        children.forEach(function (c) {
+          var ccs = __computedStyle(c, rules, cs.fontSize);
+          if (ccs.display === "none") {
+            c.__box = { x: 0, y: 0, width: 0, height: 0 };
+            layout.boxes++;
+            return;
+          }
+          if (ccs.position === "absolute" || ccs.position === "fixed") {
+            layoutAbsolute(c, ccs, x, curY, contentW, 0);
+            return;
+          }
+          var margin = __parseSides(ccs.margin, colW, cs.fontSize);
+          var padding = __parseSides(ccs.padding, colW, cs.fontSize);
+          var itemX = x + colIdx * (colW + gap);
+          var w = __parsePx(ccs.width, colW, cs.fontSize);
+          if (w == null) w = Math.max(0, colW - margin[1] - margin[3]);
+          var h = __parsePx(ccs.height, null, cs.fontSize);
+          var itemContentW = Math.max(0, w - padding[1] - padding[3]);
+          var r = layoutChildren(c, ccs, itemX + margin[3] + padding[3], curY + margin[0] + padding[0], itemContentW);
+          var itemH = (h == null) ? Math.max(0, r.bottom - (curY + margin[0] + padding[0])) : h;
+          var boxH = padding[0] + itemH + padding[2];
+          c.__box = { x: itemX + margin[3], y: curY + margin[0], width: w, height: boxH };
+          layout.boxes++;
+          if (boxH + margin[0] + margin[2] > rowH) rowH = boxH + margin[0] + margin[2];
+
+          colIdx++;
+          if (colIdx >= colCount) {
+            colIdx = 0;
+            curY += rowH + gap;
+            rowH = 0;
+          }
+        });
+        if (colIdx > 0) curY += rowH;
+        return { bottom: curY, maxW: contentW };
+      }
       if (cs.display === "flex" || cs.display === "inline-flex") {
         var gap = __parsePx(cs.gap, contentW, cs.fontSize) || 0;
         var curX = x;
@@ -1234,7 +1360,7 @@
     }
     doc.__layoutCache = layout;
     try {
-      doc.__layoutInfo = { engine: "block-flow+flex+positioned", viewportWidth: vw, boxes: layout.boxes, textMetric: "monospace-advance-0.6em", replacedDefaults: "css-300x150" };
+      doc.__layoutInfo = { engine: "block-flow+flex+grid+positioned", viewportWidth: vw, boxes: layout.boxes, textMetric: "monospace-advance-0.6em", replacedDefaults: "css-300x150" };
     } catch (e) {}
     return layout;
   }
@@ -1248,6 +1374,38 @@
   Object.defineProperty(Element.prototype, "offsetHeight", { get: function () { return this.getBoundingClientRect().height; } });
   Object.defineProperty(Element.prototype, "clientWidth", { get: function () { return this.getBoundingClientRect().width; } });
   Object.defineProperty(Element.prototype, "clientHeight", { get: function () { return this.getBoundingClientRect().height; } });
+  Object.defineProperty(Element.prototype, "offsetParent", {
+    get: function () {
+      if (this.nodeName === "body" || this.nodeName === "html") return null;
+      var p = this.parentNode;
+      while (p && p.nodeType === 1 && p.nodeName !== "body" && p.nodeName !== "html") {
+        var pos = (p.style && p.style.position) || (p.__box && p.__box.position);
+        if (pos === "relative" || pos === "absolute" || pos === "fixed") return p;
+        p = p.parentNode;
+      }
+      return (this.ownerDocument && this.ownerDocument.body) || null;
+    }
+  });
+  Object.defineProperty(Element.prototype, "offsetLeft", {
+    get: function () {
+      var doc = this.ownerDocument || global.document;
+      if (doc) __ensureLayout(doc);
+      var b = this.__box || { x: 0, y: 0 };
+      var op = this.offsetParent;
+      var opX = (op && op.__box) ? op.__box.x : 0;
+      return Math.max(0, b.x - opX);
+    }
+  });
+  Object.defineProperty(Element.prototype, "offsetTop", {
+    get: function () {
+      var doc = this.ownerDocument || global.document;
+      if (doc) __ensureLayout(doc);
+      var b = this.__box || { x: 0, y: 0 };
+      var op = this.offsetParent;
+      var opY = (op && op.__box) ? op.__box.y : 0;
+      return Math.max(0, b.y - opY);
+    }
+  });
   Object.defineProperty(Element.prototype, "scrollWidth", { get: function () { return this.clientWidth || 0; }, configurable: true });
   Object.defineProperty(Element.prototype, "scrollHeight", { get: function () { return this.clientHeight || 0; }, configurable: true });
   Object.defineProperty(Element.prototype, "classList", {
@@ -1965,17 +2123,77 @@
     },
     back: function () {}, forward: function () {}, go: function () {}
   };
+  function _dispatchWheel(dx, dy) {
+    var tNow = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
+    var we = (typeof global.WheelEvent === "function")
+      ? new global.WheelEvent("wheel", { deltaX: dx, deltaY: dy, deltaZ: 0, deltaMode: 0, clientX: 400, clientY: 300, bubbles: true, cancelable: true, isTrusted: true, timeStamp: tNow })
+      : ((typeof global.Event === "function") ? new global.Event("wheel", { bubbles: true, cancelable: true, isTrusted: true, timeStamp: tNow }) : null);
+    if (we) {
+      if (global.document && typeof global.document.dispatchEvent === "function") {
+        try { global.document.dispatchEvent(we); } catch (e) {}
+      } else if (typeof global.dispatchEvent === "function") {
+        try { global.dispatchEvent(we); } catch (e) {}
+      }
+    }
+  }
+
   function _doScroll(x, y) {
     if (typeof x === "object" && x !== null) { y = x.top || 0; x = x.left || 0; }
-    scrollState.x = Number(x) || 0;
-    scrollState.y = Number(y) || 0;
+    var targetX = Number(x) || 0;
+    var targetY = Number(y) || 0;
+    var dx = targetX - scrollState.x;
+    var dy = targetY - scrollState.y;
+    if (dx !== 0 || dy !== 0) {
+      _dispatchWheel(dx, dy);
+    }
+    scrollState.x = targetX;
+    scrollState.y = targetY;
     _notifyIntersections();
     if (typeof global.dispatchEvent === "function" && typeof global.Event === "function") {
-      try { global.dispatchEvent(new global.Event("scroll", { bubbles: false })); } catch (e) {}
+      try {
+        var tNow = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
+        global.dispatchEvent(new global.Event("scroll", { bubbles: false, isTrusted: true, timeStamp: tNow }));
+      } catch (e) {}
     }
   }
   global.scrollTo = _doScroll;
   global.scroll = _doScroll;
+  global.__scrollSmooth = function (targetX, targetY, steps) {
+    targetX = Number(targetX) || 0;
+    targetY = Number(targetY) || 0;
+    steps = Math.max(3, Math.min(25, Number(steps) || 8));
+    var startX = scrollState.x;
+    var startY = scrollState.y;
+    var totalDx = targetX - startX;
+    var totalDy = targetY - startY;
+    if (totalDx === 0 && totalDy === 0) return true;
+
+    for (var i = 1; i <= steps; i++) {
+      var progress = i / steps;
+      var ease = progress < 0.5 ? 2 * progress * progress : -1 + (4 - 2 * progress) * progress;
+      var curX = Math.round(startX + totalDx * ease);
+      var curY = Math.round(startY + totalDy * ease);
+      var stepDx = curX - scrollState.x;
+      var stepDy = curY - scrollState.y;
+
+      var stepDt = 12 + Math.round(Math.random() * 8);
+      if (typeof global.__advanceClock === "function") global.__advanceClock(stepDt);
+
+      if (stepDx !== 0 || stepDy !== 0) {
+        _dispatchWheel(stepDx, stepDy);
+      }
+      scrollState.x = curX;
+      scrollState.y = curY;
+      _notifyIntersections();
+      if (typeof global.dispatchEvent === "function" && typeof global.Event === "function") {
+        try {
+          var tNow = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
+          global.dispatchEvent(new global.Event("scroll", { bubbles: false, isTrusted: true, timeStamp: tNow }));
+        } catch (e) {}
+      }
+    }
+    return true;
+  };
   global.scrollBy = function (x, y) {
     if (typeof x === "object" && x !== null) { y = x.top || 0; x = x.left || 0; }
     _doScroll(scrollState.x + (Number(x) || 0), scrollState.y + (Number(y) || 0));
@@ -2304,6 +2522,15 @@
         });
         return req;
       },
+      databases: function () {
+        var list = [];
+        for (var k in idbDatabases) {
+          if (Object.prototype.hasOwnProperty.call(idbDatabases, k)) {
+            list.push({ name: k, version: idbDatabases[k].version || 1 });
+          }
+        }
+        return Promise.resolve(list);
+      },
       cmp: function (a, b) {
         if (a < b) return -1;
         if (a > b) return 1;
@@ -2398,15 +2625,41 @@
       if (this.nodeName.toLowerCase() !== "iframe") return null;
       if (!this._contentWindow) {
         var self = this;
-        this._contentWindow = {
+        var cw = {
           postMessage: function (data, targetOrigin) {
             if (typeof host_post_message === "function") {
               host_post_message(String(data), String(targetOrigin || "*"), self.getAttribute("src") || "");
             }
           }
         };
+        var doc = new Document();
+        var htmlEl = new Element("html");
+        var headEl = new Element("head");
+        var bodyEl = new Element("body");
+        htmlEl.appendChild(headEl);
+        htmlEl.appendChild(bodyEl);
+        doc.appendChild(htmlEl);
+        doc.documentElement = htmlEl;
+        doc.head = headEl;
+        doc.body = bodyEl;
+        doc.defaultView = cw;
+        cw.document = doc;
+        self._contentDocument = doc;
+        this._contentWindow = cw;
       }
       return this._contentWindow;
+    }
+  });
+
+  Object.defineProperty(Element.prototype, "contentDocument", {
+    get: function () {
+      if (this.nodeName.toLowerCase() !== "iframe") return null;
+      if (!this._contentDocument) {
+        // Accessing contentWindow ensures creation and linking of Document
+        var win = this.contentWindow;
+        return (win && win.document) || this._contentDocument || null;
+      }
+      return this._contentDocument;
     }
   });
 
@@ -2848,9 +3101,15 @@
     };
 
     var startTime = Date.now() - 150;
+    var _clockOffset = 0;
+    global.__advanceClock = function (ms) {
+      _clockOffset += Math.max(0, Number(ms) || 0);
+      return _clockOffset;
+    };
+    global.__getClockOffset = function () { return _clockOffset; };
     global.performance = {
       timeOrigin: startTime,
-      now: function () { return Date.now() - startTime; },
+      now: function () { return (Date.now() - startTime) + _clockOffset; },
       timing: {
         navigationStart: startTime,
         unloadEventStart: 0,
@@ -3033,7 +3292,12 @@
       this.cancelable = !!(init && init.cancelable);
       this.defaultPrevented = false;
       this.target = null;
-      this.isTrusted = !!(init && init.isTrusted);
+      var trusted = !!(init && (init.__trusted !== undefined ? init.__trusted : init.isTrusted));
+      Object.defineProperty(this, "isTrusted", {
+        value: trusted,
+        writable: false,
+        configurable: true
+      });
       this.preventDefault = function () { this.defaultPrevented = true; };
       this.stopPropagation = function () {};
       // Copy every remaining init field onto the event. Mouse handlers read
@@ -3041,7 +3305,7 @@
       // every drag arrive as a click at (0, 0).
       if (init && typeof init === "object") {
         for (var key in init) {
-          if (key === "bubbles" || key === "cancelable") continue;
+          if (key === "bubbles" || key === "cancelable" || key === "isTrusted" || key === "__trusted") continue;
           if (!Object.prototype.hasOwnProperty.call(this, key)) {
             try { this[key] = init[key]; } catch (e) {}
           }
@@ -3075,6 +3339,22 @@
       this.relatedTarget = init.relatedTarget || null;
     };
     global.MouseEvent.prototype = Object.create(global.UIEvent.prototype);
+
+    global.PointerEvent = function (type, init) {
+      global.MouseEvent.call(this, type, init);
+      init = init || {};
+      this.pointerId = init.pointerId !== undefined ? init.pointerId : 1;
+      this.width = init.width || 1;
+      this.height = init.height || 1;
+      this.pressure = init.pressure !== undefined ? init.pressure : (this.buttons ? 0.5 : 0);
+      this.tangentialPressure = init.tangentialPressure || 0;
+      this.tiltX = init.tiltX || 0;
+      this.tiltY = init.tiltY || 0;
+      this.twist = init.twist || 0;
+      this.pointerType = init.pointerType || "mouse";
+      this.isPrimary = init.isPrimary !== undefined ? !!init.isPrimary : true;
+    };
+    global.PointerEvent.prototype = Object.create(global.MouseEvent.prototype);
 
     global.FocusEvent = function (type, init) {
       global.UIEvent.call(this, type, init);
@@ -3220,34 +3500,57 @@
       return true;
     };
     global.postMessage = function (data, origin) {
-      var targetOrigin = String(origin || "*");
-      if (typeof host_post_message === "function") host_post_message(String(data), targetOrigin, "self");
-      global.dispatchEvent(new global.MessageEvent("message", {
-        data: data,
-        origin: targetOrigin === "*" ? "" : targetOrigin,
-        source: global
-      }));
+      var targetOrigin = String(origin != null ? origin : "*");
+      var senderOrigin = (global.location && global.location.origin) || "";
+      if (typeof host_post_message === "function") {
+        host_post_message(String(data), targetOrigin, "self", senderOrigin);
+      }
+      if (targetOrigin !== "*" && targetOrigin !== "/" && targetOrigin !== senderOrigin) {
+        return;
+      }
+      Promise.resolve().then(function () {
+        global.dispatchEvent(new global.MessageEvent("message", {
+          data: data,
+          origin: senderOrigin,
+          source: global
+        }));
+      });
     };
     global.parent = {
       postMessage: function (data, origin) {
-        var targetOrigin = String(origin || "*");
-        if (typeof host_post_message === "function") host_post_message(String(data), targetOrigin, "parent");
+        var targetOrigin = String(origin != null ? origin : "*");
+        var senderOrigin = (global.location && global.location.origin) || "";
+        if (typeof host_post_message === "function") {
+          host_post_message(String(data), targetOrigin, "parent", senderOrigin);
+        }
       }
     };
     global.top = global.parent;
     global.self = global;
-    global.__receiveMessage = function (data, origin) {
+    global.__receiveMessage = function (data, origin, targetOrigin) {
+      if (targetOrigin && targetOrigin !== "*") {
+        var myOrigin = (global.location && global.location.origin) || "";
+        if (myOrigin && targetOrigin !== myOrigin) {
+          return false;
+        }
+      }
       var sourceProxy = {
         postMessage: function (replyData, replyOrigin) {
-          var targetOrigin = String(replyOrigin || "*");
-          if (typeof host_post_message === "function") host_post_message(String(replyData), targetOrigin, "reply");
+          var repTarget = String(replyOrigin != null ? replyOrigin : "*");
+          var repSender = (global.location && global.location.origin) || "";
+          if (typeof host_post_message === "function") {
+            host_post_message(String(replyData), repTarget, "reply", repSender);
+          }
         }
       };
-      global.dispatchEvent(new global.MessageEvent("message", {
-        data: data,
-        origin: String(origin || ""),
-        source: sourceProxy
-      }));
+      Promise.resolve().then(function () {
+        global.dispatchEvent(new global.MessageEvent("message", {
+          data: data,
+          origin: String(origin || ""),
+          source: sourceProxy
+        }));
+      });
+      return true;
     };
     global.frames = [];
     global.innerWidth = 1280;
@@ -3263,7 +3566,8 @@
     if (global.document.getElementById(selectorOrId)) el = global.document.getElementById(selectorOrId);
     else el = global.document.querySelector(selectorOrId);
     if (!el) return false;
-    el.click();
+    if (typeof el.__nativeClick === "function") el.__nativeClick();
+    else if (typeof el.click === "function") el.click();
     return true;
   };
   function __elementChildren(n) {
@@ -3279,20 +3583,40 @@
     }
     return n;
   };
-  global.__clickPath = function (path) {
+  global.__stealthMode = false;
+  global.__setStealthMode = function (enabled) {
+    global.__stealthMode = !!enabled;
+    return global.__stealthMode;
+  };
+
+  global.__clickPath = function (path, stealth) {
     var el = global.__byPath(path);
     if (!el) return false;
-    if (typeof el.click === "function") el.click();
-    else el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true }));
+    if (stealth !== undefined) global.__stealthMode = !!stealth;
+    if (typeof el.__nativeClick === "function") el.__nativeClick();
+    else if (typeof el.click === "function") el.click();
+    else el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true, __trusted: true }));
     return true;
   };
-  function __dispatchTypeSequence(el, text) {
+
+  function __dispatchTypeSequence(el, text, delays, stealth) {
     if (!el) return false;
     if (typeof el.focus === "function") el.focus();
     text = String(text != null ? text : "");
     var curVal = el.value || "";
+    var isStealth = (stealth !== undefined) ? !!stealth : (Array.isArray(delays) || !!global.__stealthMode);
+    delays = Array.isArray(delays) ? delays : null;
+
     for (var i = 0; i < text.length; i++) {
       var ch = text[i];
+      if (isStealth) {
+        var flight = (delays && delays[i] !== undefined)
+          ? Number(delays[i])
+          : (ch === " " ? (85 + Math.round(Math.random() * 45)) : (45 + Math.round(Math.random() * 35)));
+        if (typeof global.__advanceClock === "function") global.__advanceClock(flight);
+      }
+      var tNow = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
+
       var code = "Key" + ch.toUpperCase();
       if (ch >= "0" && ch <= "9") code = "Digit" + ch;
       else if (ch === " ") code = "Space";
@@ -3300,85 +3624,219 @@
       var kc = (ch === "\n") ? 13 : ch.charCodeAt(0);
 
       var kd = (typeof global.KeyboardEvent === "function")
-        ? new global.KeyboardEvent("keydown", { key: ch, code: code, keyCode: kc, which: kc, bubbles: true, cancelable: true, isTrusted: true })
-        : new global.Event("keydown", { bubbles: true, cancelable: true, isTrusted: true });
+        ? new global.KeyboardEvent("keydown", { key: ch, code: code, keyCode: kc, which: kc, bubbles: true, cancelable: true, isTrusted: true, timeStamp: tNow })
+        : new global.Event("keydown", { bubbles: true, cancelable: true, isTrusted: true, timeStamp: tNow });
       el.dispatchEvent(kd);
 
       var kp = (typeof global.KeyboardEvent === "function")
-        ? new global.KeyboardEvent("keypress", { key: ch, code: code, keyCode: kc, which: kc, charCode: kc, bubbles: true, cancelable: true, isTrusted: true })
-        : new global.Event("keypress", { bubbles: true, cancelable: true, isTrusted: true });
+        ? new global.KeyboardEvent("keypress", { key: ch, code: code, keyCode: kc, which: kc, charCode: kc, bubbles: true, cancelable: true, isTrusted: true, timeStamp: tNow + 1 })
+        : new global.Event("keypress", { bubbles: true, cancelable: true, isTrusted: true, timeStamp: tNow + 1 });
       el.dispatchEvent(kp);
 
       curVal += ch;
       el.value = curVal;
 
-      var inp = new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true });
+      var inp = new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true, timeStamp: tNow + 2 });
       inp.data = ch;
       inp.inputType = "insertText";
       el.dispatchEvent(inp);
 
+      if (isStealth) {
+        var dwell = 25 + Math.round(Math.random() * 20);
+        if (typeof global.__advanceClock === "function") global.__advanceClock(dwell);
+      }
+      var tUp = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
+
       var ku = (typeof global.KeyboardEvent === "function")
-        ? new global.KeyboardEvent("keyup", { key: ch, code: code, keyCode: kc, which: kc, bubbles: true, cancelable: true, isTrusted: true })
-        : new global.Event("keyup", { bubbles: true, cancelable: true, isTrusted: true });
+        ? new global.KeyboardEvent("keyup", { key: ch, code: code, keyCode: kc, which: kc, bubbles: true, cancelable: true, isTrusted: true, timeStamp: tUp })
+        : new global.Event("keyup", { bubbles: true, cancelable: true, isTrusted: true, timeStamp: tUp });
       el.dispatchEvent(ku);
     }
     el.setAttribute("value", curVal);
-    el.dispatchEvent(new global.Event("change", { bubbles: true, cancelable: false, isTrusted: true }));
+    var tEnd = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
+    el.dispatchEvent(new global.Event("change", { bubbles: true, cancelable: false, isTrusted: true, timeStamp: tEnd }));
     return true;
   }
-  global.__typePath = function (path, text) {
+
+  global.__typePath = function (path, text, delays, stealth) {
     var el = global.__byPath(path);
     if (!el) return false;
-    return __dispatchTypeSequence(el, text);
+    return __dispatchTypeSequence(el, text, delays, stealth);
   };
-  global.__activateSelector = function (selector, text) {
+
+  global.__activateSelector = function (selector, text, delays, stealth) {
     var el = null;
     if (global.document.getElementById(selector)) el = global.document.getElementById(selector);
     else el = global.document.querySelector(selector);
     if (!el) return false;
+    if (stealth !== undefined) global.__stealthMode = !!stealth;
     if (text !== null && text !== undefined && text !== "") {
-      return __dispatchTypeSequence(el, text);
+      return __dispatchTypeSequence(el, text, delays, stealth);
     }
     var tag = el.nodeName.toLowerCase();
     if (tag === "input" || tag === "textarea" || tag === "select" || tag === "button" || tag === "a" || el.hasAttribute("tabindex")) {
       if (typeof el.focus === "function") el.focus();
     }
-    if (typeof el.click === "function") el.click();
-    else el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true }));
-    // Element.click() already flips checkbox state, so state is only mirrored
-    // here rather than toggled again. Setting `checked` in addition would
-    // double-toggle and land back where it started, which is why a click on a
-    // checkbox appeared to do nothing.
+    if (typeof el.__nativeClick === "function") el.__nativeClick();
+    else if (typeof el.click === "function") el.click();
+    else el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true, __trusted: true }));
     var kind = (el.getAttribute("type") || "").toLowerCase();
     if (kind === "checkbox" || kind === "radio") {
       el.setAttribute("aria-checked", el.checked ? "true" : "false");
     }
     return true;
   };
-global.__dragSelector = function (selector, dx, dy, steps) {
+
+  function __executeDrag(el, dx, dy, steps, trajectory, stealth) {
+    if (!el) return false;
+    dx = Number(dx) || 0;
+    dy = Number(dy) || 0;
+    var isStealth = (stealth !== undefined) ? !!stealth : (Array.isArray(trajectory) || !!global.__stealthMode);
+    var traj = Array.isArray(trajectory) && trajectory.length ? trajectory : null;
+    var startX = 0;
+    var startY = 0;
+    if (traj && traj[0]) {
+      startX = (traj[0].x !== undefined) ? (traj[0].x - (traj[0].movementX || 0)) : 0;
+      startY = (traj[0].y !== undefined) ? (traj[0].y - (traj[0].movementY || 0)) : 0;
+    }
+
+    var t = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : 100.0;
+    var hoverInit = { clientX: startX, clientY: startY, pageX: startX, pageY: startY, screenX: startX + 50, screenY: startY + 100, bubbles: true, cancelable: true, isTrusted: true, timeStamp: t };
+    if (typeof global.PointerEvent === "function") el.dispatchEvent(new global.PointerEvent("pointerover", hoverInit));
+    if (typeof global.MouseEvent === "function") el.dispatchEvent(new global.MouseEvent("mouseover", hoverInit));
+    if (typeof global.PointerEvent === "function") el.dispatchEvent(new global.PointerEvent("pointerenter", hoverInit));
+    if (typeof global.MouseEvent === "function") el.dispatchEvent(new global.MouseEvent("mouseenter", hoverInit));
+
+    if (isStealth) {
+      var preDelay = 25 + Math.round(Math.random() * 20);
+      if (typeof global.__advanceClock === "function") global.__advanceClock(preDelay);
+      t = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : t + preDelay;
+    }
+
+    var downInit = { clientX: startX, clientY: startY, pageX: startX, pageY: startY, screenX: startX + 50, screenY: startY + 100, button: 0, buttons: 1, pressure: 0.5, pointerId: 1, bubbles: true, cancelable: true, isTrusted: true, timeStamp: t };
+    if (typeof global.PointerEvent === "function") el.dispatchEvent(new global.PointerEvent("pointerdown", downInit));
+    var mdEv = (typeof global.MouseEvent === "function") ? new global.MouseEvent("mousedown", downInit) : new global.Event("mousedown", downInit);
+    el.dispatchEvent(mdEv);
+
+    if (isStealth) {
+      var hesitation = 35 + Math.round(Math.random() * 25);
+      if (typeof global.__advanceClock === "function") global.__advanceClock(hesitation);
+    }
+
+    if (!traj) {
+      traj = [];
+      if (isStealth) {
+        var n = Math.max(3, Math.min(50, Number(steps) || 16));
+        var prevX = startX, prevY = startY;
+        for (var i = 1; i <= n; i++) {
+          var prog = i / n;
+          var ease = 3 * prog * prog - 2 * prog * prog * prog;
+          var curX = (i === n) ? (startX + dx) : Math.round(startX + dx * ease);
+          var jitter = (i === n) ? 0 : (Math.random() - 0.5) * 1.5;
+          var curY = (i === n) ? (startY + dy) : Math.round(startY + dy * ease + jitter);
+          var stepDt = 10 + Math.round(Math.random() * 6);
+          traj.push({ x: curX, y: curY, movementX: curX - prevX, movementY: curY - prevY, dt: stepDt });
+          prevX = curX;
+          prevY = curY;
+        }
+      } else {
+        var fastSteps = Math.max(2, Math.min(6, Number(steps) || 3));
+        var pX = startX, pY = startY;
+        for (var fi = 1; fi <= fastSteps; fi++) {
+          var fProg = fi / fastSteps;
+          var fX = (fi === fastSteps) ? (startX + dx) : Math.round(startX + dx * fProg);
+          var fY = (fi === fastSteps) ? (startY + dy) : Math.round(startY + dy * fProg);
+          traj.push({ x: fX, y: fY, movementX: fX - pX, movementY: fY - pY, dt: 0 });
+          pX = fX;
+          pY = fY;
+        }
+      }
+    }
+
+    var lastX = startX;
+    var lastY = startY;
+    for (var s = 0; s < traj.length; s++) {
+      var step = traj[s];
+      var stepX = (step.x !== undefined) ? step.x : (startX + (step[0] || 0));
+      var stepY = (step.y !== undefined) ? step.y : (startY + (step[1] || 0));
+      var mvX = (step.movementX !== undefined) ? step.movementX : (stepX - lastX);
+      var mvY = (step.movementY !== undefined) ? step.movementY : (stepY - lastY);
+
+      if (isStealth && step.dt) {
+        if (typeof global.__advanceClock === "function") global.__advanceClock(step.dt);
+      }
+      t = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : t + (step.dt || 0);
+
+      var moveInit = {
+        clientX: stepX,
+        clientY: stepY,
+        pageX: stepX,
+        pageY: stepY,
+        screenX: stepX + 50,
+        screenY: stepY + 100,
+        movementX: mvX,
+        movementY: mvY,
+        button: 0,
+        buttons: 1,
+        pressure: 0.5,
+        pointerId: 1,
+        bubbles: true,
+        cancelable: true,
+        isTrusted: true,
+        timeStamp: t,
+      };
+      var moveTarget = _activePointerCaptures[1] || el;
+      if (typeof global.PointerEvent === "function") moveTarget.dispatchEvent(new global.PointerEvent("pointermove", moveInit));
+      var mmEv = (typeof global.MouseEvent === "function") ? new global.MouseEvent("mousemove", moveInit) : new global.Event("mousemove", moveInit);
+      moveTarget.dispatchEvent(mmEv);
+      lastX = stepX;
+      lastY = stepY;
+    }
+
+    if (isStealth) {
+      var postHesitation = 15 + Math.round(Math.random() * 15);
+      if (typeof global.__advanceClock === "function") global.__advanceClock(postHesitation);
+      t = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : t + postHesitation;
+    }
+
+    var upInit = {
+      clientX: startX + dx,
+      clientY: startY + dy,
+      pageX: startX + dx,
+      pageY: startY + dy,
+      screenX: startX + dx + 50,
+      screenY: startY + dy + 100,
+      button: 0,
+      buttons: 0,
+      pressure: 0,
+      pointerId: 1,
+      bubbles: true,
+      cancelable: true,
+      isTrusted: true,
+      __trusted: true,
+      timeStamp: t,
+    };
+    var upTarget = _activePointerCaptures[1] || el;
+    if (typeof global.PointerEvent === "function") upTarget.dispatchEvent(new global.PointerEvent("pointerup", upInit));
+    var muEv = (typeof global.MouseEvent === "function") ? new global.MouseEvent("mouseup", upInit) : new global.Event("mouseup", upInit);
+    upTarget.dispatchEvent(muEv);
+    if (_activePointerCaptures[1]) {
+      _activePointerCaptures[1].releasePointerCapture(1);
+    }
+    return true;
+  }
+
+  global.__dragSelector = function (selector, dx, dy, steps, trajectory, stealth) {
     var el = null;
     if (global.document.getElementById(selector)) el = global.document.getElementById(selector);
     else el = global.document.querySelector(selector);
     if (!el) return false;
-    var n = Math.max(2, Math.min(40, steps || 12));
-    var move = typeof global.MouseEvent === "function" ? global.MouseEvent : global.Event;
-    var init = { bubbles: true, cancelable: true, isTrusted: true };
-    try { init.clientX = 0; init.clientY = 0; } catch (e) {}
-    // A slider listens for press, a move chain, then release. Emitting only a
-    // click is what made every drag a no-op against these widgets.
-    el.dispatchEvent(new move("mousedown", init));
-    for (var i = 1; i <= n; i++) {
-      var step = {};
-      for (var k in init) step[k] = init[k];
-      step.clientX = Math.round((dx * i) / n);
-      step.clientY = Math.round((dy * i) / n);
-      el.dispatchEvent(new move("mousemove", step));
-    }
-    var end = {};
-    for (var j in init) end[j] = init[j];
-    end.clientX = dx; end.clientY = dy;
-    el.dispatchEvent(new move("mouseup", end));
-    return true;
+    return __executeDrag(el, dx, dy, steps, trajectory, stealth);
+  };
+  global.__dragPath = function (path, dx, dy, steps, trajectory, stealth) {
+    var el = global.__byPath(path);
+    if (!el) return false;
+    return __executeDrag(el, dx, dy, steps, trajectory, stealth);
   };
 global.__submitPath = function (path) {
     var el = global.__byPath(path);

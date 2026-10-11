@@ -47,6 +47,23 @@ def _wants_js(html: str) -> bool:
     return "react" in low or "vue" in low or "__next" in low
 
 
+def _extract_origin(url: str) -> str:
+    try:
+        p = urlparse(url)
+        scheme = p.scheme.lower()
+        if not scheme or not p.hostname:
+            return ""
+        host = p.hostname.lower()
+        port = p.port
+        if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+            port = None
+        if port:
+            return f"{scheme}://{host}:{port}"
+        return f"{scheme}://{host}"
+    except Exception:
+        return ""
+
+
 def _host_parse_html(html: str) -> str:
     tree = html_to_tree(f"<div id='__frag'>{html}</div>")
     for child in tree.get("c") or []:
@@ -141,10 +158,16 @@ async def run_scripts(
     sw_records: list[dict] = []
     sw_revalidate_queue: list[str] = []
 
-    def host_post_message_handler(data, origin="*", target="parent") -> None:
+    def host_post_message_handler(data, origin="*", target="parent", sender_origin="") -> None:
         data_str = str(data)[:4000]
+        s_orig = str(sender_origin).strip() if sender_origin else _extract_origin(url)
         info["post_messages"].append(
-            {"data": data_str, "origin": str(origin)[:500], "target": str(target)}
+            {
+                "data": data_str,
+                "origin": s_orig,
+                "target_origin": str(origin)[:500],
+                "target": str(target),
+            }
         )
         if "cookie" in data_str and "datadome=" in data_str:
             try:
@@ -576,7 +599,12 @@ async def run_scripts(
     
         # ES modules via the registry translator.
         if module_scripts:
-            import_map = extract_import_map(html)
+            from webresearch.engine.modules import resolve_import_map as _resolve_map
+
+            try:
+                import_map = await _resolve_map(html, url, client)
+            except Exception:
+                import_map = extract_import_map(html)
             graph = await load_module_graph(
                 module_scripts,
                 url,
@@ -651,9 +679,10 @@ async def run_scripts(
         for msg in messages:
             m_data = json.dumps(msg.get("data", ""))
             m_origin = json.dumps(msg.get("origin", ""))
+            m_target = json.dumps(msg.get("target", "*"))
             try:
                 ctx.eval(
-                    f"if (typeof window !== 'undefined' && typeof window.__receiveMessage === 'function') window.__receiveMessage({m_data}, {m_origin});"
+                    f"if (typeof window !== 'undefined' && typeof window.__receiveMessage === 'function') window.__receiveMessage({m_data}, {m_origin}, {m_target});"
                 )
             except Exception as exc:
                 record_error(exc)
@@ -662,6 +691,7 @@ async def run_scripts(
     # Apply agent interactions against the live (post-hydration) DOM.
     if actions:
         import json as _json
+        from webresearch.kinematics import generate_human_drag_steps, generate_human_typing_delays
 
         try:
             ctx.eval("__startDeltaRecording()")
@@ -673,30 +703,39 @@ async def run_scripts(
             path = (action or {}).get("path") or []
             selector = (action or {}).get("selector") or ""
             try:
+                stealth = bool((action or {}).get("stealth", False))
+                try:
+                    ctx.eval(f"__setStealthMode({str(stealth).lower()})")
+                except Exception:
+                    pass
                 if kind == "type":
                     text = (action or {}).get("text") or ""
+                    delays = generate_human_typing_delays(text) if stealth else False
                     if selector:
                         ok = ctx.eval(
-                            f"__activateSelector({_json.dumps(selector)}, {_json.dumps(text)})"
+                            f"__activateSelector({_json.dumps(selector)}, {_json.dumps(text)}, {_json.dumps(delays)}, {str(stealth).lower()})"
                         )
                     else:
-                        ok = ctx.eval(f"__typePath({_json.dumps(path)}, {_json.dumps(text)})")
+                        ok = ctx.eval(
+                            f"__typePath({_json.dumps(path)}, {_json.dumps(text)}, {_json.dumps(delays)}, {str(stealth).lower()})"
+                        )
                 elif kind == "drag":
                     dx = (action or {}).get("dx", 220.0)
                     dy = (action or {}).get("dy", 0.0)
-                    steps = int((action or {}).get("steps", 12))
+                    steps = int((action or {}).get("steps", 16 if stealth else 3))
+                    trajectory = generate_human_drag_steps(float(dx), float(dy)) if stealth else None
                     target = selector or path
                     ok = ctx.eval(
-                        f"__dragSelector({_json.dumps(target)}, {dx}, {dy}, {steps})"
+                        f"__dragSelector({_json.dumps(target)}, {dx}, {dy}, {steps}, {_json.dumps(trajectory)}, {str(stealth).lower()})"
                         if isinstance(target, str)
-                        else f"__dragPath({_json.dumps(target)}, {dx}, {dy}, {steps})"
+                        else f"__dragPath({_json.dumps(target)}, {dx}, {dy}, {steps}, {_json.dumps(trajectory)}, {str(stealth).lower()})"
                     )
                 elif kind == "activate":
                     target = selector or path
                     ok = ctx.eval(
-                        f"__activateSelector({_json.dumps(target)})"
+                        f"__activateSelector({_json.dumps(target)}, null, false, {str(stealth).lower()})"
                         if isinstance(target, str)
-                        else f"__clickPath({_json.dumps(target)})"
+                        else f"__clickPath({_json.dumps(target)}, {str(stealth).lower()})"
                     )
                 elif kind == "submit":
                     ok = ctx.eval(f"__submitPath({_json.dumps(path)})")
@@ -714,9 +753,13 @@ async def run_scripts(
                 elif kind == "scroll":
                     x = (action or {}).get("x", 0)
                     y = (action or {}).get("y", 800)
-                    ok = ctx.eval(f"scrollTo({_json.dumps(x)}, {_json.dumps(y)}); true")
+                    smooth = bool((action or {}).get("smooth", stealth))
+                    if smooth:
+                        ok = ctx.eval(f"__scrollSmooth({_json.dumps(x)}, {_json.dumps(y)}); true")
+                    else:
+                        ok = ctx.eval(f"scrollTo({_json.dumps(x)}, {_json.dumps(y)}); true")
                 else:
-                    ok = ctx.eval(f"__clickPath({_json.dumps(path)})")
+                    ok = ctx.eval(f"__clickPath({_json.dumps(path)}, {str(stealth).lower()})")
                 info["actions_applied"].append(
                     {
                         "kind": kind,
