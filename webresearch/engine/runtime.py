@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from pathlib import Path
@@ -34,6 +35,9 @@ MAX_MODULES = 80
 MAX_JOBS = 20_000
 MAX_TIMER_PASSES = 25
 JS_TIME_LIMIT_SECONDS = 10.0
+# Upload payloads are embedded into a JS eval call; bound them so a large file
+# cannot exhaust QuickJS or balloon the eval string. 16M b64 chars ≈ 12 MB raw.
+MAX_UPLOAD_B64_CHARS = 16_000_000
 
 
 def _wants_js(html: str) -> bool:
@@ -101,6 +105,27 @@ def _device_block() -> dict:
     }
 
 
+def _pump_websockets(ctx: Context) -> None:
+    """Deliver any WebSocket frames the host sockets have received."""
+    try:
+        from webresearch.engine import ws as _ws
+
+        raw = _ws.poll_all()
+        payload = json.loads(str(raw))
+        for msg in payload.get("messages", []):
+            ctx.eval(
+                f"if (typeof globalThis.__wsDeliver === 'function') "
+                f"globalThis.__wsDeliver({int(msg['id'])}, {json.dumps(str(msg['data']))});"
+            )
+        for fin in payload.get("closed", []):
+            ctx.eval(
+                f"if (typeof globalThis.__wsClosed === 'function') "
+                f"globalThis.__wsClosed({int(fin['id'])}, {int(fin.get('code') or 1006)}, {json.dumps(str(fin.get('reason') or ''))});"
+            )
+    except Exception:
+        pass
+
+
 def _pump_jobs(ctx: Context) -> int:
     done = 0
     for _ in range(MAX_JOBS):
@@ -110,6 +135,7 @@ def _pump_jobs(ctx: Context) -> int:
         except Exception:
             break
         done += 1
+    _pump_websockets(ctx)
     return done
 
 
@@ -149,6 +175,13 @@ async def run_scripts(
         ctx.add_callable("host_parse_html", _host_parse_html)
     else:
         reusing_ctx = True
+
+    # WebSocket host bridge: own-transport RFC 6455 sockets in engine/ws.py.
+    from webresearch.engine import ws as _ws
+
+    ctx.add_callable("host_ws_connect", _ws.connect)
+    ctx.add_callable("host_ws_send", _ws.send)
+    ctx.add_callable("host_ws_close", _ws.close)
 
     def record_error(exc: Exception) -> None:
         info["errors"] += 1
@@ -243,10 +276,13 @@ async def run_scripts(
         except Exception:
             curl_sync = None
 
-    def do_request(method: str, abs_url: str, body: str, headers: dict) -> tuple[int, str, str, str, dict, bytes]:
+    def do_request(method: str, abs_url: str, body: str, headers: dict, body_b64: str = "") -> tuple[int, str, str, str, dict, bytes]:
+        # Binary request bodies (multipart uploads with real file bytes) arrive
+        # base64-encoded so arbitrary bytes survive the JS->Python boundary.
+        content = base64.b64decode(body_b64) if body_b64 else (body or None)
         if curl_sync is not None:
             resp = curl_sync.request(
-                method or "GET", abs_url, data=body or None, headers=headers,
+                method or "GET", abs_url, data=content, headers=headers,
                 allow_redirects=True,
             )
             return (
@@ -257,7 +293,7 @@ async def run_scripts(
                 {k.lower(): v for k, v in resp.headers.items()},
                 resp.content or b"",
             )
-        resp = sync.request(method or "GET", abs_url, content=body or None, headers=headers)
+        resp = sync.request(method or "GET", abs_url, content=content, headers=headers)
         return (
             resp.status_code,
             str(resp.url),
@@ -286,7 +322,7 @@ async def run_scripts(
             return False
         return True
 
-    def host_fetch(req_url: str, method: str, body: str, headers_json: str = "{}") -> str:
+    def host_fetch(req_url: str, method: str, body: str, headers_json: str = "{}", body_b64: str = "") -> str:
         try:
             abs_url = urljoin(url, req_url)
             parsed = urlparse(abs_url)
@@ -336,7 +372,7 @@ async def run_scripts(
                     return json.dumps({"status": entry.status, "url": abs_url,
                                        "content_type": entry.resp_headers.get("content-type", ""),
                                        "body": text[:800_000]})
-            status, final, ctype, text, resp_headers, raw_bytes = do_request(method, abs_url, body, headers)
+            status, final, ctype, text, resp_headers, raw_bytes = do_request(method, abs_url, body, headers, body_b64)
             if (method or "GET").upper() == "GET" and status == 200 and raw_bytes:
                 try:
                     _SW_CACHE.store("GET", final or abs_url, {}, status,
@@ -421,7 +457,11 @@ async def run_scripts(
     if reusing_ctx:
         ran = 1
         try:
-            ctx.eval("globalThis.__WR_NAVIGATED = ''; globalThis.__WR_FORM_SUBMIT = null;")
+            ctx.eval(
+                "globalThis.__WR_NAVIGATED = ''; globalThis.__WR_FORM_SUBMIT = null;"
+                "if (typeof globalThis.__clearDialogState === 'function') globalThis.__clearDialogState();"
+                "globalThis.__WR_POPUPS = [];"
+            )
         except Exception:
             pass
     else:
@@ -750,6 +790,31 @@ async def run_scripts(
                     index = int((action or {}).get("index", 0))
                     ok = ctx.eval(f"__submitFormByIndex({index})")
                     info.setdefault("submit_outcome", str(ok))
+                elif kind in {"upload", "file"}:
+                    target = selector or path
+                    files = (action or {}).get("files") or []
+                    if not files and (action or {}).get("file"):
+                        files = [(action or {}).get("file")]
+                    payload_chars = sum(
+                        len(str(f.get("contentB64") or f.get("content_b64") or f.get("content") or ""))
+                        if isinstance(f, dict)
+                        else len(str(f))
+                        for f in files
+                    )
+                    if payload_chars > MAX_UPLOAD_B64_CHARS:
+                        raise ValueError(
+                            f"upload payload {payload_chars} chars exceeds engine limit "
+                            f"{MAX_UPLOAD_B64_CHARS} (approx {MAX_UPLOAD_B64_CHARS * 3 // 4} raw bytes)"
+                        )
+                    ok = ctx.eval(
+                        f"__uploadFiles({_json.dumps(target)}, {_json.dumps(files)})"
+                    )
+                elif kind == "press":
+                    target = selector or path
+                    key_name = (action or {}).get("key") or "Enter"
+                    ok = ctx.eval(
+                        f"__pressKey({_json.dumps(target)}, {_json.dumps(key_name)}, {str(stealth).lower()})"
+                    )
                 elif kind == "scroll":
                     x = (action or {}).get("x", 0)
                     y = (action or {}).get("y", 800)
@@ -760,13 +825,14 @@ async def run_scripts(
                         ok = ctx.eval(f"scrollTo({_json.dumps(x)}, {_json.dumps(y)}); true")
                 else:
                     ok = ctx.eval(f"__clickPath({_json.dumps(path)}, {str(stealth).lower()})")
-                info["actions_applied"].append(
-                    {
-                        "kind": kind,
-                        "path": path or selector,
-                        "ok": bool(ok),
-                    }
-                )
+                applied_item = {
+                    "kind": kind,
+                    "path": path or selector,
+                    "ok": bool(ok),
+                }
+                if kind in {"upload", "file"}:
+                    applied_item["files"] = [f.get("name") if isinstance(f, dict) else str(f) for f in files]
+                info["actions_applied"].append(applied_item)
             except Exception as exc:
                 info["actions_applied"].append(
                     {"kind": kind, "path": path or selector, "ok": False, "error": str(exc)[:200]}
@@ -802,6 +868,27 @@ async def run_scripts(
         form_sub = ctx.eval("JSON.stringify(globalThis.__WR_FORM_SUBMIT || null)")
         if form_sub and str(form_sub) != "null":
             info["form_submit"] = json.loads(str(form_sub))
+    except Exception:
+        pass
+    try:
+        dialogs_raw = ctx.eval("JSON.stringify(globalThis.__WR_DIALOGS || [])")
+        dialogs = json.loads(str(dialogs_raw)) if dialogs_raw else []
+        if dialogs:
+            info["dialogs"] = [
+                {"type": d.get("type", ""), "message": str(d.get("message", ""))[:400], "answered": d.get("answered", "default")}
+                for d in dialogs
+            ]
+    except Exception:
+        pass
+    try:
+        popups_raw = ctx.eval("JSON.stringify(globalThis.__WR_POPUPS || [])")
+        popups = json.loads(str(popups_raw)) if popups_raw else []
+        if popups:
+            info["popups"] = [
+                {"url": str(p.get("url", ""))[:2000], "name": str(p.get("name", ""))[:120]}
+                for p in popups
+                if p.get("url")
+            ]
     except Exception:
         pass
 

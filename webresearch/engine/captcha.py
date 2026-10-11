@@ -1,16 +1,19 @@
-"""Structured CAPTCHA visibility for agents.
+"""Structured CAPTCHA visibility and solving for agents.
 
-This module reports challenge structure and resources. It deliberately does
-not select tiles, produce answers, submit verification, or harvest solved
-tokens.
+Inspection: reports challenge structure and resources.
+Solving: uses an external vision model to identify tiles matching the prompt,
+then returns structured selections the session can actuate.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import json
 import re
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
@@ -23,7 +26,9 @@ from webresearch.types import (
     CaptchaFrame,
     CaptchaReport,
     CaptchaScript,
+    CaptchaSolution,
     CaptchaTile,
+    CaptchaTileSelection,
 )
 
 MAX_SPRITE_BYTES = 3_000_000
@@ -742,5 +747,289 @@ def _format_captcha_code(dump: CaptchaCodeDump) -> str:
         lines.append(dump.sprite_b64)
     lines.append(f"NOTE: {dump.note}")
     lines.append("======== END CAPTCHA CODE ========")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Vision-based CAPTCHA solving
+# ---------------------------------------------------------------------------
+
+_VISION_PROMPT_TEMPLATE = """You are solving a visual CAPTCHA. Look at the image below and identify which squares in the grid contain objects matching the prompt.
+
+PROMPT: {prompt}
+
+The image shows a grid of tiles (typically 3x3). Each tile is numbered 1-9 (left to right, top to bottom).
+
+Respond with ONLY a valid JSON object in this format:
+{{"selected": [list of tile numbers 1-9 that match the prompt]}}
+
+Example: {{"selected": [1, 3, 5]}} means tiles at positions 1, 3, and 5 contain the objects described in the prompt.
+
+Rules:
+- Select ALL tiles that contain the described objects
+- If uncertain between including or excluding a tile, include it
+- Return ONLY the JSON object, no explanation"""
+
+
+def _vision_tile_grid(prompt: str) -> str:
+    """Build a vision model prompt for tile-based CAPTCHAs."""
+    return _VISION_PROMPT_TEMPLATE.format(prompt=prompt)
+
+
+def _parse_vision_response(content: str) -> list[int]:
+    """Parse the vision model's response into a list of 1-based tile indices."""
+    content = content.strip()
+
+    # Strip markdown code blocks
+    content = re.sub(r'^```(?:json)?\s*', '', content, flags=re.MULTILINE)
+    content = re.sub(r'\s*```$', '', content, flags=re.MULTILINE)
+    content = content.strip()
+
+    # Try to find JSON in the response
+    start = content.find("{")
+    end = content.rfind("}") + 1
+    if start >= 0 and end > start:
+        json_str = content[start:end]
+    else:
+        json_str = content
+
+    try:
+        parsed = json.loads(json_str)
+        if isinstance(parsed, dict) and "selected" in parsed:
+            selected = parsed["selected"]
+            if isinstance(selected, list):
+                return [int(x) for x in selected if isinstance(x, (int, float)) and 1 <= int(x) <= 9]
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+
+    # Fallback: try to extract numbers
+    numbers = re.findall(r"\b([1-9])\b", content)
+    return [int(n) for n in numbers if 1 <= int(n) <= 9]
+
+
+async def _call_vision_model(
+    prompt: str,
+    sprite_b64: str,
+    sprite_content_type: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    client: httpx.AsyncClient | None = None,
+    *,
+    retries: int = 2,
+) -> list[int]:
+    """Call an OpenAI-compatible vision model to identify tiles.
+
+    Returns 1-based tile indices that match the CAPTCHA prompt.
+    """
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=60.0)
+
+    message_content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": _vision_tile_grid(prompt),
+        },
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{sprite_content_type};base64,{sprite_b64}",
+                "detail": "high",
+            },
+        },
+    ]
+
+    last_error: str = ""
+    try:
+        for attempt in range(max(1, retries + 1)):
+            try:
+                response = await client.post(
+                    f"{base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": message_content}],
+                        "temperature": 0.0,
+                        "max_tokens": 256,
+                    },
+                )
+            except httpx.TimeoutException:
+                last_error = f"vision model timed out (attempt {attempt + 1})"
+                await asyncio.sleep(3 * (attempt + 1))
+                continue
+            except httpx.HTTPError as exc:
+                raise CaptchaSolveError(f"vision model connection failed: {exc}") from exc
+
+            try:
+                body = response.json()
+            except ValueError:
+                body = {"error": response.text[:500]}
+
+            err = body.get("error") if isinstance(body, dict) else None
+            if response.status_code == 429:
+                last_error = f"rate limited: {err}"
+                await asyncio.sleep(5 * (2 ** attempt))
+                continue
+            if response.status_code >= 400:
+                raise CaptchaSolveError(
+                    f"vision model HTTP {response.status_code}: {err or body}"
+                )
+
+            # Extract content
+            try:
+                choices = body.get("choices") or []
+                if choices and isinstance(choices, list):
+                    content = (choices[0].get("message") or {}).get("content") or ""
+                    return _parse_vision_response(content)
+            except (KeyError, IndexError, TypeError):
+                pass
+
+            last_error = f"unexpected response format from vision model"
+
+        raise CaptchaSolveError(f"vision model failed after {retries + 1} attempts: {last_error}")
+    finally:
+        if own:
+            await client.aclose()
+
+
+@dataclass(slots=True)
+class CaptchaSolveResult:
+    """Result of an attempt to solve a visual CAPTCHA."""
+    solution: CaptchaSolution
+    error: str | None = None
+
+
+class CaptchaSolveError(Exception):
+    """Raised when CAPTCHA solving fails."""
+    pass
+
+
+async def solve_captcha(
+    inspection: CaptchaInspection,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    client: httpx.AsyncClient | None = None,
+    max_attempts: int = 1,
+) -> CaptchaSolveResult:
+    """Use a vision model to solve a tile-based visual CAPTCHA.
+
+    1. Encodes the sprite image as base64
+    2. Sends image + prompt to an OpenAI-compatible vision model
+    3. Parses the model's response to get tile indices
+    4. Returns structured tile selections
+
+    The caller (Session) is responsible for clicking the tiles and hitting verify.
+    """
+    report = inspection.report
+    sprite = inspection.sprite
+
+    if not sprite:
+        result = CaptchaSolution(
+            solved=False,
+            kind=report.kind,
+            prompt=report.prompt,
+            error="No sprite image available for solving. Call browser_captcha first.",
+        )
+        result.view = f"CAPTCHA SOLVE FAILED: {result.error}"
+        return CaptchaSolveResult(solution=result, error=result.error)
+
+    if not report.prompt:
+        result = CaptchaSolution(
+            solved=False,
+            kind=report.kind,
+            prompt=report.prompt,
+            error="No CAPTCHA prompt found. Cannot determine what to select.",
+        )
+        result.view = f"CAPTCHA SOLVE FAILED: {result.error}"
+        return CaptchaSolveResult(solution=result, error=result.error)
+
+    if not report.tiles:
+        result = CaptchaSolution(
+            solved=False,
+            kind=report.kind,
+            prompt=report.prompt,
+            error=f"No tiles found in CAPTCHA (kind={report.kind}). Only image-select captchas are supported.",
+        )
+        result.view = f"CAPTCHA SOLVE FAILED: {result.error}"
+        return CaptchaSolveResult(solution=result, error=result.error)
+
+    sprite_b64 = base64.b64encode(sprite).decode("ascii")
+    sprite_ct = report.sprite_content_type or "image/jpeg"
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            tile_indices = await _call_vision_model(
+                prompt=report.prompt,
+                sprite_b64=sprite_b64,
+                sprite_content_type=sprite_ct,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                client=client,
+                retries=2,
+            )
+
+            if not tile_indices:
+                raise CaptchaSolveError("Vision model returned empty selection")
+
+            selections = []
+            for idx in tile_indices:
+                tile_zero = idx - 1
+                if 0 <= tile_zero < len(report.tiles):
+                    tile = report.tiles[tile_zero]
+                    selections.append(CaptchaTileSelection(
+                        tile_id=tile.id,
+                        row=tile.row,
+                        column=tile.column,
+                        confidence=0.8,
+                        reason=f"Vision model selected tile {idx}",
+                    ))
+
+            solution = CaptchaSolution(
+                solved=True,
+                kind=report.kind,
+                prompt=report.prompt,
+                tiles_selected=selections,
+                model_used=model,
+                attempt=attempt,
+            )
+            solution.view = _format_solution_view(solution)
+            return CaptchaSolveResult(solution=solution)
+
+        except CaptchaSolveError as exc:
+            if attempt == max_attempts:
+                solution = CaptchaSolution(
+                    solved=False,
+                    kind=report.kind,
+                    prompt=report.prompt,
+                    model_used=model,
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                solution.view = f"CAPTCHA SOLVE FAILED (attempt {attempt}): {solution.error}"
+                return CaptchaSolveResult(solution=solution, error=str(exc))
+
+
+def _format_solution_view(solution: CaptchaSolution) -> str:
+    if not solution.solved:
+        return f"CAPTCHA SOLVE FAILED: {solution.error}"
+
+    lines = [
+        f"CAPTCHA SOLVE: {solution.kind}",
+        f"PROMPT: {solution.prompt}",
+        f"MODEL: {solution.model_used}",
+        f"ATTEMPT: {solution.attempt}",
+        f"TILES_SELECTED: {len(solution.tiles_selected)}",
+    ]
+    for sel in solution.tiles_selected:
+        lines.append(
+            f"  [{sel.tile_id}] row={sel.row} col={sel.column} "
+            f"(confidence={sel.confidence:.1f})"
+        )
     return "\n".join(lines)
 

@@ -48,12 +48,16 @@ pip install -e .
 | `browser_inspect` | List `[eN]` buttons/inputs/captcha widgets |
 | `browser_actions` | List the **complete** action surface with stable refs |
 | `browser_act` | Execute one action by ref (navigate / fill / click / drag) |
+| `browser_upload` | Upload files to `<input type='file'>` — text content or base64 (`content_b64`) for binary/video, byte-exact |
 | `browser_frames` | List loaded iframe documents as `[fN]` |
 | `browser_frame_source` | Read one frame's post-JS HTML |
 | `browser_captcha` | Separate structured challenge inspection |
 | `browser_captcha_code` | Dump widget/iframe HTML and related scripts |
 | `browser_click` | Click a top-level `[eN]` link/button/field |
 | `browser_type` | Type into `[eN]` |
+| `browser_press_key` | Named key press on a control (enter/tab/arrows/…): Enter submits, Tab focuses, arrows drive selects |
+| `browser_respond_dialog` | List alert/confirm/prompt dialogs, or stage an answer then re-run the action |
+| `browser_download` | Save a file to disk with sha256 + optional hash verification; attachments on navigation are saved, not parsed |
 | `browser_submit` | Submit form `[n]` |
 | `browser_query` | Retrieve ACD blocks by substring (structured context) |
 | `browser_slice` | Read ACD block range `b12`→`b40` |

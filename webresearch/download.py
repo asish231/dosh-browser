@@ -37,6 +37,17 @@ def _expected_digest(expected: str | None) -> tuple[str, bytes] | None:
         algo, b64 = "sha256", token[len("sha256-"):]
     else:
         algo, b64 = "sha256", token
+    # A bare hex string whose length matches a real digest length is hex.
+    # Every hex character is also a valid base64 character, so trying base64
+    # first would silently "decode" a 64-char sha256 hex digest into garbage.
+    hex_lengths = {"40": "sha1", "56": "sha224", "64": "sha256", "96": "sha384", "128": "sha512"}
+    try:
+        if algo == "sha256" and len(b64) in (40, 56, 64, 96, 128):
+            raw = bytes.fromhex(b64)
+            if len(raw) * 2 == len(b64):
+                return hex_lengths[str(len(b64))], raw
+    except ValueError:
+        pass
     try:
         return algo, base64.b64decode(b64)
     except Exception:

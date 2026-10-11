@@ -278,6 +278,7 @@ async def _fetch_impersonated(
     max_bytes: int,
     impersonate: str,
     timeout: float,
+    files: Any | None = None,
 ) -> FetchResult:
     merged = dict(client.headers)
     merged.update(navigate_headers(url))
@@ -292,6 +293,7 @@ async def _fetch_impersonated(
         url,
         data=data,
         json=json_body,
+        files=files,
         headers=merged,
         allow_redirects=True,
     )
@@ -321,6 +323,7 @@ async def _fetch_httpx(
     method: str,
     data: dict[str, str] | None,
     json_body: dict | None,
+    files: Any | None = None,
     headers: dict[str, str] | None,
     max_bytes: int,
 ) -> FetchResult:
@@ -332,6 +335,7 @@ async def _fetch_httpx(
         url,
         data=data,
         json=json_body,
+        files=files,
         headers=req_headers,
     ) as response:
         chunks: list[bytes] = []
@@ -458,6 +462,7 @@ async def fetch(
     method: str = "GET",
     data: dict[str, str] | None = None,
     json_body: dict | None = None,
+    files: Any | None = None,
     headers: dict[str, str] | None = None,
     max_bytes: int = DEFAULT_MAX_BYTES,
     impersonate: str | None = None,
@@ -545,6 +550,7 @@ async def fetch(
                     method=method,
                     data=data,
                     json_body=json_body,
+                    files=files,
                     headers=use_headers or None,
                     max_bytes=max_bytes,
                     impersonate=choice,
@@ -563,6 +569,7 @@ async def fetch(
             method=method,
             data=data,
             json_body=json_body,
+            files=files,
             headers=use_headers or None,
             max_bytes=max_bytes,
         )

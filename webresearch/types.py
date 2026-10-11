@@ -123,6 +123,27 @@ class CaptchaCodePart(BaseModel):
     truncated: bool = False
 
 
+class CaptchaTileSelection(BaseModel):
+    tile_id: str = ""
+    row: int | None = None
+    column: int | None = None
+    confidence: float = 0.0
+    reason: str = ""
+
+
+class CaptchaSolution(BaseModel):
+    solved: bool = False
+    kind: str = ""
+    prompt: str = ""
+    tiles_selected: list[CaptchaTileSelection] = Field(default_factory=list)
+    model_used: str = ""
+    attempt: int = 0
+    verify_clicked: bool = False
+    token: str = ""
+    error: str = ""
+    view: str = ""
+
+
 class CaptchaCodeDump(BaseModel):
     present: bool = False
     kind: str = ""

@@ -119,7 +119,14 @@ Be honest about these rather than working around them silently.
 | Area | State |
 | --- | --- |
 | Layout / geometry | Real block-flow engine in minidom.js: CSS cascade (tag<class<id<inline), vertical stacking with margin collapsing, text wrap by monospace advance, CSS-spec 300x150 replaced defaults. Disclosed approximations: no floats/position/flex/grid, px/%/em only, single font metric. Reported via `document.__layoutInfo`. |
-| Trusted events | `Event` carries `isTrusted`; agent-driven dispatches (click/type/activate/drag/submit) are trusted, programmatic `el.dispatchEvent` is not. |
+| File upload | Native end to end: `browser_upload`/`browser_act(files=)` sets `el.files` and fires trusted input/change; multipart submits carry the exact bytes. Binary/video/any files travel as base64 (`content_b64`) so payloads are byte-exact; payload cap ~12 MB raw. |
+| Dialogs (alert/confirm/prompt) | Recorded per script pass, reported in the view and via `browser_respond_dialog`. QuickJS is synchronous, so a dialog cannot block: an agent stages an answer, then re-runs the triggering action. Unanswered dialogs honestly report `answered: default`. |
+| Named keys | `browser_press_key` (enter/tab/escape/backspace/delete/space/arrows/home/end/pageup/pagedown) with real key/code/keyCode. Enter performs implicit form submission, Tab moves focus, arrows change selects, Backspace deletes. |
+| window.open / popups | Recorded and loaded as new session tabs (recursion depth-limited); page scripts receive an inert stub window so they do not crash. The agent stays on the opening page and can `browser_tabs` switch. |
+| File downloads | `browser_download` streams to disk with sha256 and optional hash verification (hex or base64); a navigation that lands on an attachment/binary is saved and reported (path/bytes/hash) instead of parsed as a page. No malware verdict engine — that absence is reported, not hidden. |
+| contenteditable | Detected as `editable` in both inspect and action surfaces; typing lands in textContent with input events carrying `data`/`inputType` so MutationObserver-based editors (Quill/ProseMirror) observe it. Approximation: no caret, plain text only. |
+| WebSocket | Hand-rolled RFC 6455 client (`engine/ws.py`, no third-party lib): sync handshake, masked client frames, text frames both ways, ping/pong and close handled; frames deliver on runtime pump passes. Binary frames are counted and skipped (disclosed gap). |
+| Trusted events | `Event` carries `isTrusted`; agent-driven dispatches (click/type/activate/drag/submit/press) are trusted, programmatic `el.dispatchEvent` is not. |
 | Inline `onclick=` attributes | Wired: constructor compiles `on*` attributes into listeners (minidom.js Element). |
 | Canvas / iframe pixels | Never reach the agent. Both are decomposed at parse time (`parse.py`). |
 | Trusted CDP input | Does not exist and must not be added. |

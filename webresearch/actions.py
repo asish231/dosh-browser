@@ -195,6 +195,14 @@ def _text_of(node: Node, *, limit: int = 120) -> str:
     return ""
 
 
+def _is_editable(node: Node) -> bool:
+    """True when the element itself is contenteditable (empty string = true)."""
+    raw = node.attributes.get("contenteditable")
+    if raw is None:
+        return False
+    return raw.strip().lower() != "false"
+
+
 def _role_of(node: Node, kind: str) -> str:
     attrs = node.attributes
     blob = " ".join(
@@ -222,11 +230,15 @@ def _role_of(node: Node, kind: str) -> str:
             return "select"
         if node.tag == "textarea":
             return "textarea"
+        if typ == "file":
+            return "file"
         # Normalise the HTML `type` into a role name, so `type=text` reads as
         # "textbox" the way inspect.py reports it.
         return "checkbox" if typ == "checkbox" else "textbox"
     if node.tag == "button":
         return "button"
+    if _is_editable(node):
+        return "editable"
     if node.tag == "label":
         return "label"
     if node.tag in {"iframe", "canvas", "video", "audio"}:
@@ -421,12 +433,20 @@ def collect(html: str, url: str, *, max_actions: int = 200) -> ActionSurface:
         candidates.append((node, ""))
     # Handles and drop targets are frequently bare divs with no interactive tag and
     # no role, so the tag selector above can never see them. Sweep for the
-    # class/structure signature separately and de-duplicate.
+    # class/structure signature separately and de-duplicate. Contenteditable
+    # elements are the same story: any tag can carry the attribute.
     seen_nodes = {id(node) for node, _ in candidates}
     for node in root.css("div, span, i, section, li"):
         if id(node) in seen_nodes:
             continue
         if not (_is_drag(node) or _is_drop_target(node)):
+            continue
+        candidates.append((node, ""))
+        seen_nodes.add(id(node))
+    for node in root.css("[contenteditable]"):
+        if id(node) in seen_nodes:
+            continue
+        if not _is_editable(node):
             continue
         candidates.append((node, ""))
         seen_nodes.add(id(node))
@@ -467,6 +487,11 @@ def collect(html: str, url: str, *, max_actions: int = 200) -> ActionSurface:
             # still actuated by dragging, not by POSTing a value.
             kind = "drag"
             target = _css_path(node, root)
+        elif _is_editable(node):
+            # Rich editors (Quill/ProseMirror/Medium) are typed into via the
+            # engine: text lands in textContent with input events carrying data.
+            kind = "activate"
+            target = _css_path(node, root)
         elif form_index is not None and (is_submit_control or tag in {"input", "textarea", "select", "button"}):
             kind = "submit"
             target = f"form[{form_index}]"
@@ -494,6 +519,8 @@ def collect(html: str, url: str, *, max_actions: int = 200) -> ActionSurface:
         notes = ""
         if kind in {"activate", "drag", "embed"}:
             notes = "needs real engine"
+        if _is_editable(node):
+            notes = "contenteditable: pass text to type into the editor"
         if tag == "canvas":
             notes = "canvas element: visual pixels not rendered natively; inspect AST/attributes or data-URL"
         elif tag in {"video", "audio"}:

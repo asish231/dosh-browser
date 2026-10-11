@@ -604,7 +604,9 @@
     if (this.nodeName !== "form") return;
     var action = this.getAttribute("action") || (global.location ? global.location.href : "");
     var method = (this.getAttribute("method") || "GET").toUpperCase();
+    var enctype = (this.getAttribute("enctype") || "application/x-www-form-urlencoded").toLowerCase();
     var fields = {};
+    var formFiles = {};
     var inputs = this.querySelectorAll("input, textarea, select");
     for (var i = 0; i < inputs.length; i++) {
       var inp = inputs[i];
@@ -612,6 +614,28 @@
       if (!name) continue;
       var type = (inp.getAttribute("type") || "").toLowerCase();
       if ((type === "checkbox" || type === "radio") && !inp.checked) continue;
+      if (type === "file") {
+        var fl = inp.files;
+        if (fl && fl.length > 0) {
+          formFiles[name] = [];
+          for (var fi = 0; fi < fl.length; fi++) {
+            var fObj = fl[fi];
+            var fEntry = {
+              name: fObj.name,
+              content: fObj._content || "",
+              type: fObj.type || "application/octet-stream"
+            };
+            if (fObj._binary) {
+              /* Re-encode raw bytes as base64 so the host can rebuild the exact
+                 binary payload; the plain content string is kept for logging. */
+              fEntry.contentB64 = global.btoa(fObj._content || "");
+            }
+            formFiles[name].push(fEntry);
+          }
+          fields[name] = (fl[0] && fl[0].name) ? fl[0].name : "";
+        }
+        continue;
+      }
       fields[name] = inp.value != null ? inp.value : (inp.getAttribute("value") || "");
     }
     if (method === "GET") {
@@ -631,7 +655,9 @@
       global.__WR_FORM_SUBMIT = {
         action: action,
         method: method,
-        fields: fields
+        enctype: enctype,
+        fields: fields,
+        files: formFiles
       };
     }
   };
@@ -842,6 +868,18 @@
       this.attributes.value = String(v);
       queueMutation("attributes", this, { attributeName: "value" });
     }
+  });
+  Object.defineProperty(Element.prototype, "isContentEditable", {
+    get: function () {
+      var n = this;
+      while (n && n.nodeType === 1) {
+        var ce = (n.getAttribute && n.getAttribute("contenteditable")) || "";
+        if (ce !== "") return ce.toLowerCase() !== "false";
+        n = n.parentNode;
+      }
+      return false;
+    },
+    configurable: true
   });
   Object.defineProperty(Element.prototype, "checked", {
     get: function () { return this.attributes.checked != null && this.attributes.checked !== "false"; },
@@ -1823,8 +1861,33 @@
         };
       },
       getImageData: function (x, y, w, h) {
-        var n = (w || 1) * (h || 1) * 4;
-        return { width: w || 1, height: h || 1, data: new Uint8ClampedArray(n) };
+        var cw = w || 1, ch = h || 1;
+        var n = cw * ch * 4;
+        var buf = new Uint8ClampedArray(n);
+        // Fill with deterministic non-zero data based on canvas operations
+        // Real browsers have sub-pixel rendering artifacts; all-zero is a dead giveaway
+        var ops = (this._canvas && this._canvas.__ops) ? this._canvas.__ops : 0;
+        var seed = (ops * 31) + ((x || 0) * 17) + ((y || 0) * 7);
+        for (var i = 0; i < n; i += 4) {
+          var px = i / 4;
+          var py = Math.floor(px / cw);
+          var pxx = px % cw;
+          var h2 = (((seed ^ (pxx * 374761393) ^ (py * 668265263)) >>> 0) % 256);
+          if (ops > 0) {
+            // When drawing has occurred, produce plausible pixel data
+            buf[i]     = (h2 + pxx * 2 + py) % 256;
+            buf[i + 1] = (h2 + pxx + py * 3) % 256;
+            buf[i + 2] = (h2 + py * 2 + pxx * 3) % 256;
+            buf[i + 3] = 255;
+          } else {
+            // "Blank" canvas still has sub-pixel noise in real browsers
+            buf[i]     = 255;
+            buf[i + 1] = 255;
+            buf[i + 2] = 255;
+            buf[i + 3] = 0;
+          }
+        }
+        return { width: cw, height: ch, data: buf };
       },
       putImageData: noop, createImageData: function (w, h) {
         return { width: w || 1, height: h || 1, data: new Uint8ClampedArray((w || 1) * (h || 1) * 4) };
@@ -1852,8 +1915,8 @@
 
   function makeWebGLContext(canvas) {
     var dev = (typeof global.__WR_DEVICE === "object" && global.__WR_DEVICE) ? global.__WR_DEVICE : {};
-    var renderer = dev.gpu_renderer || "ANGLE (Software, ANGLE Metal Renderer: Generic, Unspecified Version)";
-    var vendor = dev.gpu_vendor || "Google Inc. (Software)";
+    var renderer = dev.gpu_renderer || "Apple GPU M11 Pro Metal";
+    var vendor = dev.gpu_vendor || "Google Inc. (Apple)";
     var params = {
       0x1F00: "WebKit",                    // VENDOR
       0x1F01: "WebKit WebGL",              // RENDERER
@@ -2202,10 +2265,57 @@
   Object.defineProperty(global, "scrollY", { get: function () { return scrollState.y; } });
   Object.defineProperty(global, "pageXOffset", { get: function () { return scrollState.x; } });
   Object.defineProperty(global, "pageYOffset", { get: function () { return scrollState.y; } });
-  global.alert = function () {};
-  global.confirm = function () { return false; };
-  global.prompt = function () { return null; };
-  global.open = function () { return null; };
+  /* ---- Dialogs (alert/confirm/prompt) ----
+     Real browsers block the page until someone answers. QuickJS is
+     synchronous, so a dialog cannot block: it is recorded, the script gets a
+     default return value unless the agent staged an answer first, and the
+     queue is reported to the agent (never silently auto-answered). */
+  global.__WR_DIALOGS = [];
+  global.__WR_DIALOG_ANSWERS = [];
+  global.__WR_POPUPS = [];
+  global.__stageDialogAnswer = function (accept, text) {
+    global.__WR_DIALOG_ANSWERS.push({ accept: !!accept, text: text == null ? "" : String(text) });
+    return global.__WR_DIALOG_ANSWERS.length;
+  };
+  global.__clearDialogState = function () {
+    global.__WR_DIALOGS = [];
+  };
+  function __dialogSeen(type, message) {
+    var answer = global.__WR_DIALOG_ANSWERS.shift() || null;
+    global.__WR_DIALOGS.push({
+      type: type,
+      message: String(message == null ? "" : message),
+      answered: answer ? (answer.accept ? "accepted" : "dismissed") : "default"
+    });
+    return answer;
+  }
+  global.alert = function (message) { __dialogSeen("alert", message); };
+  global.confirm = function (message) {
+    var answer = __dialogSeen("confirm", message);
+    return answer ? answer.accept : false;
+  };
+  global.prompt = function (message, defaultValue) {
+    var answer = __dialogSeen("prompt", message);
+    if (answer && answer.accept) return answer.text;
+    if (answer && !answer.accept) return null;
+    return defaultValue == null ? null : String(defaultValue);
+  };
+  global.open = function (url, name, features) {
+    /* Popups become tabs the host loads; the synchronous return value is an
+       inert stub so scripts that touch the window object do not crash. */
+    var target = String(url == null ? "" : url);
+    global.__WR_POPUPS.push({ url: target, name: String(name == null ? "" : name) });
+    var stub = {
+      closed: false,
+      name: String(name == null ? "" : name),
+      location: { href: target, assign: function () {}, replace: function () {} },
+      focus: function () {},
+      close: function () { stub.closed = true; },
+      postMessage: function () {},
+      document: { write: function () {}, writeln: function () {}, body: null, title: "" }
+    };
+    return stub;
+  };
   global.close = function () {};
   global.focus = function () {};
   global.blur = function () {};
@@ -2628,7 +2738,8 @@
         var cw = {
           postMessage: function (data, targetOrigin) {
             if (typeof host_post_message === "function") {
-              host_post_message(String(data), String(targetOrigin || "*"), self.getAttribute("src") || "");
+              var msgData = (typeof data === "string") ? data : JSON.stringify(data);
+              host_post_message(msgData, String(targetOrigin || "*"), self.getAttribute("src") || "");
             }
           }
         };
@@ -2750,6 +2861,274 @@
   };
   global.ReadableStream = ReadableStream;
 
+  function Blob(blobParts, options) {
+    options = options || {};
+    this.type = String(options.type || "");
+    var parts = Array.isArray(blobParts) ? blobParts : (blobParts != null ? [blobParts] : []);
+    var str = "";
+    var binary = false;
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      if (p instanceof Blob) {
+        str += p._content;
+        if (p._binary) binary = true;
+      } else if (p instanceof Uint8Array) {
+        var s = "";
+        for (var j = 0; j < p.length; j++) s += String.fromCharCode(p[j]);
+        str += s;
+        binary = true;
+      } else if (p && p.buffer instanceof ArrayBuffer) {
+        var u8 = new Uint8Array(p.buffer, p.byteOffset, p.byteLength);
+        var s2 = "";
+        for (var k = 0; k < u8.length; k++) s2 += String.fromCharCode(u8[k]);
+        str += s2;
+        binary = true;
+      } else {
+        str += String(p);
+      }
+    }
+    this._content = str;
+    this._binary = binary;
+    /* Byte-accurate size: binary payloads are stored one char per byte, so the
+       char count IS the byte count. Text payloads count UTF-8 bytes like a real
+       browser instead of UTF-16 code units. */
+    if (binary) {
+      this.size = str.length;
+    } else {
+      this.size = (global.TextEncoder ? new global.TextEncoder().encode(str).length : str.length);
+    }
+  }
+  Blob.prototype.text = function () { return Promise.resolve(this._content); };
+  Blob.prototype.arrayBuffer = function () {
+    var enc = new TextEncoder();
+    return Promise.resolve(enc.encode(this._content).buffer);
+  };
+  Blob.prototype.slice = function (start, end, contentType) {
+    var s = this._content.slice(start, end);
+    var b = new Blob([s], { type: contentType || this.type });
+    if (this._binary) {
+      b._binary = true;
+      b.size = s.length;
+    }
+    return b;
+  };
+  global.Blob = Blob;
+
+  function File(fileBits, fileName, options) {
+    options = options || {};
+    Blob.call(this, fileBits, options);
+    this.name = String(fileName || "");
+    this.lastModified = Number(options.lastModified) || Date.now();
+  }
+  File.prototype = Object.create(Blob.prototype);
+  File.prototype.constructor = File;
+  global.File = File;
+
+  function FileList(files) {
+    var arr = Array.isArray(files) ? files : [];
+    for (var i = 0; i < arr.length; i++) {
+      this[i] = arr[i];
+    }
+    this.length = arr.length;
+  }
+  FileList.prototype.item = function (index) {
+    return this[index] || null;
+  };
+  global.FileList = FileList;
+
+  function FileReader() {
+    this.readyState = 0;
+    this.result = null;
+    this.error = null;
+    this.onload = null;
+    this.onerror = null;
+    this.onloadstart = null;
+    this.onloadend = null;
+    this._listeners = {};
+  }
+  FileReader.EMPTY = 0;
+  FileReader.LOADING = 1;
+  FileReader.DONE = 2;
+  FileReader.prototype.addEventListener = function (type, fn) {
+    if (!this._listeners[type]) this._listeners[type] = [];
+    this._listeners[type].push(fn);
+  };
+  FileReader.prototype.removeEventListener = function (type, fn) {
+    if (!this._listeners[type]) return;
+    this._listeners[type] = this._listeners[type].filter(function (l) { return l !== fn; });
+  };
+  FileReader.prototype._dispatch = function (type, evt) {
+    var handler = this["on" + type];
+    if (typeof handler === "function") {
+      try { handler.call(this, evt); } catch (e) {}
+    }
+    (this._listeners[type] || []).forEach(function (fn) {
+      try { fn(evt); } catch (e) {}
+    });
+  };
+  FileReader.prototype.readAsText = function (blob) {
+    var self = this;
+    self.readyState = FileReader.LOADING;
+    self._dispatch("loadstart", { type: "loadstart", target: self });
+    setTimeout(function () {
+      self.result = blob ? (blob._content || String(blob)) : "";
+      self.readyState = FileReader.DONE;
+      self._dispatch("load", { type: "load", target: self });
+      self._dispatch("loadend", { type: "loadend", target: self });
+    }, 0);
+  };
+  FileReader.prototype.readAsDataURL = function (blob) {
+    var self = this;
+    self.readyState = FileReader.LOADING;
+    self._dispatch("loadstart", { type: "loadstart", target: self });
+    setTimeout(function () {
+      var mime = (blob && blob.type) ? blob.type : "application/octet-stream";
+      var content = blob ? (blob._content || "") : "";
+      /* Binary blobs hold one char per byte, so btoa is byte-exact. Text
+         blobs follow the browser approximation (code units). */
+      var b64 = global.btoa(content);
+      self.result = "data:" + mime + ";base64," + b64;
+      self.readyState = FileReader.DONE;
+      self._dispatch("load", { type: "load", target: self });
+      self._dispatch("loadend", { type: "loadend", target: self });
+    }, 0);
+  };
+  FileReader.prototype.readAsArrayBuffer = function (blob) {
+    var self = this;
+    self.readyState = FileReader.LOADING;
+    self._dispatch("loadstart", { type: "loadstart", target: self });
+    setTimeout(function () {
+      if (blob && typeof blob.arrayBuffer === "function") {
+        blob.arrayBuffer().then(function (buf) {
+          self.result = buf;
+          self.readyState = FileReader.DONE;
+          self._dispatch("load", { type: "load", target: self });
+          self._dispatch("loadend", { type: "loadend", target: self });
+        });
+      } else {
+        self.result = new ArrayBuffer(0);
+        self.readyState = FileReader.DONE;
+        self._dispatch("load", { type: "load", target: self });
+        self._dispatch("loadend", { type: "loadend", target: self });
+      }
+    }, 0);
+  };
+  global.FileReader = FileReader;
+
+  function FormData(form) {
+    this._data = [];
+    if (form && form.querySelectorAll) {
+      var inputs = form.querySelectorAll("input, select, textarea");
+      for (var i = 0; i < inputs.length; i++) {
+        var el = inputs[i];
+        var name = el.getAttribute("name");
+        if (!name) continue;
+        var typ = (el.getAttribute("type") || "").toLowerCase();
+        if ((typ === "checkbox" || typ === "radio") && !el.checked) continue;
+        if (typ === "file") {
+          var fl = el.files;
+          if (fl && fl.length > 0) {
+            for (var f = 0; f < fl.length; f++) {
+              this._data.push([name, fl[f], fl[f].name]);
+            }
+          } else {
+            this._data.push([name, new global.File([], "", { type: "application/octet-stream" }), ""]);
+          }
+          continue;
+        }
+        this._data.push([name, el.value || ""]);
+      }
+    }
+  }
+  FormData.prototype.append = function (k, v, filename) {
+    if (v instanceof global.Blob || (v && typeof v._content === "string")) {
+      var fn = filename || v.name || "blob";
+      this._data.push([String(k), v, fn]);
+    } else {
+      this._data.push([String(k), String(v)]);
+    }
+  };
+  FormData.prototype.set = function (k, v, filename) {
+    this.delete(k);
+    this.append(k, v, filename);
+  };
+  FormData.prototype.get = function (k) {
+    for (var i = 0; i < this._data.length; i++) {
+      if (this._data[i][0] === String(k)) return this._data[i][1];
+    }
+    return null;
+  };
+  FormData.prototype.getAll = function (k) {
+    var res = [];
+    for (var i = 0; i < this._data.length; i++) {
+      if (this._data[i][0] === String(k)) res.push(this._data[i][1]);
+    }
+    return res;
+  };
+  FormData.prototype.has = function (k) { return this.get(k) !== null; };
+  FormData.prototype.delete = function (k) {
+    this._data = this._data.filter(function (x) { return x[0] !== String(k); });
+  };
+  FormData.prototype.entries = function () { return this._data.slice(); };
+  FormData.prototype.keys = function () {
+    var seen = {};
+    var res = [];
+    for (var i = 0; i < this._data.length; i++) {
+      var key = this._data[i][0];
+      if (!seen[key]) { seen[key] = true; res.push(key); }
+    }
+    return res;
+  };
+  FormData.prototype.values = function () {
+    var res = [];
+    for (var i = 0; i < this._data.length; i++) res.push(this._data[i][1]);
+    return res;
+  };
+  FormData.prototype.forEach = function (cb) {
+    for (var i = 0; i < this._data.length; i++) {
+      cb(this._data[i][1], this._data[i][0], this);
+    }
+  };
+  global.FormData = FormData;
+
+  function __serializeFormData(fd) {
+    var boundary = "----WebKitFormBoundary" + Math.random().toString(36).substring(2) + Date.now().toString(36);
+    var parts = [];
+    var binary = false;
+    var entries = (fd && typeof fd.entries === "function") ? fd.entries() : (fd && fd._data ? fd._data : []);
+    for (var i = 0; i < entries.length; i++) {
+      var item = entries[i];
+      var name = item[0];
+      var val = item[1];
+      var filename = item[2];
+      if (val instanceof global.Blob || (val && typeof val._content === "string")) {
+        var fn = filename || val.name || "blob";
+        var ct = val.type || "application/octet-stream";
+        var content = val._content != null ? val._content : "";
+        if (val._binary) binary = true;
+        parts.push(
+          "--" + boundary + "\r\n" +
+          "Content-Disposition: form-data; name=\"" + name + "\"; filename=\"" + fn + "\"\r\n" +
+          "Content-Type: " + ct + "\r\n\r\n" +
+          content + "\r\n"
+        );
+      } else {
+        parts.push(
+          "--" + boundary + "\r\n" +
+          "Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n" +
+          String(val) + "\r\n"
+        );
+      }
+    }
+    parts.push("--" + boundary + "--\r\n");
+    return {
+      body: parts.join(""),
+      contentType: "multipart/form-data; boundary=" + boundary,
+      binary: binary
+    };
+  }
+  global.__serializeFormData = __serializeFormData;
+
   /* Standard Response implementation */
   function Response(body, init) {
     init = init || {};
@@ -2775,6 +3154,9 @@
     var enc = new TextEncoder();
     return Promise.resolve(enc.encode(this._text).buffer);
   };
+  Response.prototype.blob = function () {
+    return Promise.resolve(new Blob([this._text], { type: this.headers.get("content-type") || "" }));
+  };
   Response.prototype.clone = function () {
     return new Response(this._text, {
       status: this.status,
@@ -2799,8 +3181,28 @@
   global.fetch = function (url, opts) {
     opts = opts || {};
     var method = String(opts.method || "GET");
-    var body = opts.body == null ? "" : String(opts.body);
-    var raw = typeof host_fetch === "function" ? host_fetch(String(url), method, body) : "{\"status\":599,\"body\":\"\"}";
+    var body = "";
+    var bodyB64 = "";
+    var customHeaders = {};
+    if (opts.headers) {
+      if (typeof opts.headers.forEach === "function") {
+        opts.headers.forEach(function (v, k) { customHeaders[String(k)] = String(v); });
+      } else {
+        for (var hk in opts.headers) customHeaders[String(hk)] = String(opts.headers[hk]);
+      }
+    }
+    if (opts.body && (opts.body instanceof global.FormData || opts.body._data)) {
+      var sfd = (typeof __serializeFormData === "function") ? __serializeFormData(opts.body) : { body: "", contentType: "" };
+      body = sfd.body;
+      bodyB64 = sfd.binary ? global.btoa(sfd.body) : "";
+      if (!customHeaders["content-type"] && !customHeaders["Content-Type"]) {
+        customHeaders["content-type"] = sfd.contentType;
+      }
+    } else {
+      body = opts.body == null ? "" : (opts.body._content != null ? opts.body._content : String(opts.body));
+      if (opts.body && opts.body._binary) bodyB64 = global.btoa(body);
+    }
+    var raw = typeof host_fetch === "function" ? host_fetch(String(url), method, body, JSON.stringify(customHeaders), bodyB64) : "{\"status\":599,\"body\":\"\"}";
     var res = typeof raw === "string" ? JSON.parse(raw) : raw;
     var respHeaders = new Headers();
     if (res.content_type) respHeaders.set("content-type", res.content_type);
@@ -2877,6 +3279,110 @@
   };
   global.EventSource = EventSource;
 
+  /* ---- WebSocket (host-bridged, own transport) ----
+     The host owns the socket (engine/ws.py, hand-rolled RFC 6455). Frames
+     arrive synchronously on the runtime's pump passes, which is how a
+     synchronous QuickJS context can still see live messages. Text frames
+     only; binary frames are a disclosed gap. */
+  global.__WS_SOCKETS = {};
+  function WebSocket(url, protocols) {
+    if (this.constructor !== WebSocket) return new WebSocket(url, protocols);
+    this.url = String(url || "");
+    this.protocol = "";
+    this.extensions = "";
+    this.bufferedAmount = 0;
+    this.readyState = 0; /* CONNECTING */
+    this.binaryType = "blob";
+    this.onopen = null;
+    this.onclose = null;
+    this.onerror = null;
+    this.onmessage = null;
+    this._listeners = {};
+    var self = this;
+    var protos = "";
+    if (Array.isArray(protocols)) protos = protocols.join(", ");
+    else if (protocols) protos = String(protocols);
+    var res = null;
+    try {
+      if (typeof host_ws_connect === "function") {
+        res = JSON.parse(host_ws_connect(this.url, protos));
+      }
+    } catch (e) { res = null; }
+    if (!res || !res.ok) {
+      this.readyState = 3; /* CLOSED */
+      var err = new global.Event("error", { bubbles: false });
+      setTimeout(function () {
+        if (typeof self.onerror === "function") { try { self.onerror(err); } catch (e) {} }
+        self._emit("error", err);
+        self._fireClose((res && res.code) || 1006, (res && res.error) || "connection failed");
+      }, 0);
+      return;
+    }
+    this._id = res.id;
+    this.protocol = res.protocol || "";
+    global.__WS_SOCKETS[res.id] = this;
+    this.readyState = 1; /* OPEN: the handshake completed synchronously */
+    setTimeout(function () {
+      var ev = new global.Event("open", { bubbles: false });
+      if (typeof self.onopen === "function") { try { self.onopen(ev); } catch (e) {} }
+      self._emit("open", ev);
+    }, 0);
+  }
+  WebSocket.CONNECTING = 0;
+  WebSocket.OPEN = 1;
+  WebSocket.CLOSING = 2;
+  WebSocket.CLOSED = 3;
+  WebSocket.prototype.addEventListener = function (type, fn) {
+    if (!this._listeners[type]) this._listeners[type] = [];
+    this._listeners[type].push(fn);
+  };
+  WebSocket.prototype.removeEventListener = function (type, fn) {
+    if (!this._listeners[type]) return;
+    this._listeners[type] = this._listeners[type].filter(function (l) { return l !== fn; });
+  };
+  WebSocket.prototype._emit = function (type, evt) {
+    (this._listeners[type] || []).forEach(function (fn) {
+      try { fn(evt); } catch (e) {}
+    });
+  };
+  WebSocket.prototype._fireClose = function (code, reason) {
+    var ev = new global.Event("close", { bubbles: false });
+    ev.code = code || 1005;
+    ev.reason = String(reason || "");
+    ev.wasClean = !!(code && code === 1000);
+    this.readyState = 3;
+    if (global.__WS_SOCKETS && this._id != null) delete global.__WS_SOCKETS[this._id];
+    if (typeof this.onclose === "function") { try { this.onclose(ev); } catch (e) {} }
+    this._emit("close", ev);
+  };
+  WebSocket.prototype.send = function (data) {
+    if (this.readyState !== 1) throw new Error("InvalidStateError: WebSocket is not open");
+    if (typeof host_ws_send === "function") host_ws_send(this._id, String(data));
+  };
+  WebSocket.prototype.close = function (code, reason) {
+    if (this.readyState === 3) return;
+    this.readyState = 2;
+    if (typeof host_ws_close === "function") host_ws_close(this._id);
+    var self = this;
+    setTimeout(function () { self._fireClose(code || 1000, reason || ""); }, 0);
+  };
+  global.WebSocket = WebSocket;
+  /* Runtime pump entry: deliver one text frame to its socket. */
+  global.__wsDeliver = function (id, data) {
+    var sock = global.__WS_SOCKETS[id];
+    if (!sock) return false;
+    var ev = new global.Event("message", { bubbles: false });
+    ev.data = data;
+    ev.origin = sock.url;
+    if (typeof sock.onmessage === "function") { try { sock.onmessage(ev); } catch (e) {} }
+    sock._emit("message", ev);
+    return true;
+  };
+  global.__wsClosed = function (id, code, reason) {
+    var sock = global.__WS_SOCKETS[id];
+    if (sock) sock._fireClose(code || 1006, reason || "");
+  };
+
   function XMLHttpRequest() {
     this.readyState = 0;
     this.status = 0;
@@ -2923,8 +3429,21 @@
   };
   XMLHttpRequest.prototype.send = function (body) {
     try {
+      var reqBody = "";
+      var reqBodyB64 = "";
+      if (body && (body instanceof global.FormData || body._data)) {
+        var sfd = (typeof __serializeFormData === "function") ? __serializeFormData(body) : { body: "", contentType: "" };
+        reqBody = sfd.body;
+        reqBodyB64 = sfd.binary ? global.btoa(sfd.body) : "";
+        if (!this._headers["content-type"] && !this._headers["Content-Type"]) {
+          this._headers["content-type"] = sfd.contentType;
+        }
+      } else {
+        reqBody = body == null ? "" : (body._content != null ? body._content : String(body));
+        if (body && body._binary) reqBodyB64 = global.btoa(reqBody);
+      }
       var raw = typeof host_fetch === "function"
-        ? host_fetch(this._url, this._method, body == null ? "" : String(body), JSON.stringify(this._headers))
+        ? host_fetch(this._url, this._method, reqBody, JSON.stringify(this._headers), reqBodyB64)
         : "{\"status\":599,\"body\":\"\"}";
       var res = typeof raw === "string" ? JSON.parse(raw) : raw;
       this.status = res.status || 0;
@@ -3252,39 +3771,8 @@
       doc.body = body;
       return doc;
     };
-    function FormData(form) {
-      this._data = [];
-      if (form && form.querySelectorAll) {
-        var inputs = form.querySelectorAll("input, select, textarea");
-        for (var i = 0; i < inputs.length; i++) {
-          var el = inputs[i];
-          var name = el.getAttribute("name");
-          if (!name) continue;
-          var typ = (el.getAttribute("type") || "").toLowerCase();
-          if ((typ === "checkbox" || typ === "radio") && !el.checked) continue;
-          this._data.push([name, el.value || ""]);
-        }
-      }
-    }
-    FormData.prototype.append = function (k, v) { this._data.push([String(k), String(v)]); };
-    FormData.prototype.get = function (k) {
-      for (var i = 0; i < this._data.length; i++) {
-        if (this._data[i][0] === String(k)) return this._data[i][1];
-      }
-      return null;
-    };
-    FormData.prototype.getAll = function (k) {
-      var res = [];
-      for (var i = 0; i < this._data.length; i++) {
-        if (this._data[i][0] === String(k)) res.push(this._data[i][1]);
-      }
-      return res;
-    };
-    FormData.prototype.has = function (k) { return this.get(k) !== null; };
-    FormData.prototype.delete = function (k) {
-      this._data = this._data.filter(function (x) { return x[0] !== String(k); });
-    };
     global.FormData = FormData;
+    global.__serializeFormData = __serializeFormData;
     global.DOMParser = DOMParser;
     global.Event = function (type, init) {
       this.type = type;
@@ -3502,8 +3990,9 @@
     global.postMessage = function (data, origin) {
       var targetOrigin = String(origin != null ? origin : "*");
       var senderOrigin = (global.location && global.location.origin) || "";
+      var msgData = (typeof data === "string") ? data : JSON.stringify(data);
       if (typeof host_post_message === "function") {
-        host_post_message(String(data), targetOrigin, "self", senderOrigin);
+        host_post_message(msgData, targetOrigin, "self", senderOrigin);
       }
       if (targetOrigin !== "*" && targetOrigin !== "/" && targetOrigin !== senderOrigin) {
         return;
@@ -3520,8 +4009,9 @@
       postMessage: function (data, origin) {
         var targetOrigin = String(origin != null ? origin : "*");
         var senderOrigin = (global.location && global.location.origin) || "";
+        var msgData = (typeof data === "string") ? data : JSON.stringify(data);
         if (typeof host_post_message === "function") {
-          host_post_message(String(data), targetOrigin, "parent", senderOrigin);
+          host_post_message(msgData, targetOrigin, "parent", senderOrigin);
         }
       }
     };
@@ -3538,8 +4028,9 @@
         postMessage: function (replyData, replyOrigin) {
           var repTarget = String(replyOrigin != null ? replyOrigin : "*");
           var repSender = (global.location && global.location.origin) || "";
+          var repMsgData = (typeof replyData === "string") ? replyData : JSON.stringify(replyData);
           if (typeof host_post_message === "function") {
-            host_post_message(String(replyData), repTarget, "reply", repSender);
+            host_post_message(repMsgData, repTarget, "reply", repSender);
           }
         }
       };
@@ -3604,6 +4095,8 @@
     if (typeof el.focus === "function") el.focus();
     text = String(text != null ? text : "");
     var curVal = el.value || "";
+    var editable = !!el.isContentEditable;
+    if (editable) curVal = el.textContent || "";
     var isStealth = (stealth !== undefined) ? !!stealth : (Array.isArray(delays) || !!global.__stealthMode);
     delays = Array.isArray(delays) ? delays : null;
 
@@ -3634,7 +4127,13 @@
       el.dispatchEvent(kp);
 
       curVal += ch;
-      el.value = curVal;
+      if (editable) {
+        /* Rich editors (Quill/ProseMirror) read the DOM via MutationObserver,
+           so the text goes into textContent and the input event carries data. */
+        el.textContent = curVal;
+      } else {
+        el.value = curVal;
+      }
 
       var inp = new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true, timeStamp: tNow + 2 });
       inp.data = ch;
@@ -3652,9 +4151,14 @@
         : new global.Event("keyup", { bubbles: true, cancelable: true, isTrusted: true, timeStamp: tUp });
       el.dispatchEvent(ku);
     }
+    if (editable) {
+      var tEnd = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
+      el.dispatchEvent(new global.Event("change", { bubbles: true, cancelable: false, isTrusted: true, timeStamp: tEnd }));
+      return true;
+    }
     el.setAttribute("value", curVal);
-    var tEnd = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
-    el.dispatchEvent(new global.Event("change", { bubbles: true, cancelable: false, isTrusted: true, timeStamp: tEnd }));
+    var tEnd2 = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
+    el.dispatchEvent(new global.Event("change", { bubbles: true, cancelable: false, isTrusted: true, timeStamp: tEnd2 }));
     return true;
   }
 
@@ -3684,6 +4188,163 @@
     if (kind === "checkbox" || kind === "radio") {
       el.setAttribute("aria-checked", el.checked ? "true" : "false");
     }
+    return true;
+  };
+
+  /* ---- Named key press (Enter/Tab/arrows/...) ---- */
+  var __KEY_DEFS = {
+    enter: { key: "Enter", code: "Enter", keyCode: 13 },
+    tab: { key: "Tab", code: "Tab", keyCode: 9 },
+    escape: { key: "Escape", code: "Escape", keyCode: 27 },
+    backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+    delete: { key: "Delete", code: "Delete", keyCode: 46 },
+    space: { key: " ", code: "Space", keyCode: 32 },
+    arrowup: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+    arrowdown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+    arrowleft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+    arrowright: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+    home: { key: "Home", code: "Home", keyCode: 36 },
+    end: { key: "End", code: "End", keyCode: 35 },
+    pageup: { key: "PageUp", code: "PageUp", keyCode: 33 },
+    pagedown: { key: "PageDown", code: "PageDown", keyCode: 34 }
+  };
+
+  function __keyEvent(type, def, extra) {
+    var tNow = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
+    var init = {
+      key: def.key, code: def.code, keyCode: def.keyCode, which: def.keyCode,
+      bubbles: true, cancelable: true, isTrusted: true, timeStamp: tNow
+    };
+    if (extra) { for (var k in extra) init[k] = extra[k]; }
+    return (typeof global.KeyboardEvent === "function")
+      ? new global.KeyboardEvent(type, init)
+      : new global.Event(type, init);
+  }
+
+  function __formOf(el) {
+    var f = el;
+    while (f && f.nodeName !== "form") f = f.parentNode;
+    return (f && f.nodeName === "form") ? f : null;
+  }
+
+  function __focusables() {
+    if (!global.document || !global.document.querySelectorAll) return [];
+    var els = global.document.querySelectorAll(
+      "input, select, textarea, button, a[href], [tabindex], [contenteditable]"
+    );
+    var out = [];
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (el.disabled) continue;
+      var ti = el.getAttribute("tabindex");
+      if (ti && Number(ti) < 0) continue;
+      out.push(el);
+    }
+    return out;
+  }
+
+  global.__pressKey = function (selectorOrPath, keyName, stealth) {
+    var el;
+    if (Array.isArray(selectorOrPath)) el = global.__byPath(selectorOrPath);
+    else if (global.document.getElementById(selectorOrPath)) el = global.document.getElementById(selectorOrPath);
+    else el = global.document.querySelector(selectorOrPath);
+    if (!el) return false;
+    if (typeof el.focus === "function" && el.nodeName.toLowerCase() !== "body") el.focus();
+    var lower = String(keyName || "").toLowerCase();
+    var def = __KEY_DEFS[lower];
+    if (!def) return false;
+
+    var kd = __keyEvent("keydown", def);
+    var prevented = !el.dispatchEvent(kd);
+
+    /* keypress fires for keys that produce text (Enter, Space) in real engines */
+    if (lower === "enter" || lower === "space") {
+      el.dispatchEvent(__keyEvent("keypress", def, lower === "space" ? { charCode: 32 } : null));
+    }
+
+    if (!prevented && !kd.defaultPrevented) {
+      var tag = el.nodeName.toLowerCase();
+      if (lower === "enter") {
+        if (tag === "input") {
+          /* Implicit submission: Enter in a single-line input submits its form. */
+          var form = __formOf(el);
+          if (form) {
+            var subEv = (typeof global.Event === "function")
+              ? new global.Event("submit", { bubbles: true, cancelable: true, isTrusted: true, __trusted: true })
+              : { type: "submit", target: form, bubbles: true, cancelable: true, isTrusted: true };
+            form.dispatchEvent(subEv);
+            if (!subEv.defaultPrevented && typeof form.submit === "function") {
+              try { form.submit(); } catch (e) {}
+            }
+          }
+        } else if (el.isContentEditable) {
+          el.textContent = (el.textContent || "") + "\n";
+          var nlEv = new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true });
+          nlEv.data = "\n";
+          nlEv.inputType = "insertLineBreak";
+          el.dispatchEvent(nlEv);
+        } else if (tag === "textarea") {
+          el.value = (el.value || "") + "\n";
+          var taEv = new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true });
+          taEv.data = "\n";
+          taEv.inputType = "insertLineBreak";
+          el.dispatchEvent(taEv);
+        }
+      } else if (lower === "tab") {
+        var list = __focusables();
+        var idx = list.indexOf(el);
+        if (idx !== -1 && list.length > 1) {
+          var next = list[(idx + 1) % list.length];
+          if (typeof next.focus === "function") next.focus();
+        }
+      } else if ((lower === "arrowup" || lower === "arrowdown") && tag === "select") {
+        var opts = (typeof el.getElementsByTagName === "function")
+          ? el.getElementsByTagName("option")
+          : [];
+        if (opts.length) {
+          var cur = 0;
+          for (var oi = 0; oi < opts.length; oi++) {
+            if (opts[oi].getAttribute("selected") != null) { cur = oi; break; }
+          }
+          var dir = lower === "arrowdown" ? 1 : -1;
+          var ni = cur + dir;
+          if (ni >= 0 && ni < opts.length) {
+            for (var oj = 0; oj < opts.length; oj++) {
+              if (oj === ni) opts[oj].setAttribute("selected", "selected");
+              else opts[oj].removeAttribute("selected");
+            }
+            var val = opts[ni].getAttribute("value");
+            if (val == null) val = opts[ni].textContent;
+            el.setAttribute("value", val);
+            el.dispatchEvent(new global.Event("input", { bubbles: true, isTrusted: true }));
+            el.dispatchEvent(new global.Event("change", { bubbles: true, isTrusted: true }));
+          }
+        }
+      } else if (lower === "backspace") {
+        if (tag === "input" || tag === "textarea") {
+          el.value = String(el.value || "").slice(0, -1);
+        } else if (el.isContentEditable) {
+          el.textContent = String(el.textContent || "").slice(0, -1);
+        }
+        var bsEv = new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true });
+        bsEv.inputType = "deleteContentBackward";
+        el.dispatchEvent(bsEv);
+      } else if (lower === "space") {
+        if (tag === "button" || tag === "a") {
+          if (typeof el.__nativeClick === "function") el.__nativeClick();
+          else if (typeof el.click === "function") el.click();
+        } else if (tag === "input" || tag === "textarea" || el.isContentEditable) {
+          if (tag === "input" || tag === "textarea") el.value = (el.value || "") + " ";
+          else el.textContent = (el.textContent || "") + " ";
+          var spEv = new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true });
+          spEv.data = " ";
+          spEv.inputType = "insertText";
+          el.dispatchEvent(spEv);
+        }
+      }
+    }
+
+    el.dispatchEvent(__keyEvent("keyup", def));
     return true;
   };
 
@@ -3885,6 +4546,80 @@ global.__submitPath = function (path) {
       el.dispatchEvent(new global.Event("input", { bubbles: true, isTrusted: true }));
       el.dispatchEvent(new global.Event("change", { bubbles: true, isTrusted: true }));
     });
+    return true;
+  };
+
+  Object.defineProperty(Element.prototype, "files", {
+    get: function () {
+      if (this.nodeName === "input" && (this.getAttribute("type") || "").toLowerCase() === "file") {
+        if (!this._files) this._files = new global.FileList([]);
+        return this._files;
+      }
+      return undefined;
+    },
+    set: function (val) {
+      if (this.nodeName === "input" && (this.getAttribute("type") || "").toLowerCase() === "file") {
+        if (val && typeof val.item === "function" && "length" in val) {
+          this._files = val;
+        } else if (Array.isArray(val)) {
+          this._files = new global.FileList(val);
+        } else {
+          this._files = new global.FileList(val ? [val] : []);
+        }
+        if (this._files.length > 0 && this._files[0]) {
+          this.value = "C:\\fakepath\\" + this._files[0].name;
+          this.setAttribute("value", this.value);
+        } else {
+          this.value = "";
+          this.removeAttribute("value");
+        }
+      }
+    },
+    configurable: true
+  });
+
+  global.__uploadFiles = function (selectorOrPath, filesList) {
+    var el = null;
+    if (Array.isArray(selectorOrPath)) {
+      el = global.__byPath(selectorOrPath);
+    } else {
+      if (global.document.getElementById(selectorOrPath)) el = global.document.getElementById(selectorOrPath);
+      else el = global.document.querySelector(selectorOrPath);
+    }
+    if (!el) return false;
+    var fileObjs = [];
+    var list = Array.isArray(filesList) ? filesList : (filesList ? [filesList] : []);
+    for (var i = 0; i < list.length; i++) {
+      var item = list[i];
+      if (typeof item === "string") {
+        item = { name: item, content: "" };
+      }
+      var name = item.name || ("file_" + i);
+      var b64in = item.contentB64 || item.content_b64;
+      var isBinary = false;
+      var content;
+      if (b64in) {
+        /* Base64 of raw bytes: decode to a one-char-per-byte Latin-1 string so
+           binary payloads (video, images, any bytes) stay byte-exact. */
+        content = global.atob(String(b64in));
+        isBinary = true;
+      } else {
+        content = item.content != null ? item.content : "";
+      }
+      var mime = item.type || "application/octet-stream";
+      var lastMod = Number(item.lastModified) || Date.now();
+      var fObj = new global.File([content], name, { type: mime, lastModified: lastMod });
+      if (isBinary) {
+        fObj._binary = true;
+        fObj.size = fObj._content.length;
+      }
+      fileObjs.push(fObj);
+    }
+    el.files = new global.FileList(fileObjs);
+    if (typeof el.focus === "function") el.focus();
+    var tNow = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
+    el.dispatchEvent(new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true, timeStamp: tNow }));
+    el.dispatchEvent(new global.Event("change", { bubbles: true, cancelable: false, isTrusted: true, timeStamp: tNow + 1 }));
     return true;
   };
 })(this);

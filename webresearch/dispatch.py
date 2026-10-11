@@ -93,8 +93,46 @@ async def invoke(http: httpx.AsyncClient, browser: Browser, name: str, args: dic
             text=args.get("text") or "",
             dx=args.get("dx"),
             dy=args.get("dy"),
+            files=args.get("files"),
             max_chars=int(args.get("max_chars", 8000)),
         )
+    if name == "browser_upload":
+        payload = args.get("files") or args.get("file_path") or []
+        return await browser.get(args["session_id"]).upload(
+            args["ref"],
+            payload,
+            max_chars=int(args.get("max_chars", 8000)),
+        )
+    if name == "browser_press_key":
+        return await browser.get(args["session_id"]).press_key(
+            args["ref"],
+            args.get("key") or "enter",
+            max_chars=int(args.get("max_chars", 8000)),
+        )
+    if name == "browser_dialogs":
+        session = browser.get(args["session_id"])
+        return {"dialogs": session.dialogs()}
+    if name == "browser_respond_dialog":
+        session = browser.get(args["session_id"])
+        if args.get("index") is None and not args.get("accept") and not args.get("dismiss"):
+            return {"dialogs": session.dialogs()}
+        accept = bool(args.get("accept")) if args.get("accept") is not None else not bool(args.get("dismiss"))
+        return session.respond_dialog(accept=accept, text=args.get("text") or "")
+    if name == "browser_download":
+        session = browser.get(args["session_id"])
+        rec = await session.download(
+            args["url"], expected=args.get("expected"), dest_dir=args.get("dest_dir")
+        )
+        return {
+            "url": rec.url,
+            "path": rec.path,
+            "bytes": rec.bytes,
+            "sha256": rec.sha256,
+            "content_type": rec.content_type,
+            "verified": rec.verified,
+            "scanned": rec.scanned,
+            "error": rec.error,
+        }
     if name == "browser_query":
         return browser.get(args["session_id"]).query(
             args.get("term") or "", limit=int(args.get("limit", 40))
@@ -147,6 +185,14 @@ async def invoke(http: httpx.AsyncClient, browser: Browser, name: str, args: dic
             url,
             client=http,
             js=args.get("js") or "auto",
+        )
+    if name == "browser_captcha_solve":
+        session_id = args.get("session_id")
+        if not session_id:
+            raise ValueError("browser_captcha_solve requires session_id")
+        return await browser.get(session_id).solve_captcha(
+            model=args.get("model") or "auto",
+            max_attempts=int(args.get("max_attempts", 1)),
         )
     if name == "browser_click":
         return await browser.get(args["session_id"]).click(args["ref"], max_chars=int(args.get("max_chars", 8000)))

@@ -97,6 +97,21 @@ class ScrollBody(BaseModel):
     max_chars: int = 8000
 
 
+class CaptchaSolveBody(BaseModel):
+    model: str = "auto"
+    max_attempts: int = 1
+
+
+class UploadBody(BaseModel):
+    """File dicts: {name, content} for text, or {name, content_b64, type} for
+    binary (base64 raw bytes — video/image/any binary stays byte-exact)."""
+
+    ref: str
+    files: list[dict] | None = None
+    file_path: str | None = None
+    max_chars: int = 8000
+
+
 class ActBody(BaseModel):
     """One action from the surface. dx/dy apply to drag controls."""
 
@@ -104,7 +119,25 @@ class ActBody(BaseModel):
     text: str = ""
     dx: float | None = None
     dy: float | None = None
+    files: list[dict] | None = None
     max_chars: int = 8000
+
+
+class PressKeyBody(BaseModel):
+    ref: str
+    key: str = "enter"
+    max_chars: int = 8000
+
+
+class RespondDialogBody(BaseModel):
+    accept: bool = True
+    text: str = ""
+
+
+class DownloadBody(BaseModel):
+    url: str
+    expected: str | None = None
+    dest_dir: str | None = None
 
 
 class ActionItem(BaseModel):
@@ -495,6 +528,18 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.post("/v1/sessions/{sid}/captcha/solve", tags=["session", "captcha"])
+    async def api_captcha_solve(sid: str, body: CaptchaSolveBody) -> dict:
+        try:
+            return await session_or_404(sid).solve_captcha(
+                model=body.model,
+                max_attempts=body.max_attempts,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(500, f"captcha solve failed: {exc}") from exc
+
     @app.post("/v1/sessions/{sid}/click", response_model=Page, tags=["session"])
     async def api_click(sid: str, body: ClickBody) -> Page:
         try:
@@ -538,6 +583,14 @@ def create_app() -> FastAPI:
             ],
         )
 
+    @app.post("/v1/sessions/{sid}/upload", response_model=Page, tags=["session"])
+    async def api_upload(sid: str, body: UploadBody) -> Page:
+        try:
+            payload = body.files or body.file_path or []
+            return await session_or_404(sid).upload(body.ref, payload, max_chars=body.max_chars)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @app.post("/v1/sessions/{sid}/act", response_model=Page, tags=["session"])
     async def api_act(sid: str, body: ActBody) -> Page:
         try:
@@ -546,6 +599,7 @@ def create_app() -> FastAPI:
                 text=body.text,
                 dx=body.dx,
                 dy=body.dy,
+                files=body.files,
                 max_chars=body.max_chars,
             )
         except ValueError as exc:
@@ -555,6 +609,44 @@ def create_app() -> FastAPI:
     async def api_back(sid: str) -> Page:
         try:
             return session_or_404(sid).back()
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/v1/sessions/{sid}/press", response_model=Page, tags=["session"])
+    async def api_press_key(sid: str, body: PressKeyBody) -> Page:
+        try:
+            return await session_or_404(sid).press_key(
+                body.ref, body.key, max_chars=body.max_chars
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/v1/sessions/{sid}/dialogs", tags=["session"])
+    async def api_dialogs(sid: str):
+        return {"dialogs": session_or_404(sid).dialogs()}
+
+    @app.post("/v1/sessions/{sid}/dialogs/respond", tags=["session"])
+    async def api_respond_dialog(sid: str, body: RespondDialogBody):
+        try:
+            return session_or_404(sid).respond_dialog(accept=body.accept, text=body.text)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/v1/sessions/{sid}/download", tags=["session"])
+    async def api_download(sid: str, body: DownloadBody):
+        try:
+            session = session_or_404(sid)
+            rec = await session.download(body.url, expected=body.expected, dest_dir=body.dest_dir)
+            return {
+                "url": rec.url,
+                "path": rec.path,
+                "bytes": rec.bytes,
+                "sha256": rec.sha256,
+                "content_type": rec.content_type,
+                "verified": rec.verified,
+                "scanned": rec.scanned,
+                "error": rec.error,
+            }
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 

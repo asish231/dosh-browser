@@ -128,7 +128,8 @@ TOOLS = [
     {
         "name": "browser_act",
         "description": "Carry out one action from the surface by ref. Navigates for links, fills and submits for "
-        "form fields (pass text), and uses a real browser for activate/drag controls. For a drag pass dx/dy.",
+        "form fields (pass text), uploads files for file inputs (pass files), "
+        "and uses a real browser for activate/drag controls. For a drag pass dx/dy.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -137,10 +138,99 @@ TOOLS = [
                 "text": {"type": "string", "description": "Value for a form field"},
                 "dx": {"type": "number", "description": "Horizontal drag distance in px"},
                 "dy": {"type": "number", "description": "Vertical drag distance in px"},
+                "files": {
+                    "type": "array",
+                    "description": "List of in-memory files to upload",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "content": {"type": "string", "description": "Plain text content (text files only)"},
+                            "content_b64": {"type": "string", "description": "Base64 raw bytes; required for binary files"},
+                            "type": {"type": "string"}
+                        },
+                        "required": ["name"]
+                    }
+                },
                 "max_chars": {"type": "integer", "default": 8000},
                 "stealth": {"type": "boolean", "default": False, "description": "Enable biological stealth mode (Bézier mouse trajectories with tremor, flight pauses). Defaults to false for speed."},
             },
             "required": ["session_id", "ref"],
+        },
+    },
+    {
+        "name": "browser_upload",
+        "description": "Upload file(s) to an <input type='file'> control by element ref (from inspect list or action surface). "
+        "Accepts a local file path (file_path) or in-memory files with name and content (text) "
+        "or content_b64 (base64 raw bytes for binary files, byte-exact).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Element ref or action ref of the file input (e.g. 'e1', 'a1b2c3d4')"},
+                "file_path": {"type": "string", "description": "Path to a local file on disk to upload"},
+                "files": {
+                    "type": "array",
+                    "description": "List of in-memory files to upload",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "content": {"type": "string", "description": "Plain text content (text files only)"},
+                            "content_b64": {"type": "string", "description": "Base64 raw bytes; required for binary files"},
+                            "type": {"type": "string"}
+                        },
+                        "required": ["name"]
+                    }
+                },
+                "max_chars": {"type": "integer", "default": 8000}
+            },
+            "required": ["ref"]
+        },
+    },
+    {
+        "name": "browser_press_key",
+        "description": "Press a named key on a control: enter, tab, escape, backspace, delete, space, arrowup, arrowdown, "
+        "arrowleft, arrowright, home, end, pageup, pagedown. Enter in a text input submits its form; "
+        "Tab moves focus; arrows change select options.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "ref": {"type": "string", "description": "Element ref ([eN] or action ref)"},
+                "key": {"type": "string", "default": "enter"},
+                "max_chars": {"type": "integer", "default": 8000},
+            },
+            "required": ["session_id", "ref"],
+        },
+    },
+    {
+        "name": "browser_respond_dialog",
+        "description": "List page dialogs (alert/confirm/prompt) or stage an answer for the next one. "
+        "The engine is synchronous: stage the answer (accept/dismiss/text), then re-run the action that triggers the dialog.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "accept": {"type": "boolean", "description": "True to accept, False to dismiss (stages an answer)"},
+                "dismiss": {"type": "boolean", "description": "Alternative to accept: true dismisses"},
+                "text": {"type": "string", "description": "Text to return for prompt() dialogs"},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "browser_download",
+        "description": "Download a file with the session's cookies: streams to disk and reports path, bytes, "
+        "sha256, content type, and optional hash verification. No malware verdict engine; the hash is provided instead.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "url": {"type": "string"},
+                "expected": {"type": "string", "description": "Expected hash (hex or base64)"},
+                "dest_dir": {"type": "string", "description": "Optional destination directory"},
+            },
+            "required": ["session_id", "url"],
         },
     },
     {
@@ -335,6 +425,7 @@ class McpServer:
             text = args.get("text", "")
             dx = args.get("dx")
             dy = args.get("dy")
+            files = args.get("files")
             max_chars = int(args.get("max_chars", 8000))
             stealth = args.get("stealth")
             try:
@@ -343,12 +434,63 @@ class McpServer:
                     text=text,
                     dx=dx,
                     dy=dy,
+                    files=files,
                     max_chars=max_chars,
                     stealth=stealth,
                 )
             except ValueError as exc:
                 return self._format_result(f"browser_act failed: {exc}")
             return self._format_result(page.view)
+
+        elif name == "browser_upload":
+            ref = args.get("ref", "")
+            file_path = args.get("file_path")
+            files = args.get("files")
+            payload = files or file_path or []
+            max_chars = int(args.get("max_chars", 8000))
+            try:
+                page = await session.upload(ref, payload, max_chars=max_chars)
+            except ValueError as exc:
+                return self._format_result(f"browser_upload failed: {exc}")
+            return self._format_result(page.view)
+
+        elif name == "browser_press_key":
+            ref = args.get("ref", "")
+            key = args.get("key") or "enter"
+            max_chars = int(args.get("max_chars", 8000))
+            try:
+                page = await session.press_key(ref, key, max_chars=max_chars)
+            except ValueError as exc:
+                return self._format_result(f"browser_press_key failed: {exc}")
+            return self._format_result(page.view)
+
+        elif name == "browser_respond_dialog":
+            if args.get("accept") is None and not args.get("dismiss"):
+                return self._format_result(json.dumps({"dialogs": session.dialogs()}, indent=2))
+            accept = bool(args.get("accept")) if args.get("accept") is not None else not bool(args.get("dismiss"))
+            result = session.respond_dialog(accept=accept, text=args.get("text") or "")
+            return self._format_result(json.dumps(result, indent=2))
+
+        elif name == "browser_download":
+            try:
+                rec = await session.download(
+                    args["url"], expected=args.get("expected"), dest_dir=args.get("dest_dir")
+                )
+            except KeyError:
+                return self._format_result("browser_download failed: url is required")
+            except ValueError as exc:
+                return self._format_result(f"browser_download failed: {exc}")
+            payload = {
+                "url": rec.url,
+                "path": rec.path,
+                "bytes": rec.bytes,
+                "sha256": rec.sha256,
+                "content_type": rec.content_type,
+                "verified": rec.verified,
+                "scanned": rec.scanned,
+                "error": rec.error,
+            }
+            return self._format_result(json.dumps(payload, indent=2))
 
         elif name == "browser_tabs":
             action = args.get("action", "list")

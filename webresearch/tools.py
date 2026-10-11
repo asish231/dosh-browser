@@ -144,8 +144,8 @@ TOOLS: list[dict] = [
             "name": "browser_act",
             "description": (
                 "Carry out one action from browser_actions by ref. Navigates for links, fills "
-                "and submits for form fields (pass text), and uses a real browser for activate "
-                "and drag controls. Pass dx/dy for a drag."
+                "and submits for form fields (pass text), uploads files for file inputs (pass files), "
+                "and uses a real browser for activate and drag controls. Pass dx/dy for a drag."
             ),
             "parameters": {
                 "type": "object",
@@ -155,9 +155,121 @@ TOOLS: list[dict] = [
                     "text": {"type": "string", "description": "Value for a form field"},
                     "dx": {"type": "number", "description": "Horizontal drag distance in px"},
                     "dy": {"type": "number", "description": "Vertical drag distance in px"},
+                    "files": {
+                        "type": "array",
+                        "description": "Optional list of files to upload for a file input",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "content": {"type": "string", "description": "Plain text content (text files only)"},
+                                "content_b64": {"type": "string", "description": "Base64 raw bytes; required for binary files"},
+                                "type": {"type": "string"},
+                            },
+                            "required": ["name"],
+                        },
+                    },
                     "max_chars": {"type": "integer", "default": 8000},
                 },
                 "required": ["session_id", "ref"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_upload",
+            "description": (
+                "Upload a file or files to an <input type='file'> control on the current page. "
+                "Simulates native file picker selection and fires input/change events. "
+                "Accepts local file path or in-memory file list with name and content (text) "
+                "or content_b64 (base64 raw bytes for binary/video/image files, byte-exact)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "ref": {"type": "string", "description": "Element ref or action ref of file input"},
+                    "file_path": {"type": "string", "description": "Path to local file on disk to upload"},
+                    "files": {
+                        "type": "array",
+                        "description": "List of file descriptors to upload",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "content": {"type": "string", "description": "Plain text content (text files only)"},
+                                "content_b64": {"type": "string", "description": "Base64 raw bytes; required for binary files"},
+                                "type": {"type": "string"},
+                            },
+                            "required": ["name"],
+                        },
+                    },
+                    "max_chars": {"type": "integer", "default": 8000},
+                },
+                "required": ["session_id", "ref"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_press_key",
+            "description": (
+                "Press a named key on a control: enter, tab, escape, backspace, delete, space, "
+                "arrowup, arrowdown, arrowleft, arrowright, home, end, pageup, pagedown. "
+                "Enter in a text input submits its form; Tab moves focus; arrows change selects."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "ref": {"type": "string", "description": "Element ref ([eN] or action ref)"},
+                    "key": {"type": "string", "default": "enter"},
+                    "max_chars": {"type": "integer", "default": 8000},
+                },
+                "required": ["session_id", "ref"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_respond_dialog",
+            "description": (
+                "List page dialogs (alert/confirm/prompt) or stage an answer. The engine is "
+                "synchronous: stage the answer, then re-run the action that triggers the dialog."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "accept": {"type": "boolean", "description": "True to accept, False to dismiss (stages an answer)"},
+                    "dismiss": {"type": "boolean", "description": "Alternative to accept: true dismisses"},
+                    "text": {"type": "string", "description": "Text to return for prompt() dialogs"},
+                },
+                "required": ["session_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_download",
+            "description": (
+                "Download a file with the session's cookies: streams to disk, reports path, "
+                "byte count, sha256, content type, and optional hash verification. "
+                "No malware verdict engine; the hash is provided instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "url": {"type": "string"},
+                    "expected": {"type": "string", "description": "Expected hash (hex or base64, sha256- prefix allowed)"},
+                    "dest_dir": {"type": "string", "description": "Optional destination directory"},
+                },
+                "required": ["session_id", "url"],
             },
         },
     },
@@ -250,6 +362,42 @@ TOOLS: list[dict] = [
                     },
                 },
                 "anyOf": [{"required": ["session_id"]}, {"required": ["url"]}],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_captcha_solve",
+            "description": (
+                "Attempt to solve a tile-based visual CAPTCHA (reCAPTCHA v2, hCaptcha) using "
+                "a vision model. Requires a prior browser_captcha call to fetch the sprite image. "
+                "Returns tile selections to click. This only handles image-select captchas with "
+                "visible tiles, not slider puzzles or audio challenges. Requires an OpenAI-compatible "
+                "vision model endpoint configured."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session with a loaded CAPTCHA page.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "Vision model id to use. Must support images. "
+                            "Default: auto-selects from configured models."
+                        ),
+                        "default": "auto",
+                    },
+                    "max_attempts": {
+                        "type": "integer",
+                        "description": "Max solve attempts before giving up.",
+                        "default": 1,
+                    },
+                },
+                "required": ["session_id"],
             },
         },
     },

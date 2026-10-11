@@ -40,6 +40,8 @@ def _is_interactive(node: dict) -> bool:
         return True
     if attrs.get("onclick"):
         return True
+    if (attrs.get("contenteditable") or "").lower() not in ("", "false"):
+        return True
     return False
 
 
@@ -82,8 +84,12 @@ def _role(node: dict) -> str:
         return "checkbox"
     if typ == "range" or role == "slider":
         return "slider"
+    if typ == "file":
+        return "file"
     if tag in {"input", "textarea"} or role == "textbox":
         return "textbox"
+    if (attrs.get("contenteditable") or "").lower() not in ("", "false"):
+        return "editable"
     if tag == "select":
         return "select"
     if tag == "label":
@@ -237,11 +243,16 @@ def type_html(html: str, ref: str, text: str) -> str:
     node, _path, tree = _node_by_ref(html, ref)
     tag = node.get("t") or ""
     attrs = node.setdefault("a", {})
-    if tag not in {"input", "textarea", "select"} and (attrs.get("role") or "") != "textbox":
+    editable = (attrs.get("contenteditable") or "").lower() not in ("", "false")
+    if tag not in {"input", "textarea", "select"} and (attrs.get("role") or "") != "textbox" and not editable:
         raise ValueError(f"[{ref}] is not typeable")
-    attrs["value"] = text
-    if tag == "textarea":
+    if editable:
+        # Rich editors read the DOM; the typed text becomes the element content.
         node["c"] = [{"t": "#text", "x": text}]
+    else:
+        attrs["value"] = text
+        if tag == "textarea":
+            node["c"] = [{"t": "#text", "x": text}]
     return tree_to_html(tree)
 
 

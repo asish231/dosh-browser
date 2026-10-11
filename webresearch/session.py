@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import base64
+import contextlib
+import json
+import mimetypes
 import os
 import re
 import secrets
 import time
+from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 
 import httpx
@@ -12,12 +17,14 @@ from webresearch.acd import query_acd, slice_acd
 from webresearch.actions import Action, ActionSurface, collect
 from webresearch.engine.captcha import (
     CaptchaInspection,
+    CaptchaSolveResult,
     dump_captcha_code,
     inspect_captcha,
+    solve_captcha,
 )
 from webresearch.engine.frames import FrameDocument, frame_infos, load_frames
 from webresearch.engine.inspect import click_html, inspect_html, type_html
-from webresearch.engine.runtime import run_scripts
+from webresearch.engine.runtime import MAX_UPLOAD_B64_CHARS, run_scripts
 from webresearch.fetch import close_impersonated, fetch, make_client
 from webresearch.parse import parse
 from webresearch.read import _decorate, read_live
@@ -26,6 +33,7 @@ from webresearch.snapshot import snapshot
 from webresearch.types import (
     CaptchaCodeDump,
     CaptchaReport,
+    CaptchaSolution,
     Challenge,
     FetchResult,
     FrameInfo,
@@ -36,6 +44,41 @@ from webresearch.types import (
 
 
 from webresearch.profile import Profile
+
+DOWNLOAD_CONTENT_TYPES = (
+    "application/pdf",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/gzip",
+    "application/x-tar",
+    "application/octet-stream",
+    "application/msword",
+    "application/vnd.",
+    "application/vnd.openxmlformats",
+    "image/",
+    "video/",
+    "audio/",
+    "font/",
+    "application/wasm",
+)
+
+
+def _is_download_response(kind: str, content_type: str, disposition: str) -> bool:
+    """True when a navigation response is a file, not a document."""
+    if kind != "other":
+        return False
+    disposition = (disposition or "").lower()
+    if "attachment" in disposition:
+        return True
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    if not ctype:
+        return False
+    if ctype.startswith(DOWNLOAD_CONTENT_TYPES):
+        return True
+    if ctype.startswith("text/"):
+        return False
+    # Unknown non-text types are treated as files rather than broken pages.
+    return True
 
 
 class Tab:
@@ -96,6 +139,10 @@ class Session:
         self.last_used = self.created_at
         self.proxy: str | None = None
         self.stealth: bool = False
+        # Per-run agent-visible state from the last JS pass.
+        self._last_dialogs: list[dict] = []
+        self._last_popups: list[dict] = []
+        self._popup_depth = 0
 
     def set_stealth(self, enabled: bool) -> bool:
         """Enable or disable humanised stealth mode (biological kinematics, typing pauses, smooth scroll)."""
@@ -213,9 +260,67 @@ class Session:
         self.frame_documents = frames
         self.captcha_inspection = captcha
         self.current_tab.ctx = js_info.get("ctx") if js_info else None
+        self._last_dialogs = list((js_info or {}).get("dialogs") or [])
+        self._last_popups = list((js_info or {}).get("popups") or [])
         if self.profile is not None:
             self.profile.save_from_client(self.client)
-        return self._push(page, html)
+
+        # A navigation that lands on a file (attachment/binary) is a download,
+        # not a broken page: stream it to disk and say where it went.
+        disposition = page.headers.get("content-disposition", "")
+        if _is_download_response(page.kind, page.content_type, disposition):
+            rec = await self.download(url, expected=None)
+            if rec.path:
+                note = (
+                    f"DOWNLOAD: {rec.bytes} bytes saved to {rec.path}\n"
+                    f"  url: {url}\n"
+                    f"  content_type: {rec.content_type}\n"
+                    f"  sha256: {rec.sha256}\n"
+                    "  malware verdict: not scanned (no verdict engine; hash is provided)"
+                )
+                page = page.model_copy(update={"view": note, "chars": len(note)})
+            elif rec.error:
+                note = f"DOWNLOAD FAILED: {rec.error}\n  url: {url}"
+                page = page.model_copy(update={"view": note, "chars": len(note)})
+            pushed = self._push(page, html)
+            await self._load_popup_tabs((js_info or {}).get("popups") or [])
+            return pushed
+
+        pushed = self._push(page, html)
+        await self._load_popup_tabs((js_info or {}).get("popups") or [])
+        return pushed
+
+    async def download(self, url: str, *, expected: str | None = None, dest_dir: str | None = None):
+        """Fetch a file with the session's cookies and save it to disk.
+
+        Returns download.py's Download record: path, byte count, sha256,
+        content type, and hash verification when ``expected`` is provided.
+        """
+        from webresearch.download import download as _download
+
+        absolute = url if url.startswith(("http://", "https://")) or not self.url else urljoin(self.url, url)
+        return await _download(absolute, self.client, expected=expected, dest_dir=dest_dir)
+
+    async def _load_popup_tabs(self, popups: list[dict]) -> None:
+        """window.open targets become real tabs; the agent stays on this page."""
+        if not popups or self._popup_depth >= 2:
+            return
+        self._popup_depth += 1
+        try:
+            for pop in popups[:4]:
+                target = urljoin(self.url, str(pop.get("url") or ""))
+                if not target.startswith(("http://", "https://")):
+                    continue
+                prev_active = self.active_tab_id
+                tid = f"tab_{len(self._tabs) + 1}"
+                while tid in self._tabs:
+                    tid += "_"
+                self.new_tab(tid)
+                with contextlib.suppress(Exception):
+                    await self.goto(target, max_chars=2000)
+                self.active_tab_id = prev_active
+        finally:
+            self._popup_depth -= 1
 
     async def open(self, n: int, *, max_chars: int = 8000) -> Page:
         current = self.page
@@ -441,6 +546,169 @@ class Session:
             max_chars,
         )
 
+    async def upload(
+        self,
+        ref: str,
+        files: list[dict] | str | Path | dict,
+        *,
+        max_chars: int = 8000,
+    ) -> Page:
+        """Upload one or more files to a file input control (<input type="file">).
+
+        Binary files (video, images, PDFs, any bytes) are transported as
+        ``contentB64`` so the payload stays byte-exact end to end; plain
+        ``content`` strings are still accepted as text.
+        """
+        if not self.html:
+            raise ValueError("no current page")
+
+        def _b64_of_file(p: Path) -> str:
+            return base64.b64encode(p.read_bytes()).decode("ascii")
+
+        file_list: list[dict] = []
+        raw_items = files if isinstance(files, list) else [files]
+        for item in raw_items:
+            if isinstance(item, (str, Path)):
+                p = Path(item)
+                if p.is_file():
+                    fname = p.name
+                    mime, _ = mimetypes.guess_type(str(p))
+                    file_list.append({
+                        "name": fname,
+                        "contentB64": _b64_of_file(p),
+                        "type": mime or "application/octet-stream",
+                    })
+                else:
+                    file_list.append({
+                        "name": str(item),
+                        "content": "",
+                        "type": "text/plain",
+                    })
+            elif isinstance(item, dict):
+                b64 = item.get("contentB64") or item.get("content_b64")
+                if b64:
+                    file_list.append({
+                        "name": item.get("name") or "file",
+                        "contentB64": b64,
+                        "type": item.get("type") or "application/octet-stream",
+                    })
+                    continue
+                fname = item.get("name") or "file"
+                content = item.get("content")
+                if content is None and item.get("path"):
+                    p = Path(item["path"])
+                    if p.is_file():
+                        fname = item.get("name") or p.name
+                        mime, _ = mimetypes.guess_type(str(p))
+                        item.setdefault("type", mime)
+                        file_list.append({
+                            "name": fname,
+                            "contentB64": _b64_of_file(p),
+                            "type": item.get("type") or "application/octet-stream",
+                        })
+                        continue
+                file_list.append({
+                    "name": fname,
+                    "content": content if content is not None else "",
+                    "type": item.get("type") or "application/octet-stream",
+                })
+
+        payload_chars = sum(
+            len(f.get("contentB64") or f.get("content") or "") for f in file_list
+        )
+        if payload_chars > MAX_UPLOAD_B64_CHARS:
+            raise ValueError(
+                f"upload payload {payload_chars} chars exceeds engine limit "
+                f"{MAX_UPLOAD_B64_CHARS} (approx {MAX_UPLOAD_B64_CHARS * 3 // 4} raw bytes)"
+            )
+
+        targets, _ = inspect_html(self.html, self.url)
+        target = next((item for item in targets if item.ref == ref), None)
+        if target is not None:
+            return await self._apply(
+                [{"kind": "upload", "path": target.path, "files": file_list}],
+                self.html,
+                max_chars,
+            )
+
+        surface = self.action_surface(max_actions=100_000)
+        action = next((a for a in surface.actions if a.ref == ref), None)
+        selector = (action.selector or action.target) if action else ref
+        return await self._apply(
+            [{"kind": "upload", "selector": selector, "files": file_list}],
+            self.html,
+            max_chars,
+        )
+
+    async def press_key(
+        self,
+        ref: str,
+        key: str,
+        *,
+        max_chars: int = 8000,
+        stealth: bool | None = None,
+    ) -> Page:
+        """Press a named key (enter/tab/escape/arrows/backspace/space/...) on a control.
+
+        Enter in a text input performs the form's implicit submission, Tab
+        moves focus to the next focusable element, arrows change select
+        options, Backspace deletes a character.
+        """
+        if not self.html:
+            raise ValueError("no current page")
+        key_norm = key.strip().lower()
+        if not key_norm:
+            raise ValueError(
+                "key must be one of: enter, tab, escape, backspace, delete, space, "
+                "arrowup, arrowdown, arrowleft, arrowright, home, end, pageup, pagedown"
+            )
+        is_stealth = self.stealth if stealth is None else bool(stealth)
+        targets, _ = inspect_html(self.html, self.url)
+        target = next((item for item in targets if item.ref == ref), None)
+        if target is not None:
+            return await self._apply(
+                [{"kind": "press", "path": target.path, "key": key_norm, "stealth": is_stealth}],
+                self.html,
+                max_chars,
+            )
+        surface = self.action_surface(max_actions=100_000)
+        action = next((a for a in surface.actions if a.ref == ref), None)
+        if action is None:
+            raise ValueError(
+                f"no target [{ref}] for key press. Refs are content-addressed and "
+                "change when a field's value changes; re-inspect and use the new ref."
+            )
+        return await self._apply(
+            [{"kind": "press", "selector": action.selector or action.target, "key": key_norm, "stealth": is_stealth}],
+            self.html,
+            max_chars,
+        )
+
+    def dialogs(self) -> list[dict]:
+        """Dialogs (alert/confirm/prompt) fired by the most recent script pass.
+
+        Each entry says how it was answered at the time the page called it:
+        'accepted'/'dismissed' (the agent had staged an answer) or 'default'
+        (no staged answer, so the engine's default return value applied).
+        """
+        return list(self._last_dialogs)
+
+    def respond_dialog(self, accept: bool, text: str = "") -> dict:
+        """Stage the answer for the next confirm/prompt the page fires.
+
+        The engine is synchronous, so the answer cannot travel back in time:
+        stage it, then re-run the action that triggers the dialog. Returns the
+        staged state plus the current dialog list.
+        """
+        ctx = self.current_tab.ctx
+        if ctx is not None:
+            ctx.eval(f"globalThis.__stageDialogAnswer({str(bool(accept)).lower()}, {json.dumps(text)})")
+        return {
+            "staged": {"accept": bool(accept), "text": text},
+            "note": "answer staged; re-run the action that triggers the dialog",
+            "dialogs": self.dialogs(),
+        }
+
     # -- action-surface driven navigation -------------------------------
     # The `[eN]` refs above are numbered in document order and stop at 80, so
     # an agent cannot address the rest of a real page. The action surface below
@@ -472,6 +740,7 @@ class Session:
         text: str = "",
         dx: float | None = None,
         dy: float | None = None,
+        files: list[dict] | str | Path | dict | None = None,
         max_chars: int = 8000,
         stealth: bool | None = None,
     ) -> Page:
@@ -490,6 +759,10 @@ class Session:
                 f"no action [{ref}]. Surface has {len(surface.actions)} action(s); "
                 f"first refs: {known}"
             )
+
+        if action.role == "file" or files is not None:
+            upload_payload = files if files is not None else (text or "uploaded_file.txt")
+            return await self.upload(ref, upload_payload, max_chars=max_chars)
 
         is_stealth = self.stealth if stealth is None else bool(stealth)
 
@@ -681,8 +954,12 @@ resolve a selector directly.
         self.frame_documents = frames
         self.captcha_inspection = captcha
         self._last_deltas = js_info.get("deltas", [])
+        self._last_dialogs = list(js_info.get("dialogs") or [])
+        popups = list(js_info.get("popups") or [])
+        self._last_popups = popups
         if self.profile is not None:
             self.profile.save_from_client(self.client)
+        await self._load_popup_tabs(popups)
         if js_info.get("navigated"):
             nav_url = urljoin(self.url, js_info["navigated"])
             return await self.goto(nav_url, max_chars=max_chars)
@@ -691,12 +968,35 @@ resolve a selector directly.
             act_url = urljoin(self.url, fs.get("action") or "")
             method = fs.get("method", "POST").upper()
             fields = fs.get("fields", {})
+            files_map = fs.get("files", {})
             if method == "GET":
                 parsed = urlparse(act_url)
                 target = urlunparse(parsed._replace(query=urlencode(fields)))
                 return await self.goto(target, max_chars=max_chars)
             else:
-                result = await fetch(act_url, client=self.client, method="POST", data=fields)
+                upload_files = None
+                if files_map:
+                    upload_files = []
+                    for f_name, f_list in files_map.items():
+                        for f_item in f_list:
+                            b64_c = f_item.get("contentB64") or f_item.get("content_b64")
+                            if b64_c:
+                                # Binary files round-trip as base64; decode to the
+                                # exact original bytes for the multipart POST.
+                                raw_bytes = base64.b64decode(b64_c)
+                            else:
+                                raw_c = f_item.get("content", "")
+                                raw_bytes = raw_c.encode("utf-8") if isinstance(raw_c, str) else bytes(raw_c)
+                            upload_files.append(
+                                (f_name, (f_item.get("name", "file"), raw_bytes, f_item.get("type", "application/octet-stream")))
+                            )
+                result = await fetch(
+                    act_url,
+                    client=self.client,
+                    method="POST",
+                    data=fields,
+                    files=upload_files,
+                )
                 dest_url = result.final_url or act_url
                 res_html = result.body
                 js_info_post: dict = {}
@@ -791,6 +1091,56 @@ resolve a selector directly.
                 code="CAPTCHA CODE: not inspected",
             )
         return dump_captcha_code(self.captcha_inspection)
+
+    async def solve_captcha(
+        self,
+        *,
+        model: str = "auto",
+        max_attempts: int = 1,
+    ) -> dict:
+        """Use a vision model to solve a tile-based CAPTCHA.
+
+        Returns the solution dict with tile selections. The caller should then
+        click the tiles and hit verify.
+        """
+        from webresearch.settings import llm_config
+
+        if not self.html:
+            raise ValueError("no current page")
+        if self.captcha_inspection is None:
+            raise ValueError(
+                "no CAPTCHA inspection available. Call browser_captcha first."
+            )
+
+        cfg = llm_config(model)
+        result: CaptchaSolveResult = await solve_captcha(
+            self.captcha_inspection,
+            api_key=cfg["api_key"],
+            base_url=cfg["base_url"],
+            model=cfg["model"],
+            client=self.client,
+            max_attempts=max_attempts,
+        )
+
+        return {
+            "solved": result.solution.solved,
+            "kind": result.solution.kind,
+            "prompt": result.solution.prompt,
+            "model_used": result.solution.model_used,
+            "attempt": result.solution.attempt,
+            "tiles_selected": [
+                {
+                    "tile_id": s.tile_id,
+                    "row": s.row,
+                    "column": s.column,
+                    "confidence": s.confidence,
+                    "reason": s.reason,
+                }
+                for s in result.solution.tiles_selected
+            ],
+            "error": result.solution.error or (result.error or ""),
+            "view": result.solution.view,
+        }
 
     def back(self) -> Page:
         if self.index <= 0:
