@@ -335,7 +335,7 @@ class ModernWebPlatformTests(unittest.TestCase):
             self.assertIn('data-i2-x-offset="166"', out)
             self.assertIn('data-badge-rel-x="45"', out)
             self.assertIn('data-badge-rel-y="25"', out)
-            self.assertIn('data-engine="block-flow+flex+positioned"', out)
+            self.assertIn('data-engine="block-flow+flex+grid+positioned"', out)
         asyncio.run(run())
 
     def test_message_event_source_reply(self):

@@ -12,7 +12,7 @@ from webresearch.types import FetchResult, Kind
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
 DEFAULT_TIMEOUT = 20.0
@@ -37,16 +37,24 @@ def _enforce_cookies(client, url, set_cookies):
 
 def browser_client_hints(ua: str = DEFAULT_UA, platform: str = "macOS") -> dict[str, str]:
     """Client hints consistent with a Chrome desktop User-Agent."""
-    version = "128"
+    version = "124"
+    full = "124.0.0.0"
     for token in ua.split():
         if token.startswith("Chrome/"):
-            version = token.split("/", 1)[1].split(".", 1)[0]
+            full = token.split("/", 1)[1]
+            version = full.split(".", 1)[0]
             break
     mobile = "?1" if "Mobile" in ua else "?0"
+    arch = "arm" if "Mac" in ua else "x86"
     return {
         "sec-ch-ua": f'"Chromium";v="{version}", "Not;A=Brand";v="24", "Google Chrome";v="{version}"',
         "sec-ch-ua-mobile": mobile,
         "sec-ch-ua-platform": f'"{platform}"',
+        "sec-ch-ua-arch": f'"{arch}"',
+        "sec-ch-ua-bitness": '"64"',
+        "sec-ch-ua-model": '""',
+        "sec-ch-ua-platform-version": '"14.0.0"',
+        "sec-ch-ua-full-version-list": f'"Chromium";v="{full}", "Not;A=Brand";v="24.0.0.0", "Google Chrome";v="{full}"',
         "upgrade-insecure-requests": "1",
     }
 
@@ -503,6 +511,7 @@ async def fetch(
             body=f"blocked by navigation throttle: {verdict.reason}",
             headers={"x-webresearch-blocked": "throttle"},
         )
+    await REGISTRY.pace(url)
 
     from webresearch.cache import CACHE
     req_headers = dict(navigate_headers(url))
@@ -541,6 +550,9 @@ async def fetch(
                     impersonate=choice,
                     timeout=timeout,
                 )
+                from webresearch.engine.throttles import REGISTRY as _REG
+
+                _REG.note_status(url, result.status)
                 return await _finalize(result, method, url, use_headers, entry, upgraded_from, client)
             except Exception:
                 # Fall back to httpx rather than failing the whole navigation.
@@ -554,6 +566,9 @@ async def fetch(
             headers=use_headers or None,
             max_bytes=max_bytes,
         )
+        from webresearch.engine.throttles import REGISTRY as _REG2
+
+        _REG2.note_status(url, result.status)
         return await _finalize(result, method, url, use_headers, entry, upgraded_from, client)
     except Exception as exc:
         from webresearch.engine.tls_policy import handle_tls_error

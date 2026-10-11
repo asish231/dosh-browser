@@ -5,7 +5,13 @@ from webresearch.fetch import FetchResult
 from webresearch.forms import forms
 from webresearch.links import links
 from webresearch.parse import parse
-from webresearch.search import _parse_google, _unwrap_google
+from webresearch.search import (
+    _parse_bing,
+    _parse_ddg_lite,
+    _parse_google,
+    _parse_yahoo,
+    _unwrap_google,
+)
 from webresearch.snapshot import snapshot
 
 HTML = """<!doctype html>
@@ -133,6 +139,51 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(hits[0].url, "https://www.tripadvisor.com/Hotel_Review.html")
         self.assertIn("Tripadvisor", hits[0].title)
         self.assertIsNone(_unwrap_google("/aclk?ad=1"))
+
+    def test_bing_result_parse(self):
+        html = """<!doctype html><html><body>
+        <ol id="b_results">
+          <li class="b_algo">
+            <h2><a href="https://docs.python.org/3/library/asyncio.html">asyncio — Python</a></h2>
+            <div class="b_caption"><p>Asynchronous I/O library documentation.</p></div>
+          </li>
+        </ol>
+        </body></html>"""
+        doc = _page(html, "https://www.bing.com/search?q=python+asyncio")
+        hits = _parse_bing(doc, max_hits=8)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].url, "https://docs.python.org/3/library/asyncio.html")
+        self.assertIn("asyncio", hits[0].title)
+        self.assertIn("documentation", hits[0].snippet)
+
+    def test_yahoo_result_parse(self):
+        html = """<!doctype html><html><body>
+        <div id="web">
+          <div class="dd algo algo-sr">
+            <h3 class="title"><a href="https://realpython.com/async-io-python/">Real Python Asyncio</a></h3>
+            <div class="compText"><p>Hands-on walkthrough for asyncio.</p></div>
+          </div>
+        </div>
+        </body></html>"""
+        doc = _page(html, "https://search.yahoo.com/search?p=python+asyncio")
+        hits = _parse_yahoo(doc, max_hits=8)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].url, "https://realpython.com/async-io-python/")
+        self.assertIn("Real Python", hits[0].title)
+
+    def test_ddg_lite_result_parse(self):
+        html = """<!doctype html><html><body>
+        <table>
+          <tr><td><a class="result-link" href="https://example.com/item">Item Title</a></td></tr>
+          <tr><td class="result-snippet">Snippet text here.</td></tr>
+        </table>
+        </body></html>"""
+        doc = _page(html, "https://lite.duckduckgo.com/lite/")
+        hits = _parse_ddg_lite(doc, max_hits=8)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].url, "https://example.com/item")
+        self.assertEqual(hits[0].title, "Item Title")
+        self.assertEqual(hits[0].snippet, "Snippet text here.")
 
 
 if __name__ == "__main__":

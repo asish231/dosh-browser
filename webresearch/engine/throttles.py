@@ -116,6 +116,56 @@ class SafeBrowsingThrottle:
 class ThrottleRegistry:
     def __init__(self) -> None:
         self.throttles: list = [SafeBrowsingThrottle()]
+        self._last_hit: dict[str, float] = {}
+        self._backoff_until: dict[str, float] = {}
+        self._consec_429: dict[str, int] = {}
+
+    @staticmethod
+    def _host(url: str) -> str:
+        try:
+            return (urlparse(url).hostname or "").lower()
+        except Exception:
+            return ""
+
+    def min_interval(self, host: str) -> float:
+        if "google." in host or "duckduckgo.com" in host:
+            return 2.5
+        if "bing.com" in host or "yahoo.com" in host or "brave.com" in host:
+            return 1.5
+        return 0.75
+
+    async def pace(self, url: str) -> None:
+        """Per-host min-interval + jitter + 429 backoff. Call before fetch."""
+        import asyncio
+        import random
+        import time
+
+        host = self._host(url)
+        if not host:
+            return
+        now = time.monotonic()
+        blocked_until = self._backoff_until.get(host, 0.0)
+        if blocked_until > now:
+            await asyncio.sleep(blocked_until - now)
+            now = time.monotonic()
+        last = self._last_hit.get(host, 0.0)
+        wait = self.min_interval(host) + random.uniform(0, 0.8) - (now - last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_hit[host] = time.monotonic()
+
+    def note_status(self, url: str, status: int) -> None:
+        import time
+
+        host = self._host(url)
+        if not host:
+            return
+        if status == 429:
+            n = self._consec_429.get(host, 0) + 1
+            self._consec_429[host] = n
+            self._backoff_until[host] = time.monotonic() + min(60.0 * (2 ** (n - 1)), 300.0)
+        elif status and status < 400:
+            self._consec_429.pop(host, None)
 
     def evaluate(self, url: str) -> ThrottleVerdict:
         for throttle in self.throttles:

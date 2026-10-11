@@ -193,7 +193,7 @@ class ModuleGraph:
 
 
 def _iter_imports(code: str) -> list[str]:
-    """Return raw specifier strings from static import/re-export statements."""
+    """Return raw specifier strings from static and dynamic import statements."""
     specs: list[str] = []
     masked = _mask_literals(code)
     for match in re.finditer(
@@ -204,6 +204,12 @@ def _iter_imports(code: str) -> list[str]:
     for match in re.finditer(r"\bimport\s*[\"']([^\"']+)[\"']", masked):
         quote = code[match.start(1):match.end(1)]
         specs.append(quote)
+    # Dynamic import("chunk") used by Vite/route-split bundles. Masking hides
+    # template-literal call sites, so only literal call sites are discovered.
+    for match in re.finditer(r"\bimport\s*\(\s*[\"']([^\"']+)[\"']\s*\)", masked):
+        quote = code[match.start(1):match.end(1)]
+        if quote not in specs:
+            specs.append(quote)
     return specs
 
 
@@ -214,10 +220,16 @@ def _resolve(specifier: str, base_url: str, import_map: dict[str, str]) -> str |
         return specifier
     if specifier in import_map:
         return import_map[specifier]
+    # Import-map prefix mappings ("@/", "~/", bare package prefixes).
+    for key, target in import_map.items():
+        if key.endswith("/") and specifier.startswith(key):
+            return target + specifier[len(key):]
     if specifier.startswith(("./", "../", "/")):
         return urljoin(base_url, specifier)
     if specifier.startswith(("http://", "https://")):
         return specifier
+    # Bare specifiers (react, @scope/pkg) without a map entry: leave unresolved
+    # but recorded, never throw. Caller logs graph.missing.
     return None
 
 
@@ -402,7 +414,11 @@ def transform_module(
 
 
 def extract_import_map(html: str) -> dict[str, str]:
-    """Parse an <script type="importmap"> block if present."""
+    """Parse inline <script type="importmap"> blocks if present.
+
+    External maps (<script type="importmap" src="...">) need a fetch; use
+    resolve_import_map() from async code paths.
+    """
     import json
 
     out: dict[str, str] = {}
@@ -417,6 +433,37 @@ def extract_import_map(html: str) -> dict[str, str]:
             continue
         out.update(data.get("imports") or {})
     return out
+
+
+def importmap_srcs(html: str) -> list[str]:
+    """External importmap URLs (<script type=importmap src=...>)."""
+    out: list[str] = []
+    for match in re.finditer(
+        r"<script[^>]*type=[\"']importmap[\"'][^>]*>",
+        html,
+        flags=re.IGNORECASE,
+    ):
+        tag = match.group(0)
+        m = re.search(r"""\bsrc\s*=\s*["']([^"']+)["']""", tag, flags=re.IGNORECASE)
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+async def resolve_import_map(html: str, base_url: str, client: httpx.AsyncClient) -> dict[str, str]:
+    """Inline maps plus best-effort fetch of external importmap src files."""
+    import json as _json
+    from urllib.parse import urljoin as _join
+
+    merged = extract_import_map(html)
+    for src in importmap_srcs(html)[:3]:
+        try:
+            resp = await client.get(_join(base_url, src), timeout=10.0)
+            data = _json.loads(resp.text or "{}")
+            merged.update(data.get("imports") or {})
+        except Exception:
+            continue
+    return merged
 
 
 async def load_module_graph(
