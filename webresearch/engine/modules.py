@@ -334,6 +334,7 @@ def _mask_literals(code: str) -> str:
             # regex literal: '/' after a value is division, after anything else it opens
             j = i + 1
             in_class = False
+            regex_closed = False
             while j < n:
                 c = code[j]
                 if c == "\\":
@@ -345,15 +346,23 @@ def _mask_literals(code: str) -> str:
                     in_class = False
                 elif c == "/" and not in_class:
                     j += 1
+                    regex_closed = True
                     break
                 elif c == "\n":
                     break
                 j += 1
-            while j < n and code[j].isalpha():
+            while regex_closed and j < n and code[j].isalpha():
                 j += 1
-            if j >= n or code[j - 1] != "/":
+            if j >= n or not regex_closed:
                 # Not a terminated regex: desync. Skip the opener only, so the
                 # code after it is still visible to the rewrites.
+                # NOTE: the terminated check must be the close event itself,
+                # NOT code[j-1] == "/" — the flag-eating loop above advances j
+                # past /g /gi /u flags, so code[j-1] is the LAST FLAG CHAR, and
+                # the old check false-positived on EVERY flagged regex, leaving
+                # its body as "code" where quotes then opened phantom strings
+                # and swallowed real statements (a real bug on LinkedIn's
+                # A2-4UjN7.js: depth never returned to 0 after a /g regex).
                 out[i] = "\x00"
                 i = i + 1
                 prev = "/"
@@ -524,6 +533,16 @@ def _rewrite_imports(code: str, module_url: str, import_map: dict[str, str]) -> 
     )
     code = _sub_code(
         code, r"\bimport\s*\.\s*meta\b", lambda m, o: "{ url: " + repr(module_url) + " }"
+    )
+    # Dynamic import(): QuickJS parses ImportCall in classic scripts but its
+    # loader rejects every URL ("could not load module"), which killed como's
+    # webpack chunk loading — React lazy chunks never registered and the
+    # hydrated app crashed with "not a function". Rewrite every real-code
+    # ``import(`` call to ``__wr_import(``, our loader (minidom).
+    code = _sub_code(
+        code,
+        r"\bimport\s*\(",
+        lambda m, o: "__wr_import(",
     )
     # Template-literal interpolations are masked as part of the literal, but
     # they are real code at eval time — a real case: LinkedIn's kvZetL-w.js has
@@ -719,18 +738,228 @@ def _repl_export_list(target: str, list_text: str) -> str:
     return " ".join(out)
 
 
+def _hoisted_export_names(code: str) -> list[str]:
+    """Exported function/class declaration names, for circular-import support.
+
+    Real ESM hoists ``export function NAME`` bindings into the module
+    environment before evaluation, so a circular importer can call NAME while
+    the exporter's body has not run yet. Registry emulation needs the same:
+    pre-register the hoisted names right after the module header. Function
+    declarations are hoisted within this IIFE, so the values exist there.
+    """
+    masked = _mask_literals(code)
+    names: list[str] = []
+    for match in re.finditer(
+        r"\bexport\s+(?:default\s+)?(?:async\s+)?(?:function\s*\*?)\s+([A-Za-z_$][\w$]*)",
+        masked,
+    ):
+        names.append(match.group(1))
+    for match in re.finditer(r"\bexport\s+class\s+([A-Za-z_$][\w$]*)", masked):
+        names.append(match.group(1))
+    return names
+
+
+def _fix_class_static_selfref(code: str) -> str:
+    """Rewrite class-name self-references in STATIC FIELD INITIALIZERS to ``this``.
+
+    ES2022: inside a static field initializer ``this`` is the class itself, so
+    ``class A { static x = 5; static y = A.x + 1; }`` is valid in real browsers
+    and engines. QuickJS (this build) rejects it with a TDZ ReferenceError —
+    ``A is not initialized`` — because the class binding is not yet live while
+    the initializer runs. ``this`` IS live there, so rewriting ``A`` to
+    ``this`` inside static initializers is a spec-faithful fix. Only static
+    field initializers are rewritten; method bodies run after class
+    initialization and keep the class-name reference.
+    """
+    masked = _mask_literals(code)
+    n = len(code)
+    edits: list[tuple[int, int]] = []  # (start, end) of each NAME token to swap
+    for decl in re.finditer(r"\bclass\s+([A-Za-z_$][\w$]*)\s*(?:extends\s+[({\w$.]+?\s*)?\{", masked):
+        cls_name = decl.group(1)
+        name_re = re.compile(r"\b" + re.escape(cls_name) + r"\b")
+        i = decl.end()  # position right after '{'
+        depth = 1  # brace depth inside the class body
+        while i < n and depth > 0:
+            c = masked[i]
+            if c == "{":
+                depth += 1
+                i += 1
+                continue
+            if c == "}":
+                depth -= 1
+                i += 1
+                continue
+            # at member level: does this member start with 'static'?
+            if (
+                depth == 1
+                and masked.startswith("static", i)
+                and (i == 0 or not (masked[i - 1].isalnum() or masked[i - 1] in "_$"))
+                and (i + 6 >= n or not (masked[i + 6].isalnum() or masked[i + 6] in "_$"))
+            ):
+                # scan the initializer; commas/semicolons at ALL-zero relative
+                # depth end it (member separator or next member).
+                j = i
+                par = brk = brace = 0
+                while j < n:
+                    cj = masked[j]
+                    if cj in "([{":
+                        if cj == "(":
+                            par += 1
+                        elif cj == "[":
+                            brk += 1
+                        else:
+                            brace += 1
+                    elif cj in ")]}":
+                        if cj == ")" and par > 0:
+                            par -= 1
+                        elif cj == "]" and brk > 0:
+                            brk -= 1
+                        elif cj == "}":
+                            if brace > 0:
+                                brace -= 1
+                            else:
+                                break  # end of class body
+                    elif cj in ";," and par == 0 and brk == 0 and brace == 0:
+                        break  # member separator
+                    if (
+                        par == 0
+                        and brk == 0
+                        and brace == 0
+                        and name_re.match(masked, j)
+                    ):
+                        before = masked[j - 1]
+                        after = masked[j + len(cls_name)] if j + len(cls_name) < n else ""
+                        # Reject property access (foo.Cls) and private member
+                        # names (#Cls) — a real bug: a private method `#tk`
+                        # inside class `tk` was rewritten to `#this`, breaking
+                        # every use of the private method (SyntaxError:
+                        # undefined private field).
+                        if (
+                            before in "#."
+                            or before.isalnum()
+                            or before in "_$"
+                            or after.isalnum()
+                            or after in "_$"
+                        ):
+                            pass  # not a whole-token class reference
+                        else:
+                            edits.append((j, j + len(cls_name)))
+                    j += 1
+                i = j
+                continue
+            i += 1
+    if not edits:
+        return code
+    out = code
+    for start, end in reversed(edits):
+        out = out[:start] + "this" + out[end:]
+    return out
+
+
+def _fix_private_in_checks(code: str) -> str:
+    """Rewrite ES2022 ergonomic brand checks ``#field in obj`` to instanceof.
+
+    QuickJS (1.19.4) rejects ``#x in obj`` at parse time — ``SyntaxError:
+    undefined private field '#x'`` — while real browsers accept it (ES2022
+    brand checks). A private instance field exists on an object exactly when
+    that object was constructed by the field's class, so inside the class
+    body ``#x in obj`` is equivalent to ``obj instanceof ClassName`` for the
+    standard brand-check pattern (fields added unconditionally in the
+    constructor). This rewrite applies only inside class bodies, where the
+    private field and the class name are both in scope.
+    """
+    masked = _mask_literals(code)
+    n = len(code)
+    edits: list[tuple[int, int, str]] = []
+    # track enclosing classes while walking
+    class_stack: list[tuple[str, int]] = []  # (name, brace_depth_at_entry)
+    depth = 0
+    i = 0
+    pending_class_name = ""
+    while i < n:
+        c = masked[i]
+        if c == "{":
+            depth += 1
+            if pending_class_name:
+                class_stack.append((pending_class_name, depth))
+                pending_class_name = ""
+            i += 1
+            continue
+        if c == "}":
+            if class_stack and class_stack[-1][1] == depth:
+                class_stack.pop()
+            depth -= 1
+            i += 1
+            continue
+        m = re.match(r"\bclass\s+([A-Za-z_$][\w$]*)", masked[i : i + 64])
+        if m and not (masked[i - 1].isalnum() or masked[i - 1] in "_$"):
+            pending_class_name = m.group(1)
+            i += m.end()
+            continue
+        pm = re.match(r"#([A-Za-z_$][\w$]*)\s+in\s+", masked[i : i + 64])
+        if pm and class_stack:
+            cls_name = class_stack[-1][0]
+            # expression extent: identifier chain or parenthesized expr
+            j = i + pm.end()
+            start_expr = j
+            par = 0
+            while j < n:
+                cj = masked[j]
+                if cj == "(":
+                    par += 1
+                elif cj == ")":
+                    if par == 0:
+                        break
+                    par -= 1
+                elif par == 0 and (cj in ",;{}" or cj in "=&|?:" or masked.startswith("&&", j) or masked.startswith("||", j)):
+                    break
+                j += 1
+            expr = code[start_expr:j].strip()
+            if expr and re.match(r"^[A-Za-z_$][\w$.]*", expr):
+                replacement = f"(({expr}) instanceof {cls_name})"
+                edits.append((i, j, replacement))
+            i = j
+            continue
+        i += 1
+    if not edits:
+        return code
+    out = code
+    for start, end, replacement in reversed(edits):
+        out = out[:start] + replacement + out[end:]
+    return out
+
+
 def transform_module(
     code: str, module_id: str, import_map: dict[str, str] | None = None
 ) -> str:
     """Translate one ES module into registry-registered classic script."""
     code = _quickjs_regex_compat(code)
+    code = _fix_class_static_selfref(code)
+    code = _fix_private_in_checks(code)
+    hoisted = _hoisted_export_names(code)
     body = _rewrite_exports(_rewrite_imports(code, module_id, import_map or {}))
     header = f"__mods[{module_id!r}] = __mods[{module_id!r}] || {{}};"
+    # Circular imports: pre-register hoisted function/class exports so an
+    # importer that runs mid-cycle (DFS order) sees the real function objects,
+    # mirroring ESM hoisting. Non-hoisted bindings stay undefined until the
+    # suffix assignment — the same shape real ESM TDZ approximates.
+    prereg = ""
+    if hoisted:
+        prereg = (
+            "try {\n"
+            + "\n".join(
+                f"__mods[{module_id!r}][{name!r}] = typeof {name} !== 'undefined' ? {name} : undefined;"
+                for name in hoisted
+            )
+            + "\n} catch (e) {}"
+        )
     suffix = (
         f"__mods[{module_id!r}] = Object.assign("
         f"__mods[{module_id!r}] || {{}}, __exports);"
     )
-    return f"(function () {{\nvar __exports = {{}};\n{header}\n{body}\n{suffix}\n}})();"
+    return (
+        f"(function () {{\nvar __exports = {{}};\n{header}\n{prereg}\n{body}\n{suffix}\n}})();"
+    )
 
 
 def extract_import_map(html: str) -> dict[str, str]:

@@ -359,11 +359,25 @@ def test_minidom_binary_file_size_and_b64_roundtrip():
     ctx.eval(f"""
         var byteStr = atob({b64mod.b64encode(raw).decode('ascii')!r});
         var binFile = new File([byteStr], "clip.mp4", {{ type: "video/mp4" }});
+        // Binary marking mirrors the engine's real upload path (__uploadFiles):
+        // atob output is one char per byte, so the binary size override is the
+        // byte count. Text Blob size is spec-correct UTF-8 length instead.
+        binFile._binary = true;
+        binFile.size = binFile._content.length;
     """)
     assert ctx.eval("binFile.size") == len(raw)
     # btoa of the Latin-1 byte string must reproduce the original base64
     roundtrip = ctx.eval("btoa(binFile._content)")
     assert b64mod.b64decode(roundtrip) == raw
+
+
+def test_text_blob_size_is_utf8_bytes():
+    """Spec: Blob size for a string is its UTF-8 byte length (was Latin-1)."""
+    ctx = Context()
+    ctx.eval(MINIDOM_JS)
+    # caf\u00e9 = 5 UTF-8 bytes (c,a,f,0xC3,0xA9), not 4 chars
+    assert ctx.eval('new Blob(["caf\\u00e9"]).size') == 5
+    assert ctx.eval('new Blob(["hello"]).size') == 5
 
 
 def test_upload_files_content_b64_marks_binary():

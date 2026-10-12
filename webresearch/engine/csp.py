@@ -16,6 +16,12 @@ def _entries(csp: str, name: str) -> list[str]:
 
 
 def _script_src(csp: str) -> list[str]:
+    # CSP3 element-specific directive takes precedence for script tags.
+    # LinkedIn's page uses script-src-elem only — a real page's inline nonce
+    # scripts were never filtered (and never matched) without this.
+    elem = _entries(csp, "script-src-elem")
+    if elem:
+        return elem
     src = _entries(csp, "script-src")
     if src:
         return src
@@ -115,13 +121,29 @@ def trusted_types_config(csp: str | None, report_only_csp: str | None = None) ->
     return cfg
 
 
-def script_source_allowed(csp: str | None, *, inline_code: str = "", external_url: str = "", page_url: str = "") -> bool:
+def script_source_allowed(
+    csp: str | None,
+    *,
+    inline_code: str = "",
+    external_url: str = "",
+    page_url: str = "",
+    nonce: str = "",
+) -> bool:
     if not csp:
         return True
     src = _script_src(csp)
     if not src:
         return True
     lowered = [s.lower() for s in src]
+    # 'strict-dynamic' (CSP3): nonce/hash-authorized scripts may load more
+    # scripts; host allowlists are ignored. A nonce match authorizes both the
+    # carrying inline script and subsequent external loads.
+    strict_dynamic = "'strict-dynamic'" in lowered
+    if nonce and any(s.startswith("'nonce-") for s in src):
+        want = nonce.strip()
+        for s in src:
+            if s.startswith("'nonce-") and s[len("'nonce-"):-1] == want:
+                return True
     if external_url:
         if "'unsafe-inline'" in lowered and not external_url:
             pass
@@ -130,6 +152,11 @@ def script_source_allowed(csp: str | None, *, inline_code: str = "", external_ur
         if "https:" in lowered and external_url.startswith("https:"):
             return True
         if "http:" in lowered and external_url.startswith("http:"):
+            return True
+        if strict_dynamic and any(s.startswith("'nonce-") for s in src):
+            # strict-dynamic trusts script-inserted loads; nonce presence in
+            # the policy means the page is nonce-bootstrapped and its module
+            # graph loads are authorized.
             return True
         return any(_host_matches(s, external_url) for s in lowered if not s.startswith("'"))
     if inline_code:

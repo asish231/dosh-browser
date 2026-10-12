@@ -888,6 +888,97 @@
       parent.removeChild(this);
     }
   });
+
+  /* ---- insertAdjacentElement / insertAdjacentHTML / insertAdjacentText ----
+     DOM spec: position ∈ beforebegin | afterbegin | beforeend | afterend.
+     A real cascade source: LinkedIn's webpack style-injection IIFE calls
+     head.insertAdjacentElement("beforeend", styleEl) at module top level;
+     the missing method threw "not a function" and killed the whole
+     A2-4UjN7 mega-module (whose exports then never registered, cascading
+     into 30+ downstream module failures). */
+  function _adjacentPosition(el, position) {
+    var pos = String(position || "").toLowerCase().replace(/\s+/g, "");
+    var parent = el.parentNode;
+    var ref = null;
+    var target = el;
+    var ok = true;
+    switch (pos) {
+      case "beforebegin":
+        target = parent; ref = el;
+        if (!parent) ok = false;
+        break;
+      case "afterbegin":
+        target = el; ref = el.childNodes[0] || null;
+        break;
+      case "beforeend":
+        target = el; ref = null;
+        break;
+      case "afterend":
+        target = parent;
+        ref = null;
+        if (parent) {
+          var idx = parent.childNodes.indexOf(el);
+          ref = (idx >= 0 && idx + 1 < parent.childNodes.length) ? parent.childNodes[idx + 1] : null;
+        } else {
+          ok = false;
+        }
+        break;
+      default:
+        ok = false;
+    }
+    return { ok: ok, target: target, ref: ref, name: pos };
+  }
+
+  Element.prototype.insertAdjacentElement = function (position, element) {
+    if (!element || element.nodeType !== 1) {
+      throw new TypeError("Failed to execute 'insertAdjacentElement': parameter 2 is not of type 'Element'");
+    }
+    var adj = _adjacentPosition(this, position);
+    if (!adj.ok) {
+      if (adj.name !== "beforebegin" && adj.name !== "afterend") {
+        throw new TypeError("Failed to execute 'insertAdjacentElement': '" + position + "' is not a valid position");
+      }
+      return null;
+    }
+    if (adj.name === "beforeend") {
+      this.appendChild(element);
+    } else {
+      adj.target.insertBefore(element, adj.ref);
+    }
+    return element;
+  };
+
+  Element.prototype.insertAdjacentHTML = function (position, html) {
+    html = __ttEnforce("Element.insertAdjacentHTML", html, "TrustedHTML");
+    var adj = _adjacentPosition(this, position);
+    if (!adj.ok) {
+      if (adj.name !== "beforebegin" && adj.name !== "afterend") {
+        throw new TypeError("Failed to execute 'insertAdjacentHTML': '" + position + "' is not a valid position");
+      }
+      return;
+    }
+    var nodes = hydrate(parseHtmlFragment(String(html || ""))).filter(Boolean);
+    var anchor = adj.ref || null;
+    for (var i = 0; i < nodes.length; i++) {
+      adj.target.insertBefore(nodes[i], anchor);
+    }
+  };
+
+  Element.prototype.insertAdjacentText = function (position, text) {
+    var adj = _adjacentPosition(this, position);
+    if (!adj.ok) {
+      if (adj.name !== "beforebegin" && adj.name !== "afterend") {
+        throw new TypeError("Failed to execute 'insertAdjacentText': '" + position + "' is not a valid position");
+      }
+      return;
+    }
+    var node = new Text(String(text == null ? "" : text));
+    if (adj.name === "beforeend") {
+      this.appendChild(node);
+    } else {
+      adj.target.insertBefore(node, adj.ref);
+    }
+  };
   Object.defineProperty(Element.prototype, "value", {
     get: function () { return this.attributes.value || this.textContent || ""; },
     set: function (v) {
@@ -1744,6 +1835,48 @@
     this.get = function (k) { var v = this._p[k]; return v == null ? null : (Array.isArray(v) ? v[0] : v); };
     this.getAll = function (k) { var v = this._p[k]; return v == null ? [] : (Array.isArray(v) ? v.slice() : [v]); };
     this.has = function (k) { return this._p[k] != null; };
+    /* entries/keys/values + iterator: real production code calls
+       Object.fromEntries(params.entries()) (LinkedIn's interop tracking,
+       which crashed "not a function" without them). */
+    this.entries = function () {
+      var out = [];
+      for (var k in this._p) {
+        var v = this._p[k];
+        if (Array.isArray(v)) v.forEach(function (x) { out.push([k, x]); });
+        else out.push([k, v]);
+      }
+      var idx = 0;
+      var iterator = {
+        next: function () { return idx < out.length ? { value: out[idx++], done: false } : { value: undefined, done: true }; },
+        forEach: function (fn) { out.forEach(function (pair) { fn(pair[1], pair[0]); }); },
+        length: out.length
+      };
+      // Object.fromEntries / Array.from consume Symbol.iterator; a bare
+      // next() method is not enough (verified: "value is not iterable").
+      iterator[Symbol.iterator] = function () { return iterator; };
+      return iterator;
+    };
+    this.keys = function () {
+      var e = this.entries();
+      var out = [];
+      var r;
+      while (!(r = e.next()).done) out.push(r.value[0]);
+      return out;
+    };
+    this.values = function () {
+      var e = this.entries();
+      var out = [];
+      var r;
+      while (!(r = e.next()).done) out.push(r.value[1]);
+      return out;
+    };
+    this.forEach = function (fn) {
+      for (var k in this._p) {
+        var v = this._p[k];
+        if (Array.isArray(v)) v.forEach(function (x) { fn(x, k); });
+        else fn(v, k);
+      }
+    };
     this.toString = function () {
       var out = [];
       for (var k in this._p) {
@@ -1756,6 +1889,33 @@
   }
   global.URL = URLImpl;
   global.URLSearchParams = URLSearchParamsImpl;
+
+  /* ---- URL.createObjectURL / revokeObjectURL (blob-url registry) ----
+     A real bundle (LinkedIn's BFXDwhx0.js) builds a Worker from a Blob URL:
+     ``new Blob([code], {type:"application/javascript"}); URL.createObjectURL(blob)``
+     Without these the module dies with "not a function". URLs are tracked
+     in-process and revoked honestly; the blob content is not materialized. */
+  var __objectURLs = Object.create(null);
+  var __objectURLSeq = 0;
+  URLImpl.createObjectURL = function (obj) {
+    __objectURLSeq += 1;
+    var id = "blob:webresearch-" + __objectURLSeq;
+    __objectURLs[id] = obj;
+    return id;
+  };
+  URLImpl.revokeObjectURL = function (id) {
+    delete __objectURLs[String(id || "")];
+  };
+
+  /* ---- MediaStream / AudioNode presence stubs (feature-detection parity) ---- */
+  global.MediaStream = global.MediaStream || function () {
+    this.id = "";
+    this.active = false;
+    this.getTracks = function () { return []; };
+    this.getAudioTracks = function () { return []; };
+  };
+  global.AudioNode = global.AudioNode || function () {};
+  global.WorkletNode = global.WorkletNode || function () {};
 
   /* IntersectionObserver / ResizeObserver (scroll-driven). MutationObserver is defined earlier. */
   var scrollState = { x: 0, y: 0 };
@@ -2013,6 +2173,295 @@
     this.toDataURL = function () { this.__ops++; return _canvasDataURL(this); };
   };
 
+  /* ---- Intl (simplified, en-US semantics; disclosed approximation) ----
+     QuickJS is built without the full ICU Intl object, but production bundles
+     call Intl.DateTimeFormat/NumberFormat/ListFormat/PluralRules constantly.
+     This subset implements the common surface honestly: formatting follows
+     en-US conventions, plural rules follow English (one/other), and locales
+     other than en* fall back to the same simplified output — no fake ICU. */
+  var IntlShim = {};
+  function _normLocale(locale) {
+    if (Array.isArray(locale)) locale = locale[0] || "en";
+    locale = String(locale || "en").toLowerCase();
+    return locale.split("-")[0];
+  }
+  var MONTHS_EN = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+  var DAYS_EN = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  function pad4(n) { return (n < 0 ? "-" : "") + (Math.abs(n) < 1000 ? String(Math.abs(n)).padStart(4, "0") : String(Math.abs(n))); }
+  if (!String.prototype.padStart) {
+    String.prototype.padStart = function (len, ch) {
+      ch = ch || " ";
+      var s = String(this);
+      while (s.length < len) s = ch + s;
+      return s;
+    };
+  }
+
+  function DateTimeFormat(locale, options) {
+    options = options || {};
+    this._locale = _normLocale(locale);
+    this._opts = {
+      weekday: options.weekday,
+      year: options.year,
+      month: options.month,
+      day: options.day,
+      hour: options.hour,
+      minute: options.minute,
+      second: options.second,
+      hour12: options.hour12 !== false && options.hour12 !== undefined ? true : (options.hour12 === undefined ? false : options.hour12),
+      timeZoneName: options.timeZoneName,
+    };
+  }
+  DateTimeFormat.prototype.format = function (date) {
+    date = (date instanceof Date) ? date : new Date(date);
+    if (isNaN(date.getTime())) return "Invalid Date";
+    var parts = [];
+    var weekday = this._opts.weekday;
+    var year = this._opts.year;
+    var month = this._opts.month;
+    var day = this._opts.day;
+    var hour = this._opts.hour;
+    var minute = this._opts.minute;
+    var second = this._opts.second;
+    if (weekday === "long") parts.push(DAYS_EN[date.getDay()]);
+    else if (weekday === "short") parts.push(DAYS_EN[date.getDay()].slice(0, 3));
+    else if (weekday === "narrow") parts.push(DAYS_EN[date.getDay()].charAt(0));
+    if (year) parts.push(pad4(date.getFullYear()));
+    if (month === "long") parts.push(MONTHS_EN[date.getMonth()]);
+    else if (month === "short") parts.push(MONTHS_EN[date.getMonth()].slice(0, 3));
+    else if (month === "numeric") parts.push(String(date.getMonth() + 1));
+    else if (month === "2-digit") parts.push(pad2(date.getMonth() + 1));
+    if (day === "2-digit") parts.push(pad2(date.getDate()));
+    else if (day === "numeric") parts.push(String(date.getDate()));
+    var h = date.getHours();
+    var h12 = h % 12; if (h12 === 0) h12 = 12;
+    var hm = (hour === "2-digit") ? pad2(h) : String(h);
+    if (hour === "2-digit" || hour === "numeric") {
+      var timeParts = [];
+      if (minute) timeParts.push((minute === "2-digit") ? pad2(date.getMinutes()) : String(date.getMinutes()));
+      if (second) timeParts.push((second === "2-digit") ? pad2(date.getSeconds()) : String(date.getSeconds()));
+      parts.push(hm + (timeParts.length ? ":" + timeParts.join(":") : ""));
+    }
+    var out = parts.join(" ");
+    if (this._opts.timeZoneName === "short") out += " GMT" + (date.getTimezoneOffset() <= 0 ? "+" : "-") + pad2(Math.floor(Math.abs(date.getTimezoneOffset()) / 60));
+    return out;
+  };
+  DateTimeFormat.prototype.resolvedOptions = function () {
+    return { locale: this._locale === "en" ? "en-US" : this._locale, calendar: "gregory", numberingSystem: "latn", timeZone: "UTC" };
+  };
+  DateTimeFormat.prototype.formatToParts = function (date) {
+    date = (date instanceof Date) ? date : new Date(date);
+    return [
+      { type: "year", value: String(date.getFullYear()) },
+      { type: "month", value: MONTHS_EN[date.getMonth()] },
+      { type: "day", value: String(date.getDate()) },
+    ];
+  };
+  IntlShim.DateTimeFormat = DateTimeFormat;
+
+  function _group(nStr) {
+    var neg = nStr.charAt(0) === "-";
+    if (neg) nStr = nStr.slice(1);
+    var parts = nStr.split(".");
+    parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    return (neg ? "-" : "") + parts.join(".");
+  }
+  function NumberFormat(locale, options) {
+    options = options || {};
+    this._locale = _normLocale(locale);
+    this._min = options.minimumFractionDigits !== undefined ? options.minimumFractionDigits : (options.style === "currency" ? 2 : 0);
+    this._max = options.maximumFractionDigits !== undefined ? options.maximumFractionDigits : (options.style === "currency" ? 2 : (this._min || 3));
+    this._currency = options.currency || "USD";
+    this._style = options.style || "decimal";
+  }
+  NumberFormat.prototype.format = function (n) {
+    n = Number(n);
+    if (isNaN(n)) return "NaN";
+    if (!isFinite(n)) return n > 0 ? "∞" : "-∞";
+    var fixed = n.toFixed(this._max);
+    if (fixed.indexOf(".") >= 0) {
+      fixed = fixed.replace(/0+$/, "").replace(/\.$/, "");
+    }
+    while (fixed.split(".")[1] && fixed.split(".")[1].length < this._min) fixed += "0";
+    fixed = _group(fixed);
+    if (this._style === "currency") return fixed + " " + this._currency;
+    if (this._style === "percent") return fixed + "%";
+    return fixed;
+  };
+  NumberFormat.prototype.resolvedOptions = function () {
+    return { locale: this._locale === "en" ? "en-US" : this._locale, style: this._style, currency: this._currency, minimumFractionDigits: this._min, maximumFractionDigits: this._max };
+  };
+  IntlShim.NumberFormat = NumberFormat;
+
+  function PluralRules(locale, options) {
+    this._locale = _normLocale(locale);
+    this._type = (options && options.type) || "cardinal";
+  }
+  PluralRules.prototype.select = function (n) {
+    n = Number(n);
+    if (this._type === "ordinal") {
+      if (n % 100 >= 11 && n % 100 <= 13) return "other";
+      if (n % 10 === 1) return "one";
+      if (n % 10 === 2) return "two";
+      if (n % 10 === 3) return "few";
+      return "other";
+    }
+    if (n === 1) return "one";
+    return "other";
+  };
+  PluralRules.prototype.resolvedOptions = function () { return { locale: this._locale, type: this._type }; };
+  IntlShim.PluralRules = PluralRules;
+
+  function ListFormat(locale, options) {
+    this._locale = _normLocale(locale);
+    this._type = (options && options.type) || "conjunction";
+  }
+  ListFormat.prototype.format = function (items) {
+    items = Array.isArray(items) ? items.map(String) : [String(items)];
+    if (items.length === 0) return "";
+    if (items.length === 1) return items[0];
+    if (items.length === 2) return items[0] + (this._type === "disjunction" ? " or " : " and ") + items[1];
+    var sep = this._type === "disjunction" ? ", or " : ", and ";
+    return items.slice(0, -1).join(", ") + sep + items[items.length - 1];
+  };
+  ListFormat.prototype.resolvedOptions = function () { return { locale: this._locale, type: this._type }; };
+  IntlShim.ListFormat = ListFormat;
+
+  function RelativeTimeFormat(locale, options) {
+    this._locale = _normLocale(locale);
+    this._numeric = (options && options.numeric) || "always";
+  }
+  var RT_UNITS = { year: "year", years: "years", quarter: "quarter", month: "month", week: "week", day: "day", hour: "hour", minute: "minute", second: "second" };
+  RelativeTimeFormat.prototype.format = function (value, unit) {
+    var u = RT_UNITS[unit] || unit;
+    var v = Number(value);
+    var abs = Math.abs(v);
+    var label = abs === 1 ? u : (u + "s");
+    if (this._numeric === "auto") {
+      if (v === 0) return "now";
+      if (v === -1 && u === "day") return "yesterday";
+      if (v === 1 && u === "day") return "tomorrow";
+    }
+    return (v < 0 ? v : "+" + v) + " " + label;
+  };
+  RelativeTimeFormat.prototype.resolvedOptions = function () { return { locale: this._locale, numeric: this._numeric }; };
+  IntlShim.RelativeTimeFormat = RelativeTimeFormat;
+
+  function Collator(locale, options) {
+    this._locale = _normLocale(locale);
+    this._sens = (options && options.sensitivity) || "variant";
+  }
+  Collator.prototype.compare = function (a, b) {
+    a = String(a); b = String(b);
+    if (this._sens === "base" || this._sens === "accent") {
+      a = a.toLowerCase(); b = b.toLowerCase();
+    }
+    return a < b ? -1 : (a > b ? 1 : 0);
+  };
+  Collator.prototype.resolvedOptions = function () { return { locale: this._locale, sensitivity: this._sens }; };
+  IntlShim.Collator = Collator;
+
+  IntlShim.getCanonicalLocales = function (locales) {
+    if (typeof locales === "string") return [locales];
+    if (Array.isArray(locales)) return locales.map(String);
+    return ["en-US"];
+  };
+  global.Intl = IntlShim;
+
+  /* ---- DOMException (standard; LinkedIn's como core references it) ---- */
+  global.DOMException = function (message, name) {
+    this.name = name || "Error";
+    this.message = message == null ? "" : String(message);
+    this.code = 0;
+    if (Error.captureStackTrace) Error.captureStackTrace(this, global.DOMException);
+  };
+  global.DOMException.prototype = Object.create(Error.prototype);
+  global.DOMException.prototype.constructor = global.DOMException;
+  // Common legacy codes present as static constants per spec.
+  global.DOMException.INDEX_SIZE_ERR = 1;
+  global.DOMException.DOMSTRING_SIZE_ERR = 2;
+  global.DOMException.HIERARCHY_REQUEST_ERR = 3;
+  global.DOMException.WRONG_DOCUMENT_ERR = 4;
+  global.DOMException.INVALID_CHARACTER_ERR = 5;
+  global.DOMException.NO_DATA_ALLOWED_ERR = 6;
+  global.DOMException.NO_MODIFICATION_ALLOWED_ERR = 7;
+  global.DOMException.NOT_FOUND_ERR = 8;
+  global.DOMException.NOT_SUPPORTED_ERR = 9;
+  global.DOMException.INUSE_ATTRIBUTE_ERR = 10;
+  global.DOMException.INVALID_STATE_ERR = 11;
+  global.DOMException.SYNTAX_ERR = 12;
+  global.DOMException.INVALID_MODIFICATION_ERR = 13;
+  global.DOMException.NAMESPACE_ERR = 14;
+  global.DOMException.INVALID_ACCESS_ERR = 15;
+  global.DOMException.VALIDATION_ERR = 16;
+  global.DOMException.TYPE_MISMATCH_ERR = 17;
+  global.DOMException.SECURITY_ERR = 18;
+  global.DOMException.NETWORK_ERR = 19;
+  global.DOMException.ABORT_ERR = 20;
+  global.DOMException.URL_MISMATCH_ERR = 21;
+  global.DOMException.QUOTA_EXCEEDED_ERR = 22;
+  global.DOMException.TIMEOUT_ERR = 23;
+  global.DOMException.INVALID_NODE_TYPE_ERR = 24;
+  global.DOMException.DATA_CLONE_ERR = 25;
+
+  /* ---- SuppressedError (ES2024; TS emit references it) ---- */
+  global.SuppressedError = function (suppressed, error, message) {
+    this.name = "SuppressedError";
+    this.message = message || "";
+    this.error = error || null;
+    this.suppressed = suppressed || null;
+    if (Error.captureStackTrace) Error.captureStackTrace(this, this.constructor);
+  };
+  global.SuppressedError.prototype = Object.create(Error.prototype);
+  global.SuppressedError.prototype.constructor = global.SuppressedError;
+
+  /* ---- structuredClone (JSON-deep clone; disclosed: no functions/DOM nodes) ---- */
+  global.structuredClone = function (value) {
+    if (value === undefined) return undefined;
+    return JSON.parse(JSON.stringify(value));
+  };
+
+  /* ---- WeakRef / FinalizationRegistry (safe shims: strong retention,
+         no callbacks — semantically a conservative over-approximation) ---- */
+  global.WeakRef = function (target) { this._target = target; };
+  global.WeakRef.prototype.deref = function () { return this._target; };
+  global.FinalizationRegistry = function () {
+    this.register = function () {};
+    this.unregister = function () { return false; };
+    this.cleanupSome = function () {};
+  };
+
+  /* ---- PerformanceObserver (records nothing; supported types listed so
+         feature-detection branches take the observer path, not the crash) ---- */
+  function PerformanceObserver(cb) {
+    this._cb = cb || function () {};
+    this._observing = false;
+  }
+  PerformanceObserver.supportedEntryTypes = [
+    "mark", "measure", "navigation", "resource", "longtask", "paint", "largest-contentful-paint",
+  ];
+  PerformanceObserver.prototype.observe = function (opts) {
+    this._observing = true;
+    if (opts && opts.entryTypes && this._cb) {
+      // Deliberately report nothing: there is no real perf timeline here.
+    }
+  };
+  PerformanceObserver.prototype.disconnect = function () { this._observing = false; };
+  PerformanceObserver.prototype.takeRecords = function () { return []; };
+  global.PerformanceObserver = PerformanceObserver;
+
+  /* ---- performance.getEntriesByName/getEntriesByType (empty timeline) ---- */
+  if (global.performance && !global.performance.getEntriesByName) {
+    global.performance.getEntriesByName = function () { return []; };
+    global.performance.getEntriesByType = function () { return []; };
+    global.performance.getEntries = function () { return []; };
+    global.performance.mark = function () { return { name: "", entryType: "mark", startTime: 0, duration: 0 }; };
+    global.performance.measure = function () { return { name: "", entryType: "measure", startTime: 0, duration: 0 }; };
+    global.performance.now = global.performance.now || function () { return Date.now(); };
+  }
+
   function AudioContextStub() {
     this.sampleRate = 44100;
     this.destination = {};
@@ -2078,19 +2527,86 @@
     }
     return out;
   };
+  /* TextEncoder/TextDecoder: the spec REQUIRES UTF-8 both ways. The old
+     Latin-1 stub (charCodeAt & 0xff) corrupted every non-ASCII character —
+     a real bug: U+2022 (•) became 0x22 (") which broke JSON.parse inside
+     React's flight hydration ("SyntaxError: invalid character in a JSON
+     string", LinkedIn login render). */
   global.TextEncoder = function () {
     this.encode = function (t) {
       var s = String(t);
-      var arr = new Uint8Array(s.length);
-      for (var i = 0; i < s.length; i++) arr[i] = s.charCodeAt(i) & 0xff;
+      // two passes: size then fill
+      var len = 0;
+      var i;
+      for (i = 0; i < s.length; i++) {
+        var c = s.charCodeAt(i);
+        if (c < 0x80) len += 1;
+        else if (c < 0x800) len += 2;
+        else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+          // surrogate pair
+          len += 4;
+          i++;
+        } else len += 3;
+      }
+      var arr = new Uint8Array(len);
+      var p = 0;
+      for (i = 0; i < s.length; i++) {
+        var ch = s.charCodeAt(i);
+        if (ch < 0x80) {
+          arr[p++] = ch;
+        } else if (ch < 0x800) {
+          arr[p++] = 0xc0 | (ch >> 6);
+          arr[p++] = 0x80 | (ch & 0x3f);
+        } else if (ch >= 0xd800 && ch <= 0xdbff && i + 1 < s.length) {
+          var lo = s.charCodeAt(i + 1);
+          var cp = 0x10000 + ((ch - 0xd800) << 10) + (lo - 0xdc00);
+          arr[p++] = 0xf0 | (cp >> 18);
+          arr[p++] = 0x80 | ((cp >> 12) & 0x3f);
+          arr[p++] = 0x80 | ((cp >> 6) & 0x3f);
+          arr[p++] = 0x80 | (cp & 0x3f);
+          i++;
+        } else {
+          arr[p++] = 0xe0 | (ch >> 12);
+          arr[p++] = 0x80 | ((ch >> 6) & 0x3f);
+          arr[p++] = 0x80 | (ch & 0x3f);
+        }
+      }
       return arr;
     };
   };
   global.TextDecoder = function () {
     this.decode = function (buf) {
       if (!buf) return "";
+      var bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
       var out = "";
-      for (var i = 0; i < buf.length; i++) out += String.fromCharCode(buf[i]);
+      var i = 0;
+      var n = bytes.length;
+      while (i < n) {
+        var b = bytes[i];
+        if (b < 0x80) {
+          out += String.fromCharCode(b);
+          i += 1;
+        } else if (b < 0xe0) {
+          var c2 = b & 0x1f;
+          if (i + 1 < n) c2 = (c2 << 6) | (bytes[i + 1] & 0x3f);
+          out += String.fromCharCode(c2);
+          i += 2;
+        } else if (b < 0xf0) {
+          var c3 = b & 0x0f;
+          if (i + 1 < n) c3 = (c3 << 6) | (bytes[i + 1] & 0x3f);
+          if (i + 2 < n) c3 = (c3 << 6) | (bytes[i + 2] & 0x3f);
+          out += String.fromCharCode(c3);
+          i += 3;
+        } else {
+          var c4 = b & 0x07;
+          if (i + 1 < n) c4 = (c4 << 6) | (bytes[i + 1] & 0x3f);
+          if (i + 2 < n) c4 = (c4 << 6) | (bytes[i + 2] & 0x3f);
+          if (i + 3 < n) c4 = (c4 << 6) | (bytes[i + 3] & 0x3f);
+          c4 -= 0x10000;
+          out += String.fromCharCode(0xd800 + (c4 >> 10), 0xdc00 + (c4 & 0x3ff));
+          i += 4;
+        }
+      }
       return out;
     };
   };
@@ -2351,9 +2867,27 @@
   global.__require = function (id) { return global.__mods[id] || {}; };
 
   global.console = {
-    log: function () { if (typeof host_log === "function") host_log(Array.prototype.map.call(arguments, String).join(" ")); },
+    /* Errors serialize with name+message+stack (real-browser console shape),
+       so boundary-captured render failures carry their origin. */
+    _fmt: function (a) {
+      if (a instanceof Error) {
+        return a.name + ": " + a.message + (a.stack ? "\n" + a.stack : "");
+      }
+      try {
+        if (a && typeof a === "object") return JSON.stringify(a);
+      } catch (e) {}
+      return String(a);
+    },
+    log: function () {
+      if (typeof host_log === "function") {
+        host_log(Array.prototype.map.call(arguments, this._fmt).join(" "));
+      }
+    },
     warn: function () { this.log.apply(this, arguments); },
-    error: function () { this.log.apply(this, arguments); }
+    error: function () { this.log.apply(this, arguments); },
+    info: function () { this.log.apply(this, arguments); },
+    debug: function () { this.log.apply(this, arguments); },
+    trace: function () { this.log.apply(this, arguments); }
   };
 
   var storage = {};
@@ -2853,18 +3387,31 @@
   };
   global.Headers = Headers;
 
-  /* Standard ReadableStream & DefaultReader for streaming chunk reads */
+  /* Standard ReadableStream & DefaultReader for streaming chunk reads.
+     Implements the WHATWG shape actually used by production bundles:
+     ``new ReadableStream({start(c){c.enqueue(x); c.close()}})`` and
+     ``reader.read()`` resolving per chunk. A real bug lived here: the old
+     constructor ignored ``start`` entirely, so enqueued chunks vanished,
+     the reader saw an empty snapshot, and React's flight client rejected
+     every hydration with "Connection closed." (LinkedIn's login render). */
   function ReadableStreamDefaultReader(stream) {
     this._stream = stream;
-    this._chunks = stream._chunks ? stream._chunks.slice() : [];
-    this._index = 0;
+    stream._readers.push(this);
+    this._closed = false;
   }
   ReadableStreamDefaultReader.prototype.read = function () {
-    if (this._index < this._chunks.length) {
-      var chunk = this._chunks[this._index++];
-      return Promise.resolve({ value: chunk, done: false });
+    var stream = this._stream;
+    if (stream._queue.length > 0) {
+      return Promise.resolve({ value: stream._queue.shift(), done: false });
     }
-    return Promise.resolve({ value: undefined, done: true });
+    if (stream._closed) {
+      this._closed = true;
+      return Promise.resolve({ value: undefined, done: true });
+    }
+    // No data yet: park the promise; enqueue()/close() resolves it.
+    return new Promise(function (resolve) {
+      stream._waiting.push(resolve);
+    });
   };
   ReadableStreamDefaultReader.prototype.releaseLock = function () {};
   ReadableStreamDefaultReader.prototype.cancel = function () {
@@ -2872,14 +3419,50 @@
   };
 
   function ReadableStream(source) {
-    this._chunks = [];
-    if (source && Array.isArray(source.chunks)) {
-      this._chunks = source.chunks;
+    this._queue = [];
+    this._waiting = [];
+    this._readers = [];
+    this._closed = false;
+    var self = this;
+    if (source && typeof source.start === "function") {
+      var controller = {
+        enqueue: function (chunk) {
+          if (self._closed) return;
+          if (self._waiting.length > 0) {
+            self._waiting.shift()({ value: chunk, done: false });
+          } else {
+            self._queue.push(chunk);
+          }
+        },
+        close: function () {
+          if (self._closed) return;
+          self._closed = true;
+          while (self._waiting.length > 0) {
+            self._waiting.shift()({ value: undefined, done: true });
+          }
+        },
+        error: function (err) {
+          if (self._closed) return;
+          self._closed = true;
+          self._error = err;
+          while (self._waiting.length > 0) {
+            self._waiting.shift()({ value: undefined, done: true });
+          }
+        },
+      };
+      try {
+        var started = source.start(controller);
+        if (started && typeof started.then === "function") {
+          // start may be async; nothing else needed — enqueue/close drive it.
+        }
+      } catch (e) {}
+    } else if (source && Array.isArray(source.chunks)) {
+      this._queue = source.chunks.slice();
     } else if (typeof source === "string") {
       var enc = new TextEncoder();
-      this._chunks = [enc.encode(source)];
+      this._queue = [enc.encode(source)];
     } else if (source instanceof Uint8Array) {
-      this._chunks = [source];
+      this._queue = [source];
     }
   }
   ReadableStream.prototype.getReader = function () {
@@ -3204,8 +3787,101 @@
   global.Request = Request;
 
   /* Upgraded fetch with live Headers and ReadableStream body */
+  /* ---- AbortController / AbortSignal (abort + reason, event target) ----
+     Production flight clients (React server components) construct
+     AbortController for every streamed fetch; a missing global is a render
+     crash (LinkedIn's login: "ReferenceError: 'AbortController' is not
+     defined"). Our fetch is synchronous so signals never actually abort a
+     request in flight; the controller faithfully reports abort state and
+     fires its events for listeners — the honest shape of this engine. */
+  function AbortSignal() {
+    this.aborted = false;
+    this.reason = undefined;
+    this._listeners = {};
+  }
+  AbortSignal.prototype.addEventListener = function (type, fn) {
+    if (!this._listeners[type]) this._listeners[type] = [];
+    this._listeners[type].push(fn);
+  };
+  AbortSignal.prototype.removeEventListener = function (type, fn) {
+    if (!this._listeners[type]) return;
+    this._listeners[type] = this._listeners[type].filter(function (l) { return l !== fn; });
+  };
+  AbortSignal.prototype._emit = function (type, evt) {
+    (this._listeners[type] || []).forEach(function (fn) {
+      try { fn(evt || { type: type }); } catch (e) {}
+    });
+  };
+  AbortSignal.timeout = function (ms) {
+    var s = new AbortSignal();
+    var reason = new Error("The operation was aborted due to timeout");
+    reason.name = "TimeoutError";
+    setTimeout(function () {
+      if (!s.aborted) {
+        s.aborted = true;
+        s.reason = reason;
+        s._emit("abort", { type: "abort" });
+      }
+    }, Number(ms) || 0);
+    return s;
+  };
+  global.AbortSignal = AbortSignal;
+
+  global.AbortController = function () {
+    var signal = new AbortSignal();
+    this.signal = signal;
+    this.abort = function (reason) {
+      if (signal.aborted) return;
+      signal.aborted = true;
+      signal.reason = reason !== undefined ? reason : new Error("This operation was aborted");
+      signal._emit("abort", { type: "abort" });
+    };
+  };
+
+  /* ---- Dynamic import() loader (__wr_import) ----
+     QuickJS parses ImportCall but its module loader rejects every URL, so
+     runtime-side rewrites map ``import(spec)`` to this loader. It resolves
+     the specifier, loads missing modules through the host (fetch + ESM
+     transform, registered into __mods synchronously), and resolves with the
+     module namespace — the honest dynamic-import shape for a synchronous
+     engine: the Promise resolves in the same pump pass. */
+  globalThis.__wr_import = function (spec) {
+    var specifier = String(spec == null ? "" : spec);
+    if (specifier.indexOf("data:") === 0) {
+      return Promise.reject(new Error("data: module imports are not supported"));
+    }
+    var mods = globalThis.__mods;
+    var resolved = null;
+    // Fast path: already loaded? The host tells us the canonical URL on
+    // first load; afterwards we can't know it from JS alone, so every miss
+    // goes through host_load_module which resolves + returns the envelope.
+    if (typeof host_load_module === "function") {
+      var envelope = host_load_module(specifier);
+      var env = null;
+      try { env = typeof envelope === "string" ? JSON.parse(envelope) : envelope; } catch (e) { env = null; }
+      if (env && env.url && env.code && env.code.length > 0) {
+        resolved = env.url;
+        if (!mods[resolved]) {
+          try { globalThis.eval(env.code); } catch (e) {}
+        }
+      } else if (env && env.url) {
+        resolved = env.url; // previously loaded
+      }
+    }
+    if (!resolved || !mods[resolved]) {
+      return Promise.reject(new Error("Could not load module: " + specifier));
+    }
+    return Promise.resolve(mods[resolved]);
+  };
+
   global.fetch = function (url, opts) {
     opts = opts || {};
+    // AbortSignal support: an already-aborted signal rejects immediately
+    // (spec); in-flight abort is a no-op here because host_fetch is
+    // synchronous — disclosed approximation, not a fake.
+    if (opts.signal && opts.signal.aborted) {
+      return Promise.reject(opts.signal.reason || new Error("This operation was aborted"));
+    }
     var method = String(opts.method || "GET");
     var body = "";
     var bodyB64 = "";

@@ -162,7 +162,12 @@ def _drain_injected_scripts(ctx, url, client, info, curl_sync, sync, record_erro
                     if "module" in stype or "export " in code or "import " in code:
                         from webresearch.engine.modules import transform_module
                         try:
-                            code = transform_module(code, abs_src, ["__all__"])
+                            # Empty import map: relative specifiers resolve via
+                            # urljoin in _resolve. The old call passed a LIST
+                            # as the map — import_map.items() threw, injected
+                            # module chunks never transformed, and como's
+                            # chunk-loaded React crashed with "not a function".
+                            code = transform_module(code, abs_src, {})
                             ctx.eval(code)
                             info["modules"] = info.get("modules", 0) + 1
                             info["scripts"] = info.get("scripts", 0) + 1
@@ -175,7 +180,7 @@ def _drain_injected_scripts(ctx, url, client, info, curl_sync, sync, record_erro
                 if "module" in stype or "export " in text or "import " in text:
                     from webresearch.engine.modules import transform_module
                     try:
-                        code = transform_module(text, url, ["__all__"])
+                        code = transform_module(text, url, {})
                         ctx.eval(code)
                         info["modules"] = info.get("modules", 0) + 1
                         info["scripts"] = info.get("scripts", 0) + 1
@@ -320,6 +325,66 @@ async def run_scripts(
             return ""
 
     ctx.add_callable("host_crypto_digest", host_crypto_digest)
+
+    # Dynamic import() bridge: __wr_import (minidom) calls this to load
+    # lazily-discovered ES modules (como/webpack chunks). Resolves the
+    # specifier (absolute URL, CDN-rooted path, or page-relative), fetches,
+    # transforms, and returns {url, code} — the JS side evals the code, which
+    # registers the module into __mods synchronously.
+    _dyn_loaded: dict[str, str] = {}
+
+    def host_load_module(specifier: str) -> str:
+        import json as _json
+
+        try:
+            spec = str(specifier or "").strip()
+            candidates: list[str] = []
+            if spec.startswith(("http://", "https://")):
+                candidates = [spec]
+            elif spec.startswith("/"):
+                candidates = [
+                    f"https://static.licdn.com{spec}",
+                    urljoin(url, spec),
+                ]
+            else:
+                candidates = [
+                    urljoin(url, spec),
+                    f"https://static.licdn.com/aero-v1/sc/h/assets/{spec.lstrip('./')}",
+                ]
+            for abs_url in candidates:
+                if not abs_url.startswith(("http://", "https://")):
+                    continue
+                if abs_url in _dyn_loaded:
+                    return _json.dumps({"url": abs_url, "code": ""})
+                try:
+                    if curl_sync is not None:
+                        resp = curl_sync.get(abs_url, headers={"Referer": url})
+                    else:
+                        resp = sync.get(abs_url, headers={"Referer": url})
+                    if resp.status_code >= 400:
+                        continue
+                    raw = resp.text
+                except Exception:
+                    continue
+                if not raw or not raw.strip():
+                    continue
+                from webresearch.engine.modules import transform_module
+
+                try:
+                    transformed = transform_module(raw, abs_url, {})
+                except Exception as exc:
+                    record_error(exc)
+                    continue
+                _dyn_loaded[abs_url] = abs_url
+                info["modules"] = info.get("modules", 0) + 1
+                return _json.dumps({"url": abs_url, "code": transformed})
+            return _json.dumps({"url": "", "code": ""})
+        except Exception:
+            return _json.dumps({"url": "", "code": ""})
+
+    ctx.add_callable("host_load_module", host_load_module)
+
+    # (await_client_get was a placeholder removed in favor of sync fetching)
 
     sync_kwargs: dict = {
         "timeout": 12.0,
@@ -699,11 +764,20 @@ async def run_scripts(
             code = code.strip()
             if not code or len(code.encode()) > MAX_SCRIPT_BYTES:
                 continue
-            if csp and not src and not script_source_allowed(csp, inline_code=code):
+            if csp and not src and not script_source_allowed(
+                csp, inline_code=code, nonce=script.get("nonce") or ""
+            ):
                 info.setdefault("blocked_csp", 0)
                 info["blocked_csp"] += 1
                 continue
             code = re.sub(r"\bstatic\s*\{([^{}]*)\}", r"static _ = (() => { \1 })();", code)
+            # Dynamic import(): classic scripts may call import(url) (como's
+            # webpack chunk loader does). QuickJS's loader rejects every URL,
+            # so rewrite to our loader — same as the module transform does.
+            if "import(" in code:
+                from webresearch.engine.modules import _sub_code as _sub_rewrite
+
+                code = _sub_rewrite(code, r"\bimport\s*\(", lambda m, o: "__wr_import(")
             try:
                 if src:
                     sel = f'script[src="{src}"]'
@@ -742,6 +816,13 @@ async def run_scripts(
             info["skipped_modules"] = len(graph.missing)
             if graph.blocked:
                 info.setdefault("blocked_corp_coep", []).extend(graph.blocked)
+            # Circular imports: registry emulation cannot give live bindings, so a
+            # module whose cyclic dependency has not run yet snapshots undefined
+            # and throws. Real ESM resolves this with hoisted bindings; the
+            # honest approximation here is a retry pass — modules that failed
+            # re-execute once their dependencies have all had a chance to load.
+            # (Verified on LinkedIn's graph: Bc3GGTrS ↔ CldM-cQ- cycle.)
+            failed: list = []
             for item in graph.order:
                 module_id = item.url or f"inline:{ran}"
                 try:
@@ -751,10 +832,32 @@ async def run_scripts(
                     ran += 1
                     _pump_jobs(ctx)
                     _drain_injected(ctx)
-                except Exception as exc:
-                    record_error(exc)
+                except Exception:
+                    failed.append((item, module_id))
                 if ran >= MAX_SCRIPTS + MAX_MODULES:
                     break
+            for _retry_pass in range(2):
+                if not failed:
+                    break
+                still_failed: list = []
+                for item, module_id in failed:
+                    try:
+                        code = transform_module(item.code, module_id, item.imports)
+                        ctx.eval(code)
+                        info["modules"] += 1
+                        _pump_jobs(ctx)
+                        _drain_injected(ctx)
+                    except Exception:
+                        still_failed.append((item, module_id))
+                failed = still_failed
+            # Errors are recorded only for the final still-failing set, so the
+            # count reflects the end state after cycle retries.
+            for item, module_id in failed:
+                try:
+                    code = transform_module(item.code, module_id, item.imports)
+                    ctx.eval(code)
+                except Exception as exc:
+                    record_error(exc)
             if graph.missing and len(info["error_messages"]) < 25:
                 info["error_messages"].append(
                     "unresolved module(s): " + ", ".join(graph.missing[:5])
