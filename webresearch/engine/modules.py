@@ -24,6 +24,208 @@ from webresearch.engine.security import mixed_content_blocked, verify_integrity
 SPECIFIER_RE = re.compile(r"[\"']([^\"']+)[\"']")
 
 
+_REGEX_KEYWORDS = (
+    "return",
+    "typeof",
+    "instanceof",
+    "in",
+    "of",
+    "case",
+    "delete",
+    "void",
+    "new",
+    "do",
+    "else",
+    "yield",
+    "await",
+    "throw",
+)
+
+
+def _prev_ends_keyword(code: str, pos: int) -> bool:
+    """True when the token right before ``pos`` ends a JS keyword that can
+    legitimately precede a regex literal (``return/\\d/.test(x)``).
+
+    Minified bundles glue regexes directly to keywords with no space, and the
+    last keyword letter is alnum — so the plain prev-token heuristic calls the
+    regex opener a division, walks into the literal as code, then treats the
+    literal's CLOSING slash as a new opener and swallows hundreds of chars of
+    real code (a real bug: LinkedIn's A2-4UjN7.js lost its export statement).
+    """
+    for kw in _REGEX_KEYWORDS:
+        start = pos - len(kw)
+        if start < 0:
+            continue
+        if code[start:pos] == kw:
+            before = code[start - 1] if start > 0 else " "
+            if not (before.isalnum() or before in "_$"):
+                return True
+    return False
+
+
+_CLASS_ESCAPE_OK = set("dDwWsstrnvfbB0cxukpP") | set("123456789")
+# Chars QuickJS rejects when backslash-escaped inside a character class but
+# Chrome (Annex B) accepts literally.
+
+
+def _fix_class_escapes(regex_body: str) -> str:
+    """Drop invalid literal escapes inside a character class body.
+
+    ``[\\;\\-\\,]`` → ``[;-\\,]``-equivalent form QuickJS accepts: every
+    rejected ``\\<punct>`` loses its backslash (the punct is literal in a
+    class), and ``\\-`` becomes ``\\x2d`` (a bare ``-`` could form a range).
+    Valid escapes (``\\d``, ``\\s``, ``\\x2a``, ``\\p{L}``, ``\\]``, ...) are
+    preserved untouched.
+    """
+    out: list[str] = []
+    k, m = 0, len(regex_body)
+    in_class = False
+    while k < m:
+        c = regex_body[k]
+        if c == "\\" and k + 1 < m:
+            nxt = regex_body[k + 1]
+            if in_class and nxt == "\\":
+                # \\ is a valid escaped backslash; keep both chars untouched.
+                out.append(c)
+                out.append(nxt)
+                k += 2
+                continue
+            if in_class and nxt not in _CLASS_ESCAPE_OK and nxt != "[" and nxt != "]":
+                if nxt == "-":
+                    out.append("\\x2d")
+                else:
+                    # drop the backslash; the punctuation char is literal
+                    out.append(nxt)
+                k += 2
+                continue
+            out.append(c)
+            out.append(nxt)
+            k += 2
+            continue
+        if c == "[":
+            in_class = True
+        elif c == "]":
+            in_class = False
+        out.append(c)
+        k += 1
+    return "".join(out)
+
+
+def _quickjs_regex_compat(code: str) -> str:
+    """Fix regex literals QuickJS rejects but real Chrome accepts.
+
+    Chrome (Annex B) accepts backslash-escaped literal punctuation inside
+    character classes — ``[;\\-\\/]`` from a real LinkedIn bundle — while
+    QuickJS rejects ``\\- \\; \\, ...`` as invalid escapes, killing the whole
+    module at parse time. This pass rewrites those escapes inside regex
+    literals only. The scanner is literal-aware — strings, templates and
+    comments are consumed with the same rules as ``_mask_literals`` so a
+    ``/`` inside a string is never mistaken for a regex opener.
+    """
+    edits: list[tuple[int, int, str]] = []
+    i, n = 0, len(code)
+    prev = ""
+    while i < n:
+        ch = code[i]
+        nxt = code[i + 1] if i + 1 < n else ""
+        # Consume comments (same rules as _mask_literals).
+        if ch == "/" and nxt == "/":
+            j = code.find("\n", i)
+            j = n if j < 0 else j
+            i = j
+            continue
+        if ch == "/" and nxt == "*":
+            j = code.find("*/", i)
+            j = min(n, i + 2) if j < 0 else j + 2
+            i = j
+            continue
+        # Consume template literals.
+        if ch == "`":
+            j = i + 1
+            while j < n:
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == "`":
+                    j += 1
+                    break
+                j += 1
+            i = min(j, n)
+            prev = "`"
+            continue
+        # Consume strings.
+        if ch in "\"'":
+            j = i + 1
+            while j < n:
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == ch:
+                    j += 1
+                    break
+                j += 1
+            i = min(j, n)
+            prev = ch
+            continue
+        # Regex literal?
+        opens_regex = ch == "/" and (
+            _prev_ends_keyword(code, i)
+            or (prev not in ")]}\"'`" and not (prev.isalnum() or prev in "_$"))
+        )
+        if opens_regex:
+            j = i + 1
+            in_class = False
+            closed = False
+            needs_fix = False
+            while j < n:
+                c = code[j]
+                if c == "\\":
+                    nxt2 = code[j + 1] if j + 1 < n else ""
+                    if in_class and nxt2 not in _CLASS_ESCAPE_OK and nxt2 not in "[]":
+                        needs_fix = True
+                    j += 2
+                    continue
+                if c == "[":
+                    in_class = True
+                elif c == "]":
+                    in_class = False
+                elif c == "/" and not in_class:
+                    j += 1
+                    closed = True
+                    break
+                elif c == "\n":
+                    break
+                j += 1
+            while closed and j < n and code[j].isalpha():
+                j += 1
+            if not closed:
+                i += 1
+                prev = "/"
+                continue
+            if needs_fix:
+                f = j
+                while f > i and code[f - 1].isalpha():
+                    f -= 1
+                body_end = f - 1  # position of the closing "/"
+                if body_end > i:
+                    new_body = _fix_class_escapes(code[i:body_end])
+                    if new_body != code[i:body_end]:
+                        edits.append((i, body_end, new_body))
+            i = j
+            prev = "/"
+            continue
+        if not ch.isspace():
+            prev = ch
+        i += 1
+    if not edits:
+        return code
+    # Apply edits back-to-front; indices are original so order is safe.
+    out = code
+    for start, end, new_body in reversed(edits):
+        out = out[:start] + new_body + out[end:]
+    return out
+
+
 def _mask_literals(code: str) -> str:
     """Blank out string, template, comment and regex literals, preserving length.
 
@@ -44,6 +246,15 @@ def _mask_literals(code: str) -> str:
         if ch == "/" and nxt == "/":
             j = code.find("\n", i)
             j = n if j < 0 else j
+            if j - i > 500:
+                # A "line comment" hundreds of chars long in minified code is a
+                # scanner desync artifact (typically // inside a URL string the
+                # loop walked into). Masking to the next newline swallowed real
+                # code; cap the damage by masking only the opener.
+                out[i] = "\x00"
+                out[i + 1] = "\x00"
+                i = i + 2
+                continue
             for k in range(i, j):
                 out[k] = "\x00"
             i = j
@@ -111,7 +322,10 @@ def _mask_literals(code: str) -> str:
             i = j
             prev = ch
             continue
-        if ch == "/" and prev not in ")]}\"'`" and not (prev.isalnum() or prev in "_$"):
+        if ch == "/" and (
+            _prev_ends_keyword(code, i)
+            or (prev not in ")]}\"'`" and not (prev.isalnum() or prev in "_$"))
+        ):
             # A '/' opens a regex only when the previous token cannot end an
             # expression. A string or template delimiter *is* value-ending, so
             # the '/' after `"path:"` is division, not a regex: treating it as a
@@ -286,6 +500,22 @@ def _rewrite_imports(code: str, module_url: str, import_map: dict[str, str]) -> 
         r"([\"']\x00*[\"']);?",
         repl_binding,
     )
+    # import defaultName from "spec" — default-only, no braces and no star.
+    # A real pattern from LinkedIn's oO-sjsKw.js: ``import iI from"./B5BL-RZl.js"``.
+    # The combined pattern above requires a {..} or * as clause, so this form
+    # needs its own rewrite or the raw ``import`` keyword survives and QuickJS
+    # rejects the whole module.
+    def repl_default_only(match: re.Match[str], original: str) -> str:
+        default = match.group(1)
+        spec = _spec_from(match, 2, original)
+        mid = resolve_id(spec)
+        return f"var {default} = __mods[{mid!r}].default;"
+
+    code = _sub_code(
+        code,
+        r"\bimport\s+([A-Za-z_$][\w$]*)\s*from\s*([\"']\x00*[\"']);?",
+        repl_default_only,
+    )
     # ``import.meta`` is only legal inside module code, and every module here is
     # evaluated as a classic script, so a surviving ``import.meta`` is a hard
     # syntax error. Point it at the module's own id.
@@ -295,6 +525,95 @@ def _rewrite_imports(code: str, module_url: str, import_map: dict[str, str]) -> 
     code = _sub_code(
         code, r"\bimport\s*\.\s*meta\b", lambda m, o: "{ url: " + repr(module_url) + " }"
     )
+    # Template-literal interpolations are masked as part of the literal, but
+    # they are real code at eval time — a real case: LinkedIn's kvZetL-w.js has
+    # ``createRequire(import.meta.url)`` in real class code that the FULL mask
+    # swallowed via an apostrophe-in-template desync chain
+    # (``Error(`Can't find font...`)`` — the apostrophe in ``Can't`` opened a
+    # phantom string blanking 12k chars of code, so the masked rewrite never
+    # saw the import.meta). This pass uses a template-aware string-only mask:
+    # templates are skipped whole (their interpolations stay visible to THIS
+    # pass), ordinary strings are blanked, and quotes inside templates or
+    # regex bodies never flip the parity.
+    def _mask_strings_only(src: str) -> str:
+        out = list(src)
+        i2, n2 = 0, len(src)
+        prev2 = ""
+        while i2 < n2:
+            c2 = src[i2]
+            if c2 == "`":
+                # Skip the whole template: interpolations stay visible.
+                j2 = i2 + 1
+                while j2 < n2:
+                    if src[j2] == "\\":
+                        j2 += 2
+                        continue
+                    if src[j2] == "`":
+                        j2 += 1
+                        break
+                    j2 += 1
+                i2 = min(j2, n2)
+                prev2 = "`"
+                continue
+            if c2 == "/" and prev2 not in ")]}\"'`" and not (prev2.isalnum() or prev2 in "_$"):
+                # Regex body: skip so a quote inside /["']/ never opens a string.
+                j2 = i2 + 1
+                in_cls = False
+                closed = False
+                while j2 < n2:
+                    c3 = src[j2]
+                    if c3 == "\\":
+                        j2 += 2
+                        continue
+                    if c3 == "[":
+                        in_cls = True
+                    elif c3 == "]":
+                        in_cls = False
+                    elif c3 == "/" and not in_cls:
+                        j2 += 1
+                        closed = True
+                        break
+                    elif c3 == "\n":
+                        break
+                    j2 += 1
+                while closed and j2 < n2 and src[j2].isalpha():
+                    j2 += 1
+                if not closed:
+                    i2 += 1
+                    prev2 = "/"
+                    continue
+                i2 = j2
+                prev2 = "/"
+                continue
+            if c2 in "\"'":
+                j2 = i2 + 1
+                while j2 < n2:
+                    if src[j2] == "\\":
+                        j2 += 2
+                        continue
+                    if src[j2] == c2:
+                        j2 += 1
+                        break
+                    j2 += 1
+                if j2 >= n2:
+                    break
+                for k2 in range(i2 + 1, j2 - 1 if src[j2 - 1] == c2 else min(j2, n2)):
+                    out[k2] = "\x00"
+                i2 = j2
+                prev2 = c2
+                continue
+            if not c2.isspace():
+                prev2 = c2
+            i2 += 1
+        return "".join(out)
+
+    _smask = _mask_strings_only(code)
+    for match in re.finditer(r"\bimport\s*\.\s*meta\s*\.\s*(?:url|filename)\b", _smask):
+        code = code[: match.start()] + repr(module_url) + code[match.end():]
+        _smask = _mask_strings_only(code)
+    for match in re.finditer(r"\bimport\s*\.\s*meta\b", _smask):
+        code = code[: match.start()] + "{ url: " + repr(module_url) + " }" + code[match.end():]
+        _smask = _mask_strings_only(code)
     # import "spec";  (side effect)
     code = _sub_code(
         code,
@@ -404,6 +723,7 @@ def transform_module(
     code: str, module_id: str, import_map: dict[str, str] | None = None
 ) -> str:
     """Translate one ES module into registry-registered classic script."""
+    code = _quickjs_regex_compat(code)
     body = _rewrite_exports(_rewrite_imports(code, module_id, import_map or {}))
     header = f"__mods[{module_id!r}] = __mods[{module_id!r}] || {{}};"
     suffix = (

@@ -764,7 +764,17 @@ class Session:
             return wall
         return detect_otp_page(self.html, self.url, targets)
 
-    async def login(self, url: str, username: str, password: str, *, max_chars: int = 4000) -> dict:
+    async def login(
+        self,
+        url: str,
+        username: str,
+        password: str,
+        *,
+        max_chars: int = 4000,
+        submit_url: str | None = None,
+        username_field: str | None = None,
+        password_field: str | None = None,
+    ) -> dict:
         """Log in to a site using credentials the agent got from the user.
 
         Fills the login form through the normal type/submit lanes, then
@@ -772,6 +782,13 @@ class Session:
         verified / otp_required (with a checkpoint) / failed / human_only /
         account_locked / unknown. The password itself is never part of the
         result.
+
+        When the page's submit control is inert in the engine (form-less React
+        SPAs whose click handler never attaches — LinkedIn is the real case),
+        a direct-POST fallback lane runs: POST ``submit_url`` with
+        ``username_field``/``password_field`` form data, carrying the session
+        cookies + CSRF from the page. The response page is loaded and verified
+        with the same honest verdicts.
         """
         from webresearch.engine.login import verify_logged_in
 
@@ -823,6 +840,46 @@ class Session:
         else:
             post = await self._submit_first_login_form(max_chars)
 
+        # Inert-click fallback: if the engine click did nothing (still the
+        # same URL, password field still present) the page's React handler
+        # never attached. When a submit_url is provided, POST the credentials
+        # directly — the same request the handler would have sent.
+        still_login = (
+            "password" in (self.html or "").lower()
+            and 'type="password"' in (self.html or "")
+        )
+        if still_login and submit_url:
+            csrf = self._extract_login_csrf()
+            data: dict[str, str] = {
+                username_field or "session_key": username,
+                password_field or "session_password": password,
+            }
+            if csrf:
+                data.setdefault("loginCsrfParam", csrf)
+            result = await fetch(
+                submit_url,
+                client=self.client,
+                method="POST",
+                data=data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": url,
+                    "Origin": urlparse(url).scheme + "://" + urlparse(url).netloc,
+                },
+            )
+            dest = result.final_url or submit_url
+            res_html = result.body
+            js_info_post: dict = {}
+            if result.kind == "html":
+                res_html, js_info_post = await run_scripts(
+                    res_html, dest, self.client, headers=result.headers
+                )
+                result = result.model_copy(update={"body": res_html})
+                self.current_tab.ctx = js_info_post.get("ctx") or None
+            page = snapshot(parse(result), max_chars=max_chars)
+            page = _decorate(page, res_html, bool(js_info_post.get("ran")), js_info_post)
+            post = self._push(page, res_html)
+
         verdict = verify_logged_in(
             self.html, self.url, pre_url, dict(self.client.cookies),
             post.status if post else 200,
@@ -852,6 +909,22 @@ class Session:
             "message": "credentials did not lead to a logged-in page; check them and retry",
             "url": self.url,
         }
+
+    def _extract_login_csrf(self) -> str:
+        """Best-effort CSRF token for the direct-POST fallback lane.
+
+        Reads data-csrf attributes and csrf-ish meta/hidden fields from the
+        current page. Never invents a value; empty string when absent.
+        """
+        if not self.html:
+            return ""
+        m = re.search(r'data-csrf="([^"]+)"', self.html)
+        if m:
+            return m.group(1)
+        m = re.search(r'name="loginCsrfParam"\s+value="([^"]+)"', self.html)
+        if m:
+            return m.group(1)
+        return ""
 
     async def _submit_first_login_form(self, max_chars: int) -> Page:
         current = self.page

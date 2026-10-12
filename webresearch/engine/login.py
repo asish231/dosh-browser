@@ -374,11 +374,16 @@ def verify_logged_in(
     if any(h in text_low for h in LOCK_TEXT_HINTS):
         return "account_locked"
 
-    # OTP checkpoint after credentials: the challenge page, not success.
-    otp_signal = any(h in text_low for h in OTP_TEXT_HINTS) or _url_matches(url, ("/challenge", "/verify", "/otp", "/2fa", "/mfa"))
-    code_input = any(h in targets_blob.replace(" ", "") for h in OTP_NAME_HINTS)
-    if otp_signal and (code_input or "one-time-code" in html_low):
-        return "otp_required"
+    # A page still showing a password field is the LOGIN FORM, never an OTP
+    # checkpoint — no matter what OTP-ish text its scripts contain (a real
+    # false-positive: LinkedIn's login page mentions verification in bundle
+    # scripts, and the verdict said otp_required while we were still on the
+    # sign-in page with an inert button).
+    if not has_password_field:
+        otp_signal = any(h in text_low for h in OTP_TEXT_HINTS) or _url_matches(url, ("/challenge", "/verify", "/otp", "/2fa", "/mfa"))
+        code_input = any(h in targets_blob.replace(" ", "") for h in OTP_NAME_HINTS)
+        if otp_signal and (code_input or "one-time-code" in html_low):
+            return "otp_required"
 
     # Logged-in markers
     logged_text = any(h in text_low for h in LOGGED_IN_TEXT_HINTS)

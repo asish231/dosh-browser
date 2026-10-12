@@ -112,6 +112,12 @@
     }
     return child;
   };
+  Node.prototype.remove = function () {
+    /* DOM spec: remove self from parent. A single missing method here
+       (LinkedIn's cdnMonitor calls el.remove() at line 30) kills a page's
+       entire bootstrap when absent. */
+    if (this.parentNode) this.parentNode.removeChild(this);
+  };
   Node.prototype.insertBefore = function (child, ref) {
     if (!ref) return this.appendChild(child);
     if (child.parentNode) child.parentNode.removeChild(child);

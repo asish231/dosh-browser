@@ -134,6 +134,8 @@ Be honest about these rather than working around them silently.
 | Cross-origin frame messaging | Frames are fetched as separate documents; there is no real `postMessage` handshake between them. |
 | Fingerprint parity | TLS JA3/JA4 matches Chrome 124 via `curl_cffi` (both page fetch and subresource `host_fetch` lanes); Sec-Fetch-* headers computed from origin relationship; Sec-CH-UA client hints; enriched `navigator.*` device block (hardwareConcurrency, deviceMemory, screen, timezone, platform); inter-submit delay in login flows mimics human timing. |
 | Injected script execution | Scripts added to the DOM at runtime via `appendChild` (SPA chunk injection) are detected and executed: `src` scripts are fetched and evaled, inline scripts evaled directly, ESM auto-detected for both. Failures are surfaced as JS console errors. |
+| ESM module translator | Real production bundles parse: regex-after-keyword detection (`return/^\d:/` no longer swallows 681 chars), line-comment cap bounds URL-string desyncs, default-only imports (`import X from "..."`) rewrite, `import.meta` replaced in real code and template interpolations via a template-aware string mask, and QuickJS Annex-B regex compatibility (`\-` → `\x2d`, `\;` `\,` dropped — `\\` preserved) for u-flagged classes. Verified against LinkedIn's 66-module graph: 0 parse failures (was 5). |
+| Login submit fallback | When a page's submit control is inert in the engine (form-less React SPAs), `browser_login(submit_url=..., username_field=..., password_field=...)` POSTs credentials directly with page cookies + CSRF. Honest verdicts either way. |
 
 Say "this needs a real browser" plainly when it is true. Do not paper over it.
 
