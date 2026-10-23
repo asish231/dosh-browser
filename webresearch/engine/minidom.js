@@ -1835,6 +1835,23 @@
     this.get = function (k) { var v = this._p[k]; return v == null ? null : (Array.isArray(v) ? v[0] : v); };
     this.getAll = function (k) { var v = this._p[k]; return v == null ? [] : (Array.isArray(v) ? v.slice() : [v]); };
     this.has = function (k) { return this._p[k] != null; };
+    /* append/set/delete/sort: the standard mutation surface. A real miss:
+       LinkedIn's interop iframe URL builder called params.append("_l", v)
+       and crashed "not a function" — killing the whole login render. */
+    this.append = function (k, v) {
+      var cur = this._p[k];
+      if (cur == null) this._p[k] = String(v);
+      else if (Array.isArray(cur)) cur.push(String(v));
+      else this._p[k] = [cur, String(v)];
+    };
+    this.set = function (k, v) { this._p[k] = String(v); };
+    this.delete = function (k) { delete this._p[k]; };
+    this.sort = function () {
+      var keys = Object.keys(this._p).sort();
+      var sorted = {};
+      for (var i = 0; i < keys.length; i++) sorted[keys[i]] = this._p[keys[i]];
+      this._p = sorted;
+    };
     /* entries/keys/values + iterator: real production code calls
        Object.fromEntries(params.entries()) (LinkedIn's interop tracking,
        which crashed "not a function" without them). */
@@ -2172,6 +2189,113 @@
     };
     this.toDataURL = function () { this.__ops++; return _canvasDataURL(this); };
   };
+
+  /* ---- Array ES2021–ES2024 methods (QuickJS 1.19 lacks them; production
+     bundles use them — LinkedIn's page-layout builder calls findLast and
+     the whole login render died with "not a function") ---- */
+  if (!Array.prototype.at) {
+    Array.prototype.at = function (n) {
+      var len = this.length;
+      var i = Math.trunc(Number(n) || 0);
+      if (i < 0) i += len;
+      if (i < 0 || i >= len) return undefined;
+      return this[i];
+    };
+  }
+  if (!Array.prototype.findLast) {
+    Array.prototype.findLast = function (fn, thisArg) {
+      for (var i = this.length - 1; i >= 0; i--) {
+        if (fn.call(thisArg, this[i], i, this)) return this[i];
+      }
+      return undefined;
+    };
+  }
+  if (!Array.prototype.findLastIndex) {
+    Array.prototype.findLastIndex = function (fn, thisArg) {
+      for (var i = this.length - 1; i >= 0; i--) {
+        if (fn.call(thisArg, this[i], i, this)) return i;
+      }
+      return -1;
+    };
+  }
+  if (!Array.prototype.toSorted) {
+    Array.prototype.toSorted = function (cmp) {
+      var copy = Array.prototype.slice.call(this);
+      Array.prototype.sort.call(copy, cmp);
+      return copy;
+    };
+  }
+  if (!Array.prototype.toReversed) {
+    Array.prototype.toReversed = function () {
+      var copy = Array.prototype.slice.call(this);
+      Array.prototype.reverse.call(copy);
+      return copy;
+    };
+  }
+  if (!Array.prototype.toSpliced) {
+    Array.prototype.toSpliced = function () {
+      var copy = Array.prototype.slice.call(this);
+      Array.prototype.splice.apply(copy, arguments);
+      return copy;
+    };
+  }
+  if (!Array.prototype.with) {
+    Array.prototype.with = function (i, v) {
+      var len = this.length;
+      var idx = Math.trunc(Number(i) || 0);
+      if (idx < 0) idx += len;
+      if (idx < 0 || idx >= len) throw new RangeError("Invalid index : " + i);
+      var copy = Array.prototype.slice.call(this);
+      copy[idx] = v;
+      return copy;
+    };
+  }
+
+  /* ---- String ES2021–ES2024 (same engine vintage) ---- */
+  if (!String.prototype.at) {
+    String.prototype.at = function (n) {
+      var len = this.length;
+      var i = Math.trunc(Number(n) || 0);
+      if (i < 0) i += len;
+      if (i < 0 || i >= len) return undefined;
+      return this.charAt(i);
+    };
+  }
+  if (!String.prototype.replaceAll) {
+    String.prototype.replaceAll = function (a, b) {
+      if (a instanceof RegExp) {
+        if (a.global) return this.replace(a, b);
+        throw new TypeError("String.prototype.replaceAll called with a non-global RegExp argument");
+      }
+      return this.split(a).join(b);
+    };
+  }
+
+  /* ---- Object.groupBy / Map.groupBy (ES2024) ---- */
+  if (typeof Object.groupBy !== "function") {
+    Object.groupBy = function (items, cb) {
+      var out = Object.create(null);
+      var arr = Array.isArray(items) ? items : Array.from(items);
+      for (var i = 0; i < arr.length; i++) {
+        var key = cb(arr[i], i);
+        (out[key] || (out[key] = [])).push(arr[i]);
+      }
+      return out;
+    };
+  }
+  if (typeof Map.groupBy !== "function" && typeof Map !== "undefined") {
+    Map.groupBy = function (items, cb) {
+      var m = new Map();
+      var arr = Array.isArray(items) ? items : Array.from(items);
+      for (var i = 0; i < arr.length; i++) {
+        var key = cb(arr[i], i);
+        var list = m.get(key);
+        if (!list) { list = []; m.set(key, list); }
+        list.push(arr[i]);
+      }
+      return m;
+    };
+  }
 
   /* ---- Intl (simplified, en-US semantics; disclosed approximation) ----
      QuickJS is built without the full ICU Intl object, but production bundles

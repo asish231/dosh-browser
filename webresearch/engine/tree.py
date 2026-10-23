@@ -109,6 +109,7 @@ def extract_scripts(html: str) -> tuple[list[dict[str, str]], str]:
                 "type": attrs.get("type") or "",
                 "integrity": attrs.get("integrity") or "",
                 "defer": defer,
+                "nonce": attrs.get("nonce") or "",
             })
         for child in node.get("c") or []:
             if isinstance(child, dict):
