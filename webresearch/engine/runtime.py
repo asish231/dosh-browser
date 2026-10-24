@@ -44,11 +44,13 @@ def _wants_js(html: str) -> bool:
     low = html.lower()
     if "<script" not in low:
         return False
-    if 'id="root"' in low or 'id="app"' in low or "data-reactroot" in low:
-        return True
-    if low.count("<script") >= 2:
-        return True
-    return "react" in low or "vue" in low or "__next" in low
+    # Any inline or src script can register listeners, fetch data, or mutate
+    # the document — a one-script page is still a live page. The old heuristic
+    # (>=2 script tags or a framework marker) skipped single-script pages, so
+    # goto() never built the engine ctx: sitework (infinite scroll, JS fetch,
+    # event handlers) only materialised after the first forced action, at the
+    # wrong scroll position. Any page with a script gets its scripts run.
+    return True
 
 
 def _extract_origin(url: str) -> str:
@@ -884,6 +886,17 @@ async def run_scripts(
             _drain_injected(ctx)
             if not left:
                 break
+        # End-of-pass intersection evaluation. The engine evaluates IO entries
+        # on scroll only, but mutations (lazy-feed appends) also move targets
+        # in/out of the viewport between scrolls; real observers re-evaluate
+        # once per frame after any change. Missing this pass-end check made a
+        # growing feed register its sentinel's state at observe time and never
+        # transition again — the feed stalled after one batch.
+        try:
+            ctx.eval("__notifyIntersections(); true")
+            _pump_jobs(ctx)
+        except Exception:
+            pass
     
         # Drain service-worker StaleWhileRevalidate revalidations.
         for _reval_url in sw_revalidate_queue:
@@ -1010,10 +1023,18 @@ async def run_scripts(
                     x = (action or {}).get("x", 0)
                     y = (action or {}).get("y", 800)
                     smooth = bool((action or {}).get("smooth", stealth))
+                    # Wheel-delta semantics (like a real mouse wheel): the
+                    # values add onto the current scroll position. The old
+                    # scrollTo already kept a persistent scrollState, so a
+                    # repeated scroll(y=800) landed on the same absolute
+                    # target after the first call and infinite feeds never
+                    # re-triggered their IntersectionObserver.
                     if smooth:
-                        ok = ctx.eval(f"__scrollSmooth({_json.dumps(x)}, {_json.dumps(y)}); true")
+                        ok = ctx.eval(
+                            f"__scrollSmooth(scrollX + {_json.dumps(x)}, scrollY + {_json.dumps(y)}); true"
+                        )
                     else:
-                        ok = ctx.eval(f"scrollTo({_json.dumps(x)}, {_json.dumps(y)}); true")
+                        ok = ctx.eval(f"scrollBy({_json.dumps(x)}, {_json.dumps(y)}); true")
                 else:
                     ok = ctx.eval(f"__clickPath({_json.dumps(path)}, {str(stealth).lower()})")
                 applied_item = {
@@ -1039,6 +1060,12 @@ async def run_scripts(
             _drain_injected(ctx)
             if not left:
                 break
+        # Same end-of-pass intersection evaluation for action passes.
+        try:
+            ctx.eval("__notifyIntersections(); true")
+            _pump_jobs(ctx)
+        except Exception:
+            pass
         try:
             deltas_raw = ctx.eval("__drainDeltaRecords()")
             info["deltas"] = json.loads(str(deltas_raw)) if deltas_raw else []

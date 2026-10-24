@@ -165,8 +165,11 @@ class ScrollIntersectionTests(unittest.TestCase):
         self.assertIn("loaded", html)
 
     def test_scroll_dispatches_scroll_event(self):
+        # A tall body mirrors a real scrollable document: on an unscrollable
+        # page a real browser clamps scrollY to 0 and fires no scroll event.
         page = (
-            "<html><body><div id='out'>0</div><script>"
+            "<html><body><div style='height:3000px'>tall</div>"
+            "<div id='out'>0</div><script>"
             "window.addEventListener('scroll', function(){"
             "document.getElementById('out').textContent = 'scrolled:' + window.scrollY;"
             "});"

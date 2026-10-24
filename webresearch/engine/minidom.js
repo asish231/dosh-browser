@@ -403,8 +403,6 @@
 
   function Element(tag, attrs, kids) {
     Node.call(this, 1, tag, attrs || {}, kids || []);
-    this.id = (this.attributes.id || "");
-    this.className = (this.attributes["class"] || "");
     this.style = new CSSStyleDeclaration(this);
     if (this.attributes.style) {
       var sParts = String(this.attributes.style).split(";");
@@ -437,8 +435,8 @@
   Element.prototype.setAttribute = function (n, v) {
     var oldVal = this.attributes[n] == null ? null : String(this.attributes[n]);
     this.attributes[n] = String(v);
-    if (n === "id") this.id = String(v);
-    if (n === "class") this.className = String(v);
+    /* id/className expose attributes directly via prototype accessors below;
+       syncing here would recurse (setter -> setAttribute -> setter). */
     queueMutation("attributes", this, { attributeName: n, oldValue: oldVal });
     if (typeof this.attributeChangedCallback === "function") {
       var obs = (this.constructor && this.constructor.observedAttributes) || this.observedAttributes;
@@ -452,6 +450,22 @@
     queueMutation("attributes", this, { attributeName: n });
   };
   Element.prototype.hasAttribute = function (n) { return Object.prototype.hasOwnProperty.call(this.attributes, n); };
+  /* id/className write straight onto the instance as plain properties —
+     shadowing any prototype accessor — so a runtime `d.className = "item"`
+     never reached the attributes table. The serializer, the CSS matcher and
+     the action surface all read attributes: runtime-created controls lost
+     their class (infinite-feed items serialized as bare <div>) and id-based
+     targeting silently missed. Route both through setAttribute. */
+  Object.defineProperty(Element.prototype, "className", {
+    get: function () { return this.attributes["class"] == null ? "" : String(this.attributes["class"]); },
+    set: function (v) { this.setAttribute("class", String(v)); },
+    configurable: true
+  });
+  Object.defineProperty(Element.prototype, "id", {
+    get: function () { return this.attributes["id"] == null ? "" : String(this.attributes["id"]); },
+    set: function (v) { this.setAttribute("id", String(v)); },
+    configurable: true
+  });
   Element.prototype.getElementsByTagName = function (tag) {
     tag = String(tag).toLowerCase();
     var out = [];
@@ -1517,6 +1531,16 @@
     try {
       doc.__layoutInfo = { engine: "block-flow+flex+grid+positioned", viewportWidth: vw, boxes: layout.boxes, textMetric: "monospace-advance-0.6em", replacedDefaults: "css-300x150" };
     } catch (e) {}
+    /* A fresh layout pass can move IntersectionObserver targets in or out of
+       the viewport (lazy feeds append content; the sentinel crosses the fold).
+       Real IO re-evaluates on the next frame after a change: deliver the
+       deferred notification via a microtask so callbacks run after the current
+       pass, never re-entrantly while boxes are being computed. */
+    if (typeof queueMicrotask === "function") {
+      queueMicrotask(function () { try { _notifyIntersections(); } catch (e) {} });
+    } else if (typeof Promise === "function") {
+      Promise.resolve().then(function () { try { _notifyIntersections(); } catch (e) {} });
+    }
     return layout;
   }
   Element.prototype.getBoundingClientRect = function () {
@@ -1570,15 +1594,13 @@
         add: function (c) {
           var p = (el.className || "").split(/\s+/).filter(Boolean);
           if (p.indexOf(c) < 0) p.push(c);
+          /* The className setter routes through setAttribute, which records
+             the mutation: no extra queueMutation here. */
           el.className = p.join(" ");
-          el.attributes["class"] = el.className;
-          queueMutation("attributes", el, { attributeName: "class" });
         },
         remove: function (c) {
           var p = (el.className || "").split(/\s+/).filter(function (x) { return x && x !== c; });
           el.className = p.join(" ");
-          el.attributes["class"] = el.className;
-          queueMutation("attributes", el, { attributeName: "class" });
         },
         contains: function (c) { return (el.className || "").split(/\s+/).indexOf(c) >= 0; }
       };
@@ -2866,17 +2888,44 @@
     }
   }
 
+  /* Scroll positions clamp to the document: [0, max(0, docHeight - viewport)].
+     Real browsers never scroll past the bottom of the document — and infinite
+     feeds DEPEND on the clamp: each lazy batch grows the document, the clamped
+     position advances with it, and the sentinel re-enters the viewport so the
+     IntersectionObserver fires again. Without a clamp the position runs past
+     the growing document and the feed loads once and stalls. */
+  function _clampScroll(x, y) {
+    var cx = Number(x) || 0;
+    var cy = Number(y) || 0;
+    var vd = (typeof global.innerHeight === "number" && global.innerHeight > 0) ? global.innerHeight : 720;
+    if (cx < 0) cx = 0;
+    if (cy < 0) cy = 0;
+    try {
+      var de = global.document && global.document.documentElement;
+      if (de && typeof de.getBoundingClientRect === "function" && !de.__layoutSkip) {
+        var h = de.getBoundingClientRect().height;
+        var max = Math.max(0, h - vd);
+        if (cy > max) cy = max;
+        if (cx > max) cx = max;
+      }
+    } catch (e) {}
+    return [cx, cy];
+  }
+
   function _doScroll(x, y) {
     if (typeof x === "object" && x !== null) { y = x.top || 0; x = x.left || 0; }
-    var targetX = Number(x) || 0;
-    var targetY = Number(y) || 0;
-    var dx = targetX - scrollState.x;
-    var dy = targetY - scrollState.y;
+    var unclampedX = Number(x) || 0;
+    var unclampedY = Number(y) || 0;
+    var dx = unclampedX - scrollState.x;
+    var dy = unclampedY - scrollState.y;
+    /* The wheel event carries the requested delta even when the page cannot
+       scroll that far — listeners read the gesture, not the position. */
     if (dx !== 0 || dy !== 0) {
       _dispatchWheel(dx, dy);
     }
-    scrollState.x = targetX;
-    scrollState.y = targetY;
+    var clamped = _clampScroll(unclampedX, unclampedY);
+    scrollState.x = clamped[0];
+    scrollState.y = clamped[1];
     _notifyIntersections();
     if (typeof global.dispatchEvent === "function" && typeof global.Event === "function") {
       try {
@@ -2900,8 +2949,9 @@
     for (var i = 1; i <= steps; i++) {
       var progress = i / steps;
       var ease = progress < 0.5 ? 2 * progress * progress : -1 + (4 - 2 * progress) * progress;
-      var curX = Math.round(startX + totalDx * ease);
-      var curY = Math.round(startY + totalDy * ease);
+      var cl = _clampScroll(startX + totalDx * ease, startY + totalDy * ease);
+      var curX = Math.round(cl[0]);
+      var curY = Math.round(cl[1]);
       var stepDx = curX - scrollState.x;
       var stepDy = curY - scrollState.y;
 

@@ -89,6 +89,14 @@ class Tab:
     def __init__(self, tab_id: str) -> None:
         self.id = tab_id
         self.history: list[Page] = []
+        # Parallel snapshot per history entry: the DOM/headers/frames state that
+        # entry represented, so back()/forward() can restore a live document
+        # instead of leaving the engine on the navigated-away page.
+        self.snapshots: list[dict] = []
+        # Absolute scroll position to re-apply after the next fresh engine pass
+        # (history restore replays page scripts, then wheels back to where the
+        # entry was left).
+        self.pending_scroll_y: int = 0
         self.index: int = -1
         self.html: str = ""
         self.url: str = ""
@@ -103,16 +111,55 @@ class Tab:
             return self.history[self.index]
         return None
 
-    def push(self, page: Page, html: str | None = None, headers: dict | None = None) -> Page:
+    def push(
+        self, page: Page, html: str | None = None, headers: dict | None = None, replace: bool = False
+    ) -> Page:
         if html is not None:
             self.html = html
             self.url = page.url
         if headers is not None:
             self.headers = dict(headers)
         self.history = self.history[: self.index + 1]
-        self.history.append(page)
-        self.index = len(self.history) - 1
-        return page
+        del self.snapshots[self.index + 1 :]
+        if replace:
+            # An in-page action (scroll/type/mutation) that stayed on this
+            # document rewrites the current entry, like a real browser: these
+            # never create history entries.
+            if self.history:
+                self.history[self.index] = page
+                pushed_page = self.history[self.index]
+            else:
+                self.history.append(page)
+                self.index = len(self.history) - 1
+                pushed_page = self.history[self.index]
+        else:
+            self.history.append(page)
+            self.index = len(self.history) - 1
+            pushed_page = page
+        # Capture the state this entry represents. Entries pushed without an
+        # HTML payload (synthetic API pages) record None: there is no live
+        # document behind them, and restoring one honestly clears the DOM.
+        # scroll_y is read at push time — the ctx may be further mutated by
+        # later entries, but the entry's position is fixed now.
+        scroll_y = 0
+        if html is not None and self.ctx is not None:
+            try:
+                scroll_y = int(float(self.ctx.eval("scrollY || 0") or 0))
+            except Exception:
+                scroll_y = 0
+        snap = {
+            "html": self.html if html is not None else None,
+            "url": page.url,
+            "headers": dict(self.headers),
+            "frames": list(self.frame_documents) if html is not None else [],
+            "captcha": self.captcha_inspection if html is not None else None,
+            "scroll_y": scroll_y,
+        }
+        if replace and self.snapshots:
+            self.snapshots[self.index] = snap
+        else:
+            self.snapshots.append(snap)
+        return pushed_page
 
 
 class Session:
@@ -213,7 +260,8 @@ class Session:
 
     @index.setter
     def index(self, val: int) -> None:
-        self.current_tab.index = val
+        # Numeric history moves restore the live document (back/forward).
+        self._goto_history_index(val)
 
     @property
     def html(self) -> str:
@@ -251,8 +299,10 @@ class Session:
     def page(self) -> Page | None:
         return self.current_tab.page
 
-    def _push(self, page: Page, html: str | None = None) -> Page:
-        return self.current_tab.push(page, html, headers=getattr(page, "headers", None))
+    def _push(self, page: Page, html: str | None = None, replace: bool = False) -> Page:
+        return self.current_tab.push(
+            page, html, headers=getattr(page, "headers", None), replace=replace
+        )
 
     async def goto(self, url: str, *, max_chars: int = 8000, js: str = "auto") -> Page:
         page, html, frames, captcha, js_info = await read_live(
@@ -1223,7 +1273,9 @@ resolve a selector directly.
     async def scroll(
         self, y: int = 800, x: int = 0, *, max_chars: int = 8000, stealth: bool | None = None
     ) -> Page:
-        """Scroll the page; fires scroll event + IntersectionObserver notifications."""
+        """Wheel the page by a delta (x, y add onto the current position, like a
+        real mouse wheel); fires wheel + scroll events and IntersectionObserver
+        notifications."""
         if not self.html:
             raise ValueError("no current page")
         is_stealth = self.stealth if stealth is None else bool(stealth)
@@ -1235,10 +1287,24 @@ resolve a selector directly.
         self, actions: list[dict], html: str, max_chars: int
     ) -> Page:
         """Re-run page JS with agent interactions, then rebuild the page model."""
+        had_ctx = self.current_tab.ctx is not None
         new_html, js_info = await run_scripts(
             html, self.url, self.client, force=True, actions=actions, ctx=self.current_tab.ctx
         )
         self.current_tab.ctx = js_info.get("ctx") or self.current_tab.ctx
+        # A fresh engine build may be a history restore replaying this entry's
+        # document: re-apply the stored scroll position once, before the page
+        # snapshot is taken, so IntersectionObserver-driven feeds load the
+        # same content a real browser would show at that position.
+        if not had_ctx and self.current_tab.pending_scroll_y:
+            re_y = self.current_tab.pending_scroll_y
+            self.current_tab.pending_scroll_y = 0
+            ctx = self.current_tab.ctx
+            if ctx is not None:
+                try:
+                    ctx.eval(f"scrollTo(0, {re_y}); true")
+                except Exception:
+                    pass
         js_ran = bool(js_info.get("ran"))
         result = FetchResult(
             url=self.url,
@@ -1358,7 +1424,9 @@ resolve a selector directly.
                     js_info_post if result.kind == "html" else None,
                 )
                 return self._push(page, res_html)
-        return self._push(page, new_html)
+        # The action stayed on this document (scroll/type/inline JS mutation):
+        # rewrite the current history entry instead of creating a new one.
+        return self._push(page, new_html, replace=True)
 
     @property
     def last_deltas(self) -> list[dict]:
@@ -1487,10 +1555,48 @@ resolve a selector directly.
             "view": result.solution.view,
         }
 
+    def _goto_history_index(self, i: int) -> None:
+        """Move the tab's history pointer and restore that entry's live DOM.
+
+        The engine context belongs to the entry we are leaving, so it is
+        dropped and rebuilt from the stored HTML on the next action pass —
+        the same code path as a fresh load of that document. The stored
+        scroll position is re-applied after the rebuild.
+        """
+        tab = self.current_tab
+        if not 0 <= i < len(tab.history):
+            raise ValueError(f"no page at history index {i}")
+        tab.index = i
+        snap = tab.snapshots[i] if i < len(tab.snapshots) else None
+        if snap is None or snap.get("html") is None:
+            # Synthetic entry (no stored document): clear the live state.
+            self.html = ""
+            self.url = snap.get("url", "") if snap else ""
+            tab.headers = {}
+            self.frame_documents = []
+            tab.captcha_inspection = None
+        else:
+            self.html = snap["html"]
+            self.url = snap["url"]
+            tab.headers = dict(snap.get("headers") or {})
+            self.frame_documents = list(snap.get("frames") or [])
+            tab.captcha_inspection = snap.get("captcha")
+        tab.pending_scroll_y = int((snap or {}).get("scroll_y") or 0)
+        tab.ctx = None
+
     def back(self) -> Page:
         if self.index <= 0:
             raise ValueError("no previous page")
-        self.index -= 1
+        self._goto_history_index(self.index - 1)
+        page = self.page
+        assert page is not None
+        return page
+
+    def forward(self) -> Page:
+        tab = self.current_tab
+        if tab.index >= len(tab.history) - 1:
+            raise ValueError("no forward page")
+        self._goto_history_index(tab.index + 1)
         page = self.page
         assert page is not None
         return page
