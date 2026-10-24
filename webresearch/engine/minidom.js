@@ -1806,6 +1806,22 @@
     return timers.length;
   };
 
+  /* Parse an absolute URL string into plain fields on `u`; returns the raw
+     query (with its leading "?") for the caller to feed into searchParams. */
+  function __urlParseInto(u, absolute) {
+    var m = /^([a-zA-Z][a-zA-Z0-9+.-]*:)?(?:\/\/([^/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(absolute) || [];
+    u.protocol = m[1] || "";
+    var auth = m[2] || "";
+    var host = auth.split("@").pop();
+    u.host = host;
+    u.hostname = host.split(":")[0];
+    u.port = host.indexOf(":") >= 0 ? host.split(":")[1] : "";
+    u.pathname = m[3] || "/";
+    u.hash = m[5] || "";
+    u.username = auth.indexOf("@") > 0 ? auth.split("@")[0].split(":")[0] : "";
+    u.password = auth.indexOf("@") > 0 && auth.split("@")[0].indexOf(":") > 0 ? auth.split("@")[0].split(":")[1] : "";
+    return m[4] || "";
+  }
   function URLImpl(input, base) {
     var raw = String(input == null ? "" : input);
     var absolute = raw;
@@ -1818,42 +1834,63 @@
         absolute = "http://localhost/" + raw.replace(/^\//, "");
       }
     }
-    var m = /^([a-zA-Z][a-zA-Z0-9+.-]*:)?(?:\/\/([^/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(absolute) || [];
-    this.protocol = m[1] || "";
-    var auth = m[2] || "";
-    var host = auth.split("@").pop();
-    this.host = host;
-    this.hostname = host.split(":")[0];
-    this.port = host.indexOf(":") >= 0 ? host.split(":")[1] : "";
-    this.pathname = m[3] || "/";
-    this.search = m[4] || "";
-    this.hash = m[5] || "";
-    this.username = auth.indexOf("@") > 0 ? auth.split("@")[0].split(":")[0] : "";
-    this.password = auth.indexOf("@") > 0 && auth.split("@")[0].indexOf(":") > 0 ? auth.split("@")[0].split(":")[1] : "";
-    this.origin = this.protocol && this.host ? this.protocol + "//" + this.host : "";
-    this.href = this.origin + this.pathname + this.search + this.hash;
     var self = this;
+    var initialSearch = __urlParseInto(this, absolute);
+    /* href/search/origin are live accessors over the parsed fields and the
+       searchParams object, per the spec's URLUtils contract: every
+       searchParams mutation (set/append/delete/sort) is reflected in .href,
+       .search and .toString(), and assigning .search/.href re-parses. The
+       old plain-data href froze at construction, so searchParams writes
+       were silently dropped and every engine-side GET form submit navigated
+       without its query string (a verified P0: session.submit on a GET form
+       fetched the action URL with no query at all). */
+    this.searchParams = new URLSearchParamsImpl(initialSearch);
+    Object.defineProperty(this, "search", {
+      get: function () {
+        var qs = self.searchParams.toString();
+        return qs ? "?" + qs : "";
+      },
+      set: function (v) { self.searchParams._replace(String(v == null ? "" : v)); },
+      configurable: true,
+      enumerable: true
+    });
+    Object.defineProperty(this, "origin", {
+      get: function () { return (self.protocol && self.host) ? self.protocol + "//" + self.host : ""; },
+      configurable: true,
+      enumerable: true
+    });
+    Object.defineProperty(this, "href", {
+      get: function () { return self.origin + self.pathname + self.search + (self.hash || ""); },
+      set: function (v) {
+        var s = __urlParseInto(self, String(v == null ? "" : v));
+        self.searchParams._replace(s);
+      },
+      configurable: true,
+      enumerable: true
+    });
     this.toString = function () { return self.href; };
-    this.searchParams = new URLSearchParamsImpl(this.search);
     this.assign = function (u) { try { global.__WR_NAVIGATED = String(u || ""); } catch (e) {} };
     this.replace = function (u) { try { global.__WR_NAVIGATED = String(u || ""); } catch (e) {} };
     this.reload = function () {};
   }
-  function URLSearchParamsImpl(query) {
-    var raw = String(query || "").replace(/^\?/, "");
-    this._p = {};
-    var self = this;
+  /* Shared parser for URLSearchParams sources: "?a=1&b=2" -> {a:"1",b:"2"},
+     with duplicate keys collapsing to arrays. */
+  function __spParse(query) {
+    var raw = String(query == null ? "" : query).replace(/^\?/, "");
+    var p = {};
     raw.split("&").forEach(function (pair) {
       if (!pair) return;
       var eq = pair.indexOf("=");
       var k = eq >= 0 ? pair.slice(0, eq) : pair;
       var v = eq >= 0 ? pair.slice(eq + 1) : "";
       try { k = decodeURIComponent(k.replace(/\+/g, " ")); v = decodeURIComponent(v.replace(/\+/g, " ")); } catch (e) {}
-      self_append(self._p, k, v);
+      if (p[k] == null) p[k] = v; else if (Array.isArray(p[k])) p[k].push(v); else p[k] = [p[k], v];
     });
-    function self_append(obj, k, v) {
-      if (obj[k] == null) obj[k] = v; else if (Array.isArray(obj[k])) obj[k].push(v); else obj[k] = [obj[k], v];
-    }
+    return p;
+  }
+  function URLSearchParamsImpl(query) {
+    this._p = __spParse(query);
+    var self = this;
     this.get = function (k) { var v = this._p[k]; return v == null ? null : (Array.isArray(v) ? v[0] : v); };
     this.getAll = function (k) { var v = this._p[k]; return v == null ? [] : (Array.isArray(v) ? v.slice() : [v]); };
     this.has = function (k) { return this._p[k] != null; };
@@ -1916,6 +1953,10 @@
         else fn(v, k);
       }
     };
+    /* Reset the contents in place, keeping object identity: code holding a
+       reference to `url.searchParams` must observe `url.search = "..."` and
+       `url.href = "..."` re-assignments. */
+    this._replace = function (query) { this._p = __spParse(query); };
     this.toString = function () {
       var out = [];
       for (var k in this._p) {
