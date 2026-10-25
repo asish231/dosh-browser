@@ -1218,6 +1218,13 @@ class Session:
                 f"first refs: {known}"
             )
 
+        # Disabled is checked before every lane: a disabled link must not
+        # navigate, a disabled submit must not POST, a disabled field must
+        # not type. The old code only guarded the activate branch, so
+        # disabled submit buttons and links drove real HTTP requests.
+        if action.disabled:
+            raise ValueError(f"[{ref}] {action.label!r} is disabled")
+
         if action.role == "file" or files is not None:
             upload_payload = files if files is not None else (text or "uploaded_file.txt")
             return await self.upload(ref, upload_payload, max_chars=max_chars)
@@ -1237,9 +1244,6 @@ class Session:
             if action.selector and (action.role in {"textbox", "searchbox"} or action.tag in {"input", "textarea"}):
                 return await self._act_engine(action, text=text, dx=dx, dy=dy, max_chars=max_chars, stealth=is_stealth)
             return await self._act_submit_field(action, text, max_chars)
-
-        if action.disabled:
-            raise ValueError(f"[{ref}] {action.label!r} is disabled")
 
         if action.kind == "dropzone":
             raise ValueError(

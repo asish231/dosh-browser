@@ -562,6 +562,14 @@
   Element.prototype._dispatchClickSequence = function (isNative) {
     var trusted = !!isNative;
     var tag = this.nodeName.toLowerCase();
+    /* Disabled form controls are non-interactive: a real browser dispatches
+       no click (programmatic el.click() included), fires no listeners, and
+       never navigates. Before this guard, a disabled submit button produced
+       a real HTTP submit and disabled buttons ran their click listeners. */
+    if (this.disabled && (tag === "input" || tag === "button" || tag === "select"
+        || tag === "textarea" || tag === "option" || tag === "fieldset")) {
+      return false;
+    }
     if (tag === "input" || tag === "textarea" || tag === "select" || tag === "button" || tag === "a" || this.hasAttribute("tabindex")) {
       this.focus();
     }
@@ -679,6 +687,7 @@
         }
       }
     }
+    return true;
   };
   Element.prototype.click = function () {
     return this._dispatchClickSequence(false);
@@ -1257,6 +1266,17 @@
       if (v) this.attributes.checked = "checked"; else delete this.attributes.checked;
       queueMutation("attributes", this, { attributeName: "checked" });
     }
+  });
+  /* HTML-spec disabled: presence of the attribute means disabled, whatever
+     its value. Before this property existed, el.disabled was undefined, so
+     the __focusables() Tab-skip guard silently passed disabled controls. */
+  Object.defineProperty(Element.prototype, "disabled", {
+    get: function () { return this.hasAttribute("disabled"); },
+    set: function (v) {
+      if (v) this.setAttribute("disabled", "disabled");
+      else this.removeAttribute("disabled");
+    },
+    configurable: true
   });
   Object.defineProperty(Element.prototype, "src", {
     get: function () { return this.attributes.src == null ? "" : String(this.attributes.src); },
@@ -5252,6 +5272,11 @@
       /* Defense in depth: the typing lane must never append to a select. */
       return __selectByValueOrText(el, text);
     }
+    /* Disabled form controls never receive typed input. */
+    var elTag = el.nodeName.toLowerCase();
+    if (el.disabled && (elTag === "input" || elTag === "textarea" || elTag === "select")) {
+      return false;
+    }
     if (typeof el.focus === "function") el.focus();
     text = String(text != null ? text : "");
     var curVal = el.value || "";
@@ -5335,6 +5360,7 @@
     if (!el) return false;
     if (stealth !== undefined) global.__stealthMode = !!stealth;
     if (el.nodeName === "select") {
+      if (el.disabled) return false;
       /* Typing into a select means choosing an option (by value, then by
          visible text) — never appending text to a value that is derived
          from the chosen option. A bare activate just focuses it. */
@@ -5351,9 +5377,14 @@
     if (tag === "input" || tag === "textarea" || tag === "select" || tag === "button" || tag === "a" || el.hasAttribute("tabindex")) {
       if (typeof el.focus === "function") el.focus();
     }
-    if (typeof el.__nativeClick === "function") el.__nativeClick();
-    else if (typeof el.click === "function") el.click();
-    else el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true, __trusted: true }));
+    var clickOk = false;
+    if (typeof el.__nativeClick === "function") clickOk = el.__nativeClick();
+    else if (typeof el.click === "function") clickOk = el.click();
+    else {
+      el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true, __trusted: true }));
+      clickOk = true;
+    }
+    if (!clickOk) return false;
     var kind = (el.getAttribute("type") || "").toLowerCase();
     if (kind === "checkbox" || kind === "radio") {
       el.setAttribute("aria-checked", el.checked ? "true" : "false");
@@ -5419,6 +5450,11 @@
     else if (global.document.getElementById(selectorOrPath)) el = global.document.getElementById(selectorOrPath);
     else el = global.document.querySelector(selectorOrPath);
     if (!el) return false;
+    /* Disabled form controls are not focusable and receive no key events. */
+    var pkTag = el.nodeName.toLowerCase();
+    if (el.disabled && (pkTag === "input" || pkTag === "textarea" || pkTag === "select" || pkTag === "button")) {
+      return false;
+    }
     if (typeof el.focus === "function" && el.nodeName.toLowerCase() !== "body") el.focus();
     var lower = String(keyName || "").toLowerCase();
     var def = __KEY_DEFS[lower];
