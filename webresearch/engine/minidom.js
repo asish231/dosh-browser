@@ -566,13 +566,59 @@
       this.focus();
     }
     if (this.nodeName === "input" && (this.attributes.type || "") === "checkbox") {
-      var on = this.attributes.checked == null ? "checked" : null;
-      if (on) this.attributes.checked = "checked"; else delete this.attributes.checked;
-      this.checked = !!on;
+      var on = !(this.checked);
+      this.checked = on;
+      var chgIn = (typeof global.Event === "function")
+        ? new global.Event("input", { bubbles: true, isTrusted: trusted, __trusted: trusted })
+        : { type: "input", target: this, bubbles: true, isTrusted: trusted };
+      this.dispatchEvent(chgIn);
       var chgEv = (typeof global.Event === "function")
         ? new global.Event("change", { bubbles: true, isTrusted: trusted, __trusted: trusted })
         : { type: "change", target: this, bubbles: true, isTrusted: trusted };
       this.dispatchEvent(chgEv);
+    }
+    if (this.nodeName === "input" && (this.attributes.type || "") === "radio") {
+      /* Radio group exclusivity: the clicked radio becomes checked, every
+         other radio with the same name in the same form (or document)
+         unchecks, and input+change fire — matching a real browser. Before
+         this, a radio click was a complete state no-op: the clicked radio
+         never checked and forms submitted whatever was checked before. */
+      this.checked = true;
+      var rname = this.getAttribute("name") || "";
+      if (rname) {
+        var rscope = __formOf(this) || this.ownerDocument || global.document;
+        var radios = (typeof rscope.querySelectorAll === "function")
+          ? rscope.querySelectorAll("input")
+          : [];
+        for (var ri = 0; ri < radios.length; ri++) {
+          var ro = radios[ri];
+          if (ro !== this
+              && ro.nodeName === "input"
+              && (ro.getAttribute("type") || "").toLowerCase() === "radio"
+              && (ro.getAttribute("name") || "") === rname) {
+            ro.checked = false;
+          }
+        }
+      }
+      var rIn = (typeof global.Event === "function")
+        ? new global.Event("input", { bubbles: true, isTrusted: trusted, __trusted: trusted })
+        : { type: "input", target: this, bubbles: true, isTrusted: trusted };
+      this.dispatchEvent(rIn);
+      var rChg = (typeof global.Event === "function")
+        ? new global.Event("change", { bubbles: true, isTrusted: trusted, __trusted: trusted })
+        : { type: "change", target: this, bubbles: true, isTrusted: trusted };
+      this.dispatchEvent(rChg);
+    }
+    if (this.nodeName === "option") {
+      /* Clicking an option selects it in its parent select (real browsers
+         treat option clicks as a selection gesture on the select). */
+      var optSel = __selectOf(this);
+      if (optSel) {
+        optSel.__selectDeselected = false;
+        this.selected = true;
+        optSel.dispatchEvent(new global.Event("input", { bubbles: true, isTrusted: trusted, __trusted: trusted }));
+        optSel.dispatchEvent(new global.Event("change", { bubbles: true, isTrusted: trusted, __trusted: trusted }));
+      }
     }
     var rect = (typeof this.getBoundingClientRect === "function") ? this.getBoundingClientRect() : { left: 10, top: 10, width: 20, height: 20 };
     var cx = Math.round(rect.left + rect.width * (0.4 + 0.2 * Math.random()));
@@ -654,6 +700,23 @@
       if (!name) continue;
       var type = (inp.getAttribute("type") || "").toLowerCase();
       if ((type === "checkbox" || type === "radio") && !inp.checked) continue;
+      if (type === "checkbox" || type === "radio") {
+        /* HTML spec: the default value of checkbox/radio is "on". */
+        fields[name] = inp.getAttribute("value") != null ? inp.getAttribute("value") : "on";
+        continue;
+      }
+      if (inp.nodeName === "select" && inp.getAttribute("multiple") != null) {
+        /* A multiple select submits one pair per selected option; a JS
+           object cannot repeat keys, so carry them as an array the host
+           expands back into repeated pairs. */
+        var vals = [];
+        var sopts = inp.getElementsByTagName("option");
+        for (var si = 0; si < sopts.length; si++) {
+          if (sopts[si].getAttribute("selected") != null) vals.push(__optionValue(sopts[si]));
+        }
+        if (vals.length) fields[name] = vals;
+        continue;
+      }
       if (type === "file") {
         var fl = inp.files;
         if (fl && fl.length > 0) {
@@ -993,12 +1056,188 @@
       adj.target.insertBefore(node, adj.ref);
     }
   };
+  /* ---- HTMLSelectElement semantics ----
+     Real select elements read and write the selected state of their <option>
+     children. The old generic value getter concatenated option TEXT
+     ("AlphaBeta"), typing appended to it, and submitted selects went out
+     empty or wrong. Helpers first, then the properties. */
+  function __selectOptionEls(el) {
+    if (!el || el.nodeName !== "select" || typeof el.getElementsByTagName !== "function") return [];
+    return el.getElementsByTagName("option");
+  }
+  function __optionValue(opt) {
+    var v = opt.getAttribute("value");
+    return v != null ? String(v) : String(opt.textContent == null ? "" : opt.textContent);
+  }
+  function __selectAttrIndex(el) {
+    var opts = __selectOptionEls(el);
+    for (var i = 0; i < opts.length; i++) {
+      if (opts[i].getAttribute("selected") != null) return i;
+    }
+    return -1;
+  }
+  function __selectIsMultiple(el) {
+    return el.getAttribute("multiple") != null;
+  }
+  function __selectOf(node) {
+    var n = node && node.parentNode;
+    while (n && n.nodeName !== "select") n = n.parentNode;
+    return (n && n.nodeName === "select") ? n : null;
+  }
+  function __selectSetChoice(el, idx) {
+    var opts = __selectOptionEls(el);
+    var multiple = __selectIsMultiple(el);
+    if (idx >= 0 && idx < opts.length) opts[idx].setAttribute("selected", "selected");
+    if (!multiple) {
+      for (var i = 0; i < opts.length; i++) {
+        if (i !== idx) opts[i].removeAttribute("selected");
+      }
+    }
+  }
+  /* Agent typing into a select: pick the option whose value — then whose
+     text — matches. Returns false when nothing matches, never appends text. */
+  function __selectByValueOrText(el, text) {
+    var opts = __selectOptionEls(el);
+    var want = String(text == null ? "" : text);
+    var match = -1;
+    for (var i = 0; i < opts.length; i++) {
+      if (__optionValue(opts[i]) === want) { match = i; break; }
+    }
+    if (match < 0) {
+      var t = want.replace(/^\s+|\s+$/g, "").toLowerCase();
+      for (var j = 0; j < opts.length; j++) {
+        if (String(opts[j].textContent || "").replace(/^\s+|\s+$/g, "").toLowerCase() === t) { match = j; break; }
+      }
+    }
+    if (match < 0) return false;
+    el.__selectDeselected = false;
+    __selectSetChoice(el, match);
+    el.dispatchEvent(new global.Event("input", { bubbles: true, isTrusted: true, __trusted: true }));
+    el.dispatchEvent(new global.Event("change", { bubbles: true, isTrusted: true, __trusted: true }));
+    return true;
+  }
   Object.defineProperty(Element.prototype, "value", {
-    get: function () { return this.attributes.value || this.textContent || ""; },
+    get: function () {
+      if (this.nodeName === "select") {
+        var opts = __selectOptionEls(this);
+        var idx = __selectAttrIndex(this);
+        var picked = null;
+        if (idx >= 0) picked = opts[idx];
+        else if (!this.__selectDeselected && opts.length) picked = opts[0];
+        return picked ? __optionValue(picked) : "";
+      }
+      return this.attributes.value || this.textContent || "";
+    },
     set: function (v) {
+      if (this.nodeName === "select") {
+        var want = String(v == null ? "" : v);
+        var opts = __selectOptionEls(this);
+        var match = -1;
+        for (var i = 0; i < opts.length; i++) {
+          if (__optionValue(opts[i]) === want) { match = i; break; }
+        }
+        if (match < 0) this.__selectDeselected = true;
+        else this.__selectDeselected = false;
+        __selectSetChoice(this, match);
+        return;
+      }
       this.attributes.value = String(v);
       queueMutation("attributes", this, { attributeName: "value" });
     }
+  });
+  Object.defineProperty(Element.prototype, "selectedIndex", {
+    get: function () {
+      if (this.nodeName !== "select") return undefined;
+      var opts = __selectOptionEls(this);
+      var idx = __selectAttrIndex(this);
+      if (idx >= 0) return idx;
+      if (this.__selectDeselected) return -1;
+      return opts.length ? 0 : -1;
+    },
+    set: function (i) {
+      if (this.nodeName !== "select") return;
+      var n = Math.floor(Number(i));
+      if (isNaN(n) || n < 0) {
+        this.__selectDeselected = true;
+        __selectSetChoice(this, -1);
+        return;
+      }
+      this.__selectDeselected = false;
+      __selectSetChoice(this, n);
+    },
+    configurable: true
+  });
+  Object.defineProperty(Element.prototype, "options", {
+    get: function () {
+      if (this.nodeName !== "select") return undefined;
+      var opts = __selectOptionEls(this).slice();
+      opts.item = function (i) { return opts[Number(i)] || null; };
+      opts.namedItem = function (n) {
+        n = String(n);
+        for (var i = 0; i < opts.length; i++) {
+          if (opts[i].getAttribute("id") === n || opts[i].getAttribute("name") === n) return opts[i];
+        }
+        return null;
+      };
+      return opts;
+    },
+    configurable: true
+  });
+  Object.defineProperty(Element.prototype, "selectedOptions", {
+    get: function () {
+      if (this.nodeName !== "select") return undefined;
+      var opts = __selectOptionEls(this);
+      var out = [];
+      if (__selectIsMultiple(this)) {
+        for (var i = 0; i < opts.length; i++) {
+          if (opts[i].getAttribute("selected") != null) out.push(opts[i]);
+        }
+      } else {
+        var idx = __selectAttrIndex(this);
+        if (idx >= 0) out.push(opts[idx]);
+        else if (!this.__selectDeselected && opts.length) out.push(opts[0]);
+      }
+      out.item = function (i) { return out[Number(i)] || null; };
+      return out;
+    },
+    configurable: true
+  });
+  Object.defineProperty(Element.prototype, "selected", {
+    /* Option.selected: reflects/mutates the parent select's choice. Setting
+       it on one option clears the others of a single-select, like a real
+       browser's exclusive selection. */
+    get: function () {
+      if (this.nodeName !== "option") return undefined;
+      var sel = __selectOf(this);
+      if (sel) {
+        if (this.getAttribute("selected") != null) return true;
+        /* Implicit first-option selection only applies when NO option is
+           explicitly chosen (HTML spec); a chosen sibling wins. */
+        if (__selectAttrIndex(sel) >= 0) return false;
+        var opts = __selectOptionEls(sel);
+        if (!sel.__selectDeselected && opts.length && opts[0] === this) return true;
+        return false;
+      }
+      return this.getAttribute("selected") != null;
+    },
+    set: function (v) {
+      if (this.nodeName !== "option") return;
+      var sel = __selectOf(this);
+      if (v) {
+        this.setAttribute("selected", "selected");
+        if (sel && !__selectIsMultiple(sel)) {
+          var opts = __selectOptionEls(sel);
+          for (var i = 0; i < opts.length; i++) {
+            if (opts[i] !== this) opts[i].removeAttribute("selected");
+          }
+        }
+        if (sel) sel.__selectDeselected = false;
+      } else {
+        this.removeAttribute("selected");
+        if (sel) sel.__selectDeselected = true;
+      }
+    },
+    configurable: true
   });
   Object.defineProperty(Element.prototype, "isContentEditable", {
     get: function () {
@@ -5009,6 +5248,10 @@
 
   function __dispatchTypeSequence(el, text, delays, stealth) {
     if (!el) return false;
+    if (el.nodeName === "select") {
+      /* Defense in depth: the typing lane must never append to a select. */
+      return __selectByValueOrText(el, text);
+    }
     if (typeof el.focus === "function") el.focus();
     text = String(text != null ? text : "");
     var curVal = el.value || "";
@@ -5091,6 +5334,16 @@
     else el = global.document.querySelector(selector);
     if (!el) return false;
     if (stealth !== undefined) global.__stealthMode = !!stealth;
+    if (el.nodeName === "select") {
+      /* Typing into a select means choosing an option (by value, then by
+         visible text) — never appending text to a value that is derived
+         from the chosen option. A bare activate just focuses it. */
+      if (typeof el.focus === "function") el.focus();
+      if (text !== null && text !== undefined && text !== "") {
+        return __selectByValueOrText(el, text);
+      }
+      return true;
+    }
     if (text !== null && text !== undefined && text !== "") {
       return __dispatchTypeSequence(el, text, delays, stealth);
     }
@@ -5219,20 +5472,12 @@
           ? el.getElementsByTagName("option")
           : [];
         if (opts.length) {
-          var cur = 0;
-          for (var oi = 0; oi < opts.length; oi++) {
-            if (opts[oi].getAttribute("selected") != null) { cur = oi; break; }
-          }
+          var cur = el.selectedIndex;
           var dir = lower === "arrowdown" ? 1 : -1;
           var ni = cur + dir;
           if (ni >= 0 && ni < opts.length) {
-            for (var oj = 0; oj < opts.length; oj++) {
-              if (oj === ni) opts[oj].setAttribute("selected", "selected");
-              else opts[oj].removeAttribute("selected");
-            }
-            var val = opts[ni].getAttribute("value");
-            if (val == null) val = opts[ni].textContent;
-            el.setAttribute("value", val);
+            el.__selectDeselected = false;
+            __selectSetChoice(el, ni);
             el.dispatchEvent(new global.Event("input", { bubbles: true, isTrusted: true }));
             el.dispatchEvent(new global.Event("change", { bubbles: true, isTrusted: true }));
           }

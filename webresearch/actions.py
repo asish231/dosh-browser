@@ -31,7 +31,12 @@ from selectolax.lexbor import LexborNode as Node
 from webresearch.parse import Document
 
 # Elements that only a layout/render engine can actuate.
-ACTIVE_TAGS = {"button", "input", "textarea", "select", "option", "label", "summary"}
+# No "option" here: an <option> is the internal state of its <select>, not a
+# control in its own right. Surfacing options as activate actions made agents
+# "click" them and silently change nothing (a false success the conversion
+# protocol forbids); the select itself is the actionable control, and the
+# engine now implements clicking an option as a selection on the parent.
+ACTIVE_TAGS = {"button", "input", "textarea", "select", "label", "summary"}
 EMBED_TAGS = {"iframe", "canvas", "video", "audio", "object", "embed"}
 NAV_TAGS = {"a", "area"}
 

@@ -490,7 +490,7 @@ class SubresourceSecurityTests(unittest.TestCase):
         os.environ["WEBRESEARCH_TLS_PROCEED_HOSTS"] = "expired.example"
         real_plain = fetch_mod._plain_fetch
 
-        async def fake_plain(url, *, client, method, data, json_body, headers, max_bytes):
+        async def fake_plain(url, *, client, method, data, json_body, headers, max_bytes, content=None):
             return httpx.Response(200, text="insecure-ok") and __import__(
                 "webresearch.fetch", fromlist=["_build_result"]
             )._build_result(

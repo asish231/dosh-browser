@@ -4,7 +4,7 @@ import contextlib
 import inspect
 import json
 import os
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import httpx
 
@@ -279,6 +279,7 @@ async def _fetch_impersonated(
     impersonate: str,
     timeout: float,
     files: Any | None = None,
+    content: str | bytes | None = None,
 ) -> FetchResult:
     merged = dict(client.headers)
     merged.update(navigate_headers(url))
@@ -291,7 +292,9 @@ async def _fetch_impersonated(
     response = await session.request(
         method.upper(),
         url,
-        data=data,
+        # curl_cffi (requests semantics) takes a raw urlencoded string body
+        # in data=; the explicit form content-type rides in merged headers.
+        data=content if content is not None else data,
         json=json_body,
         files=files,
         headers=merged,
@@ -326,6 +329,7 @@ async def _fetch_httpx(
     files: Any | None = None,
     headers: dict[str, str] | None,
     max_bytes: int,
+    content: str | bytes | None = None,
 ) -> FetchResult:
     req_headers = dict(navigate_headers(url))
     if headers:
@@ -333,6 +337,9 @@ async def _fetch_httpx(
     async with client.stream(
         method.upper(),
         url,
+        # httpx only accepts Mapping form data; repeated names arrive
+        # pre-encoded as urlencoded content instead.
+        content=content,
         data=data,
         json=json_body,
         files=files,
@@ -460,7 +467,7 @@ async def fetch(
     *,
     client: httpx.AsyncClient,
     method: str = "GET",
-    data: dict[str, str] | None = None,
+    data: dict[str, str] | list[tuple[str, str]] | None = None,
     json_body: dict | None = None,
     files: Any | None = None,
     headers: dict[str, str] | None = None,
@@ -540,6 +547,22 @@ async def fetch(
         for k, v in entry.conditional_headers().items():
             use_headers.setdefault(k, v)
 
+    # Normalize pair-list form data: unambiguous name->value pairs become a
+    # plain dict (what httpx/curl_cffi expect), and repeated names — a
+    # multiple select submits one pair per selected option — ride as a
+    # pre-encoded urlencoded body with the standard form content type,
+    # because a dict cannot carry them and httpx refuses raw iterables as
+    # data (verified: RuntimeError "sync request with an AsyncClient").
+    content: str | None = None
+    if isinstance(data, list):
+        names = [k for k, _ in data]
+        if len(names) == len(set(names)):
+            data = dict(data)
+        else:
+            use_headers["content-type"] = "application/x-www-form-urlencoded"
+            content = urlencode(data)
+            data = None
+
     choice = DEFAULT_IMPERSONATE if impersonate is None else impersonate
     try:
         if choice and _curl_requests is not None and _impersonation_allowed(client):
@@ -555,6 +578,7 @@ async def fetch(
                     max_bytes=max_bytes,
                     impersonate=choice,
                     timeout=timeout,
+                    content=content,
                 )
                 from webresearch.engine.throttles import REGISTRY as _REG
 
@@ -572,6 +596,7 @@ async def fetch(
             files=files,
             headers=use_headers or None,
             max_bytes=max_bytes,
+            content=content,
         )
         from webresearch.engine.throttles import REGISTRY as _REG2
 
@@ -601,6 +626,7 @@ async def fetch(
                 json_body=json_body,
                 headers=use_headers or None,
                 max_bytes=max_bytes,
+                content=content,
             )
         for key, value in plain.cookies.items():
             try:

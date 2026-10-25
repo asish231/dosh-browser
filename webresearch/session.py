@@ -402,39 +402,103 @@ class Session:
         if js_outcome == "prevented":
             return self.page
 
-        payload = {item.name: item.value for item in form.fields}
-        if fields:
-            payload.update(fields)
-        # Hidden fields are reported by name without their value so the model
-        # never sees a session blob it might try to invent or echo. A real
-        # submit still needs them, so pull the live values from the document.
-        if self.html:
-            from webresearch.parse import parse as parse_document
-            from webresearch.forms import hidden_values as read_hidden_values
-            from webresearch.types import FetchResult as _FetchResult
+        # The engine's form.submit() records the LIVE form state in
+        # __WR_FORM_SUBMIT: typed values, toggled checkboxes, selected
+        # options, checked radios, file inputs — everything page JS and the
+        # agent's set_form_fields pass mutated. The old code ignored it and
+        # re-parsed the ORIGINAL html, so any engine-side change was silently
+        # lost on the wire. Use the engine state when present; caller-passed
+        # fields always win. Payload is a pair list so repeated names
+        # (multiple selects) survive to the wire.
+        engine_fs: dict | None = None
+        if js_outcome == "submitted":
+            info = getattr(self, "_last_form_js_info", None) or {}
+            fs = info.get("form_submit")
+            if isinstance(fs, dict) and fs.get("fields"):
+                engine_fs = fs
 
-            live = read_hidden_values(
-                parse_document(
-                    _FetchResult(
-                        url=self.url,
-                        final_url=self.url,
-                        status=current.status,
-                        content_type=current.content_type,
-                        kind=current.kind,
-                        body=self.html,
-                    )
-                ),
-                n,
-            )
-            for key, value in live.items():
-                payload.setdefault(key, value)
-        payload = {k: v for k, v in payload.items() if k}
-        if form.method == "GET":
-            parsed = urlparse(form.action)
-            url = urlunparse(parsed._replace(query=urlencode(payload)))
+        upload_files = None
+        if engine_fs is not None:
+            method = str(engine_fs.get("method") or form.method or "POST").upper()
+            action = urljoin(self.url, str(engine_fs.get("action") or form.action or ""))
+            # Engine multi-select values arrive as arrays (a JS object cannot
+            # repeat keys); expand them back into one pair per value.
+            pairs: list[tuple[str, str]] = []
+            for k, v in (engine_fs.get("fields") or {}).items():
+                if not k:
+                    continue
+                if isinstance(v, list):
+                    pairs.extend((str(k), str(item)) for item in v)
+                else:
+                    pairs.append((str(k), str(v)))
+            if fields:
+                override = set(fields)
+                pairs = [(k, v) for k, v in pairs if k not in override]
+                pairs.extend((str(k), str(v)) for k, v in fields.items() if k)
+            files_map = engine_fs.get("files") or {}
+            if files_map:
+                upload_files = []
+                for f_name, f_list in files_map.items():
+                    for f_item in f_list:
+                        b64_c = f_item.get("contentB64") or f_item.get("content_b64")
+                        if b64_c:
+                            # Binary files round-trip as base64; decode to the
+                            # exact original bytes for the multipart POST.
+                            raw_bytes = base64.b64decode(b64_c)
+                        else:
+                            raw_c = f_item.get("content", "")
+                            raw_bytes = raw_c.encode("utf-8") if isinstance(raw_c, str) else bytes(raw_c)
+                        upload_files.append(
+                            (
+                                f_name,
+                                (
+                                    f_item.get("name", "file"),
+                                    raw_bytes,
+                                    f_item.get("type", "application/octet-stream"),
+                                ),
+                            )
+                        )
+        else:
+            method = form.method
+            action = form.action
+            pairs = [(item.name, item.value) for item in form.fields if item.name]
+            if fields:
+                override = set(fields)
+                pairs = [(k, v) for k, v in pairs if k not in override]
+                pairs.extend((str(k), str(v)) for k, v in fields.items() if k)
+            # Hidden fields are reported by name without their value so the
+            # model never sees a session blob it might try to invent or echo.
+            # A real submit still needs them, so pull the live values from the
+            # document.
+            if self.html:
+                from webresearch.parse import parse as parse_document
+                from webresearch.forms import hidden_values as read_hidden_values
+                from webresearch.types import FetchResult as _FetchResult
+
+                live = read_hidden_values(
+                    parse_document(
+                        _FetchResult(
+                            url=self.url,
+                            final_url=self.url,
+                            status=current.status,
+                            content_type=current.content_type,
+                            kind=current.kind,
+                            body=self.html,
+                        )
+                    ),
+                    n,
+                )
+                present = {k for k, _ in pairs}
+                for key, value in live.items():
+                    if key and key not in present:
+                        pairs.append((key, value))
+
+        if method == "GET":
+            parsed = urlparse(action)
+            url = urlunparse(parsed._replace(query=urlencode(pairs)))
             result = await fetch(url, client=self.client)
         else:
-            result = await fetch(form.action, client=self.client, method="POST", data=payload)
+            result = await fetch(action, client=self.client, method="POST", data=pairs, files=upload_files)
         html = result.body
         js_info: dict | None = None
         js_ran = False
@@ -500,6 +564,9 @@ class Session:
             self.html, self.url, self.client, force=True, actions=actions, ctx=self.current_tab.ctx
         )
         self.current_tab.ctx = js_info.get("ctx") or self.current_tab.ctx
+        # submit() reads the engine's live form state (fields/files the page
+        # JS actually collected) from this snapshot.
+        self._last_form_js_info = js_info
         outcome = str(js_info.get("submit_outcome") or "submitted")
         if js_info.get("navigated"):
             nav_url = urljoin(self.url, js_info["navigated"])
