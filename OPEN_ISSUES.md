@@ -6,11 +6,11 @@
 > round 1; they confirmed the core fixes but found real defects the author's
 > own tests didn't encode — several introduced by the fixes themselves. The
 > confirmed high-impact findings were then fixed and re-verified (20 new
-> regressions in tests/test_reaudit_fixes.py). Round 3 (2026-10-27):
-> action-surface visibility truth — JS style writes now reach the cascade,
-> `[hidden]` and closed-`<details>` are honored, engine arbitrates every
-> control (12 regressions in tests/test_visibility_truth.py; suite at 455
-> passed). Commits: 6a6c493..d928e7d + the round-3 commit.
+> regressions in tests/test_reaudit_fixes.py). Round 3 (2026-10-27/28):
+> action-surface visibility truth, the frame reply lane + URL-form
+> targetOrigin, and the option-element API (36 regressions across
+> tests/test_visibility_truth.py, test_frame_reply.py, test_option_api.py;
+> suite at 471 passed). Commits: 6a6c493..0a342a3 + the round-3 commits.
 >
 > Rule from AGENTS.md still applies: a capability gap is a bug report against
 > `minidom.js`, never a reason to reach for a browser binary.
@@ -339,15 +339,20 @@ engine-heavy passes (suite 254s -> ~263-275s).
 
 ## Known remaining (honest, post round 2)
 
-- **P0-area spec edges (verified, unfixed)**: engine lane does not disable
-  fieldset-disabled descendants for page-JS flows (act() catches them via
-  the surface; wire excludes them since round 2 — the engine click/type
-  lanes still act on them); `option.text`/`option.label` undefined;
-  `<option value="">Text</option>` reports value "Text" (spec: "");
-  multiple-select with no selection reports first option's value (spec: "");
-  out-of-range selectedIndex reverts to first option (spec: deselect);
-  parse-time radio exclusivity not applied (two `checked` attrs in one group
-  both read checked — wire is safe by collection order).
+- **P0-area spec edges**: **option API FIXED in round 3** — `option.text`/
+  `.label`/`.index` exist per spec (label attribute wins, index is the
+  position in the select's list); `<option value="">` reports `""` (the old
+  `attr || text` path treated the empty attribute as absent); the option
+  value setter writes the text when no value attribute exists; multiple
+  selects have no implicit first-option selection (value ""/selectedIndex
+  -1 with nothing chosen, first selected wins otherwise); out-of-range
+  selectedIndex deselects per spec (was: snap back to the first option).
+  10 regressions in tests/test_option_api.py. Still open in this area:
+  the engine lane does not disable fieldset-disabled descendants for
+  page-JS flows (act() catches them via the surface; wire excludes them
+  since round 2 — the engine click/type lanes still act on them);
+  parse-time radio exclusivity not applied (two `checked` attrs in one
+  group both read checked — wire is safe by collection order).
 - **URL serializer/parsing edges**: `%20` instead of `+` for spaces in the
   application/x-www-form-urlencoded serializer; href getter drops
   username/password and non-special schemes (mailto:); default port kept
