@@ -6,8 +6,11 @@
 > round 1; they confirmed the core fixes but found real defects the author's
 > own tests didn't encode — several introduced by the fixes themselves. The
 > confirmed high-impact findings were then fixed and re-verified (20 new
-> regressions in tests/test_reaudit_fixes.py; suite at 443 passed). Commits:
-> 6a6c493..1b191f1 (round 1) + the round-2 fix commit.
+> regressions in tests/test_reaudit_fixes.py). Round 3 (2026-10-27):
+> action-surface visibility truth — JS style writes now reach the cascade,
+> `[hidden]` and closed-`<details>` are honored, engine arbitrates every
+> control (12 regressions in tests/test_visibility_truth.py; suite at 455
+> passed). Commits: 6a6c493..d928e7d + the round-3 commit.
 >
 > Rule from AGENTS.md still applies: a capability gap is a bug report against
 > `minidom.js`, never a reason to reach for a browser binary.
@@ -289,6 +292,51 @@ defects below were confirmed live, fixed, and re-verified:
   evidence model is shared and the remaining known disagreement class is
   listed below.
 
+## Round 3 — action-surface visibility truth (fixed)
+
+The conversion protocol's core promise — never report a control as actionable
+when it is not — was broken in BOTH directions, verified live before fixing:
+
+1. **JS style-property writes never reached the cascade** (false negatives):
+   `el.style.display = 'block'` (the React/jQuery reveal pattern) updated
+   only the style object, never the style ATTRIBUTE that `__computedStyle`,
+   the serializer, and the surface parser all read — JS-revealed controls
+   stayed invisible to checkVisibility and the action surface. Fixed: the
+   style object is a Proxy whose set/delete traps sync every write back to
+   the attribute (through setAttribute, so MutationObserver records fire),
+   `style.x = ''` removes the declaration (un-hide), `setAttribute('style')`
+   re-parses into the object (guarded against loops), a replacing attribute
+   drops prior declarations, and unset properties read as `""` (spec).
+2. **`[hidden]` attribute ignored** (false positives): UA rule
+   `[hidden] { display: none }` added to `__computedStyle` (author CSS that
+   sets display explicitly still wins, matching cascade order — and the
+   cascade's selector matcher `__matchesSel` now supports attribute
+   selectors so `#x[hidden] { display: block }` overrides can apply);
+   ancestor `[hidden]` hides subtrees via the existing checkVisibility walk;
+   the no-engine fallback walks ancestors too.
+3. **Collapsed `<details>` content treated as visible** (false positives):
+   UA rule — a closed `<details>` hides everything except its summary (and
+   the summary's own contents); opening it (JS or a click) reveals the
+   content to checkVisibility and the surface.
+4. **Engine arbitration for every control**: `action_surface()` previously
+   dropped inline-flagged controls without consulting the cascade, so an
+   author-override (`#x[hidden] { display: block }`) could never surface.
+   The engine now arbitrates ALL controls when a ctx exists; the inline flag
+   is the fallback only.
+5. **Honest disclosure for scriptless pages**: without an engine ctx the
+   fallback filters inline/[hidden]/details/ancestor hiding, and if a
+   `<style>` block exists the coverage line says stylesheet-hidden controls
+   could not be verified (never silently claims a clean list).
+
+Verified live: JS-revealed button surfaces (attr `display: block`,
+checkVisibility true, listed actionable); [hidden] and closed-details
+controls filtered with honest counts; author CSS overrides [hidden];
+`<details>` opening live-surfaces its content; style writes produce
+MutationObserver records. 12 hermetic regressions in
+tests/test_visibility_truth.py; full suite 455 passed; tab_surf_check ALL
+CHECKS PASSED. Known cost: the per-element style Proxy adds ~5-8% to
+engine-heavy passes (suite 254s -> ~263-275s).
+
 ## Known remaining (honest, post round 2)
 
 - **P0-area spec edges (verified, unfixed)**: engine lane does not disable
@@ -329,11 +377,7 @@ defects below were confirmed live, fixed, and re-verified:
   register scriptURL not resolved absolute; checkVisibility always consults
   visibility (spec: only with checkVisibilityCSS:true); popover missing
   InvalidStateError/NotSupportedError cases and auto-close-of-others.
-- **Hidden controls**: `[hidden]` attribute and collapsed `<details>` content
-  not consulted; `el.style.display='block'` property writes do not sync the
-  style attribute the cascade reads (JS-revealed controls stay filtered);
-  scriptless pages (no ctx) get inline-hidden filtering only — the surface
-  does not disclose that stylesheet-hidden controls may be listed.
+- **Hidden controls**: **FIXED in round 3** (see below).
 - **Frames**: `e.source.postMessage` replies (target 'reply') are excluded by
   the session's child-msg filter — the standard cross-frame reply form
   never reaches the parent; URL-form targetOrigin

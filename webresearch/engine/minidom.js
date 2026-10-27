@@ -470,11 +470,44 @@
 
   function CSSStyleDeclaration(el) {
     this._el = el;
+    /* Re-parse guard: when the host (re)builds this object from the style
+       attribute, property writes must not sync back (infinite loop). */
+    this.__parsing = false;
   }
+  function __camelToKebab(s) {
+    return String(s).replace(/[A-Z]/g, function (c) { return "-" + c.toLowerCase(); });
+  }
+  CSSStyleDeclaration.prototype.__syncAttr = function () {
+    if (this.__parsing) return;
+    var out = [];
+    var seen = {};
+    for (var k in this) {
+      if (!Object.prototype.hasOwnProperty.call(this, k)) continue;
+      if (k === "_el" || k === "__parsing") continue;
+      var v = this[k];
+      if (v == null || v === "") continue;
+      /* setProperty stores both camelCase and kebab-case forms of the same
+         property; serialize each property once under its canonical name. */
+      var canonical = String(k).replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
+      if (seen[canonical]) continue;
+      seen[canonical] = true;
+      out.push(__camelToKebab(canonical) + ": " + v);
+    }
+    var s = out.join("; ");
+    /* Through setAttribute (not a raw attribute write): mutation records
+       fire for style changes like a real browser, and the object/attribute
+       pair stays mirrored (the re-parse inside setAttribute is guarded). */
+    if (s) {
+      this._el.setAttribute("style", s);
+    } else {
+      this._el.removeAttribute("style");
+    }
+  };
   CSSStyleDeclaration.prototype.setProperty = function (prop, val, priority) {
     var camel = String(prop).replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
     this[camel] = String(val);
     this[prop] = String(val);
+    this.__syncAttr();
   };
   CSSStyleDeclaration.prototype.getPropertyValue = function (prop) {
     var camel = String(prop).replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
@@ -485,21 +518,72 @@
     var old = this.getPropertyValue(prop);
     delete this[camel];
     delete this[prop];
+    this.__syncAttr();
     return old;
+  };
+  /* The live style object: every property write/delete syncs back to the
+     style ATTRIBUTE, because that is what the cascade (__computedStyle), the
+     serializer, and the action-surface parser all read. Page JS reveals and
+     hides controls through el.style.display = '...' (React/jQuery pattern);
+     before this sync, the cascade never saw those writes and JS-revealed
+     controls stayed invisible to checkVisibility and the action surface —
+     while the serialized HTML kept claiming they were hidden. */
+  var __styleProxyHandler = {
+    set: function (target, prop, value) {
+      if (prop === "_el" || prop === "__parsing") { target[prop] = value; return true; }
+      if (value == null || value === "") {
+        /* Real browsers: assigning '' removes the declaration (un-hides). */
+        var camel = String(prop).replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
+        delete target[camel];
+        delete target[prop];
+      } else {
+        target[prop] = String(value);
+      }
+      target.__syncAttr();
+      return true;
+    },
+    deleteProperty: function (target, prop) {
+      delete target[prop];
+      target.__syncAttr();
+      return true;
+    },
+    get: function (target, prop) {
+      /* Spec: unset CSS properties read as "" (not undefined); prototype
+         methods (setProperty & co.) still resolve through the chain. */
+      var v = target[prop];
+      if (typeof v !== "undefined") return v;
+      if (typeof prop === "string") return "";
+      return v;
+    }
+  };
+  CSSStyleDeclaration.prototype.__parseFromAttr = function (styleStr) {
+    this.__parsing = true;
+    try {
+      /* A new style attribute REPLACES every prior declaration (spec:
+         setAttribute('style','color:red') drops display:none). */
+      for (var k in this) {
+        if (!Object.prototype.hasOwnProperty.call(this, k)) continue;
+        if (k === "_el" || k === "__parsing") continue;
+        delete this[k];
+      }
+      var parts = String(styleStr || "").split(";");
+      for (var i = 0; i < parts.length; i++) {
+        var p = parts[i].trim();
+        if (!p) continue;
+        var col = p.indexOf(":");
+        if (col > 0) this.setProperty(p.slice(0, col).trim(), p.slice(col + 1).trim());
+      }
+    } finally {
+      this.__parsing = false;
+    }
   };
   global.CSSStyleDeclaration = CSSStyleDeclaration;
 
   function Element(tag, attrs, kids) {
     Node.call(this, 1, tag, attrs || {}, kids || []);
-    this.style = new CSSStyleDeclaration(this);
+    this.style = new Proxy(new CSSStyleDeclaration(this), __styleProxyHandler);
     if (this.attributes.style) {
-      var sParts = String(this.attributes.style).split(";");
-      for (var sIdx = 0; sIdx < sParts.length; sIdx++) {
-        var sP = sParts[sIdx].trim();
-        if (!sP) continue;
-        var sCol = sP.indexOf(":");
-        if (sCol > 0) this.style.setProperty(sP.slice(0, sCol).trim(), sP.slice(sCol + 1).trim());
-      }
+      this.style.__parseFromAttr(this.attributes.style);
     }
     this.dataset = {};
     if (this.nodeName === "canvas") _attachCanvas(this);
@@ -526,6 +610,13 @@
     /* id/className expose attributes directly via prototype accessors below;
        syncing here would recurse (setter -> setAttribute -> setter). */
     queueMutation("attributes", this, { attributeName: n, oldValue: oldVal });
+    /* Style attribute writes re-parse into the live style object (spec), like
+       real browsers: setAttribute('style', ...) and el.style.x = ... are two
+       views of one state. The parse is guarded (__parsing) so the object's
+       own writes cannot loop back through here. */
+    if (n === "style" && this.style && typeof this.style.__parseFromAttr === "function") {
+      this.style.__parseFromAttr(v);
+    }
     if (typeof this.attributeChangedCallback === "function") {
       var obs = (this.constructor && this.constructor.observedAttributes) || this.observedAttributes;
       if (Array.isArray(obs) && obs.indexOf(n) >= 0) {
@@ -535,6 +626,9 @@
   };
   Element.prototype.removeAttribute = function (n) {
     delete this.attributes[n];
+    if (n === "style" && this.style && typeof this.style.__parseFromAttr === "function") {
+      this.style.__parseFromAttr("");
+    }
     queueMutation("attributes", this, { attributeName: n });
   };
   Element.prototype.hasAttribute = function (n) { return Object.prototype.hasOwnProperty.call(this.attributes, n); };
@@ -1505,7 +1599,12 @@
     sel = sel.trim().toLowerCase();
     if (!sel || sel === "*") return true;
     var tag = null, id = null, cls = null;
-    var m = sel.match(/^([a-z][a-z0-9]*)?(#[a-z0-9\-_]+)?((?:\.[a-z0-9\-_]+)*)$/);
+    /* Attribute selectors ([hidden], [type=checkbox]) participate in the
+       cascade: author rules like `#keep[hidden] { display: block }` must be
+       able to override the UA [hidden] rule. The old regex rejected any
+       selector with a [...] group, so such rules never applied and the UA
+       rule always won. */
+    var m = sel.match(/^([a-z][a-z0-9]*)?(#[a-z0-9\-_]+)?((?:\.[a-z0-9\-_]+)*)(\[([a-z\-_]+)(?:=["']?([^"'\]]*)["']?)?\])?$/);
     if (!m) return false;
     tag = m[1] || null; id = m[2] ? m[2].slice(1) : null;
     var classes = m[3] ? m[3].split(".").filter(Boolean) : [];
@@ -1514,6 +1613,13 @@
     var have = (" " + (el.className || "") + " ").toLowerCase();
     for (var i = 0; i < classes.length; i++) {
       if (have.indexOf(" " + classes[i] + " ") < 0) return false;
+    }
+    if (m[5]) {
+      if (typeof el.hasAttribute !== "function" || !el.hasAttribute(m[5])) return false;
+      if (m[6] != null) {
+        var attrVal = String(el.getAttribute(m[5]) || "").toLowerCase();
+        if (attrVal !== m[6].toLowerCase()) return false;
+      }
     }
     return true;
   }
@@ -1576,6 +1682,32 @@
       if (fs != null && fs > 0) fontSize = fs;
     }
     var disp = (st.display || "").toLowerCase();
+    if (!disp) {
+      /* UA rules (HTML spec rendering): [hidden] { display: none }, and a
+         closed <details> hides everything except its summary. Author CSS
+         that sets display explicitly wins over these UA rules — matching
+         real cascade order (UA < author). Previously neither was consulted,
+         so [hidden] controls and collapsed-details content were reported
+         visible to checkVisibility and the action surface. */
+      if (el.hasAttribute && el.hasAttribute("hidden")) {
+        disp = "none";
+      } else {
+        var dn = el;
+        while (dn) {
+          if (dn.nodeName === "details" && !(dn.hasAttribute && dn.hasAttribute("open"))) {
+            var up = el;
+            var viaSummary = false;
+            while (up && up !== dn) {
+              if (up.nodeName === "summary") { viaSummary = true; break; }
+              up = up.parentNode;
+            }
+            if (dn !== el && !viaSummary) disp = "none";
+            break;
+          }
+          dn = dn.parentNode;
+        }
+      }
+    }
     if (!disp) disp = (__BLOCK_TAGS[el.nodeName] ? "block" : "inline");
     var pos = (st.position || "").toLowerCase();
     var flexDir = (st.flexDirection || "row").toLowerCase();
