@@ -1366,8 +1366,20 @@
         var idx = __selectAttrIndex(this);
         var picked = null;
         if (idx >= 0) picked = opts[idx];
-        else if (!this.__selectDeselected && opts.length) picked = opts[0];
+        /* Spec: the implicit first-option selection applies only to
+           single selects — a multiple select with no option chosen has
+           value "". */
+        else if (!__selectIsMultiple(this) && !this.__selectDeselected && opts.length) picked = opts[0];
         return picked ? __optionValue(picked) : "";
+      }
+      if (this.nodeName === "option") {
+        /* Spec: option.value is the value attribute if present — even when
+           it is the empty string — else the text content. The generic
+           `attr || text` path treated value="" as absent and reported the
+           text instead. */
+        var ov = this.attributes.value;
+        if (ov !== undefined && ov !== null) return String(ov);
+        return String(this.textContent == null ? "" : this.textContent);
       }
       return this.attributes.value || this.textContent || "";
     },
@@ -1384,6 +1396,17 @@
         __selectSetChoice(this, match);
         return;
       }
+      if (this.nodeName === "option") {
+        var hasVal = this.attributes.value !== undefined && this.attributes.value !== null;
+        if (hasVal) {
+          this.attributes.value = String(v);
+          queueMutation("attributes", this, { attributeName: "value" });
+          return;
+        }
+        /* No value attribute: writing .value targets the text per spec. */
+        this.textContent = String(v == null ? "" : v);
+        return;
+      }
       this.attributes.value = String(v);
       queueMutation("attributes", this, { attributeName: "value" });
     }
@@ -1395,12 +1418,18 @@
       var idx = __selectAttrIndex(this);
       if (idx >= 0) return idx;
       if (this.__selectDeselected) return -1;
+      /* Spec: a multiple select has no implicit first-option selection. */
+      if (__selectIsMultiple(this)) return -1;
       return opts.length ? 0 : -1;
     },
     set: function (i) {
       if (this.nodeName !== "select") return;
       var n = Math.floor(Number(i));
-      if (isNaN(n) || n < 0) {
+      var count = __selectOptionEls(this).length;
+      /* Spec: setting selectedIndex out of range deselects everything
+       (Chrome: 99 on a 2-option select -> selectedIndex -1, value ""). The
+       old code snapped back to the first option instead. */
+      if (isNaN(n) || n < 0 || n >= count) {
         this.__selectDeselected = true;
         __selectSetChoice(this, -1);
         return;
@@ -1455,8 +1484,10 @@
       if (sel) {
         if (this.getAttribute("selected") != null) return true;
         /* Implicit first-option selection only applies when NO option is
-           explicitly chosen (HTML spec); a chosen sibling wins. */
+           explicitly chosen (HTML spec) and the select is not multiple;
+           a chosen sibling wins. */
         if (__selectAttrIndex(sel) >= 0) return false;
+        if (__selectIsMultiple(sel)) return false;
         var opts = __selectOptionEls(sel);
         if (!sel.__selectDeselected && opts.length && opts[0] === this) return true;
         return false;
@@ -1479,6 +1510,53 @@
         this.removeAttribute("selected");
         if (sel) sel.__selectDeselected = true;
       }
+    },
+    configurable: true
+  });
+  /* ---- HTMLOptionElement API ----
+     Real form-driving JS reads option.text/.label/.index constantly (populating
+     selects, finding a choice by label); all three were undefined. Per spec:
+     text is the option's text content; label is the label attribute or the
+     text; index is the option's position in its select's options list. */
+  Object.defineProperty(Element.prototype, "text", {
+    get: function () {
+      if (this.nodeName !== "option") return undefined;
+      var out = "";
+      (this.childNodes || []).forEach(function (c) {
+        if (c.nodeType === 3) out += String(c.data != null ? c.data : (c.textContent || ""));
+      });
+      return out;
+    },
+    set: function (v) {
+      if (this.nodeName !== "option") return;
+      this.textContent = String(v == null ? "" : v);
+    },
+    configurable: true
+  });
+  Object.defineProperty(Element.prototype, "label", {
+    get: function () {
+      if (this.nodeName !== "option") return undefined;
+      var lab = this.getAttribute("label");
+      if (lab != null) return String(lab);
+      /* No label attribute: the label is the option's text, trimmed. */
+      return String(this.text || "").replace(/^\s+|\s+$/g, "");
+    },
+    set: function (v) {
+      if (this.nodeName !== "option") return;
+      this.setAttribute("label", String(v == null ? "" : v));
+    },
+    configurable: true
+  });
+  Object.defineProperty(Element.prototype, "index", {
+    get: function () {
+      if (this.nodeName !== "option") return undefined;
+      var sel = __selectOf(this);
+      if (!sel) return 0;
+      var opts = __selectOptionEls(sel);
+      for (var i = 0; i < opts.length; i++) {
+        if (opts[i] === this) return i;
+      }
+      return 0;
     },
     configurable: true
   });
