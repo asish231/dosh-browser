@@ -118,7 +118,7 @@ Be honest about these rather than working around them silently.
 
 | Area | State |
 | --- | --- |
-| Layout / geometry | Real block-flow engine in minidom.js: CSS cascade (tag<class<id<inline), vertical stacking with margin collapsing, text wrap by monospace advance, CSS-spec 300x150 replaced defaults. Disclosed approximations: no floats/position/flex/grid, px/%/em only, single font metric. Reported via `document.__layoutInfo`. |
+| Layout / geometry | Real block-flow engine in minidom.js: CSS cascade (tag<class<id<inline), vertical stacking with additive margins, flex (row/column + gap), grid (repeat(N) columns, wrap), position absolute/fixed/relative, text wrap by a proportional per-character advance table, CSS-spec 300x150 replaced defaults; units px/%/em/rem/pt. Disclosed approximations: no floats, no sticky, no flex-wrap/justify/align distribution, no bidi/shaping. Reported via `document.__layoutInfo`. |
 | File upload | Native end to end: `browser_upload`/`browser_act(files=)` sets `el.files` and fires trusted input/change; multipart submits carry the exact bytes. Binary/video/any files travel as base64 (`content_b64`) so payloads are byte-exact; payload cap ~12 MB raw. |
 | Dialogs (alert/confirm/prompt) | Recorded per script pass, reported in the view and via `browser_respond_dialog`. QuickJS is synchronous, so a dialog cannot block: an agent stages an answer, then re-runs the triggering action. Unanswered dialogs honestly report `answered: default`. |
 | Named keys | `browser_press_key` (enter/tab/escape/backspace/delete/space/arrows/home/end/pageup/pagedown) with real key/code/keyCode. Enter performs implicit form submission, Tab moves focus, arrows change selects, Backspace deletes. |

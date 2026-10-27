@@ -1334,13 +1334,16 @@
   /* Genuine block-flow layout engine (approximate, disclosed).
    * Computes real boxes from the live DOM + parsed CSS: <style> rules and
    * inline styles cascade (tag < class < id < inline), block boxes stack
-   * vertically with margin collapsing, inline text wraps by measured advance.
-   * Text uses a monospace advance metric (0.6em/char) since no font engine
-   * ships here; replaced elements default to the CSS-spec 300x150 box unless
-   * sized. Viewport width comes from window.innerWidth. This is a simplified
-   * but real engine: every number derives from markup + styles, never hashed.
-   * Known simplifications: no floats/positioning/flex/grid, px + % + em only,
-   * single font metric, no bidi/shaping. Reported via __layoutInfo. */
+   * vertically with margins stacking additively, inline text wraps by
+   * measured advance. Text uses a proportional per-character advance table
+   * (system sans-serif ratios — see __CHAR_ADVANCES); replaced elements
+   * default to the CSS-spec 300x150 box unless sized. Viewport width comes
+   * from window.innerWidth. This is a simplified but real engine: every
+   * number derives from markup + styles, never hashed. Implemented: flex
+   * (row/column + gap), grid (repeat(N) columns, wrap), position
+   * absolute/fixed/relative; units px, %, em, rem, pt.
+   * Known simplifications: no floats, no sticky, no flex-wrap or
+   * justify/align distribution, no bidi/shaping. Reported via __layoutInfo. */
   var __BLOCK_TAGS = { address:1, article:1, aside:1, blockquote:1, body:1, br:0, canvas:0, dd:1, div:1, dl:1, dt:1, fieldset:1, figcaption:1, figure:1, footer:1, form:1, h1:1, h2:1, h3:1, h4:1, h5:1, h6:1, header:1, hgroup:1, hr:1, html:1, iframe:0, img:0, input:0, legend:1, li:1, main:1, nav:1, noscript:1, ol:1, option:0, output:0, p:1, pre:1, section:1, select:0, table:1, tbody:1, td:1, textarea:0, tfoot:1, th:1, thead:1, tr:1, ul:1, video:0, button:0 };
   var __REPLACED_TAGS = { img:1, iframe:1, canvas:1, video:1, input:1, select:1, textarea:1, button:1, object:1, embed:1 };
   function __parsePx(v, base, fontSize) {
@@ -1859,7 +1862,7 @@
       doc.__scrollExtent = { width: __maxR, height: __maxB };
     } catch (e) {}
     try {
-      doc.__layoutInfo = { engine: "block-flow+flex+grid+positioned", viewportWidth: vw, boxes: layout.boxes, textMetric: "monospace-advance-0.6em", replacedDefaults: "css-300x150" };
+      doc.__layoutInfo = { engine: "block-flow+flex+grid+positioned", viewportWidth: vw, boxes: layout.boxes, textMetric: "proportional-advance-table", replacedDefaults: "css-300x150" };
     } catch (e) {}
     /* A fresh layout pass can move IntersectionObserver targets in or out of
        the viewport (lazy feeds append content; the sentinel crosses the fold).
@@ -4758,6 +4761,23 @@
     if (opts.signal && opts.signal.aborted) {
       return Promise.reject(opts.signal.reason || new Error("This operation was aborted"));
     }
+    var urlStr = String(url);
+    if (urlStr.indexOf("blob:") === 0) {
+      /* blob: URLs resolve from the in-process object-URL registry. They
+         must never leak to the network lane as malformed requests (the old
+         path fetched '/webresearch-1' off the page's origin). */
+      var blobObj = __objectURLs[urlStr];
+      if (blobObj && blobObj._content != null) {
+        var blobHeaders = new Headers();
+        if (blobObj.type) blobHeaders.set("content-type", blobObj.type);
+        return Promise.resolve(new Response(blobObj._content, {
+          status: 200,
+          url: urlStr,
+          headers: blobHeaders
+        }));
+      }
+      return Promise.reject(new TypeError("Failed to fetch: unknown blob URL '" + urlStr + "'"));
+    }
     var method = String(opts.method || "GET");
     var body = "";
     var bodyB64 = "";
@@ -5025,6 +5045,28 @@
   };
   XMLHttpRequest.prototype.send = function (body) {
     try {
+      /* blob: URLs resolve locally; they must never reach the network lane. */
+      if (String(this._url || "").indexOf("blob:") === 0) {
+        var blobObjX = __objectURLs[String(this._url)];
+        if (!blobObjX || blobObjX._content == null) {
+          this.status = 0;
+          this.readyState = 4;
+          if (typeof this.onerror === "function") this.onerror(new Error("unknown blob URL"));
+          this._emit("error");
+          return;
+        }
+        this.status = 200;
+        this.responseURL = String(this._url);
+        this.responseText = blobObjX._content;
+        this.response = this.responseType === "json"
+          ? JSON.parse(this.responseText || "null")
+          : this.responseText;
+        this.readyState = 4;
+        if (typeof this.onreadystatechange === "function") this.onreadystatechange();
+        if (typeof this.onload === "function") this.onload();
+        this._emit("load");
+        return;
+      }
       var reqBody = "";
       var reqBodyB64 = "";
       if (body && (body instanceof global.FormData || body._data)) {
