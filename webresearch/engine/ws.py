@@ -3,7 +3,11 @@
 No third-party websocket library. The handshake, frame masking, and
 fragmentation rules are implemented directly from RFC 6455 so page scripts get
 a real socket, not a stub. Text frames are delivered to the JS context; binary
-frames are counted and skipped (disclosed gap, not silently mangled).
+frames are counted and skipped (disclosed gap, not silently mangled) —
+including every continuation frame of a fragmented binary message, which used
+to leak into the text inbox as mojibake. Outgoing binary sends travel as real
+opcode-2 frames, and the client answers server pings and sends its own
+keepalive pings on idle connections.
 
 Connections live in a module-level registry because a QuickJS context is
 reused across action passes and a page's socket should stay open across them.
@@ -20,6 +24,7 @@ import os
 import socket
 import ssl
 import struct
+import time
 from urllib.parse import unquote, urlsplit
 
 _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -27,6 +32,7 @@ _CONNECT_TIMEOUT = 6.0
 _IO_TIMEOUT = 4.0
 _MAX_HANDSHAKE_BYTES = 16 * 1024
 _MAX_FRAME_BYTES = 16 * 1024 * 1024
+_PING_INTERVAL = 25.0
 
 _IDS = itertools.count(1)
 
@@ -45,6 +51,7 @@ class _Conn:
         self.binary_skipped = 0
         self.frag_buffer = b""
         self.frag_opcode = 0
+        self.last_ping = time.time()
 
 
 _REGISTRY: dict[int, _Conn] = {}
@@ -159,6 +166,23 @@ def send(conn_id: int, data: str) -> int:
         return 0
 
 
+def send_binary(conn_id: int, data_b64: str) -> int:
+    """Send an opcode-2 binary frame. The JS side hands us base64 so the
+    payload is byte-exact (text frames are the only thing String() can carry)."""
+    conn = _REGISTRY.get(int(conn_id))
+    if conn is None or conn.closed:
+        return 0
+    try:
+        payload = base64.b64decode(str(data_b64 or ""))
+    except Exception:
+        return 0
+    try:
+        _send_frame(conn, 0x2, payload)
+        return 1
+    except Exception:
+        return 0
+
+
 def close(conn_id: int, code: int = 1000) -> int:
     conn = _REGISTRY.pop(int(conn_id), None)
     if conn is None:
@@ -236,6 +260,24 @@ def _parse_frames(conn: _Conn) -> None:
             continue
         if opcode == 0x2:  # binary: counted, not delivered (disclosed gap)
             conn.binary_skipped += 1
+            # A fragmented binary message's continuation frames belong to the
+            # binary lane: track the state so opcode-0 frames that follow are
+            # skipped too instead of being decoded as UTF-8 text into the
+            # inbox (the old leak delivered mojibake as a chat message).
+            if not fin:
+                conn.frag_opcode = 0x2
+                conn.frag_buffer = b""
+            else:
+                conn.frag_opcode = 0
+                conn.frag_buffer = b""
+            continue
+        if opcode == 0x0 and conn.frag_opcode == 0x2:
+            # Continuation of a skipped binary message: skip, count, and stay
+            # in binary-fragment state until FIN.
+            conn.binary_skipped += 1
+            if fin:
+                conn.frag_opcode = 0
+                conn.frag_buffer = b""
             continue
         if opcode in (0x1, 0x0):  # text / continuation
             if opcode == 0x1:
@@ -253,8 +295,16 @@ def poll_all() -> str:
     """Drain every open socket. Returns {messages:[{id,data}], closed:[{id,code,reason}]}."""
     messages: list[dict] = []
     closed: list[dict] = []
+    now = time.time()
     for conn in list(_REGISTRY.values()):
         try:
+            # Client-initiated ping keepalive: real browsers ping idle
+            # connections so proxies keep them open; we do the same on a
+            # fixed interval. Server pongs are consumed silently above.
+            if conn.sock is not None and (now - conn.last_ping) > _PING_INTERVAL:
+                with contextlib.suppress(Exception):
+                    _send_frame(conn, 0x9, b"keepalive")
+                conn.last_ping = now
             if conn.sock is not None:
                 conn.sock.setblocking(False)
                 while True:

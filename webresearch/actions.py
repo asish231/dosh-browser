@@ -112,6 +112,10 @@ class Action:
     tag: str = ""
     checked: bool | None = None
     disabled: bool = False
+    # Inline style hides the control (display:none/visibility:hidden on the
+    # element itself). Stylesheet-hidden controls are caught by the engine
+    # cascade at action_surface() time; this flag is the no-engine fallback.
+    hidden: bool = False
     frame: str = ""  # set when the control lives inside an iframe document
     notes: str = ""
 
@@ -131,6 +135,9 @@ class ActionSurface:
     frame_actions: int = 0
     engine_only: int = 0
     dropzones: int = 0
+    # CSS-hidden controls excluded from `actions` (inline style, stylesheet
+    # rule, or hidden ancestor). Reported, never silently dropped.
+    hidden_controls: int = 0
 
     @property
     def complete(self) -> bool:
@@ -138,11 +145,18 @@ class ActionSurface:
 
     def coverage_line(self) -> str:
         if not self.truncated:
-            return f"ACTIONS: {len(self.actions)} of {self.total_found} (complete)"
-        return (
-            f"ACTIONS: {len(self.actions)} of {self.total_found} "
-            f"({self.truncated} hidden by budget; raise limit or filter by kind)"
-        )
+            line = f"ACTIONS: {len(self.actions)} of {self.total_found} (complete)"
+        else:
+            line = (
+                f"ACTIONS: {len(self.actions)} of {self.total_found} "
+                f"({self.truncated} hidden by budget; raise limit or filter by kind)"
+            )
+        if self.hidden_controls:
+            line += (
+                f"; {self.hidden_controls} control(s) hidden by CSS "
+                "(display:none/visibility) and not actionable"
+            )
+        return line
 
     def view(self, *, limit: int = 60) -> str:
         lines = [self.coverage_line()]
@@ -255,6 +269,18 @@ def _role_of(node: Node, kind: str) -> str:
     if typ == "submit":
         return "button"
     return (attrs.get("role") or node.tag or "element").lower()
+
+
+def _inline_hidden(node: Node) -> bool:
+    """The element's own style attribute hides it. This is the no-engine
+    fallback only — stylesheet rules and hidden ancestors need the cascade,
+    which the engine consults in Session.action_surface()."""
+    style = (node.attributes.get("style") or "").replace(" ", "").lower()
+    if "display:none" in style:
+        return True
+    if "visibility:hidden" in style or "visibility:collapse" in style:
+        return True
+    return False
 
 
 def _disabled(node: Node) -> bool:
@@ -549,6 +575,7 @@ def collect(html: str, url: str, *, max_actions: int = 200) -> ActionSurface:
                 tag=tag,
                 checked=_checked(node),
                 disabled=_disabled(node),
+                hidden=_inline_hidden(node),
                 notes=notes,
             )
         )

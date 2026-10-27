@@ -1401,7 +1401,11 @@
       height: null,
       margin: "0",
       padding: "0",
-      fontSize: null
+      fontSize: null,
+      /* visibility participates in the cascade: checkVisibility() must see
+         stylesheet visibility:hidden, which the old template dropped. */
+      visibility: null,
+      opacity: null
     };
     rules.forEach(function (r) {
       r.sel.split(",").forEach(function (s) {
@@ -1445,7 +1449,9 @@
       height: st.height,
       margin: st.margin,
       padding: st.padding,
-      fontSize: fontSize
+      fontSize: fontSize,
+      visibility: st.visibility,
+      opacity: st.opacity
     };
   }
   /* Authentic proportional character advance ratios for standard system sans-serif (Inter / Roboto / Arial) */
@@ -1906,6 +1912,29 @@
       n = n.parentNode;
     }
     return true;
+  };
+  /* Batch visibility check for the action surface: CSS-hidden controls must
+     not appear actionable, and the cascade (stylesheet rules, hidden
+     ancestors) — not just inline styles — decides. Returns one boolean per
+     selector; a selector that does not resolve is reported visible (never
+     drop a control the engine cannot verify). */
+  global.__hiddenCheck = function (selectors) {
+    /* Accepts an array (the session passes a JS literal) or a JSON string. */
+    var sels = selectors;
+    if (typeof sels === "string") {
+      try { sels = JSON.parse(sels); } catch (e) { sels = []; }
+    }
+    if (!sels || !sels.length) return "[]";
+    var out = [];
+    for (var i = 0; i < sels.length; i++) {
+      var hidden = false;
+      try {
+        var el = global.document.querySelector(sels[i]);
+        if (el && typeof el.checkVisibility === "function" && !el.checkVisibility()) hidden = true;
+      } catch (e) { hidden = false; }
+      out.push(hidden);
+    }
+    return JSON.stringify(out);
   };
   /* ---- Fullscreen (documented approximation) ----
      No top-layer or paint: state + events only, which is what page JS
@@ -4857,6 +4886,24 @@
   };
   WebSocket.prototype.send = function (data) {
     if (this.readyState !== 1) throw new Error("InvalidStateError: WebSocket is not open");
+    /* Binary payloads (ArrayBuffer / typed array views) travel as real
+       opcode-2 frames: base64 to the host so the bytes are exact. */
+    var isBinary = false;
+    var bytes = null;
+    try {
+      if (data instanceof ArrayBuffer) { bytes = new Uint8Array(data); isBinary = true; }
+      else if (data && (data.buffer instanceof ArrayBuffer) && typeof data.byteLength === "number") {
+        bytes = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength); isBinary = true;
+      }
+    } catch (e) { isBinary = false; }
+    if (isBinary && bytes) {
+      var bin = "";
+      for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      if (typeof host_ws_send_binary === "function") {
+        host_ws_send_binary(this._id, global.btoa(bin));
+      }
+      return;
+    }
     if (typeof host_ws_send === "function") host_ws_send(this._id, String(data));
   };
   WebSocket.prototype.close = function (code, reason) {

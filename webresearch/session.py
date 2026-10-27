@@ -1352,7 +1352,36 @@ class Session:
     # uses content-addressed refs and discloses its own budget instead.
 
     def action_surface(self, *, max_actions: int = 200) -> ActionSurface:
-        return collect(self.html, self.url, max_actions=max_actions)
+        surface = collect(self.html, self.url, max_actions=max_actions)
+        # CSS-hidden controls are not actionable in a real browser; the
+        # engine's cascade (stylesheet rules, hidden ancestors — not just
+        # the inline styles collect() can see) decides. Hidden controls are
+        # excluded from the list but counted on the surface: never silently
+        # dropped.
+        hidden_inline = [a for a in surface.actions if a.hidden]
+        candidates = [a for a in surface.actions if not a.hidden]
+        engine_hidden = 0
+        ctx = self.current_tab.ctx
+        if ctx is not None and candidates:
+            import json as _json
+
+            try:
+                selectors = [a.selector for a in candidates]
+                raw = ctx.eval(f"__hiddenCheck({_json.dumps(selectors)})")
+                flags = _json.loads(str(raw)) if raw else []
+            except Exception:
+                flags = []
+            if len(flags) == len(candidates):
+                kept: list[Action] = []
+                for action, is_hidden in zip(candidates, flags):
+                    if is_hidden:
+                        engine_hidden += 1
+                    else:
+                        kept.append(action)
+                candidates = kept
+        surface.actions = candidates
+        surface.hidden_controls = len(hidden_inline) + engine_hidden
+        return surface
 
     def actions(self, *, max_actions: int = 200) -> list[Action]:
         """Convenience alias returning the list of Action objects on the current surface."""

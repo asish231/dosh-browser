@@ -264,6 +264,7 @@ async def run_scripts(
 
     ctx.add_callable("host_ws_connect", _ws.connect)
     ctx.add_callable("host_ws_send", _ws.send)
+    ctx.add_callable("host_ws_send_binary", _ws.send_binary)
     ctx.add_callable("host_ws_close", _ws.close)
 
     def record_error(exc: Exception) -> None:
