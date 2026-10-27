@@ -213,6 +213,27 @@ def _pump_jobs(ctx: Context) -> int:
     return done
 
 
+def _sync_resource_entries(ctx: Context, info: dict) -> None:
+    """Push one performance resource-timing entry per subresource this pass
+    actually fetched (scripts, in-page fetch/XHR, SW-served): real URLs and
+    real byte sizes. Timing values stay 0 — no fabricated timing data.
+    Real stats collectors reduce() over getEntriesByType('resource') without
+    an initial value; an always-empty timeline made that reduce undefined."""
+    try:
+        entries = [
+            {
+                "url": r.get("url", ""),
+                "transferSize": int(r.get("bytes") or len(r.get("body") or "")),
+                "initiatorType": r.get("initiatorType") or "fetch",
+            }
+            for r in info.get("resource_requests", [])
+            if r.get("url")
+        ]
+        ctx.eval(f"performance.__setResourceEntries({json.dumps(entries)}); true")
+    except Exception:
+        pass
+
+
 async def run_scripts(
     html: str,
     url: str,
@@ -566,6 +587,7 @@ async def run_scripts(
                     "method": method,
                     "data": data_payload,
                     "body": body[:50000] if body else "",
+                    "bytes": len(body or ""),
                     **({"sw": sw_tag} if sw_tag else {}),
                 }
             )
@@ -698,10 +720,13 @@ async def run_scripts(
             else:
                 classic.append(script)
     
-        def record_error(exc: Exception) -> None:
+        def record_error(exc: Exception, source: str = "") -> None:
             info["errors"] += 1
             if len(info["error_messages"]) < 25:
-                info["error_messages"].append(f"{type(exc).__name__}: {exc}"[:300])
+                msg = f"{type(exc).__name__}: {exc}"[:300]
+                if source:
+                    msg = f"{msg} (in {source[:160]})"
+                info["error_messages"].append(msg)
     
         # Service workers install before any page script runs, so in-page
         # fetch/XHR (host_fetch) passes through their fetch handlers.
@@ -767,6 +792,13 @@ async def run_scripts(
                             info.setdefault("script_mime_errors", []).append({"url": abs_src, "content_type": ctype})
                             continue
                         code = resp.text
+                        # Real subresource record for the performance
+                        # resource-timing entries (and the network log).
+                        info["resource_requests"].append(
+                            {"url": abs_src[:2000], "status": resp.status_code,
+                             "content_type": ctype[:200], "method": "GET",
+                             "body": "", "bytes": len(code), "initiatorType": "script"}
+                        )
                         if not verify_integrity(code, script.get("integrity")):
                             info.setdefault("blocked_sri_failures", 0)
                             info["blocked_sri_failures"] += 1
@@ -802,7 +834,7 @@ async def run_scripts(
                 _pump_jobs(ctx)
                 _drain_injected(ctx)
             except Exception as exc:
-                record_error(exc)
+                record_error(exc, source=src or f"inline script #{ran + 1}")
             finally:
                 try:
                     ctx.eval("if (typeof document !== 'undefined') document.currentScript = null;")
@@ -811,6 +843,9 @@ async def run_scripts(
     
         # ES modules via the registry translator.
         if module_scripts:
+            # Modules' own stats collectors read the resource timeline; give
+            # them the real entries collected so far (classic scripts).
+            _sync_resource_entries(ctx, info)
             from webresearch.engine.modules import resolve_import_map as _resolve_map
 
             try:
@@ -829,6 +864,18 @@ async def run_scripts(
             info["skipped_modules"] = len(graph.missing)
             if graph.blocked:
                 info.setdefault("blocked_corp_coep", []).extend(graph.blocked)
+            # Module fetches are real subresources: record them on the
+            # resource timeline (real URL + byte size) and sync before the
+            # first module executes — module code that reduce()s over
+            # getEntriesByType('resource') needs a non-empty, honest timeline.
+            for _m_item in graph.order:
+                if getattr(_m_item, "url", "") and getattr(_m_item, "code", ""):
+                    info["resource_requests"].append(
+                        {"url": str(_m_item.url)[:2000], "status": 200,
+                         "content_type": "text/javascript", "method": "GET",
+                         "body": "", "bytes": len(_m_item.code), "initiatorType": "script"}
+                    )
+            _sync_resource_entries(ctx, info)
             # Circular imports: registry emulation cannot give live bindings, so a
             # module whose cyclic dependency has not run yet snapshots undefined
             # and throws. Real ESM resolves this with hoisted bindings; the
@@ -870,13 +917,16 @@ async def run_scripts(
                     code = transform_module(item.code, module_id, item.imports)
                     ctx.eval(code)
                 except Exception as exc:
-                    record_error(exc)
+                    record_error(exc, source=f"module {getattr(item, 'src', '') or module_id}")
             if graph.missing and len(info["error_messages"]) < 25:
                 info["error_messages"].append(
                     "unresolved module(s): " + ", ".join(graph.missing[:5])
                 )
     
         try:
+            # Final sync before load events: module fetches and any classic
+            # subresources are all in the resource timeline by now.
+            _sync_resource_entries(ctx, info)
             ctx.eval(
                 "if (typeof document !== 'undefined' && document && document.dispatchEvent) {"
                 "  document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true, cancelable: true }));"
@@ -1067,6 +1117,9 @@ async def run_scripts(
                 )
             _pump_jobs(ctx)
             _drain_injected(ctx)
+        # Action passes fetch subresources too (in-page fetch during click
+        # handlers); keep the resource timeline real before the drains.
+        _sync_resource_entries(ctx, info)
         for _ in range(MAX_TIMER_PASSES):
             try:
                 left = ctx.eval("__drainTimers()")

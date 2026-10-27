@@ -134,6 +134,52 @@
     this.removeChild(old);
     return old;
   };
+  /* ---- ParentNode/ChildNode insertion methods ----
+     Real production scripts call these (example.com's s.js calls
+     document.body.prepend(...); GitHub and most React trees use append).
+     They accept variadic nodes or strings (strings become Text nodes, per
+     spec) and route through insertBefore/appendChild so mutation records,
+     connected/disconnected notification, and injected-script detection all
+     still fire. */
+  function __toInsertable(v) {
+    if (typeof v === "string") return new Text(v);
+    return v;
+  }
+  Node.prototype.append = function () {
+    for (var i = 0; i < arguments.length; i++) {
+      var n = __toInsertable(arguments[i]);
+      if (n) this.appendChild(n);
+    }
+  };
+  Node.prototype.prepend = function () {
+    var ref = this.childNodes.length ? this.childNodes[0] : null;
+    for (var j = arguments.length - 1; j >= 0; j--) {
+      var n2 = __toInsertable(arguments[j]);
+      if (n2) this.insertBefore(n2, ref);
+    }
+  };
+  Node.prototype.before = function () {
+    if (!this.parentNode) return;
+    for (var k = 0; k < arguments.length; k++) {
+      var n3 = __toInsertable(arguments[k]);
+      if (n3) this.parentNode.insertBefore(n3, this);
+    }
+  };
+  Node.prototype.after = function () {
+    if (!this.parentNode) return;
+    var next = this.nextSibling;
+    for (var m = arguments.length - 1; m >= 0; m--) {
+      var n4 = __toInsertable(arguments[m]);
+      if (n4) this.parentNode.insertBefore(n4, next);
+    }
+  };
+  Node.prototype.replaceChildren = function () {
+    while (this.childNodes.length) this.removeChild(this.childNodes[0]);
+    for (var q = 0; q < arguments.length; q++) {
+      var n5 = __toInsertable(arguments[q]);
+      if (n5) this.appendChild(n5);
+    }
+  };
   Object.defineProperty(Node.prototype, "ownerDocument", {
     get: function () {
       if (this.nodeType === 9) return null;
@@ -3194,7 +3240,10 @@
   PerformanceObserver.prototype.takeRecords = function () { return []; };
   global.PerformanceObserver = PerformanceObserver;
 
-  /* ---- performance.getEntriesByName/getEntriesByType (empty timeline) ---- */
+  /* ---- performance stubs for pre-__load contexts ----
+     __load installs the real performance object (with resource-timing
+     entries injected by the host); these fallbacks only matter before it
+     runs. */
   if (global.performance && !global.performance.getEntriesByName) {
     global.performance.getEntriesByName = function () { return []; };
     global.performance.getEntriesByType = function () { return []; };
@@ -5325,9 +5374,38 @@
       return _clockOffset;
     };
     global.__getClockOffset = function () { return _clockOffset; };
+    /* Resource-timing entries: the host injects one per subresource this
+       pass actually fetched (scripts, in-page fetch/XHR) with real URLs and
+       byte sizes. Timing values are 0 — no fabricated timing data, the
+       honest representation. Real stats collectors reduce() over
+       getEntriesByType('resource') without an initial value; an always-empty
+       timeline made that reduce undefined (GitHub bundle-stats crashed). */
+    var __resourceEntries = [];
     global.performance = {
       timeOrigin: startTime,
       now: function () { return (Date.now() - startTime) + _clockOffset; },
+      __setResourceEntries: function (list) {
+        try {
+          var parsed = (typeof list === "string") ? JSON.parse(list) : list;
+          __resourceEntries = [];
+          (parsed || []).forEach(function (r) {
+            __resourceEntries.push({
+              name: String(r.url || ""),
+              entryType: "resource",
+              initiatorType: String(r.initiatorType || "other"),
+              startTime: 0, duration: 0,
+              redirectStart: 0, redirectEnd: 0,
+              fetchStart: 0, domainLookupStart: 0, domainLookupEnd: 0,
+              connectStart: 0, connectEnd: 0, secureConnectionStart: 0,
+              requestStart: 0, responseStart: 0, responseEnd: 0,
+              transferSize: Number(r.transferSize) || 0,
+              encodedBodySize: Number(r.transferSize) || 0,
+              decodedBodySize: Number(r.transferSize) || 0,
+              nextHopProtocol: "", workerStart: 0
+            });
+          });
+        } catch (e) {}
+      },
       timing: {
         navigationStart: startTime,
         unloadEventStart: 0,
@@ -5351,10 +5429,15 @@
         loadEventStart: startTime + 149,
         loadEventEnd: startTime + 150
       },
-      getEntries: function () { return []; },
-      getEntriesByType: function () { return []; },
-      mark: function () {},
-      measure: function () {}
+      getEntries: function () { return __resourceEntries.slice(); },
+      getEntriesByType: function (t) { return t === "resource" ? __resourceEntries.slice() : []; },
+      getEntriesByName: function (n, t) {
+        return __resourceEntries.filter(function (e) {
+          return e.name === String(n) && (!t || t === "resource");
+        });
+      },
+      mark: function (name) { return { name: String(name || ""), entryType: "mark", startTime: this.now(), duration: 0 }; },
+      measure: function (name) { return { name: String(name || ""), entryType: "measure", startTime: 0, duration: 0 }; }
     };
     if (!global.location || global.location.href === "about:blank") {
       try {

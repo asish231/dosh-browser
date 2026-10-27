@@ -345,6 +345,23 @@ TOOLS = [
     },
 ]
 
+# session_id uniformity: the server hosts one shared session, so the
+# parameter is accepted everywhere (agents pass "default" habitually) but is
+# never required and never changes which session a call addresses. Before
+# this pass some tools required it and others did not accept it at all.
+for _tool in TOOLS:
+    _props = (_tool.get("inputSchema") or {}).get("properties") or {}
+    if "session_id" in _props:
+        _props["session_id"] = {
+            "type": "string",
+            "description": (
+                "Optional session label. This server hosts one shared session; "
+                "any value addresses it and 'default' works everywhere."
+            ),
+        }
+        _req = (_tool.get("inputSchema") or {}).get("required") or []
+        _tool["inputSchema"]["required"] = [r for r in _req if r != "session_id"]
+
 
 def estimate_tokens(text: str) -> int:
     """Accurate token estimate (~4 characters per token)."""
@@ -366,9 +383,16 @@ class McpServer:
         self.total_tool_calls += 1
         burned = estimate_tokens(text)
         self.total_tokens_burned += burned
-        footer = f"\n\n[Tokens burned for this task: ~{burned:,} tokens ({len(text):,} chars) | Session total: ~{self.total_tokens_burned:,} tokens]"
+        # Accounting rides at the TOP of the result: MCP clients truncate long
+        # results from the tail, and a footer at the end vanished exactly for
+        # the biggest calls — so per-call numbers summed by an agent
+        # undercounted the session total by the truncated calls' burn.
+        header = (
+            f"[tokens: ~{burned:,} this call ({len(text):,} chars) | "
+            f"session total: ~{self.total_tokens_burned:,} over {self.total_tool_calls} call(s)]\n"
+        )
         return {
-            "content": [{"type": "text", "text": text + footer}],
+            "content": [{"type": "text", "text": header + text}],
             "_meta": {
                 "tokens": burned,
                 "session_total_tokens": self.total_tokens_burned,
@@ -627,6 +651,9 @@ class McpServer:
                 f"Session Token Usage Summary:\n"
                 f"- Total Tool Calls: {self.total_tool_calls}\n"
                 f"- Cumulative Tokens Burned: ~{self.total_tokens_burned:,} tokens\n"
+                f"- Reconciliation: every accounted call prints its own burn in its "
+                f"result header; the sum of all call headers equals this cumulative "
+                f"total. No call is counted without a printed number.\n"
                 f"- Current Page: {session.url or 'blank'}\n"
                 f"- Profile: {prof_name}"
             )

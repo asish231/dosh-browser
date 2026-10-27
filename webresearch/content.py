@@ -155,13 +155,32 @@ def content_root(tree: HTMLParser) -> Node | None:
     best: Node | None = None
     best_key: tuple[int, int, int, int] | None = None
     for priority, candidate, (words, headings, blocks) in candidates:
+        # List pages (GitHub trending, HN, product grids) repeat the SAME
+        # landmark tag many times as siblings: a candidate whose candidate
+        # descendants number three or more is their CONTAINER, not a wrapper
+        # around one duplicate. Subtracting every descendant emptied <main>
+        # on such pages and crowned a single <article> row, so ACD read one
+        # repo card and dropped its nine siblings. Nested-duplicate pages
+        # (a promo card inside the real content) still subtract normally.
+        descendant_candidates = 0
         for other_priority, other, other_score in candidates:
             if _same_node(other, candidate):
                 continue
             if _ancestor_of(other, candidate):
-                words = max(0, words - other_score[0])
-                headings = max(0, headings - other_score[1])
-                blocks = max(0, blocks - other_score[2])
+                if descendant_candidates >= 2:
+                    # Three or more candidate descendants: this is a list
+                    # container. Keep the full score.
+                    descendant_candidates = 99
+                    break
+                descendant_candidates += 1
+        if descendant_candidates < 99:
+            for other_priority, other, other_score in candidates:
+                if _same_node(other, candidate):
+                    continue
+                if _ancestor_of(other, candidate):
+                    words = max(0, words - other_score[0])
+                    headings = max(0, headings - other_score[1])
+                    blocks = max(0, blocks - other_score[2])
         key = (words, headings, blocks, priority)
         if best is None or (best_key is not None and key > best_key):
             best = candidate

@@ -108,7 +108,15 @@ def count_interactive(html: str) -> int:
 
 
 def detect_challenges(html: str, url: str = "", targets: list[Target] | None = None) -> list[Challenge]:
-    blob = f"{html} {url}".lower()
+    from webresearch.engine.captcha import _markup_only
+
+    # Same evidence model as browser_captcha (engine/captcha.py): script/
+    # style/noscript CONTENTS never count — inline config like Wikipedia's
+    # wgConfirmEditHCaptchaSiteKey used to flag every article as an hCaptcha
+    # challenge here while browser_captcha correctly said "not detected".
+    # Tags and attributes DO count: a recaptcha/turnstile script src or a
+    # cf-turnstile div is genuine widget evidence.
+    blob = f"{_markup_only(html)} {url}".lower()
     found: list[Challenge] = []
     targets = targets or []
     for kind, passable, needles in CHALLENGE_RULES:
@@ -152,8 +160,20 @@ def inspect_html(html: str, url: str = "") -> tuple[list[Target], list[Challenge
             checked = attrs.get("checked") is not None and str(attrs.get("checked")).lower() != "false"
         challenge = role in {"recaptcha", "hcaptcha", "turnstile"} or "robot" in text.lower()
         import hashlib
+        # The ref is the element's identity, and typing is a state change, not
+        # an identity change: for form fields the value/checked attributes
+        # are excluded from the hash. The old hash included value, so after
+        # typing into one of two identical search boxes the TYPED box's ref
+        # changed while the empty twin kept the stale ref — Enter then
+        # resolved to the twin and submitted the wrong (empty) form.
+        stable_text = text.strip()[:40]
+        if node.get("t") in ("input", "textarea", "select"):
+            stable_text = (
+                attrs.get("placeholder") or attrs.get("title")
+                or attrs.get("aria-label") or attrs.get("name") or attrs.get("id") or ""
+            )
         digest = hashlib.sha1(
-            "|".join([role, node.get("t") or "", attrs.get("name") or attrs.get("id") or "", text.strip()[:40], href]).encode("utf-8", "ignore")
+            "|".join([role, node.get("t") or "", attrs.get("name") or attrs.get("id") or "", stable_text, href]).encode("utf-8", "ignore")
         ).hexdigest()[:8]
         base_ref = f"e{digest}"
         n = seen_refs.get(base_ref, 0) + 1
