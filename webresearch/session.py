@@ -101,6 +101,10 @@ class Tab:
         # (history restore replays page scripts, then wheels back to where the
         # entry was left).
         self.pending_scroll_y: int = 0
+        # popstate contract for history restores: fired (with the entry's
+        # pushed state) when the restored document is next rebuilt.
+        self.pending_popstate: bool = False
+        self.pending_popstate_state: object = None
         self.index: int = -1
         self.html: str = ""
         self.url: str = ""
@@ -151,6 +155,12 @@ class Tab:
                 scroll_y = int(float(self.ctx.eval("scrollY || 0") or 0))
             except Exception:
                 scroll_y = 0
+        # An in-place replace (scroll/type/SPA mutation) must not lose the
+        # entry's pushed history state — a later restore dispatches popstate
+        # with it.
+        prev_state = None
+        if replace and 0 <= self.index < len(self.snapshots):
+            prev_state = self.snapshots[self.index].get("history_state")
         snap = {
             "html": self.html if html is not None else None,
             "url": page.url,
@@ -158,6 +168,7 @@ class Tab:
             "frames": list(self.frame_documents) if html is not None else [],
             "captcha": self.captcha_inspection if html is not None else None,
             "scroll_y": scroll_y,
+            "history_state": prev_state,
         }
         if replace and self.snapshots:
             self.snapshots[self.index] = snap
@@ -259,6 +270,98 @@ class Session:
         session = drained.get("session")
         if isinstance(session, dict):
             self.current_tab.session_storage = {str(k): str(v) for k, v in session.items()}
+
+    def _absorb_history(self, js_info: dict | None) -> None:
+        """Record engine pushState/replaceState at session level.
+
+        A pushState adds a real history entry carrying the CURRENT document
+        (same DOM, new URL) — exactly like an SPA router in a real browser:
+        no reload, the entry becomes current, the live ctx is preserved.
+        A replaceState rewrites the current entry's URL. The state object is
+        stored on the entry snapshot so a later restore can dispatch popstate
+        with it. back/forward/go are NOT handled here (they need a document
+        restore; handled by _engine_history_move in action passes).
+        """
+        pushed = (js_info or {}).get("history_push")
+        if isinstance(pushed, dict) and pushed.get("url"):
+            page = self.page
+            if page is None:
+                return
+            new_page = page.model_copy(update={"url": str(pushed["url"])})
+            self._push(new_page, self.html)
+            if 0 <= self.current_tab.index < len(self.current_tab.snapshots):
+                self.current_tab.snapshots[self.current_tab.index]["history_state"] = pushed.get("state")
+        replaced = (js_info or {}).get("history_replace")
+        if isinstance(replaced, dict) and replaced.get("url"):
+            tab = self.current_tab
+            url = str(replaced["url"])
+            self.url = url
+            if 0 <= tab.index < len(tab.history) and tab.history[tab.index] is not None:
+                tab.history[tab.index] = tab.history[tab.index].model_copy(update={"url": url})
+            if 0 <= tab.index < len(tab.snapshots):
+                tab.snapshots[tab.index]["url"] = url
+                tab.snapshots[tab.index]["history_state"] = replaced.get("state")
+
+    def _dispatch_popstate(self, state: object) -> None:
+        """Fire popstate (with the entry's pushed state) into the live ctx."""
+        ctx = self.current_tab.ctx
+        if ctx is None:
+            return
+        try:
+            payload = json.dumps(state)
+        except Exception:
+            payload = "null"
+        try:
+            ctx.eval(f"history.state = {payload}; true")
+        except Exception:
+            pass
+        try:
+            js = (
+                "(function(){var ev = new Event('popstate'); ev.state = "
+                + payload
+                + "; window.dispatchEvent(ev);})()"
+            )
+            ctx.eval(js)
+        except Exception:
+            pass
+
+    async def _engine_history_move(self, delta: int, *, max_chars: int) -> Page:
+        """history.back()/forward()/go(delta) from page JS: move the tab's
+        history to the target entry, restore its document, rebuild the live
+        engine context, and dispatch popstate with the entry's pushed state."""
+        tab = self.current_tab
+        target = tab.index + int(delta)
+        if not 0 <= target < len(tab.history):
+            # Out-of-range is a no-op in a real browser, not an error.
+            return self.page  # type: ignore[return-value]
+        self._goto_history_index(target)
+        state = (tab.snapshots[target] or {}).get("history_state") if target < len(tab.snapshots) else None
+        new_html, js_info = await run_scripts(
+            self.html, self.url, self.client, force=True, storage_seed=self._storage_seed(),
+            ctx=None,
+        )
+        self.current_tab.ctx = js_info.get("ctx")
+        self._absorb_storage(js_info)
+        self._absorb_history(js_info)
+        self._dispatch_popstate(state)
+        result = FetchResult(
+            url=self.url,
+            final_url=self.url,
+            status=200,
+            content_type="text/html",
+            kind="html",
+            body=new_html,
+        )
+        captcha = await inspect_captcha(
+            new_html,
+            self.url,
+            self.client,
+            self.frame_documents,
+            sprite_endpoint=f"/v1/sessions/{self.id}/captcha/sprite",
+        )
+        page = snapshot(parse(result), max_chars=max_chars)
+        page = _decorate(page, new_html, bool(js_info.get("ran")), js_info, captcha=captcha.report)
+        return self._push(page, new_html, replace=True)
 
     def set_stealth(self, enabled: bool) -> bool:
         """Enable or disable humanised stealth mode (biological kinematics, typing pauses, smooth scroll)."""
@@ -381,6 +484,7 @@ class Session:
         self.captcha_inspection = captcha
         self.current_tab.ctx = js_info.get("ctx") if js_info else None
         self._absorb_storage(js_info, url)
+        self._absorb_history(js_info)
         self._last_dialogs = list((js_info or {}).get("dialogs") or [])
         self._last_popups = list((js_info or {}).get("popups") or [])
         if self.profile is not None:
@@ -577,6 +681,7 @@ class Session:
             )
             js_ran = bool(js_info.get("ran"))
             self._absorb_storage(js_info, result.final_url or form.action)
+            self._absorb_history(js_info)
             result = result.model_copy(update={"body": html})
             # The response is a NEW document: its JS context replaces the
             # previous page's. A script-less page has no live context at all
@@ -633,6 +738,7 @@ class Session:
         )
         self.current_tab.ctx = js_info.get("ctx") or self.current_tab.ctx
         self._absorb_storage(js_info)
+        self._absorb_history(js_info)
         # submit() reads the engine's live form state (fields/files the page
         # JS actually collected) from this snapshot.
         self._last_form_js_info = js_info
@@ -1065,6 +1171,7 @@ class Session:
                 result = result.model_copy(update={"body": res_html})
                 self.current_tab.ctx = js_info_post.get("ctx") or None
                 self._absorb_storage(js_info_post, dest)
+                self._absorb_history(js_info_post)
             page = snapshot(parse(result), max_chars=max_chars)
             page = _decorate(page, res_html, bool(js_info_post.get("ran")), js_info_post)
             post = self._push(page, res_html)
@@ -1437,6 +1544,7 @@ resolve a selector directly.
         )
         self.current_tab.ctx = js_info.get("ctx") or self.current_tab.ctx
         self._absorb_storage(js_info)
+        self._absorb_history(js_info)
         # A fresh engine build may be a history restore replaying this entry's
         # document: re-apply the stored scroll position once, before the page
         # snapshot is taken, so IntersectionObserver-driven feeds load the
@@ -1450,6 +1558,17 @@ resolve a selector directly.
                     ctx.eval(f"scrollTo(0, {re_y}); true")
                 except Exception:
                     pass
+        if not had_ctx and self.current_tab.pending_popstate:
+            # The restored document is live again: popstate fires with the
+            # entry's pushed state (real back/forward contract).
+            state = self.current_tab.pending_popstate_state
+            self.current_tab.pending_popstate = False
+            self.current_tab.pending_popstate_state = None
+            self._dispatch_popstate(state)
+        # history.back()/forward()/go(delta) from page JS: restore the target
+        # entry's document (fresh ctx + popstate) and return that page.
+        if js_info.get("history_move"):
+            return await self._engine_history_move(int(js_info["history_move"]), max_chars=max_chars)
         js_ran = bool(js_info.get("ran"))
         result = FetchResult(
             url=self.url,
@@ -1483,6 +1602,7 @@ resolve a selector directly.
             )
             self.current_tab.ctx = extra_js.get("ctx") or self.current_tab.ctx
             self._absorb_storage(extra_js)
+            self._absorb_history(extra_js)
             if extra_js.get("navigated"):
                 js_info["navigated"] = extra_js["navigated"]
             if extra_js.get("form_submit"):
@@ -1565,6 +1685,7 @@ resolve a selector directly.
                     # the previous one, so the next action drives THIS page.
                     self.current_tab.ctx = js_info_post.get("ctx") or None
                     self._absorb_storage(js_info_post, dest_url)
+                    self._absorb_history(js_info_post)
                 page = snapshot(parse(result), max_chars=max_chars)
                 page = _decorate(
                     page,
@@ -1731,6 +1852,11 @@ resolve a selector directly.
             self.frame_documents = list(snap.get("frames") or [])
             tab.captcha_inspection = snap.get("captcha")
         tab.pending_scroll_y = int((snap or {}).get("scroll_y") or 0)
+        # popstate fires when the restored document is next rebuilt (the
+        # engine ctx was dropped above), carrying the entry's pushed state —
+        # the same event contract as a real browser's back/forward.
+        tab.pending_popstate = True
+        tab.pending_popstate_state = (snap or {}).get("history_state")
         tab.ctx = None
 
     def back(self) -> Page:

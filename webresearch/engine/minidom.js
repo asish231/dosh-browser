@@ -1853,6 +1853,109 @@
     },
     configurable: true
   });
+  /* ---- scrollIntoView family ----
+     Real scroll-to-element against the block-flow geometry: computes the
+     target scroll position from the element's laid-out box, clamps to the
+     document extent, and drives the same _doScroll lane as wheel scrolling
+     (scroll + IntersectionObserver side effects included). */
+  Element.prototype.scrollIntoView = function (arg) {
+    var opts = (arg && typeof arg === "object") ? arg : {};
+    var block = opts.block || (arg === false ? "end" : "start");
+    var doc = this.ownerDocument || global.document;
+    if (doc) __ensureLayout(doc);
+    var b = this.__box || { x: 0, y: 0, width: 0, height: 0 };
+    var vh = (typeof global.innerHeight === "number" && global.innerHeight > 0) ? global.innerHeight : 720;
+    var cur = scrollState ? scrollState.y : 0;
+    var target = cur;
+    if (block === "start") target = b.y;
+    else if (block === "center") target = b.y - (vh - b.height) / 2;
+    else if (block === "end") target = b.y + b.height - vh;
+    else if (block === "nearest") {
+      var top = b.y, bottom = b.y + b.height;
+      if (top >= cur && bottom <= cur + vh) return; // already fully visible
+      target = (top < cur) ? top : Math.max(bottom - vh, top - (vh - b.height));
+    }
+    var clamped = _clampScroll(scrollState ? scrollState.x : 0, target);
+    _doScroll(clamped[0], clamped[1]);
+    return undefined;
+  };
+  Element.prototype.scrollIntoViewIfNeeded = function (arg) {
+    var doc = this.ownerDocument || global.document;
+    if (doc) __ensureLayout(doc);
+    var b = this.__box || { x: 0, y: 0, width: 0, height: 0 };
+    var vh = (typeof global.innerHeight === "number" && global.innerHeight > 0) ? global.innerHeight : 720;
+    var cur = scrollState ? scrollState.y : 0;
+    if (b.y >= cur && b.y + b.height <= cur + vh) return; // visible: no-op
+    this.scrollIntoView(arg && typeof arg === "object" ? arg : { block: "nearest" });
+  };
+  /* ---- checkVisibility ----
+     Consults the real cascade (__computedStyle over collected rules), not
+     just inline styles — display:none by stylesheet rule counts, and
+     visibility:hidden anywhere on the ancestor chain counts. */
+  Element.prototype.checkVisibility = function (opts) {
+    opts = opts || {};
+    var doc = this.ownerDocument || global.document;
+    var rules = doc ? __collectStyleRules(doc) : [];
+    var n = this;
+    while (n && n.nodeType === 1) {
+      var cs = __computedStyle(n, rules, 16);
+      if ((cs.display || "").toLowerCase() === "none") return false;
+      var vis = (cs.visibility || "").toLowerCase();
+      if (vis === "hidden" || vis === "collapse") return false;
+      if (opts.checkOpacity && Number(cs.opacity) === 0) return false;
+      n = n.parentNode;
+    }
+    return true;
+  };
+  /* ---- Fullscreen (documented approximation) ----
+     No top-layer or paint: state + events only, which is what page JS
+     feature-detects and reacts to. */
+  Element.prototype.requestFullscreen = function () {
+    var doc = this.ownerDocument || global.document;
+    if (doc) {
+      doc.__fullscreenElement = this;
+      try { doc.dispatchEvent(new global.Event("fullscreenchange", { bubbles: true })); } catch (e) {}
+    }
+    return Promise.resolve();
+  };
+  /* ---- Popover API subset ----
+     beforetoggle is cancelable (a page may prevent showing); toggle carries
+     newState/oldState like the spec. Rendering state rides the open
+     attribute (there is no top layer). */
+  Element.prototype.showPopover = function () {
+    if (this.__popoverOpen) return;
+    var ev = new global.Event("beforetoggle", { bubbles: true, cancelable: true });
+    ev.oldState = "closed";
+    ev.newState = "open";
+    this.dispatchEvent(ev);
+    if (ev.defaultPrevented) return;
+    this.__popoverOpen = true;
+    this.setAttribute("open", "");
+    var t = new global.Event("toggle", { bubbles: true });
+    t.oldState = "closed";
+    t.newState = "open";
+    this.dispatchEvent(t);
+  };
+  Element.prototype.hidePopover = function () {
+    if (!this.__popoverOpen) return;
+    this.__popoverOpen = false;
+    this.removeAttribute("open");
+    var t = new global.Event("toggle", { bubbles: true });
+    t.oldState = "open";
+    t.newState = "closed";
+    this.dispatchEvent(t);
+  };
+  Element.prototype.togglePopover = function (prefer) {
+    if (prefer === undefined) {
+      if (this.__popoverOpen) this.hidePopover();
+      else this.showPopover();
+    } else if (prefer) this.showPopover();
+    else this.hidePopover();
+  };
+  Object.defineProperty(Element.prototype, "popoverOpen", {
+    get: function () { return !!this.__popoverOpen; },
+    configurable: true
+  });
   Object.defineProperty(Element.prototype, "offsetParent", {
     get: function () {
       if (this.nodeName === "body" || this.nodeName === "html") return null;
@@ -1940,6 +2043,15 @@
         return fallback;
       }
     }
+    /* Built-in HTMLElement subclasses (HTMLDialogElement & co) so instanceof
+       checks match a real browser. The registry lives in a nested scope; the
+       global export is the stable handle. */
+    var htmlCtorMap = global.__htmlCtorByTag;
+    var htmlCtor = (htmlCtorMap && htmlCtorMap[tagLower]) || null;
+    if (htmlCtor) {
+      var sub = new htmlCtor(tagLower);
+      if (sub && sub.nodeType === 1) return sub;
+    }
     return new Element(tagLower);
   };
   Document.prototype.createTextNode = function (t) { return new Text(String(t)); };
@@ -1973,6 +2085,97 @@
     },
     configurable: true
   });
+  Document.prototype.exitFullscreen = function () {
+    var had = this.__fullscreenElement != null;
+    this.__fullscreenElement = null;
+    if (had) { try { this.dispatchEvent(new global.Event("fullscreenchange", { bubbles: true })); } catch (e) {} }
+    return Promise.resolve();
+  };
+  Object.defineProperty(Document.prototype, "fullscreenElement", {
+    get: function () { return this.__fullscreenElement || null; },
+    configurable: true
+  });
+  Object.defineProperty(Document.prototype, "fullscreenEnabled", {
+    get: function () { return true; },
+    configurable: true
+  });
+  var htmlElements = [
+    "HTMLAnchorElement", "HTMLAreaElement", "HTMLAudioElement", "HTMLBaseElement",
+    "HTMLBaseFontElement", "HTMLBodyElement", "HTMLBRElement", "HTMLButtonElement",
+    "HTMLCanvasElement", "HTMLDataElement", "HTMLDataListElement", "HTMLDetailsElement",
+    "HTMLDialogElement", "HTMLDirectoryElement", "HTMLDivElement", "HTMLDListElement",
+    "HTMLEmbedElement", "HTMLFieldSetElement", "HTMLFontElement", "HTMLFormElement",
+    "HTMLFrameElement", "HTMLFrameSetElement", "HTMLHeadingElement", "HTMLHeadElement",
+    "HTMLHRElement", "HTMLHtmlElement", "HTMLIFrameElement", "HTMLImageElement",
+    "HTMLInputElement", "HTMLLabelElement", "HTMLLegendElement", "HTMLLIElement",
+    "HTMLLinkElement", "HTMLMapElement", "HTMLMarqueeElement", "HTMLMetaElement",
+    "HTMLMeterElement", "HTMLModElement", "HTMLObjectElement", "HTMLOListElement",
+    "HTMLOptGroupElement", "HTMLOptionElement", "HTMLOutputElement",
+    "HTMLParagraphElement", "HTMLParamElement", "HTMLPictureElement", "HTMLPreElement",
+    "HTMLProgressElement", "HTMLQuoteElement", "HTMLScriptElement", "HTMLSelectElement",
+    "HTMLSlotElement", "HTMLSourceElement", "HTMLSpanElement", "HTMLStyleElement",
+    "HTMLTableCaptionElement", "HTMLTableCellElement", "HTMLTableColElement",
+    "HTMLTableElement", "HTMLTableRowElement", "HTMLTableSectionElement",
+    "HTMLTemplateElement", "HTMLTextAreaElement", "HTMLTimeElement", "HTMLTitleElement",
+    "HTMLTrackElement", "HTMLUListElement", "HTMLVideoElement", "HTMLUnknownElement"
+  ];
+  var __htmlCtorByTag = {};
+  for (var i = 0; i < htmlElements.length; i++) {
+    (function (name) {
+      function HtmlSubElement(tag, attrs, children) {
+        Element.call(this, tag, attrs, children);
+      }
+      HtmlSubElement.prototype = Object.create(Element.prototype);
+      HtmlSubElement.prototype.constructor = HtmlSubElement;
+      global[name] = HtmlSubElement;
+      /* HTMLElement subclasses must be instanceof-checkable: a page doing
+         `document.createElement('dialog') instanceof HTMLDialogElement`
+         got false when every element was a bare Element. Map constructor
+         name -> tag so createElement can instantiate the real subclass. */
+      var tag = name.replace(/^HTML/, "").replace(/Element$/, "").toLowerCase();
+      __htmlCtorByTag[tag] = HtmlSubElement;
+    })(htmlElements[i]);
+  }
+  global.__htmlCtorByTag = __htmlCtorByTag;
+  /* ---- <dialog> semantics ----
+     The constructor existed as a name-list shell; showModal/close threw
+     "not a function" and modals could never open. Real subset: open
+     attribute, show/showModal, close(returnValue), returnValue, and the
+     close/cancel events. Disclosed approximation: no focus trap, no
+     ::modal backdrop, no top-layer rendering (there is no paint stack). */
+  var __DialogCtor = global.HTMLDialogElement;
+  if (typeof __DialogCtor === "function") {
+    Object.defineProperty(__DialogCtor.prototype, "open", {
+      get: function () { return this.hasAttribute("open"); },
+      set: function (v) {
+        if (v) this.setAttribute("open", "");
+        else this.removeAttribute("open");
+      },
+      configurable: true
+    });
+    __DialogCtor.prototype.show = function () {
+      if (this.open) return;
+      this.setAttribute("open", "");
+    };
+    __DialogCtor.prototype.showModal = function () {
+      if (this.open) return;
+      this.setAttribute("open", "");
+      this.dispatchEvent(new global.Event("open", { bubbles: false }));
+    };
+    __DialogCtor.prototype.close = function (returnValue) {
+      if (!this.open) return;
+      this.removeAttribute("open");
+      if (returnValue !== undefined) this.returnValue = String(returnValue);
+      var ev = new global.Event("close", { bubbles: false });
+      this.dispatchEvent(ev);
+    };
+    Object.defineProperty(__DialogCtor.prototype, "returnValue", {
+      get: function () { return this.__returnValue || ""; },
+      set: function (v) { this.__returnValue = String(v == null ? "" : v); },
+      configurable: true
+    });
+  }
+
   Document.prototype.getElementsByClassName = Element.prototype.getElementsByClassName;
   Document.prototype.querySelectorAll = Element.prototype.querySelectorAll;
   Document.prototype.querySelector = Element.prototype.querySelector;
@@ -2065,7 +2268,13 @@
       return docKids;
     }
     var kids = (j.c || []).map(hydrateOne).filter(Boolean);
-    return new Element(j.t, j.a || {}, kids);
+    /* Parsed elements get the real HTMLElement subclass (dialog instanceof
+       HTMLDialogElement must hold for markup too, not just createElement).
+       The registry lives in a nested scope; the global export is the
+       stable handle. */
+    var ctorMap = global.__htmlCtorByTag;
+    var ctor = (ctorMap && ctorMap[j.t]) || null;
+    return ctor ? new ctor(j.t, j.a || {}, kids) : new Element(j.t, j.a || {}, kids);
   }
   function serializeNode(n, parentTag) {
     if (!n) return "";
@@ -3210,7 +3419,12 @@
   global.Window = Window;
   global.window = global;
 
-  /* History API for SPA routers. */
+  /* History API for SPA routers.
+     pushState/replaceState record the request on __WR_PUSHED/__WR_REPLACED
+     for the host session (which owns the real history entries); back/forward/
+     go record a move on __WR_HISTORY_MOVE. The host performs the actual entry
+     moves and dispatches popstate into the rebuilt document — the engine
+     context cannot outlive a navigation, so it cannot own history alone. */
   global.history = {
     length: 1,
     state: null,
@@ -3222,15 +3436,30 @@
         if (typeof global._updateLocationQuietly === "function") global._updateLocationQuietly(url);
         else if (global.location) global.location.href = String(url);
       }
+      if (url) {
+        var abs = String(url);
+        try { abs = new URL(String(url), (global.location && global.location.href) || "about:blank").href; } catch (e) {}
+        var ser = null;
+        try { ser = (state === undefined) ? null : JSON.parse(JSON.stringify(state == null ? null : state)); } catch (e) { ser = null; }
+        global.__WR_PUSHED = { url: abs, state: ser };
+      }
     },
     replaceState: function (state, title, url) {
       this.state = state;
       if (url) {
         if (typeof global._updateLocationQuietly === "function") global._updateLocationQuietly(url);
         else if (global.location) global.location.href = String(url);
+        var abs2 = String(url);
+        try { abs2 = new URL(String(url), (global.location && global.location.href) || "about:blank").href; } catch (e) {}
+        global.__WR_REPLACED = { url: abs2, state: state === undefined ? null : state };
       }
     },
-    back: function () {}, forward: function () {}, go: function () {}
+    back: function () { global.__WR_HISTORY_MOVE = (global.__WR_HISTORY_MOVE || 0) - 1; },
+    forward: function () { global.__WR_HISTORY_MOVE = (global.__WR_HISTORY_MOVE || 0) + 1; },
+    go: function (delta) {
+      var d = Math.floor(Number(delta) || 0);
+      global.__WR_HISTORY_MOVE = (global.__WR_HISTORY_MOVE || 0) + d;
+    }
   };
   function _dispatchWheel(dx, dy) {
     var tNow = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
@@ -4834,6 +5063,70 @@
       mediaDevices: {
         enumerateDevices: function () { return Promise.resolve([]); },
         getUserMedia: function () { return Promise.reject(new Error("NotSupportedError")); }
+      },
+      /* sendBeacon: fire-and-forget POST through the owned host_fetch lane
+         (CORS-checked there like every in-page request). Returns true when the
+         request was handed to the host, per spec semantics. */
+      sendBeacon: function (url, data) {
+        try {
+          var body = "";
+          if (data == null) body = "";
+          else if (typeof data === "string") body = data;
+          else if (data instanceof global.FormData || data._data) {
+            var sfd = (typeof __serializeFormData === "function") ? __serializeFormData(data) : { body: "", contentType: "" };
+            body = sfd.body;
+          } else if (typeof data === "object") body = JSON.stringify(data);
+          else body = String(data);
+          var abs = String(url || "");
+          try { abs = new URL(String(url || ""), (global.location && global.location.href) || "about:blank").href; } catch (e) {}
+          if (typeof host_fetch === "function") {
+            host_fetch(abs, "POST", body, JSON.stringify({ "content-type": "text/plain;charset=UTF-8" }), "");
+            return true;
+          }
+          return false;
+        } catch (e) { return false; }
+      },
+      /* Geolocation: an agent browser has no location hardware. The honest
+         answer is PERMISSION_DENIED — same as a real browser with location
+         blocked — never invented coordinates. */
+      geolocation: {
+        getCurrentPosition: function (success, error) {
+          if (typeof error === "function") {
+            error({ code: 1, message: "User has denied permission to use positioning" });
+          }
+        },
+        watchPosition: function (success, error) {
+          if (typeof error === "function") {
+            error({ code: 1, message: "User has denied permission to use positioning" });
+          }
+          return 0;
+        },
+        clearWatch: function () {}
+      },
+      /* Service worker container: register() resolves with a registration so
+         feature-detecting pages proceed; actual SW analysis/installation is
+         host-side (sw.py regex + strategy simulation) and navigator.serviceWorker
+         does not imply SW JS execution. controller is null: no page is
+         controlled by a SW in this engine. */
+      serviceWorker: {
+        controller: null,
+        ready: Promise.resolve({
+          active: { scope: "/", state: "activated", unregister: function () { return Promise.resolve(true); } }
+        }),
+        register: function (scriptUrl, options) {
+          var scope = (options && options.scope) || "/";
+          return Promise.resolve({
+            scope: scope,
+            installing: null,
+            waiting: null,
+            active: { scope: scope, state: "activated", scriptURL: String(scriptUrl || ""), unregister: function () { return Promise.resolve(true); } },
+            unregister: function () { return Promise.resolve(true); }
+          });
+        },
+        getRegistration: function () { return Promise.resolve(undefined); },
+        getRegistrations: function () { return Promise.resolve([]); },
+        addEventListener: function () {},
+        removeEventListener: function () {}
       }
     };
 
@@ -4861,6 +5154,94 @@
       scale: 1,
       addEventListener: function () {},
       removeEventListener: function () {}
+    };
+
+    /* Notification: the constructor exists for feature-detection parity;
+       permission is "denied" (a headless agent browser shows no notifications
+       and never invents one) and requestPermission resolves "denied". */
+    global.Notification = function (title, options) {
+      this.title = String(title || "");
+      this.body = (options && options.body) || "";
+      this.tag = (options && options.tag) || "";
+      this.onclick = null;
+      this.onclose = null;
+    };
+    global.Notification.permission = "denied";
+    global.Notification.maxActions = 0;
+    global.Notification.requestPermission = function () { return Promise.resolve("denied"); };
+
+    /* BroadcastChannel: same-context pub/sub. Every channel instance in this
+     document receives posted messages except the sender. Disclosed
+     approximation: no cross-context/cross-frame delivery (the host lane
+     for that is frames' postMessage). */
+    (function () {
+      var __bcRegistry = {};
+      var __bcSeq = 0;
+      global.BroadcastChannel = function (name) {
+        this.name = String(name);
+        this._id = ++__bcSeq;
+        this.onmessage = null;
+        this._listeners = [];
+        (__bcRegistry[this.name] = __bcRegistry[this.name] || []).push(this);
+        this.postMessage = function (data) {
+          var list = __bcRegistry[this.name] || [];
+          for (var i = 0; i < list.length; i++) {
+            if (list[i] === this) continue;
+            (function (ch) {
+              var ev = new global.MessageEvent("message", { data: data });
+              Promise.resolve().then(function () {
+                try {
+                  if (typeof ch.onmessage === "function") ch.onmessage(ev);
+                } catch (e) {}
+                ch._listeners.forEach(function (fn) {
+                  try { fn(ev); } catch (e) {}
+                });
+              });
+            })(list[i]);
+          }
+        };
+        this.addEventListener = function (type, fn) { if (type === "message") this._listeners.push(fn); };
+        this.removeEventListener = function (type, fn) {
+          this._listeners = this._listeners.filter(function (f) { return f !== fn; });
+        };
+        this.close = function () {
+          var list = __bcRegistry[this.name] || [];
+          __bcRegistry[this.name] = list.filter(function (ch) { return ch !== this; });
+        };
+      };
+    })();
+
+    /* window.print: dispatches the beforeprint/afterprint event pair, the
+       observable contract of a real print invocation (no paper here). */
+    global.print = function () {
+      try {
+        global.dispatchEvent(new global.Event("beforeprint"));
+        global.dispatchEvent(new global.Event("afterprint"));
+      } catch (e) {}
+    };
+
+    /* caretRangeFromPoint: hit-test against laid-out boxes and return a Range
+       collapsed at the innermost containing element. Disclosed approximation:
+       no caret geometry, so the Range carries the element, not an offset. */
+    Document.prototype.caretRangeFromPoint = function (x, y) {
+      __ensureLayout(this);
+      var px = Number(x) || 0, py = Number(y) || 0;
+      var best = null;
+      (function walk(n) {
+        if (!n || n.nodeType !== 1) return;
+        var b = n.__box;
+        if (b && px >= b.x && px <= b.x + b.width && py >= b.y && py <= b.y + b.height) {
+          if (!best) best = n;
+        }
+        (n.childNodes || []).forEach(function (c) { if (c.nodeType === 1) walk(c); });
+      })(this.body || this.documentElement);
+      var r = new global.Range();
+      if (best) {
+        r.startContainer = best;
+        r.endContainer = best;
+        r.collapsed = true;
+      }
+      return r;
     };
 
     global.chrome = {
@@ -4993,36 +5374,6 @@
     global.Document = Document;
     global.SVGElement = Element;
 
-    var htmlElements = [
-      "HTMLAnchorElement", "HTMLAreaElement", "HTMLAudioElement", "HTMLBaseElement",
-      "HTMLBaseFontElement", "HTMLBodyElement", "HTMLBRElement", "HTMLButtonElement",
-      "HTMLCanvasElement", "HTMLDataElement", "HTMLDataListElement", "HTMLDetailsElement",
-      "HTMLDialogElement", "HTMLDirectoryElement", "HTMLDivElement", "HTMLDListElement",
-      "HTMLEmbedElement", "HTMLFieldSetElement", "HTMLFontElement", "HTMLFormElement",
-      "HTMLFrameElement", "HTMLFrameSetElement", "HTMLHeadingElement", "HTMLHeadElement",
-      "HTMLHRElement", "HTMLHtmlElement", "HTMLIFrameElement", "HTMLImageElement",
-      "HTMLInputElement", "HTMLLabelElement", "HTMLLegendElement", "HTMLLIElement",
-      "HTMLLinkElement", "HTMLMapElement", "HTMLMarqueeElement", "HTMLMetaElement",
-      "HTMLMeterElement", "HTMLModElement", "HTMLObjectElement", "HTMLOListElement",
-      "HTMLOptGroupElement", "HTMLOptionElement", "HTMLOutputElement",
-      "HTMLParagraphElement", "HTMLParamElement", "HTMLPictureElement", "HTMLPreElement",
-      "HTMLProgressElement", "HTMLQuoteElement", "HTMLScriptElement", "HTMLSelectElement",
-      "HTMLSlotElement", "HTMLSourceElement", "HTMLSpanElement", "HTMLStyleElement",
-      "HTMLTableCaptionElement", "HTMLTableCellElement", "HTMLTableColElement",
-      "HTMLTableElement", "HTMLTableRowElement", "HTMLTableSectionElement",
-      "HTMLTemplateElement", "HTMLTextAreaElement", "HTMLTimeElement", "HTMLTitleElement",
-      "HTMLTrackElement", "HTMLUListElement", "HTMLVideoElement", "HTMLUnknownElement"
-    ];
-    for (var i = 0; i < htmlElements.length; i++) {
-      (function (name) {
-        function HtmlSubElement(tag, attrs, children) {
-          Element.call(this, tag, attrs, children);
-        }
-        HtmlSubElement.prototype = Object.create(Element.prototype);
-        HtmlSubElement.prototype.constructor = HtmlSubElement;
-        global[name] = HtmlSubElement;
-      })(htmlElements[i]);
-    }
     function DOMParser() {}
     DOMParser.prototype.parseFromString = function (str, mime) {
       var doc = new Document();
@@ -5151,6 +5502,81 @@
       this.ports = (init && init.ports) || [];
     };
     global.MessageEvent.prototype = Object.create(global.Event.prototype);
+
+    /* WheelEvent: the wheel dispatcher used to fall back to a generic Event;
+       instanceof checks and delta fields now match a real browser. */
+    global.WheelEvent = function (type, init) {
+      global.UIEvent.call(this, type, init);
+      init = init || {};
+      this.deltaX = init.deltaX || 0;
+      this.deltaY = init.deltaY || 0;
+      this.deltaZ = init.deltaZ || 0;
+      this.deltaMode = init.deltaMode || 0;
+      this.ctrlKey = !!init.ctrlKey;
+      this.shiftKey = !!init.shiftKey;
+      this.altKey = !!init.altKey;
+      this.metaKey = !!init.metaKey;
+    };
+    global.WheelEvent.prototype = Object.create(global.UIEvent.prototype);
+
+    /* InputEvent: typing used to deliver generic Events with data/inputType
+       bolted on; now the class exists for instanceof and feature checks. */
+    global.InputEvent = function (type, init) {
+      global.UIEvent.call(this, type, init);
+      init = init || {};
+      this.data = init.data !== undefined ? init.data : null;
+      this.isComposing = !!init.isComposing;
+      this.inputType = init.inputType || "";
+      this.dataTransfer = init.dataTransfer || null;
+    };
+    global.InputEvent.prototype = Object.create(global.UIEvent.prototype);
+
+    /* SubmitEvent: form submissions carried a generic Event; the class (and
+       submitter) now exist like a real browser. */
+    global.SubmitEvent = function (type, init) {
+      global.Event.call(this, type, init);
+      this.submitter = (init && init.submitter) || null;
+    };
+    global.SubmitEvent.prototype = Object.create(global.Event.prototype);
+
+    /* DataTransfer + DragEvent: native HTML5 drag & drop needs a real
+       dataTransfer the dragstart handler can write into and the drop handler
+       reads back. Previously both classes were undefined and any
+       draggable=true flow crashed. */
+    global.DataTransfer = function () {
+      this.dropEffect = "none";
+      this.effectAllowed = "uninitialized";
+      this.__data = {};
+      this.types = [];
+      this.items = [];
+    };
+    global.DataTransfer.prototype.setData = function (type, value) {
+      type = String(type);
+      this.__data[type] = String(value);
+      this.types = Object.keys(this.__data);
+    };
+    global.DataTransfer.prototype.getData = function (type) {
+      type = String(type);
+      return Object.prototype.hasOwnProperty.call(this.__data, type) ? this.__data[type] : "";
+    };
+    global.DataTransfer.prototype.hasData = function (type) {
+      return Object.prototype.hasOwnProperty.call(this.__data, String(type));
+    };
+    global.DataTransfer.prototype.clearData = function (type) {
+      if (type === undefined) { this.__data = {}; }
+      else { delete this.__data[String(type)]; }
+      this.types = Object.keys(this.__data);
+    };
+    global.DataTransfer.prototype.setDragImage = function () {};
+    Object.defineProperty(global.DataTransfer.prototype, "files", {
+      get: function () { return []; },
+      configurable: true
+    });
+    global.DragEvent = function (type, init) {
+      global.MouseEvent.call(this, type, init);
+      this.dataTransfer = (init && init.dataTransfer) || null;
+    };
+    global.DragEvent.prototype = Object.create(global.MouseEvent.prototype);
 
     function Range() {
       this.startContainer = null;
@@ -5672,6 +6098,47 @@
     var mdEv = (typeof global.MouseEvent === "function") ? new global.MouseEvent("mousedown", downInit) : new global.Event("mousedown", downInit);
     el.dispatchEvent(mdEv);
 
+    /* Native HTML5 drag & drop: when the source is draggable (or listens for
+       dragstart), the drag sequence carries a real DataTransfer — dragstart
+       (cancelable: preventDefault aborts), drag per step, dragover/drop on the
+       element under the translated source box, dragend on the source. Pages
+       with only mouse listeners keep the plain pointer lane. */
+    var nativeDrag = false;
+    var dragDT = null;
+    var wantsNativeDrag = (el.getAttribute("draggable") || "").toLowerCase() === "true"
+      || (el._listeners && el._listeners["dragstart"] && el._listeners["dragstart"].length > 0);
+    if (wantsNativeDrag && typeof global.DragEvent === "function" && typeof global.DataTransfer === "function") {
+      dragDT = new global.DataTransfer();
+      var dsInit = { bubbles: true, cancelable: true, isTrusted: true, __trusted: true, clientX: startX, clientY: startY, button: 0, buttons: 1, dataTransfer: dragDT, timeStamp: t };
+      var dsEv = new global.DragEvent("dragstart", dsInit);
+      el.dispatchEvent(dsEv);
+      nativeDrag = !dsEv.defaultPrevented;
+    }
+    /* Innermost laid-out box containing a document-space point. */
+    function __dragHitTest(px, py) {
+      var doc = global.document;
+      if (!doc) return null;
+      var root = doc.body || doc.documentElement;
+      if (!root || typeof root.getBoundingClientRect !== "function") return null;
+      root.getBoundingClientRect(); // ensure layout
+      var best = null, bestArea = Infinity;
+      (function walk(n) {
+        if (!n || n.nodeType !== 1) return;
+        var b = n.__box;
+        if (b && b.width > 0 && b.height > 0 && px >= b.x && px <= b.x + b.width && py >= b.y && py <= b.y + b.height) {
+          var area = b.width * b.height;
+          if (area <= bestArea) { best = n; bestArea = area; }
+        }
+        (n.childNodes || []).forEach(function (c) { if (c.nodeType === 1) walk(c); });
+      })(root);
+      return best;
+    }
+    var dragDropTarget = null;
+    if (nativeDrag) {
+      var srcBox = (typeof el.getBoundingClientRect === "function") ? el.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0 };
+      dragDropTarget = __dragHitTest(srcBox.x + dx, srcBox.y + dy) || el;
+    }
+
     if (isStealth) {
       var hesitation = 35 + Math.round(Math.random() * 25);
       if (typeof global.__advanceClock === "function") global.__advanceClock(hesitation);
@@ -5745,6 +6212,11 @@
       moveTarget.dispatchEvent(mmEv);
       lastX = stepX;
       lastY = stepY;
+      if (nativeDrag && typeof global.DragEvent === "function") {
+        try {
+          el.dispatchEvent(new global.DragEvent("drag", { bubbles: true, cancelable: true, isTrusted: true, __trusted: true, clientX: stepX, clientY: stepY, button: 0, buttons: 1, dataTransfer: dragDT, timeStamp: t }));
+        } catch (e) {}
+      }
     }
 
     if (isStealth) {
@@ -5776,6 +6248,16 @@
     upTarget.dispatchEvent(muEv);
     if (_activePointerCaptures[1]) {
       _activePointerCaptures[1].releasePointerCapture(1);
+    }
+    if (nativeDrag && typeof global.DragEvent === "function") {
+      var endInit = { bubbles: true, cancelable: true, isTrusted: true, __trusted: true, clientX: startX + dx, clientY: startY + dy, button: 0, buttons: 0, dataTransfer: dragDT, timeStamp: t };
+      try {
+        dragDropTarget.dispatchEvent(new global.DragEvent("dragover", endInit));
+        dragDropTarget.dispatchEvent(new global.DragEvent("drop", endInit));
+      } catch (e) {}
+      try {
+        el.dispatchEvent(new global.DragEvent("dragend", endInit));
+      } catch (e) {}
     }
     return true;
   }

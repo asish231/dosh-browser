@@ -621,6 +621,7 @@ async def run_scripts(
                 "globalThis.__WR_NAVIGATED = ''; globalThis.__WR_FORM_SUBMIT = null;"
                 "if (typeof globalThis.__clearDialogState === 'function') globalThis.__clearDialogState();"
                 "globalThis.__WR_POPUPS = [];"
+                "globalThis.__WR_PUSHED = null; globalThis.__WR_REPLACED = null; globalThis.__WR_HISTORY_MOVE = 0;"
             )
         except Exception:
             pass
@@ -1123,6 +1124,36 @@ async def run_scripts(
                 for p in popups
                 if p.get("url")
             ]
+    except Exception:
+        pass
+    # History API drains: the engine records pushState/replaceState requests
+    # and back/forward/go moves; the session owns the real history entries
+    # (the engine context cannot outlive a navigation).
+    try:
+        pushed_raw = ctx.eval("JSON.stringify(globalThis.__WR_PUSHED || null)")
+        pushed = json.loads(str(pushed_raw)) if pushed_raw else None
+        if isinstance(pushed, dict) and pushed.get("url"):
+            info["history_push"] = {
+                "url": str(pushed.get("url", ""))[:2000],
+                "state": pushed.get("state"),
+            }
+    except Exception:
+        pass
+    try:
+        replaced_raw = ctx.eval("JSON.stringify(globalThis.__WR_REPLACED || null)")
+        replaced = json.loads(str(replaced_raw)) if replaced_raw else None
+        if isinstance(replaced, dict) and replaced.get("url"):
+            info["history_replace"] = {
+                "url": str(replaced.get("url", ""))[:2000],
+                "state": replaced.get("state"),
+            }
+    except Exception:
+        pass
+    try:
+        move_raw = ctx.eval("Number(globalThis.__WR_HISTORY_MOVE || 0)")
+        move = int(float(str(move_raw))) if move_raw else 0
+        if move:
+            info["history_move"] = move
     except Exception:
         pass
     # Login wall detection: surface the wall as a first-class object so the
