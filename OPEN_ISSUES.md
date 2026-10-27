@@ -378,11 +378,15 @@ engine-heavy passes (suite 254s -> ~263-275s).
   visibility (spec: only with checkVisibilityCSS:true); popover missing
   InvalidStateError/NotSupportedError cases and auto-close-of-others.
 - **Hidden controls**: **FIXED in round 3** (see below).
-- **Frames**: `e.source.postMessage` replies (target 'reply') are excluded by
-  the session's child-msg filter — the standard cross-frame reply form
-  never reaches the parent; URL-form targetOrigin
-  ('https://host/path' vs origin) is dropped at the child; frames re-fetch
-  and re-run their scripts on every action pass (init messages repeat).
+- **Frames**: **FIXED in round 3** — `e.source.postMessage` replies
+  (target 'reply') now pass the session's message pumps and reach the parent
+  with the child's origin, and URL-form targetOrigin
+  ('https://host/path') is parsed down to its origin instead of naively
+  string-compared (wrong origins still dropped). Verified end to end:
+  parent → child delivery, reply, direct parent message, and URL-form
+  targeting all work through a real act() pass; 6 regressions in
+  tests/test_frame_reply.py. Remaining in this area: frames re-fetch and
+  re-run their scripts on every action pass (init messages repeat).
 - **MCP**: error-path results (unknown tool, bad args) bypass token
   accounting; the legacy `_iter_refs` fallback hash is still value-inclusive
   (it can never resolve inspect-issued form-field refs — it errors honestly

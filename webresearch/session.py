@@ -797,9 +797,13 @@ class Session:
                 pm
                 for f in frames
                 for pm in f.post_messages
-                if pm.get("target") in {"parent", "top", "*"}
+                if pm.get("target") in {"parent", "top", "reply", "*", ""}
             ]
             if child_msgs and js_ran:
+                # Replies (e.source.postMessage — the standard cross-frame
+                # reply form) carry the child's origin in msg["origin"] (the
+                # engine records the sender), so the parent's delivery
+                # verifies them like any other message.
                 pumped_html, extra_js = await run_scripts(
                     new_html, self.url, self.client, force=True, messages=child_msgs,
                     storage_seed=self._storage_seed(),
@@ -1657,9 +1661,12 @@ resolve a selector directly.
             pm
             for f in frames
             for pm in f.post_messages
-            if pm.get("target") in {"parent", "top", "*"}
+            if pm.get("target") in {"parent", "top", "reply", "*", ""}
         ]
         if child_msgs and js_ran:
+            # Replies (e.source.postMessage — the standard cross-frame reply
+            # form) must reach the parent like parent/top-targeted messages;
+            # the old filter dropped them.
             pumped_html, extra_js = await run_scripts(
                 new_html, self.url, self.client, force=True, messages=child_msgs, ctx=self.current_tab.ctx,
                 storage_seed=self._storage_seed(),
