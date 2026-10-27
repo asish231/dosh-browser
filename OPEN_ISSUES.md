@@ -371,9 +371,12 @@ engine-heavy passes (suite 254s -> ~263-275s).
 - **scrollIntoView**: `behavior:'smooth'` is synchronous (no animation);
   no scrollable-ancestor support (scrolls the document); `ifNeeded` does
   nearest instead of centering; `display:none` target scrolls to phantom.
-- **DnD**: drop fires without the dragover-preventDefault gate;
-  drag-to-nothing still drops on the source's own position; DataTransfer
-  types not ASCII-lowercased (setData/getData case-sensitive); no
+- **DnD**: **drop gate + phantom-drop + DataTransfer case FIXED in round 3**
+  — drop now fires ONLY when the target cancels dragover (preventDefault =
+  acceptance per spec); dragging to empty space delivers dragend only (the
+  old `|| el` fallback "dropped" on the source's own position); DataTransfer
+  types are ASCII-lowercased with case-insensitive setData/getData. 4
+  regressions in tests/test_dnd_gate.py. Still open in this area: no
   dragenter/dragleave; dropEffect/effectAllowed not negotiated; the
   dragstart-listener heuristic (a non-draggable element with a dragstart
   listener gets a native DnD sequence — a real browser fires none) is a
