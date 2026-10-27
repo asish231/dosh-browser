@@ -931,10 +931,15 @@ async def run_scripts(
         for msg in messages:
             m_data = json.dumps(msg.get("data", ""))
             m_origin = json.dumps(msg.get("origin", ""))
-            m_target = json.dumps(msg.get("target", "*"))
+            # The third argument of __receiveMessage is the targetOrigin
+            # constraint, not the routing target. Passing msg["target"] (a
+            # frame URL like https://host/page.html) made the child's
+            # origin check compare URL-vs-origin and silently drop every
+            # parent-to-frame and reply message.
+            m_target_origin = json.dumps(msg.get("target_origin") or "*")
             try:
                 ctx.eval(
-                    f"if (typeof window !== 'undefined' && typeof window.__receiveMessage === 'function') window.__receiveMessage({m_data}, {m_origin}, {m_target});"
+                    f"if (typeof window !== 'undefined' && typeof window.__receiveMessage === 'function') window.__receiveMessage({m_data}, {m_origin}, {m_target_origin});"
                 )
             except Exception as exc:
                 record_error(exc)

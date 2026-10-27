@@ -1787,6 +1787,25 @@
       })(root, bodyMargin, bodyMargin);
     }
     doc.__layoutCache = layout;
+    /* Document scroll extent: the furthest right/bottom edge any laid-out
+       box reaches (documentElement's own box never grows past the viewport
+       width, so a 5000px-wide child used to be invisible to the scroll
+       clamp — maxX computed as 0 even after an axis fix). Mirrors
+       scrollWidth/scrollHeight semantics. */
+    try {
+      var __maxR = 0, __maxB = 0;
+      (function __walkExtent(n) {
+        if (!n) return;
+        if (n.__box) {
+          var r = n.__box.x + n.__box.width;
+          var b = n.__box.y + n.__box.height;
+          if (r > __maxR) __maxR = r;
+          if (b > __maxB) __maxB = b;
+        }
+        (n.childNodes || []).forEach(function (c) { if (c.nodeType === 1) __walkExtent(c); });
+      })(root);
+      doc.__scrollExtent = { width: __maxR, height: __maxB };
+    } catch (e) {}
     try {
       doc.__layoutInfo = { engine: "block-flow+flex+grid+positioned", viewportWidth: vw, boxes: layout.boxes, textMetric: "monospace-advance-0.6em", replacedDefaults: "css-300x150" };
     } catch (e) {}
@@ -1812,6 +1831,28 @@
   Object.defineProperty(Element.prototype, "offsetHeight", { get: function () { return this.getBoundingClientRect().height; } });
   Object.defineProperty(Element.prototype, "clientWidth", { get: function () { return this.getBoundingClientRect().width; } });
   Object.defineProperty(Element.prototype, "clientHeight", { get: function () { return this.getBoundingClientRect().height; } });
+  /* scrollWidth/scrollHeight: for the documentElement these are the full
+     document scroll extents (laid-out boxes may overflow the viewport);
+     for any other element the box dims (per-element overflow is not
+     tracked — disclosed approximation). */
+  Object.defineProperty(Element.prototype, "scrollWidth", {
+    get: function () {
+      var doc = this.ownerDocument || global.document;
+      if (doc) { __ensureLayout(doc); if (doc.documentElement === this && doc.__scrollExtent) return doc.__scrollExtent.width; }
+      var b = this.__box || { width: 0 };
+      return b.width;
+    },
+    configurable: true
+  });
+  Object.defineProperty(Element.prototype, "scrollHeight", {
+    get: function () {
+      var doc = this.ownerDocument || global.document;
+      if (doc) { __ensureLayout(doc); if (doc.documentElement === this && doc.__scrollExtent) return doc.__scrollExtent.height; }
+      var b = this.__box || { height: 0 };
+      return b.height;
+    },
+    configurable: true
+  });
   Object.defineProperty(Element.prototype, "offsetParent", {
     get: function () {
       if (this.nodeName === "body" || this.nodeName === "html") return null;
@@ -1844,8 +1885,9 @@
       return Math.max(0, b.y - opY);
     }
   });
-  Object.defineProperty(Element.prototype, "scrollWidth", { get: function () { return this.clientWidth || 0; }, configurable: true });
-  Object.defineProperty(Element.prototype, "scrollHeight", { get: function () { return this.clientHeight || 0; }, configurable: true });
+  /* scrollWidth/scrollHeight are defined above with document-level extents;
+     the old clientWidth-based stub here silently overrode them (later
+     defineProperty wins) and hid viewport overflow from the scroll clamp. */
   Object.defineProperty(Element.prototype, "classList", {
     get: function () {
       var el = this;
@@ -1915,6 +1957,22 @@
     return found;
   };
   Document.prototype.getElementsByTagName = Element.prototype.getElementsByTagName;
+  /* document.scrollWidth/scrollHeight mirror the documentElement's scroll
+     extents (the full laid-out document, including viewport overflow). */
+  Object.defineProperty(Document.prototype, "scrollWidth", {
+    get: function () {
+      var de = this.documentElement;
+      return de ? de.scrollWidth : 0;
+    },
+    configurable: true
+  });
+  Object.defineProperty(Document.prototype, "scrollHeight", {
+    get: function () {
+      var de = this.documentElement;
+      return de ? de.scrollHeight : 0;
+    },
+    configurable: true
+  });
   Document.prototype.getElementsByClassName = Element.prototype.getElementsByClassName;
   Document.prototype.querySelectorAll = Element.prototype.querySelectorAll;
   Document.prototype.querySelector = Element.prototype.querySelector;
@@ -3197,16 +3255,25 @@
   function _clampScroll(x, y) {
     var cx = Number(x) || 0;
     var cy = Number(y) || 0;
-    var vd = (typeof global.innerHeight === "number" && global.innerHeight > 0) ? global.innerHeight : 720;
+    var vw = (typeof global.innerWidth === "number" && global.innerWidth > 0) ? global.innerWidth : 1280;
+    var vh = (typeof global.innerHeight === "number" && global.innerHeight > 0) ? global.innerHeight : 720;
     if (cx < 0) cx = 0;
     if (cy < 0) cy = 0;
     try {
-      var de = global.document && global.document.documentElement;
+      var doc = global.document;
+      var de = doc && doc.documentElement;
       if (de && typeof de.getBoundingClientRect === "function" && !de.__layoutSkip) {
-        var h = de.getBoundingClientRect().height;
-        var max = Math.max(0, h - vd);
-        if (cy > max) cy = max;
-        if (cx > max) cx = max;
+        /* Each axis clamps against its own document extent: horizontal to
+           scrollWidth - viewport, vertical to scrollHeight - viewport. The
+           old code clamped BOTH axes with the vertical max (docHeight -
+           viewport), so a wide page could never scroll past ~one viewport
+           of horizontal travel. */
+        var sw = (typeof de.scrollWidth === "number" && de.scrollWidth > 0) ? de.scrollWidth : vw;
+        var sh = (typeof de.scrollHeight === "number" && de.scrollHeight > 0) ? de.scrollHeight : vh;
+        var maxX = Math.max(0, sw - vw);
+        var maxY = Math.max(0, sh - vh);
+        if (cy > maxY) cy = maxY;
+        if (cx > maxX) cx = maxX;
       }
     } catch (e) {}
     return [cx, cy];
