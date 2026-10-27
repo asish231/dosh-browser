@@ -3364,7 +3364,36 @@
     trace: function () { this.log.apply(this, arguments); }
   };
 
+  /* Web storage. The old per-context closures lost everything on the next
+     navigation (each goto builds a fresh engine context), so a token stored
+     on page 1 read null on page 2. Now the host seeds both stores from the
+     session-level per-origin state before page scripts run, and drains them
+     back at the end of every engine pass:
+     - localStorage: session-scoped per origin (persisted to the profile's
+       sqlite storage table when one is attached);
+     - sessionStorage: per-tab lifetime, owned by the Tab.
+     Disclosed approximation: frame documents get their own unseeded context
+     (same-origin frame storage sharing is not wired). */
+  var __storageSeed = {};
+  try { __storageSeed = (typeof globalThis.__WR_STORAGE_SEED === "object" && globalThis.__WR_STORAGE_SEED) || {}; } catch (e) {}
   var storage = {};
+  var __seedL = __storageSeed.local;
+  if (__seedL) {
+    for (var __slk in __seedL) {
+      if (Object.prototype.hasOwnProperty.call(__seedL, __slk)) storage[__slk] = String(__seedL[__slk]);
+    }
+  }
+  var sessionStorageStore = {};
+  var __seedS = __storageSeed.session;
+  if (__seedS) {
+    for (var __ssk in __seedS) {
+      if (Object.prototype.hasOwnProperty.call(__seedS, __ssk)) sessionStorageStore[__ssk] = String(__seedS[__ssk]);
+    }
+  }
+  global.__drainStorage = function () {
+    try { return JSON.stringify({ local: storage, session: sessionStorageStore }); }
+    catch (e) { return "{}"; }
+  };
   global.localStorage = {
     getItem: function (k) { return Object.prototype.hasOwnProperty.call(storage, k) ? storage[k] : null; },
     setItem: function (k, v) { storage[k] = String(v); },
@@ -3373,7 +3402,6 @@
     key: function (i) { return Object.keys(storage)[i] || null; },
     get length() { return Object.keys(storage).length; }
   };
-  var sessionStorageStore = {};
   global.sessionStorage = {
     getItem: function (k) { return Object.prototype.hasOwnProperty.call(sessionStorageStore, k) ? sessionStorageStore[k] : null; },
     setItem: function (k, v) { sessionStorageStore[k] = String(v); },

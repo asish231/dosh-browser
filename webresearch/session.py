@@ -10,7 +10,7 @@ import re
 import secrets
 import time
 from pathlib import Path
-from urllib.parse import urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import urlencode, urljoin, urlparse, urlsplit, urlunparse
 
 import httpx
 
@@ -89,6 +89,10 @@ class Tab:
     def __init__(self, tab_id: str) -> None:
         self.id = tab_id
         self.history: list[Page] = []
+        # sessionStorage is per-tab per-origin-less lifetime: owned by this
+        # tab, gone when it closes. localStorage lives on the Session
+        # (shared per origin across tabs), per the storage spec.
+        self.session_storage: dict[str, str] = {}
         # Parallel snapshot per history entry: the DOM/headers/frames state that
         # entry represented, so back()/forward() can restore a live document
         # instead of leaving the engine on the navigated-away page.
@@ -196,6 +200,65 @@ class Session:
         self._otp_checkpoints: dict[str, OtpCheckpoint] = {}
         self._last_login_wall: dict[str, Any] | None = None
         self._last_login_verdict: str = ""
+        # Web storage, host side: localStorage per origin (optionally backed
+        # by the profile's sqlite storage table), sessionStorage per tab.
+        # Seeded into each fresh engine context and drained back after every
+        # JS pass — the engine context itself dies on navigation.
+        self._web_storage: dict[str, dict[str, str]] = {}
+
+    def _origin_of(self, url: str) -> str:
+        parts = urlsplit(url or "")
+        if parts.scheme and parts.netloc:
+            return f"{parts.scheme}://{parts.netloc}"
+        return "about:blank"
+
+    def _storage_seed(self, url: str | None = None) -> dict[str, dict[str, str]]:
+        """Seed payload for a fresh engine context at `url`."""
+        origin = self._origin_of(url or self.url)
+        if origin not in self._web_storage:
+            loaded: dict[str, str] = {}
+            if self.profile is not None:
+                try:
+                    loaded = {str(k): str(v) for k, v in self.profile.load_storage(origin).items()}
+                except Exception:
+                    loaded = {}
+            self._web_storage[origin] = loaded
+        return {
+            "local": dict(self._web_storage[origin]),
+            "session": dict(self.current_tab.session_storage),
+        }
+
+    def _absorb_storage(self, js_info: dict | None, url: str | None = None) -> None:
+        """Persist drained web storage from an engine pass at session level."""
+        drained = (js_info or {}).get("storage")
+        if not isinstance(drained, dict):
+            return
+        origin = self._origin_of(url or self.url)
+        local = drained.get("local")
+        if isinstance(local, dict):
+            if origin not in self._web_storage:
+                self._storage_seed(url or self.url)  # ensures origin entry + profile load
+            before = self._web_storage.get(origin, {})
+            for k, v in local.items():
+                k = str(k)
+                v = str(v)
+                if before.get(k) != v:
+                    self._web_storage[origin][k] = v
+                    if self.profile is not None:
+                        try:
+                            self.profile.save_storage(origin, k, v)
+                        except Exception:
+                            pass
+            for k in [k for k in before if k not in local]:
+                self._web_storage[origin].pop(k, None)
+                if self.profile is not None:
+                    try:
+                        self.profile.delete_storage(origin, k)
+                    except Exception:
+                        pass
+        session = drained.get("session")
+        if isinstance(session, dict):
+            self.current_tab.session_storage = {str(k): str(v) for k, v in session.items()}
 
     def set_stealth(self, enabled: bool) -> bool:
         """Enable or disable humanised stealth mode (biological kinematics, typing pauses, smooth scroll)."""
@@ -312,10 +375,12 @@ class Session:
             js=js,  # type: ignore[arg-type]
             sprite_endpoint=f"/v1/sessions/{self.id}/captcha/sprite",
             return_js_info=True,
+            storage_seed=self._storage_seed(url),
         )
         self.frame_documents = frames
         self.captcha_inspection = captcha
         self.current_tab.ctx = js_info.get("ctx") if js_info else None
+        self._absorb_storage(js_info, url)
         self._last_dialogs = list((js_info or {}).get("dialogs") or [])
         self._last_popups = list((js_info or {}).get("popups") or [])
         if self.profile is not None:
@@ -508,8 +573,10 @@ class Session:
                 result.final_url or form.action,
                 self.client,
                 headers=result.headers,
+                storage_seed=self._storage_seed(result.final_url or form.action),
             )
             js_ran = bool(js_info.get("ran"))
+            self._absorb_storage(js_info, result.final_url or form.action)
             result = result.model_copy(update={"body": html})
             # The response is a NEW document: its JS context replaces the
             # previous page's. A script-less page has no live context at all
@@ -561,9 +628,11 @@ class Session:
             actions.append({"kind": "set_form_fields", "index": index, "fields": fields})
         actions.append({"kind": "submit_form", "index": index})
         new_html, js_info = await run_scripts(
-            self.html, self.url, self.client, force=True, actions=actions, ctx=self.current_tab.ctx
+            self.html, self.url, self.client, force=True, actions=actions, ctx=self.current_tab.ctx,
+            storage_seed=self._storage_seed(),
         )
         self.current_tab.ctx = js_info.get("ctx") or self.current_tab.ctx
+        self._absorb_storage(js_info)
         # submit() reads the engine's live form state (fields/files the page
         # JS actually collected) from this snapshot.
         self._last_form_js_info = js_info
@@ -602,7 +671,8 @@ class Session:
             ]
             if child_msgs and js_ran:
                 pumped_html, extra_js = await run_scripts(
-                    new_html, self.url, self.client, force=True, messages=child_msgs
+                    new_html, self.url, self.client, force=True, messages=child_msgs,
+                    storage_seed=self._storage_seed(),
                 )
                 if extra_js.get("navigated"):
                     js_info["navigated"] = extra_js["navigated"]
@@ -989,10 +1059,12 @@ class Session:
             js_info_post: dict = {}
             if result.kind == "html":
                 res_html, js_info_post = await run_scripts(
-                    res_html, dest, self.client, headers=result.headers
+                    res_html, dest, self.client, headers=result.headers,
+                    storage_seed=self._storage_seed(dest),
                 )
                 result = result.model_copy(update={"body": res_html})
                 self.current_tab.ctx = js_info_post.get("ctx") or None
+                self._absorb_storage(js_info_post, dest)
             page = snapshot(parse(result), max_chars=max_chars)
             page = _decorate(page, res_html, bool(js_info_post.get("ran")), js_info_post)
             post = self._push(page, res_html)
@@ -1360,9 +1432,11 @@ resolve a selector directly.
         """Re-run page JS with agent interactions, then rebuild the page model."""
         had_ctx = self.current_tab.ctx is not None
         new_html, js_info = await run_scripts(
-            html, self.url, self.client, force=True, actions=actions, ctx=self.current_tab.ctx
+            html, self.url, self.client, force=True, actions=actions, ctx=self.current_tab.ctx,
+            storage_seed=self._storage_seed(),
         )
         self.current_tab.ctx = js_info.get("ctx") or self.current_tab.ctx
+        self._absorb_storage(js_info)
         # A fresh engine build may be a history restore replaying this entry's
         # document: re-apply the stored scroll position once, before the page
         # snapshot is taken, so IntersectionObserver-driven feeds load the
@@ -1404,9 +1478,11 @@ resolve a selector directly.
         ]
         if child_msgs and js_ran:
             pumped_html, extra_js = await run_scripts(
-                new_html, self.url, self.client, force=True, messages=child_msgs, ctx=self.current_tab.ctx
+                new_html, self.url, self.client, force=True, messages=child_msgs, ctx=self.current_tab.ctx,
+                storage_seed=self._storage_seed(),
             )
             self.current_tab.ctx = extra_js.get("ctx") or self.current_tab.ctx
+            self._absorb_storage(extra_js)
             if extra_js.get("navigated"):
                 js_info["navigated"] = extra_js["navigated"]
             if extra_js.get("form_submit"):
@@ -1480,13 +1556,15 @@ resolve a selector directly.
                 js_info_post: dict = {}
                 if result.kind == "html":
                     res_html, js_info_post = await run_scripts(
-                        res_html, dest_url, self.client, headers=result.headers
+                        res_html, dest_url, self.client, headers=result.headers,
+                        storage_seed=self._storage_seed(dest_url),
                     )
                     result = result.model_copy(update={"body": res_html})
                     # Same as submit(): the POST response is a new document —
                     # its JS context (or None for a script-less page) replaces
                     # the previous one, so the next action drives THIS page.
                     self.current_tab.ctx = js_info_post.get("ctx") or None
+                    self._absorb_storage(js_info_post, dest_url)
                 page = snapshot(parse(result), max_chars=max_chars)
                 page = _decorate(
                     page,

@@ -464,6 +464,29 @@ class Profile:
             json.dump(data, f, indent=2)
         temp_file.replace(self.storage_file)
 
+    def delete_storage(self, origin: str, key: str) -> None:
+        """Remove one key of origin localStorage from SQLite and JSON."""
+        self._ensure_dir()
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                conn.execute("DELETE FROM storage WHERE origin = ? AND key = ?", (origin, key))
+                conn.commit()
+        except Exception:
+            pass
+        if not self.storage_file.exists():
+            return
+        try:
+            with open(self.storage_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get(origin), dict):
+                data[origin].pop(key, None)
+                temp_file = self.storage_file.with_suffix(".tmp")
+                with open(temp_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                temp_file.replace(self.storage_file)
+        except Exception:
+            pass
+
     def import_browser_sqlite(self, sqlite_path: str | Path) -> int:
         """Import cookies from external browser SQLite database (Firefox or Chrome/Chromium)."""
         p = Path(sqlite_path)

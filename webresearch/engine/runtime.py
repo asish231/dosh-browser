@@ -223,6 +223,7 @@ async def run_scripts(
     headers: dict | None = None,
     messages: list[dict] | None = None,
     ctx: Context | None = None,
+    storage_seed: dict | None = None,
 ) -> tuple[str, dict]:
     """Execute page scripts against mini-DOM. Returns (html, info)."""
     info: dict = {
@@ -244,6 +245,14 @@ async def run_scripts(
     reusing_ctx = False
     if ctx is None:
         ctx = Context()
+        # Web storage seed must be set before MINIDOM_JS evaluates: the
+        # storage closures read __WR_STORAGE_SEED at definition time. (json is
+        # the module-level import; _json is function-local elsewhere.)
+        if storage_seed:
+            try:
+                ctx.eval(f"globalThis.__WR_STORAGE_SEED = {json.dumps(storage_seed)}; true")
+            except Exception:
+                pass
         ctx.eval(MINIDOM_JS)
         ctx.add_callable("host_log", lambda *_a: None)
         ctx.add_callable("host_parse_html", _host_parse_html)
@@ -1156,6 +1165,14 @@ async def run_scripts(
     info["ran"] = ran > 0
     info["scripts"] = ran
     info["ctx"] = ctx
+    # Drain web storage so the caller can persist it at session level; the
+    # engine context dies on the next navigation, but the values must not.
+    try:
+        drained = ctx.eval("__drainStorage()")
+        if drained:
+            info["storage"] = json.loads(str(drained))
+    except Exception:
+        pass
     return out, info
 
 
