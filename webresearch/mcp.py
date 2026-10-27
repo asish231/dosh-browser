@@ -346,21 +346,24 @@ TOOLS = [
 ]
 
 # session_id uniformity: the server hosts one shared session, so the
-# parameter is accepted everywhere (agents pass "default" habitually) but is
-# never required and never changes which session a call addresses. Before
-# this pass some tools required it and others did not accept it at all.
+# parameter is accepted EVERYWHERE (an agent passing "default" to any tool
+# works), never required, and never changes which session a call addresses.
+# The first pass only normalized tools that already declared it; the re-audit
+# found 14 of 22 tools (including browser_navigate/click/type) had no
+# session_id property at all, so schema-strict clients rejected the call.
+_SESSION_ID_PROP = {
+    "type": "string",
+    "description": (
+        "Optional session label. This server hosts one shared session; "
+        "any value addresses it and 'default' works everywhere."
+    ),
+}
 for _tool in TOOLS:
-    _props = (_tool.get("inputSchema") or {}).get("properties") or {}
-    if "session_id" in _props:
-        _props["session_id"] = {
-            "type": "string",
-            "description": (
-                "Optional session label. This server hosts one shared session; "
-                "any value addresses it and 'default' works everywhere."
-            ),
-        }
-        _req = (_tool.get("inputSchema") or {}).get("required") or []
-        _tool["inputSchema"]["required"] = [r for r in _req if r != "session_id"]
+    _schema = _tool.setdefault("inputSchema", {"type": "object", "properties": {}})
+    _props = _schema.setdefault("properties", {})
+    _props["session_id"] = dict(_SESSION_ID_PROP)
+    _req = _schema.get("required") or []
+    _schema["required"] = [r for r in _req if r != "session_id"]
 
 
 def estimate_tokens(text: str) -> int:

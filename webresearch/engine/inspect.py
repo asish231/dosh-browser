@@ -109,6 +109,7 @@ def count_interactive(html: str) -> int:
 
 def detect_challenges(html: str, url: str = "", targets: list[Target] | None = None) -> list[Challenge]:
     from webresearch.engine.captcha import _markup_only
+    from webresearch.engine.tree import html_to_tree, walk
 
     # Same evidence model as browser_captcha (engine/captcha.py): script/
     # style/noscript CONTENTS never count — inline config like Wikipedia's
@@ -116,11 +117,45 @@ def detect_challenges(html: str, url: str = "", targets: list[Target] | None = N
     # challenge here while browser_captcha correctly said "not detected".
     # Tags and attributes DO count: a recaptcha/turnstile script src or a
     # cf-turnstile div is genuine widget evidence.
-    blob = f"{_markup_only(html)} {url}".lower()
+    #
+    # Provider rules (recaptcha/hcaptcha/turnstile/datadome) match ONLY
+    # structural evidence — tag names, attribute values, class tokens —
+    # never raw text: an HTML comment, a data attribute, or an article that
+    # merely MENTIONS "datadome" is not a challenge (re-audit false
+    # positives). Interstitial rules (cloudflare/google_sorry) still match
+    # visible text: those walls ARE detected by their phrases.
+    markup = _markup_only(html)
+    attr_blob: list[str] = [url.lower()]
+    text_blob: list[str] = [url.lower()]
+    try:
+        tree = html_to_tree(markup)
+        for node in walk(tree):
+            attrs = node.get("a") or {}
+            tag = node.get("t") or ""
+            if tag:
+                attr_blob.append(tag.lower())
+            for k, v in attrs.items():
+                # Structural evidence only: class tokens, ids, URL-bearing
+                # attributes. Arbitrary data-* values are NOT evidence — a
+                # data-note="recaptcha" on a div is prose in disguise (the
+                # re-audit's false-positive class).
+                if k.lower() in ("class", "id", "src", "href", "action"):
+                    attr_blob.append(str(v).lower())
+            if node.get("t") == "#text":
+                text_blob.append(str(node.get("x") or "").lower())
+    except Exception:
+        attr_blob.append(markup.lower())
+        text_blob.append(markup.lower())
+
+    provider_rules = {k for k, _p, _n in CHALLENGE_RULES if k in {"recaptcha", "hcaptcha", "turnstile", "datadome"}}
     found: list[Challenge] = []
     targets = targets or []
     for kind, passable, needles in CHALLENGE_RULES:
-        if not any(n in blob for n in needles):
+        if kind in provider_rules:
+            hay = " ".join(attr_blob)
+        else:
+            hay = " ".join(text_blob) or markup.lower()
+        if not any(n in hay for n in needles):
             continue
         refs = [t.ref for t in targets if t.challenge or t.role in {kind, "recaptcha", "hcaptcha", "turnstile", "checkbox"}]
         if kind == "recaptcha":

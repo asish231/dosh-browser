@@ -75,6 +75,16 @@
 
   Node.prototype.appendChild = function (child) {
     if (!child) return child;
+    /* Spec: appending a DocumentFragment inserts its CHILDREN (the fragment
+       itself never enters the tree). Each child flows through this method,
+       so mutation records and injected-script detection fire per child. */
+    if (child.nodeType === 11) {
+      var fragKids = child.childNodes.slice();
+      for (var fk = 0; fk < fragKids.length; fk++) {
+        this.appendChild(fragKids[fk]);
+      }
+      return child;
+    }
     if (child.parentNode) child.parentNode.removeChild(child);
     child.parentNode = this;
     this.childNodes.push(child);
@@ -82,10 +92,14 @@
     _notifyConnected(child);
     /* Runtime-injected scripts (document.createElement('script')) can't be seen
        by the static extractor. Push them onto a queue that the host drains after
-       each pump pass so LinkedIn-style dynamically-loaded ESM bundles execute. */
-    if (child && (child.nodeName === "SCRIPT" || (child.nodeName === "#document-fragment" && child.querySelectorAll))) {
+       each pump pass so LinkedIn-style dynamically-loaded ESM bundles execute.
+       Node names in this engine are LOWERCASE ('script'), so the old
+       `=== "SCRIPT"` check never matched and the entire injection lane was
+       dead (re-audit 2026-10-27). */
+    var __t = (child.nodeName || "").toLowerCase();
+    if (child && (__t === "script" || (__t === "#document-fragment" && child.querySelectorAll))) {
       var scripts = [];
-      if (child.nodeName === "SCRIPT") scripts = [child];
+      if (__t === "script") scripts = [child];
       else scripts = child.querySelectorAll("script");
       for (var s = 0; s < scripts.length; s++) {
         var el = scripts[s];
@@ -119,6 +133,13 @@
     if (this.parentNode) this.parentNode.removeChild(this);
   };
   Node.prototype.insertBefore = function (child, ref) {
+    /* Spec: insertBefore with a string throws TypeError. The old code pushed
+       the raw string into childNodes, and the serializer then failed — the
+       runtime's fallback silently discarded the entire pass's DOM mutations
+       with errors=0 (re-audit finding). */
+    if (typeof child === "string") {
+      throw new TypeError("Failed to execute 'insertBefore': parameter 1 is not of type 'Node'");
+    }
     if (!ref) return this.appendChild(child);
     if (child.parentNode) child.parentNode.removeChild(child);
     var i = this.childNodes.indexOf(ref);
@@ -425,6 +446,27 @@
   }
   Text.prototype = Object.create(Node.prototype);
   Text.prototype.constructor = Text;
+  /* Spec: Text.data and nodeValue are the same string; both were undefined
+  (only textContent worked), which broke page code reading el.data. */
+  Object.defineProperty(Text.prototype, "data", {
+    get: function () { return this._text; },
+    set: function (v) { this._text = String(v == null ? "" : v); },
+    configurable: true
+  });
+  Object.defineProperty(Text.prototype, "nodeValue", {
+    get: function () { return this._text; },
+    set: function (v) { this._text = String(v == null ? "" : v); },
+    configurable: true
+  });
+
+  function DocumentFragment() {
+    Node.call(this, 11, "#document-fragment", {}, []);
+  }
+  DocumentFragment.prototype = Object.create(Node.prototype);
+  DocumentFragment.prototype.constructor = DocumentFragment;
+  DocumentFragment.prototype.querySelectorAll = function (sel) { return cssSelect(this, sel); };
+  DocumentFragment.prototype.querySelector = function (sel) { return cssSelect(this, sel)[0] || null; };
+  global.DocumentFragment = DocumentFragment;
 
   function CSSStyleDeclaration(el) {
     this._el = el;
@@ -728,7 +770,9 @@
             : { type: "submit", target: form, bubbles: true, cancelable: true, isTrusted: trusted };
           form.dispatchEvent(subEv);
           if (!subEv.defaultPrevented && typeof form.submit === "function") {
-            try { form.submit(); } catch (e) {}
+            /* The clicked button is the submitter: its name/value pair
+               joins the entry list (spec). */
+            try { form.submit(this); } catch (e) {}
           }
         }
       }
@@ -741,26 +785,67 @@
   Element.prototype.__nativeClick = function () {
     return this._dispatchClickSequence(true);
   };
-  Element.prototype.submit = function () {
+  /* Form entry-list helpers: repeated names (same-name checkboxes, text
+     inputs sharing a name) must reach the wire as repeated pairs; a JS
+     object cannot repeat keys, so the second value for a name promotes it
+     to an array (the host expands arrays back into pairs). */
+  function __addField(fields, name, value) {
+    if (!Object.prototype.hasOwnProperty.call(fields, name)) {
+      fields[name] = value;
+      return;
+    }
+    var cur = fields[name];
+    if (Array.isArray(cur)) cur.push(value);
+    else fields[name] = [cur, value];
+  }
+  /* Spec: disabled controls — directly or inside a disabled <fieldset> —
+     are excluded from the entry list; the first <legend>'s contents are
+     exempt. */
+  function __entryDisabled(form, node) {
+    var n = node;
+    while (n && n !== form) {
+      if (n.disabled) return true;
+      if (n.nodeName === "legend") return false;
+      n = n.parentNode;
+    }
+    return false;
+  }
+  Element.prototype.submit = function (submitter) {
     if (this.nodeName !== "form") return;
     var action = this.getAttribute("action") || (global.location ? global.location.href : "");
     var method = (this.getAttribute("method") || "GET").toUpperCase();
     var enctype = (this.getAttribute("enctype") || "application/x-www-form-urlencoded").toLowerCase();
     var fields = {};
     var formFiles = {};
-    var inputs = this.querySelectorAll("input, textarea, select");
+    /* Spec: disabled form controls — directly or inside a disabled
+       <fieldset> — are excluded from the entry list; the first <legend>'s
+       contents are exempt (checked by __entryDisabled). */
+    var inputs = this.querySelectorAll("input, textarea, select, button");
     for (var i = 0; i < inputs.length; i++) {
       var inp = inputs[i];
       var name = inp.getAttribute("name");
       if (!name) continue;
       var type = (inp.getAttribute("type") || "").toLowerCase();
+      var tag = (inp.nodeName || "").toLowerCase();
+      /* button/reset are never entry-list creators (the submitter is the
+         only button that contributes, handled below). */
+      if (type === "button" || type === "reset") continue;
+      /* The clicked submitter contributes its own name/value pair; other
+         submit buttons do not (spec). */
+      if (type === "submit" || type === "image") {
+        if (submitter === inp) {
+          __addField(fields, name, inp.getAttribute("value") != null ? inp.getAttribute("value") : "");
+        }
+        continue;
+      }
+      if (__entryDisabled(this, inp)) continue;
       if ((type === "checkbox" || type === "radio") && !inp.checked) continue;
       if (type === "checkbox" || type === "radio") {
         /* HTML spec: the default value of checkbox/radio is "on". */
-        fields[name] = inp.getAttribute("value") != null ? inp.getAttribute("value") : "on";
+        __addField(fields, name, inp.getAttribute("value") != null ? inp.getAttribute("value") : "on");
         continue;
       }
-      if (inp.nodeName === "select" && inp.getAttribute("multiple") != null) {
+      if (tag === "select" && inp.getAttribute("multiple") != null) {
         /* A multiple select submits one pair per selected option; a JS
            object cannot repeat keys, so carry them as an array the host
            expands back into repeated pairs. */
@@ -794,15 +879,24 @@
         }
         continue;
       }
-      fields[name] = inp.value != null ? inp.value : (inp.getAttribute("value") || "");
+      __addField(fields, name, inp.value != null ? inp.value : (inp.getAttribute("value") || ""));
     }
     if (method === "GET") {
       try {
         var base = (global.location && global.location.href) ? global.location.href : "about:blank";
         var u = new URL(action, base);
-        for (var k in fields) {
-          u.searchParams.set(k, fields[k]);
+        /* Spec: on GET submit the serialized form data REPLACES the action
+           URL's query (not appended); repeated names become repeated pairs. */
+        var pairs = [];
+        for (var gk in fields) {
+          var gv = fields[gk];
+          if (Array.isArray(gv)) {
+            for (var gi = 0; gi < gv.length; gi++) pairs.push(encodeURIComponent(gk) + "=" + encodeURIComponent(gv[gi]));
+          } else {
+            pairs.push(encodeURIComponent(gk) + "=" + encodeURIComponent(gv));
+          }
         }
+        u.search = pairs.length ? "?" + pairs.join("&") : "";
         if (global.location && typeof global.location.assign === "function") {
           global.location.assign(u.href);
         } else {
@@ -2133,6 +2227,7 @@
     return new Element(tagLower);
   };
   Document.prototype.createTextNode = function (t) { return new Text(String(t)); };
+  Document.prototype.createDocumentFragment = function () { return new DocumentFragment(); };
   Document.prototype.getElementById = function (id) {
     var found = null;
     (function walk(n) {
@@ -2291,30 +2386,71 @@
     return out;
   }
   function matchSelector(root, sel) {
-    var tokens = sel.split(/\s+/);
-    var sets = [collectElements(root)];
-    tokens.forEach(function (tok) {
-      var next = [];
-      sets[sets.length - 1].forEach(function (n) {
-        collectElements(n).forEach(function (c) {
-          if (matchSimple(c, tok) && next.indexOf(c) < 0) next.push(c);
-        });
-        if (n !== root && matchSimple(n, tok) && next.indexOf(n) < 0 && n.nodeType === 1) next.push(n);
-      });
-      sets.push(next);
+    /* Selector support: comma-free chains of simple selectors joined by the
+       descendant (space) and child (>) combinators. The old tokenizer split
+       on whitespace only, so `div.menu > button` died on the bare `>` token,
+       and the single-class regex could not parse `button.s2.save` — which
+       made every id-less combinatorial selector unresolvable and defeated
+       the hidden-control filter for exactly the controls it targets. */
+    var norm = String(sel || "").replace(/\s*>\s*/g, " > ").trim();
+    if (!norm) return [];
+    var tokens = norm.split(/\s+/);
+    var seq = [];
+    var pendingComb = null;
+    for (var i = 0; i < tokens.length; i++) {
+      if (tokens[i] === ">") { pendingComb = ">"; continue; }
+      seq.push({ comb: pendingComb || " ", simple: tokens[i] });
+      pendingComb = null;
+    }
+    if (!seq.length) return [];
+    var current = [];
+    collectElements(root).forEach(function (n) {
+      if (matchSimple(n, seq[0].simple) && current.indexOf(n) < 0) current.push(n);
     });
-    return sets[sets.length - 1];
+    if (root !== global.document && root.nodeType === 1 && matchSimple(root, seq[0].simple) && current.indexOf(root) < 0) {
+      current.push(root);
+    }
+    for (var s = 1; s < seq.length; s++) {
+      var next = [];
+      current.forEach(function (n) {
+        if (seq[s].comb === ">") {
+          (n.childNodes || []).forEach(function (c) {
+            if (c.nodeType === 1 && matchSimple(c, seq[s].simple) && next.indexOf(c) < 0) next.push(c);
+          });
+        } else {
+          collectElements(n).forEach(function (c) {
+            if (matchSimple(c, seq[s].simple) && next.indexOf(c) < 0) next.push(c);
+          });
+          if (n !== root && matchSimple(n, seq[s].simple) && next.indexOf(n) < 0) next.push(n);
+        }
+      });
+      current = next;
+    }
+    return current;
   }
   function matchSimple(el, tok) {
     if (el.nodeType !== 1) return false;
     if (tok === "*") return true;
     if (tok.charAt(0) === "#") return el.id === tok.slice(1) || el.attributes.id === tok.slice(1);
-    if (tok.charAt(0) === ".") return (el.className || "").split(/\s+/).indexOf(tok.slice(1)) >= 0;
-    var m = tok.match(/^([a-z0-9-]+)?(?:#([a-zA-Z0-9_-]+))?(?:\.([a-zA-Z0-9_-]+))?(?:\[([a-zA-Z0-9_-]+)(?:=["']?([^"'\]]*)["']?)?\])?$/i);
+    if (tok.charAt(0) === ".") {
+      var dotCls = tok.slice(1).split(".");
+      var dotHave = (el.className || "").split(/\s+/);
+      for (var di = 0; di < dotCls.length; di++) {
+        if (dotHave.indexOf(dotCls[di]) < 0) return false;
+      }
+      return true;
+    }
+    var m = tok.match(/^([a-z0-9-]+)?(?:#([a-zA-Z0-9_-]+))?((?:\.[a-zA-Z0-9_-]+)*)(?:\[([a-zA-Z0-9_-]+)(?:=["']?([^"'\]]*)["']?)?\])?$/i);
     if (!m) return el.nodeName === tok.toLowerCase();
     if (m[1] && el.nodeName !== m[1].toLowerCase()) return false;
     if (m[2] && el.id !== m[2] && el.attributes.id !== m[2]) return false;
-    if (m[3] && (el.className || "").split(/\s+/).indexOf(m[3]) < 0) return false;
+    if (m[3]) {
+      var classes = m[3].split(".").filter(Boolean);
+      var have = (el.className || "").split(/\s+/);
+      for (var k = 0; k < classes.length; k++) {
+        if (have.indexOf(classes[k]) < 0) return false;
+      }
+    }
     if (m[4]) {
       if (!el.hasAttribute(m[4])) return false;
       if (m[5] != null && el.getAttribute(m[4]) !== m[5]) return false;
@@ -3501,38 +3637,71 @@
   global.window = global;
 
   /* History API for SPA routers.
-     pushState/replaceState record the request on __WR_PUSHED/__WR_REPLACED
-     for the host session (which owns the real history entries); back/forward/
-     go record a move on __WR_HISTORY_MOVE. The host performs the actual entry
-     moves and dispatches popstate into the rebuilt document — the engine
-     context cannot outlive a navigation, so it cannot own history alone. */
+     pushState/replaceState record the request on __WR_PUSHED (a LIST:
+     several pushes in one script pass each create their entry) /
+     __WR_REPLACED for the host session (which owns the real history
+     entries); back/forward/go record a move on __WR_HISTORY_MOVE. The host
+     performs the actual entry moves and dispatches popstate into the
+     rebuilt document — the engine context cannot outlive a navigation, so
+     it cannot own history alone. Cross-origin URLs throw SecurityError per
+     spec; the absolute URL is resolved against the CURRENT location
+     BEFORE the location is updated (the old order resolved relative URLs
+     twice: 'sub/page' from /deep/dir/page became .../sub/sub/page). */
   global.history = {
     length: 1,
     state: null,
     _stack: [],
     pushState: function (state, title, url) {
-      this.state = state;
-      this._stack.push(url);
+      var abs = "";
       if (url) {
-        if (typeof global._updateLocationQuietly === "function") global._updateLocationQuietly(url);
-        else if (global.location) global.location.href = String(url);
+        try {
+          abs = new URL(String(url), (global.location && global.location.href) || "about:blank").href;
+        } catch (e) {
+          throw new Error("SecurityError: malformed URL '" + String(url) + "' for history.pushState");
+        }
+        var curOrig = (global.location && global.location.origin) || "";
+        var newOrig = "";
+        try { newOrig = new URL(abs).origin; } catch (e2) {}
+        if (curOrig && newOrig && newOrig !== curOrig) {
+          throw new Error(
+            "SecurityError: a history state object with URL '" + abs +
+            "' may not be created in a document with origin '" + curOrig + "'"
+          );
+        }
+      } else {
+        abs = (global.location && global.location.href) || "";
       }
+      this.state = state;
+      this._stack.push(abs);
       if (url) {
-        var abs = String(url);
-        try { abs = new URL(String(url), (global.location && global.location.href) || "about:blank").href; } catch (e) {}
+        if (typeof global._updateLocationQuietly === "function") global._updateLocationQuietly(abs);
+        else if (global.location) global.location.href = abs;
         var ser = null;
-        try { ser = (state === undefined) ? null : JSON.parse(JSON.stringify(state == null ? null : state)); } catch (e) { ser = null; }
-        global.__WR_PUSHED = { url: abs, state: ser };
+        try { ser = (state === undefined) ? null : JSON.parse(JSON.stringify(state == null ? null : state)); } catch (e3) { ser = null; }
+        global.__WR_PUSHED = global.__WR_PUSHED || [];
+        global.__WR_PUSHED.push({ url: abs, state: ser });
       }
     },
     replaceState: function (state, title, url) {
-      this.state = state;
+      var abs2 = "";
       if (url) {
-        if (typeof global._updateLocationQuietly === "function") global._updateLocationQuietly(url);
-        else if (global.location) global.location.href = String(url);
-        var abs2 = String(url);
-        try { abs2 = new URL(String(url), (global.location && global.location.href) || "about:blank").href; } catch (e) {}
+        try { abs2 = new URL(String(url), (global.location && global.location.href) || "about:blank").href; } catch (e) { abs2 = String(url); }
+        var curOrig2 = (global.location && global.location.origin) || "";
+        var newOrig2 = "";
+        try { newOrig2 = new URL(abs2).origin; } catch (e2) {}
+        if (curOrig2 && newOrig2 && newOrig2 !== curOrig2) {
+          throw new Error(
+            "SecurityError: a history state object with URL '" + abs2 +
+            "' may not be created in a document with origin '" + curOrig2 + "'"
+          );
+        }
+        this.state = state;
+        if (typeof global._updateLocationQuietly === "function") global._updateLocationQuietly(abs2);
+        else if (global.location) global.location.href = abs2;
         global.__WR_REPLACED = { url: abs2, state: state === undefined ? null : state };
+      } else {
+        this.state = state;
+        global.__WR_REPLACED = { url: (global.location && global.location.href) || "", state: state === undefined ? null : state };
       }
     },
     back: function () { global.__WR_HISTORY_MOVE = (global.__WR_HISTORY_MOVE || 0) - 1; },
@@ -5203,9 +5372,16 @@
         getUserMedia: function () { return Promise.reject(new Error("NotSupportedError")); }
       },
       /* sendBeacon: fire-and-forget POST through the owned host_fetch lane
-         (CORS-checked there like every in-page request). Returns true when the
-         request was handed to the host, per spec semantics. */
+         (CORS-checked there like every in-page request). Returns true when
+         the request was handed to the host, FALSE when the URL cannot be
+         resolved (spec) — the old lane posted blindly and always said true. */
       sendBeacon: function (url, data) {
+        var abs = "";
+        try {
+          abs = new URL(String(url || ""), (global.location && global.location.href) || "about:blank").href;
+        } catch (e) {
+          return false;
+        }
         try {
           var body = "";
           if (data == null) body = "";
@@ -5215,8 +5391,6 @@
             body = sfd.body;
           } else if (typeof data === "object") body = JSON.stringify(data);
           else body = String(data);
-          var abs = String(url || "");
-          try { abs = new URL(String(url || ""), (global.location && global.location.href) || "about:blank").href; } catch (e) {}
           if (typeof host_fetch === "function") {
             host_fetch(abs, "POST", body, JSON.stringify({ "content-type": "text/plain;charset=UTF-8" }), "");
             return true;
@@ -5320,8 +5494,11 @@
         this._id = ++__bcSeq;
         this.onmessage = null;
         this._listeners = [];
+        this._closed = false;
         (__bcRegistry[this.name] = __bcRegistry[this.name] || []).push(this);
         this.postMessage = function (data) {
+          /* Spec: postMessage on a closed channel is a no-op. */
+          if (this._closed) return;
           var list = __bcRegistry[this.name] || [];
           for (var i = 0; i < list.length; i++) {
             if (list[i] === this) continue;
@@ -5343,8 +5520,13 @@
           this._listeners = this._listeners.filter(function (f) { return f !== fn; });
         };
         this.close = function () {
+          /* `this` inside the filter callback is not the channel — the old
+             callback compared against a non-bound `this` and removed
+             nothing, so closed channels kept receiving (re-audit finding). */
+          this._closed = true;
+          var self = this;
           var list = __bcRegistry[this.name] || [];
-          __bcRegistry[this.name] = list.filter(function (ch) { return ch !== this; });
+          __bcRegistry[this.name] = list.filter(function (ch) { return ch !== self; });
         };
       };
     })();
@@ -5359,26 +5541,28 @@
     };
 
     /* caretRangeFromPoint: hit-test against laid-out boxes and return a Range
-       collapsed at the innermost containing element. Disclosed approximation:
-       no caret geometry, so the Range carries the element, not an offset. */
+       collapsed at the INNERMOST containing element (smallest box wins — the
+       old walk took the first/outermost match). Outside every box it returns
+       null, like Chrome. Disclosed approximation: no caret geometry, so the
+       Range carries the element, not an offset. */
     Document.prototype.caretRangeFromPoint = function (x, y) {
       __ensureLayout(this);
       var px = Number(x) || 0, py = Number(y) || 0;
-      var best = null;
+      var best = null, bestArea = Infinity;
       (function walk(n) {
         if (!n || n.nodeType !== 1) return;
         var b = n.__box;
-        if (b && px >= b.x && px <= b.x + b.width && py >= b.y && py <= b.y + b.height) {
-          if (!best) best = n;
+        if (b && b.width > 0 && b.height > 0 && px >= b.x && px <= b.x + b.width && py >= b.y && py <= b.y + b.height) {
+          var area = b.width * b.height;
+          if (area < bestArea) { best = n; bestArea = area; }
         }
         (n.childNodes || []).forEach(function (c) { if (c.nodeType === 1) walk(c); });
       })(this.body || this.documentElement);
+      if (!best) return null;
       var r = new global.Range();
-      if (best) {
-        r.startContainer = best;
-        r.endContainer = best;
-        r.collapsed = true;
-      }
+      r.startContainer = best;
+      r.endContainer = best;
+      r.collapsed = true;
       return r;
     };
 
@@ -5419,20 +5603,30 @@
     /* Resource-timing entries: the host injects one per subresource this
        pass actually fetched (scripts, in-page fetch/XHR) with real URLs and
        byte sizes. Timing values are 0 — no fabricated timing data, the
-       honest representation. Real stats collectors reduce() over
-       getEntriesByType('resource') without an initial value; an always-empty
-       timeline made that reduce undefined (GitHub bundle-stats crashed). */
+       honest representation. MERGE by URL (not replace): action passes
+       reuse this ctx, and the old replace wiped the page-load subresources
+       after the first scroll — an agent reading the timeline post-action
+       saw an empty history. A fresh navigation builds a fresh ctx, which
+       resets the timeline like a real page load. Real stats collectors
+       reduce() over getEntriesByType('resource') without an initial
+       value; an always-empty timeline made that reduce undefined. */
     var __resourceEntries = [];
+    var __markEntries = [];
     global.performance = {
       timeOrigin: startTime,
       now: function () { return (Date.now() - startTime) + _clockOffset; },
       __setResourceEntries: function (list) {
         try {
           var parsed = (typeof list === "string") ? JSON.parse(list) : list;
-          __resourceEntries = [];
           (parsed || []).forEach(function (r) {
+            var nm = String(r.url || "");
+            var exists = false;
+            for (var i = 0; i < __resourceEntries.length; i++) {
+              if (__resourceEntries[i].name === nm) { exists = true; break; }
+            }
+            if (exists) return;
             __resourceEntries.push({
-              name: String(r.url || ""),
+              name: nm,
               entryType: "resource",
               initiatorType: String(r.initiatorType || "other"),
               startTime: 0, duration: 0,
@@ -5471,15 +5665,28 @@
         loadEventStart: startTime + 149,
         loadEventEnd: startTime + 150
       },
-      getEntries: function () { return __resourceEntries.slice(); },
-      getEntriesByType: function (t) { return t === "resource" ? __resourceEntries.slice() : []; },
+      getEntries: function () { return __resourceEntries.slice().concat(__markEntries); },
+      getEntriesByType: function (t) {
+        if (t === "resource") return __resourceEntries.slice();
+        if (t === "mark") return __markEntries.filter(function (e) { return e.entryType === "mark"; });
+        if (t === "measure") return __markEntries.filter(function (e) { return e.entryType === "measure"; });
+        return [];
+      },
       getEntriesByName: function (n, t) {
-        return __resourceEntries.filter(function (e) {
-          return e.name === String(n) && (!t || t === "resource");
+        return (__resourceEntries.concat(__markEntries)).filter(function (e) {
+          return e.name === String(n) && (!t || t === e.entryType);
         });
       },
-      mark: function (name) { return { name: String(name || ""), entryType: "mark", startTime: this.now(), duration: 0 }; },
-      measure: function (name) { return { name: String(name || ""), entryType: "measure", startTime: 0, duration: 0 }; }
+      mark: function (name) {
+        var mk = { name: String(name || ""), entryType: "mark", startTime: this.now(), duration: 0 };
+        __markEntries.push(mk);
+        return mk;
+      },
+      measure: function (name) {
+        var ms = { name: String(name || ""), entryType: "measure", startTime: 0, duration: 0 };
+        __markEntries.push(ms);
+        return ms;
+      }
     };
     if (!global.location || global.location.href === "about:blank") {
       try {
@@ -6455,7 +6662,12 @@ global.__submitPath = function (path) {
     var ev = new global.Event("submit", { bubbles: true, cancelable: true });
     el.dispatchEvent(ev);
     if (ev.defaultPrevented) return "prevented";
-    if (form && typeof form.submit === "function") { try { form.submit(); } catch (e) {} }
+    if (form && typeof form.submit === "function") {
+      /* el is the agent-clicked control (a submit button): it is the
+         submitter and contributes its own name/value pair. */
+      var submitter = (el.nodeName === "button" || el.nodeName === "input") ? el : null;
+      try { form.submit(submitter); } catch (e) {}
+    }
     return "submitted";
   };
   global.__submitFormByIndex = function (index) {

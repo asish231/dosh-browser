@@ -1,12 +1,13 @@
 # Open Issues — dosh-browser engine
 
-> Work register of verified gaps. Every entry was reproduced through the real
-> engine and cross-checked by three subagent audits instructed to disprove
-> each claim. **Status pass completed 2026-10-27**: all P0, P1, P2 (except the
-> three disclosed substrate-execution items), DOC, and the five MCP-layer
-> findings are fixed with hermetic regressions. Commits: 6a6c493, eb40aa8,
-> 3a6effe, 555a35e, 7d5aacd, 0967508, c9cd30a, 91bb561, plus the docs pass.
-> Suite at the final verification: 420 passed, 8 skipped. Full history in git.
+> Work register of verified gaps. Round 1 (2026-10-24): every entry reproduced
+> through the real engine and cross-checked by three subagent audits. Round 2
+> (2026-10-27): three ADVERSARIAL audits tried to disprove every fix from
+> round 1; they confirmed the core fixes but found real defects the author's
+> own tests didn't encode — several introduced by the fixes themselves. The
+> confirmed high-impact findings were then fixed and re-verified (20 new
+> regressions in tests/test_reaudit_fixes.py; suite at 443 passed). Commits:
+> 6a6c493..1b191f1 (round 1) + the round-2 fix commit.
 >
 > Rule from AGENTS.md still applies: a capability gap is a bug report against
 > `minidom.js`, never a reason to reach for a browser binary.
@@ -197,23 +198,188 @@ not throw), and their limits are disclosed rather than faked:
 
 ---
 
-## Known remaining (honest)
+## Round 2 — adversarial re-audit: confirmed defects and their fixes
 
-- GitHub rspack chunk-require `hk` live-binding error (above): non-fatal,
-  module-provenance reported; full webpack cross-chunk emulation is part of
-  the ESM registry approximation, tracked with the module system.
-- Worker/WASM/SW execution depth: disclosed above, by decision.
-- Overlay occlusion: disclosed above (P2-6).
-- Binary WebSocket frames INCOMING are counted and skipped (disclosed gap);
-  outgoing binary is real opcode-2.
-- No pixel rendering: canvas/video frames never reach the agent (decomposed
-  at parse); captcha stays inspection-only by policy.
+Three adversarial audits tried to disprove the round-1 fixes. The CORE claims
+all held (searchParams liveness, select/radio/disabled lanes, storage
+persistence, scroll clamp, frame messaging, tab-surf, MCP findings). The
+defects below were confirmed live, fixed, and re-verified:
+
+### Fixed in round 2
+
+1. **Injected-script execution lane was entirely dead** — the detector
+   compared `nodeName === "SCRIPT"` but engine nodeNames are lowercase, so
+   runtime `<script>` injection never executed (AGENTS.md had been claiming
+   this worked). Also missing: `createDocumentFragment` (undefined),
+   fragment flattening, Text `.data`/`.nodeValue`. Fixed: lowercase match,
+   DocumentFragment + spec flattening, Text data/nodeValue; 4 regressions.
+   AGENTS.md row restored to truth.
+2. **Wire entry-list infidelity** — same-name checkboxes/text inputs
+   collapsed to one pair; disabled inputs and fieldset-disabled descendants
+   were submitted; the clicked submitter's name/value pair was missing;
+   button/reset inputs were submitted; GET forms APPENDED to the action
+   query instead of replacing it; GET multi-select serialized as one
+   comma-joined pair. Fixed: __addField array promotion, __entryDisabled
+   (fieldset + legend exemption), submitter threading through
+   __submitPath/click, button/reset exclusion, GET query replacement with
+   repeated pairs. 3 regressions.
+3. **Forward entries destroyed by any action pass** — `Tab.push(replace=True)`
+   truncated the forward stack unconditionally, so back()+scroll made
+   forward() fail. Fixed: only new entries truncate. 1 regression.
+4. **sessionStorage leaked across origins in a tab** — b.test read a.test's
+   session store (per-origin scoping was never implemented). Fixed:
+   per-origin slice per tab. 1 regression.
+5. **WebSocket close never reached JS** — `_parse_frames` popped the conn
+   before `poll_all` could report it, so server-initiated close never fired
+   onclose and readyState stayed OPEN. Fixed: conn stays in the registry
+   until poll_all reports it. 1 regression (local RFC 6455 close server).
+6. **BroadcastChannel.close() was a no-op** — the filter callback compared
+   against unbound `this`; closed channels kept receiving. Fixed: self-bound
+   filter + closed guard on postMessage. 1 regression.
+7. **Selector engine could not resolve `A > B.c.d`** — no child combinator,
+   no multi-class compounds — which silently defeated the round-1 hidden-
+   control filter for every id-less nested control (its `__hiddenCheck`
+   selectors never resolved, and "unresolvable → visible" kicked in). Fixed:
+   child-combinator + multi-class selector support; hidden filter now
+   catches the id-less case. 2 regressions.
+8. **History API holes** — two pushStates in one pass collapsed to one
+   entry; relative pushState URLs resolved twice (`sub/page` →
+   `.../sub/sub/page`); cross-origin pushState did not throw SecurityError;
+   load-pass pushStates were dropped when the page had no entry yet. Fixed:
+   __WR_PUSHED as a list, resolve-then-update ordering, origin check,
+   absorb-after-push in goto. 2 regressions.
+9. **caretRangeFromPoint returned the OUTERMOST box** (its own comment said
+   innermost) and returned an empty Range outside every box instead of
+   null. Fixed: smallest-box wins; null outside. 1 regression.
+10. **Captcha false positives remained** — HTML comments, data-attributes,
+    and provider names in visible prose ("an article about datadome") still
+    fired the inspect banner while browser_captcha stayed quiet (lanes
+    disagreed). Fixed: provider rules match structural evidence only
+    (class/id/src/href/action attribute values); interstitial rules keep
+    matching visible text. 2 regressions.
+11. **14/22 MCP tools had no session_id in their schema at all** — the
+    round-1 "uniform" claim only normalized the 8 that already had it.
+    Fixed: declared on every tool, never required. 1 regression.
+12. **Resource timeline reset every action pass** — page-load subresource
+    entries vanished after the first scroll. Fixed: merge-by-URL instead of
+    replace (fresh navigation still starts a fresh timeline, like a real
+    page load); marks/measures now appear in getEntries()/getEntriesByType.
+    1 regression.
+13. **content_root was O(candidates²)** — 400 sibling rows measured ~63s
+    (fresh parent-chain walks per candidate pair, with expensive selectolax
+    node comparisons). Fixed: chains precomputed once, container-tag gate;
+    300 rows now well under the test budget. 1 regression.
+14. **sendBeacon returned true for unresolvable URLs** — fixed: URL parse
+    failure returns false per spec.
+15. **insertBefore("string") corrupted the tree** and the serializer
+    fallback then silently discarded the whole pass's DOM mutations with
+    errors=0. Fixed: TypeError per spec; the serializer fallback now records
+    an error naming the discarded pass. 1 regression.
+
+### Corrections to round-1 claims (now accurate in this register)
+
+- Round-1 commit 0967508's message claimed dialog "close/cancel events" —
+  the cancel event (ESC) was never implemented (see remaining).
+- Round-1 claimed "session_id uniformly optional across all tools" — was
+  true for 8/22; now all 22.
+- Round-1 claimed multi-select "submits one pair per selection" — was true
+  only for POST; GET serialized one comma-joined pair (now both repeat).
+- Round-1's OPEN_ISSUES claimed "inspect and browser_captcha lanes agree" —
+  three evidence classes disagreed (comments, data-attrs, prose); now the
+  evidence model is shared and the remaining known disagreement class is
+  listed below.
+
+## Known remaining (honest, post round 2)
+
+- **P0-area spec edges (verified, unfixed)**: engine lane does not disable
+  fieldset-disabled descendants for page-JS flows (act() catches them via
+  the surface; wire excludes them since round 2 — the engine click/type
+  lanes still act on them); `option.text`/`option.label` undefined;
+  `<option value="">Text</option>` reports value "Text" (spec: "");
+  multiple-select with no selection reports first option's value (spec: "");
+  out-of-range selectedIndex reverts to first option (spec: deselect);
+  parse-time radio exclusivity not applied (two `checked` attrs in one group
+  both read checked — wire is safe by collection order).
+- **URL serializer/parsing edges**: `%20` instead of `+` for spaces in the
+  application/x-www-form-urlencoded serializer; href getter drops
+  username/password and non-special schemes (mailto:); default port kept
+  in href; `?a` re-serializes as `?a=`; naive base resolution for
+  base-with-query cases.
+- **History**: `history.length` is engine-local (always 1) even when the
+  session owns several entries; `scrollRestoration` undefined; popstate
+  state is JSON-round-tripped (structured-clone subset: undefined keys and
+  functions silently dropped); load-pass `history.back()` (in a setTimeout
+  during page load) is dropped — moves are consumed only on action passes;
+  history restore re-executes the destination's scripts, so a page that
+  pushStates on load re-pushes after back().
+- **Dialog**: no cancel event (ESC), no InvalidStateError on double-show,
+  `form[method=dialog]` submit does not close the dialog; focus trap and
+  top layer disclosed-absent.
+- **scrollIntoView**: `behavior:'smooth'` is synchronous (no animation);
+  no scrollable-ancestor support (scrolls the document); `ifNeeded` does
+  nearest instead of centering; `display:none` target scrolls to phantom.
+- **DnD**: drop fires without the dragover-preventDefault gate;
+  drag-to-nothing still drops on the source's own position; DataTransfer
+  types not ASCII-lowercased (setData/getData case-sensitive); no
+  dragenter/dragleave; dropEffect/effectAllowed not negotiated; the
+  dragstart-listener heuristic (a non-draggable element with a dragstart
+  listener gets a native DnD sequence — a real browser fires none) is a
+  disclosed deviation.
+- **Small APIs**: geolocation watchPosition ids not unique; serviceWorker
+  register scriptURL not resolved absolute; checkVisibility always consults
+  visibility (spec: only with checkVisibilityCSS:true); popover missing
+  InvalidStateError/NotSupportedError cases and auto-close-of-others.
+- **Hidden controls**: `[hidden]` attribute and collapsed `<details>` content
+  not consulted; `el.style.display='block'` property writes do not sync the
+  style attribute the cascade reads (JS-revealed controls stay filtered);
+  scriptless pages (no ctx) get inline-hidden filtering only — the surface
+  does not disclose that stylesheet-hidden controls may be listed.
+- **Frames**: `e.source.postMessage` replies (target 'reply') are excluded by
+  the session's child-msg filter — the standard cross-frame reply form
+  never reaches the parent; URL-form targetOrigin
+  ('https://host/path' vs origin) is dropped at the child; frames re-fetch
+  and re-run their scripts on every action pass (init messages repeat).
+- **MCP**: error-path results (unknown tool, bad args) bypass token
+  accounting; the legacy `_iter_refs` fallback hash is still value-inclusive
+  (it can never resolve inspect-issued form-field refs — it errors honestly
+  instead); `press_key`'s stale-ref error text still describes the old
+  value-sensitive refs.
+- **Scroll**: every page gets ~8px of phantom horizontal scroll (the body
+  box is shifted by its margin and counted in the extent); body.scrollWidth
+  returns the box width, not the content extent.
+- **Perf**: content_root's 2-sibling no-main pages still drop a sibling
+  (below the 3+ container threshold — pre-existing subtraction model).
+- **Storage**: no `storage` events in other same-origin tabs (spec fires
+  them); key() ordering after cross-navigation re-seed follows host seed
+  order, not original set order.
+- Substrate execution depth (Worker/WASM/SW-JS) remains disclosed-not-
+  implemented per the round-1 decision; blob: URLs resolve locally.
 
 ## Verified working — do not re-file
 
 - ArrowUp/ArrowDown on a focused select changes selection and fires events.
 - Checkbox click toggling (no double-toggle artifact).
-- Frame→parent postMessage replay at load time (correct origins).
+- Frame→parent postMessage replay at load time (correct origins);
+  parent→frame delivery (round 2 re-verified).
 - SW strategy simulation for in-page fetch/XHR honors declared strategies.
-- Storage across navigation/restore/tabs/profiles (P0-5).
+- Storage across navigation/restore/tabs/profiles (P0-5), now including
+  sessionStorage per-origin scoping (round 2).
 - All P1 APIs above (each has a live probe + regression).
+- Injected-script execution (round 2): appendChild/prepend src + inline,
+  fragment flattening, Text.data/nodeValue.
+- Wire entry-list: repeated pairs (GET and POST), disabled/fieldset
+  exclusion, submitter pair, GET query replacement.
+- Forward() survives action passes between back/forward (round 2).
+- WS server-initiated close reaches JS onclose with code + readyState 3
+  (round 2).
+- BroadcastChannel close() stops delivery (round 2).
+- Selector engine: `A > B.c.d` child combinator + multi-class (round 2).
+- history: multi-push entries, relative single-resolution, cross-origin
+  SecurityError (round 2).
+- caretRangeFromPoint: innermost box; null outside (round 2).
+- Captcha evidence: comments/data-attrs/prose quiet in both lanes; real
+  widgets still fire (round 2).
+- session_id declared on all 22 tools (round 2).
+- Resource timeline persists across action passes; marks/measures in
+  getEntries (round 2).
+- content_root: 300-row lists under test budget (round 2).

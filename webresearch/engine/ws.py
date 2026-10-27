@@ -250,7 +250,11 @@ def _parse_frames(conn: _Conn) -> None:
                     conn.sock.close()
             conn.sock = None
             conn.closed = True
-            _REGISTRY.pop(conn.id, None)
+            # Stay in the registry: poll_all's tail loop is what reports the
+            # close to JS (firing onclose) and pops the entry. The old pop
+            # here removed the conn before that loop could see it, so a
+            # server-initiated close NEVER reached JS — onclose never fired,
+            # readyState stayed OPEN, and later sends silently vanished.
             return
         if opcode == 0x9:  # ping -> pong
             with contextlib.suppress(Exception):

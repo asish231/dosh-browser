@@ -152,35 +152,56 @@ def content_root(tree: HTMLParser) -> Node | None:
                 (ROOT_SELECTOR_PRIORITY[selector], candidate, _candidate_score(candidate))
             )
 
+    # Precompute each candidate's ancestor chain ONCE and gate container
+    # candidates by tag. The previous loops ran _ancestor_of (a fresh
+    # parent-chain walk with expensive node comparisons) for every candidate
+    # PAIR — O(n²·depth), and a 400-row list measured ~63s. With chains the
+    # pair test is a short list walk, and only candidates whose tag appears
+    # as someone's ancestor tag can ever be a container, so leaf rows skip
+    # the pair work entirely.
+    chains: list[list[Node]] = []
+    for _priority, candidate, _score in candidates:
+        chain: list[Node] = [candidate]
+        node = candidate.parent
+        while node is not None and len(chain) < 24:
+            chain.append(node)
+            node = node.parent
+        chains.append(chain)
+    container_tags: set[str] = set()
+    for ch in chains:
+        for anc in ch[1:]:
+            if getattr(anc, "tag", None):
+                container_tags.add(str(anc.tag).lower())
+
     best: Node | None = None
     best_key: tuple[int, int, int, int] | None = None
-    for priority, candidate, (words, headings, blocks) in candidates:
-        # List pages (GitHub trending, HN, product grids) repeat the SAME
-        # landmark tag many times as siblings: a candidate whose candidate
-        # descendants number three or more is their CONTAINER, not a wrapper
-        # around one duplicate. Subtracting every descendant emptied <main>
-        # on such pages and crowned a single <article> row, so ACD read one
-        # repo card and dropped its nine siblings. Nested-duplicate pages
-        # (a promo card inside the real content) still subtract normally.
-        descendant_candidates = 0
-        for other_priority, other, other_score in candidates:
-            if _same_node(other, candidate):
-                continue
-            if _ancestor_of(other, candidate):
-                if descendant_candidates >= 2:
-                    # Three or more candidate descendants: this is a list
-                    # container. Keep the full score.
-                    descendant_candidates = 99
-                    break
-                descendant_candidates += 1
-        if descendant_candidates < 99:
-            for other_priority, other, other_score in candidates:
-                if _same_node(other, candidate):
+    for idx, (priority, candidate, (words, headings, blocks)) in enumerate(candidates):
+        # Descendant candidates (their scores are this candidate's nested
+        # content — subtracted below unless this is a list container).
+        descendant_scores: list[tuple[int, int, int]] = []
+        if str(candidate.tag or "").lower() in container_tags:
+            for ydx, (_op, _other, other_score) in enumerate(candidates):
+                if ydx == idx:
                     continue
-                if _ancestor_of(other, candidate):
-                    words = max(0, words - other_score[0])
-                    headings = max(0, headings - other_score[1])
-                    blocks = max(0, blocks - other_score[2])
+                for anc in chains[ydx][1:]:
+                    if _same_node(anc, candidate):
+                        descendant_scores.append(other_score)
+                        break
+        if len(descendant_scores) >= 3:
+            # List pages (GitHub trending, HN, product grids) repeat the SAME
+            # landmark tag many times as siblings: a candidate with three or
+            # more candidate descendants is their CONTAINER, not a wrapper
+            # around one duplicate. Subtracting every descendant emptied
+            # <main> on such pages and crowned a single <article> row, so ACD
+            # read one repo card and dropped its siblings. Nested-duplicate
+            # pages (a promo card inside the real content) still subtract
+            # normally.
+            pass
+        else:
+            for other_words, other_headings, other_blocks in descendant_scores:
+                words = max(0, words - other_words)
+                headings = max(0, headings - other_headings)
+                blocks = max(0, blocks - other_blocks)
         key = (words, headings, blocks, priority)
         if best is None or (best_key is not None and key > best_key):
             best = candidate

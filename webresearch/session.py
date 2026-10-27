@@ -89,10 +89,10 @@ class Tab:
     def __init__(self, tab_id: str) -> None:
         self.id = tab_id
         self.history: list[Page] = []
-        # sessionStorage is per-tab per-origin-less lifetime: owned by this
-        # tab, gone when it closes. localStorage lives on the Session
-        # (shared per origin across tabs), per the storage spec.
-        self.session_storage: dict[str, str] = {}
+        # sessionStorage is per-tab per-ORIGIN lifetime (spec): owned by this
+        # tab, scoped per origin, gone when it closes. localStorage lives on
+        # the Session (shared per origin across tabs).
+        self.session_storage: dict[str, dict[str, str]] = {}
         # Parallel snapshot per history entry: the DOM/headers/frames state that
         # entry represented, so back()/forward() can restore a live document
         # instead of leaving the engine on the navigated-away page.
@@ -127,8 +127,14 @@ class Tab:
             self.url = page.url
         if headers is not None:
             self.headers = dict(headers)
-        self.history = self.history[: self.index + 1]
-        del self.snapshots[self.index + 1 :]
+        # Only a genuinely NEW entry truncates the forward stack. An in-place
+        # replace (scroll/type/mutation/history-move rebuild) must keep it:
+        # the old code truncated unconditionally, so back() + one action
+        # destroyed the forward entry and forward() then failed (re-audit
+        # finding).
+        if not replace:
+            self.history = self.history[: self.index + 1]
+            del self.snapshots[self.index + 1 :]
         if replace:
             # An in-page action (scroll/type/mutation) that stayed on this
             # document rewrites the current entry, like a real browser: these
@@ -236,7 +242,10 @@ class Session:
             self._web_storage[origin] = loaded
         return {
             "local": dict(self._web_storage[origin]),
-            "session": dict(self.current_tab.session_storage),
+            # Per-origin slice only: a cross-origin navigation in this tab
+            # starts with an empty session store (the old flat dict leaked
+            # a.test's values to b.test — re-audit finding).
+            "session": dict(self.current_tab.session_storage.get(origin, {})),
         }
 
     def _absorb_storage(self, js_info: dict | None, url: str | None = None) -> None:
@@ -269,24 +278,36 @@ class Session:
                         pass
         session = drained.get("session")
         if isinstance(session, dict):
-            self.current_tab.session_storage = {str(k): str(v) for k, v in session.items()}
+            origin_s = self._origin_of(url or self.url)
+            self.current_tab.session_storage[origin_s] = {
+                str(k): str(v) for k, v in session.items()
+            }
 
     def _absorb_history(self, js_info: dict | None) -> None:
         """Record engine pushState/replaceState at session level.
 
-        A pushState adds a real history entry carrying the CURRENT document
+        Each pushState adds a real history entry carrying the CURRENT document
         (same DOM, new URL) — exactly like an SPA router in a real browser:
         no reload, the entry becomes current, the live ctx is preserved.
-        A replaceState rewrites the current entry's URL. The state object is
+        Multiple pushes in one script pass each create their entry. A
+        replaceState rewrites the current entry's URL. The state object is
         stored on the entry snapshot so a later restore can dispatch popstate
         with it. back/forward/go are NOT handled here (they need a document
         restore; handled by _engine_history_move in action passes).
         """
-        pushed = (js_info or {}).get("history_push")
-        if isinstance(pushed, dict) and pushed.get("url"):
+        pushes = (js_info or {}).get("history_pushes") or []
+        # Back-compat: single-push shape from earlier revisions.
+        single = (js_info or {}).get("history_push")
+        if isinstance(single, dict) and single.get("url"):
+            pushes = [*pushes, single]
+        for pushed in pushes:
+            if not (isinstance(pushed, dict) and pushed.get("url")):
+                continue
             page = self.page
             if page is None:
-                return
+                # No document to carry yet: skip this push, do not abort the
+                # remaining ones.
+                continue
             new_page = page.model_copy(update={"url": str(pushed["url"])})
             self._push(new_page, self.html)
             if 0 <= self.current_tab.index < len(self.current_tab.snapshots):
@@ -484,7 +505,6 @@ class Session:
         self.captcha_inspection = captcha
         self.current_tab.ctx = js_info.get("ctx") if js_info else None
         self._absorb_storage(js_info, url)
-        self._absorb_history(js_info)
         self._last_dialogs = list((js_info or {}).get("dialogs") or [])
         self._last_popups = list((js_info or {}).get("popups") or [])
         if self.profile is not None:
@@ -508,10 +528,14 @@ class Session:
                 note = f"DOWNLOAD FAILED: {rec.error}\n  url: {url}"
                 page = page.model_copy(update={"view": note, "chars": len(note)})
             pushed = self._push(page, html)
+            # pushState during page load carries the NEWLY loaded document —
+            # absorb after the push so the entries have a page to carry.
+            self._absorb_history(js_info)
             await self._load_popup_tabs((js_info or {}).get("popups") or [])
             return pushed
 
         pushed = self._push(page, html)
+        self._absorb_history(js_info)
         await self._load_popup_tabs((js_info or {}).get("popups") or [])
         return pushed
 

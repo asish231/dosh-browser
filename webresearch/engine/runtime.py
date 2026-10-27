@@ -1143,8 +1143,12 @@ async def run_scripts(
 
     try:
         out = str(ctx.eval("__serialize()") or html)
-    except Exception:
+    except Exception as exc:
+        # A poisoned tree (e.g. a raw string in childNodes) must not silently
+        # discard every DOM mutation of the pass: fall back to the source
+        # html but SURFACE the failure so the agent knows the view is stale.
         out = html
+        record_error(exc, source="serializer (page mutations discarded; view is pre-pass HTML)")
 
     info["framework_data"] = _extract_framework_data(ctx, html)
     try:
@@ -1180,17 +1184,21 @@ async def run_scripts(
             ]
     except Exception:
         pass
-    # History API drains: the engine records pushState/replaceState requests
-    # and back/forward/go moves; the session owns the real history entries
+    # History API drains: the engine records pushState requests as a LIST
+    # (several pushes in one script pass each create an entry) and
+    # replaceState requests; the session owns the real history entries
     # (the engine context cannot outlive a navigation).
     try:
         pushed_raw = ctx.eval("JSON.stringify(globalThis.__WR_PUSHED || null)")
         pushed = json.loads(str(pushed_raw)) if pushed_raw else None
-        if isinstance(pushed, dict) and pushed.get("url"):
-            info["history_push"] = {
-                "url": str(pushed.get("url", ""))[:2000],
-                "state": pushed.get("state"),
-            }
+        pushes = [p for p in pushed if isinstance(p, dict) and p.get("url")] if isinstance(pushed, list) else (
+            [pushed] if isinstance(pushed, dict) and pushed.get("url") else []
+        )
+        if pushes:
+            info["history_pushes"] = [
+                {"url": str(p.get("url", ""))[:2000], "state": p.get("state")}
+                for p in pushes
+            ]
     except Exception:
         pass
     try:
