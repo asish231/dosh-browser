@@ -6140,20 +6140,22 @@
       this.items = [];
     };
     global.DataTransfer.prototype.setData = function (type, value) {
-      type = String(type);
+      /* Spec: the type is converted to ASCII lowercase. */
+      type = String(type).toLowerCase();
       this.__data[type] = String(value);
       this.types = Object.keys(this.__data);
     };
     global.DataTransfer.prototype.getData = function (type) {
-      type = String(type);
+      /* Spec: the type is converted to ASCII lowercase. */
+      type = String(type).toLowerCase();
       return Object.prototype.hasOwnProperty.call(this.__data, type) ? this.__data[type] : "";
     };
     global.DataTransfer.prototype.hasData = function (type) {
-      return Object.prototype.hasOwnProperty.call(this.__data, String(type));
+      return Object.prototype.hasOwnProperty.call(this.__data, String(type).toLowerCase());
     };
     global.DataTransfer.prototype.clearData = function (type) {
       if (type === undefined) { this.__data = {}; }
-      else { delete this.__data[String(type)]; }
+      else { delete this.__data[String(type).toLowerCase()]; }
       this.types = Object.keys(this.__data);
     };
     global.DataTransfer.prototype.setDragImage = function () {};
@@ -6733,7 +6735,10 @@
     var dragDropTarget = null;
     if (nativeDrag) {
       var srcBox = (typeof el.getBoundingClientRect === "function") ? el.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0 };
-      dragDropTarget = __dragHitTest(srcBox.x + dx, srcBox.y + dy) || el;
+      dragDropTarget = __dragHitTest(srcBox.x + dx, srcBox.y + dy);
+      /* No element under the translated source box: a real browser drops
+         NOTHING (dragend only) — the old `|| el` fallback "dropped" on the
+         source's own position and reported a drop that never happened. */
     }
 
     if (isStealth) {
@@ -6848,10 +6853,22 @@
     }
     if (nativeDrag && typeof global.DragEvent === "function") {
       var endInit = { bubbles: true, cancelable: true, isTrusted: true, __trusted: true, clientX: startX + dx, clientY: startY + dy, button: 0, buttons: 0, dataTransfer: dragDT, timeStamp: t };
-      try {
-        dragDropTarget.dispatchEvent(new global.DragEvent("dragover", endInit));
-        dragDropTarget.dispatchEvent(new global.DragEvent("drop", endInit));
-      } catch (e) {}
+      /* Spec: drop is delivered ONLY if the target cancels dragover
+         (preventDefault signals acceptance). The old code fired drop
+         unconditionally — reporting a drop a real browser would never
+         deliver. dragover must also fire only over a real target. */
+      var dropAccepted = false;
+      if (dragDropTarget) {
+        try {
+          var ovEv = new global.DragEvent("dragover", endInit);
+          dragDropTarget.dispatchEvent(ovEv);
+          if (ovEv.defaultPrevented) {
+            dropAccepted = true;
+            dragDropTarget.dispatchEvent(new global.DragEvent("drop", endInit));
+          }
+        } catch (e) {}
+      }
+      /* dragend always fires on the source (spec), accepted or not. */
       try {
         el.dispatchEvent(new global.DragEvent("dragend", endInit));
       } catch (e) {}
