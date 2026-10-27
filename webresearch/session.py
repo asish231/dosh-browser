@@ -1379,12 +1379,14 @@ class Session:
         surface = collect(self.html, self.url, max_actions=max_actions)
         # CSS-hidden controls are not actionable in a real browser; the
         # engine's cascade (stylesheet rules, hidden ancestors — not just
-        # the inline styles collect() can see) decides. Hidden controls are
-        # excluded from the list but counted on the surface: never silently
-        # dropped.
-        hidden_inline = [a for a in surface.actions if a.hidden]
-        candidates = [a for a in surface.actions if not a.hidden]
-        engine_hidden = 0
+        # the inline styles collect() can see) decides. When an engine
+        # context exists it arbitrates EVERY control, including the ones
+        # flagged inline-hidden: author CSS can override the UA [hidden]
+        # rule (#x[hidden] { display: block }), so the flag alone must not
+        # drop a control the cascade says is visible. Without a ctx the
+        # inline flag is the honest fallback. Hidden controls are excluded
+        # from the list but counted on the surface: never silently dropped.
+        candidates = surface.actions
         ctx = self.current_tab.ctx
         if ctx is not None and candidates:
             import json as _json
@@ -1397,14 +1399,23 @@ class Session:
                 flags = []
             if len(flags) == len(candidates):
                 kept: list[Action] = []
+                engine_hidden = 0
                 for action, is_hidden in zip(candidates, flags):
                     if is_hidden:
                         engine_hidden += 1
                     else:
                         kept.append(action)
-                candidates = kept
-        surface.actions = candidates
-        surface.hidden_controls = len(hidden_inline) + engine_hidden
+                surface.actions = kept
+                surface.hidden_controls = engine_hidden
+                return surface
+        # No engine (or the check could not run): the inline/ancestor flag
+        # is the fallback truth. If a <style> block exists, stylesheet rules
+        # could not be verified — say so on the coverage line instead of
+        # silently claiming the list is clean.
+        kept2 = [a for a in candidates if not a.hidden]
+        surface.hidden_controls = len(candidates) - len(kept2)
+        surface.stylesheet_unverified = "<style" in (self.html or "").lower()
+        surface.actions = kept2
         return surface
 
     def actions(self, *, max_actions: int = 200) -> list[Action]:

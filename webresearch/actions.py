@@ -138,6 +138,10 @@ class ActionSurface:
     # CSS-hidden controls excluded from `actions` (inline style, stylesheet
     # rule, or hidden ancestor). Reported, never silently dropped.
     hidden_controls: int = 0
+    # True when no engine context existed to verify stylesheet rules: inline
+    # and [hidden]/details hiding were filtered, but stylesheet-hidden
+    # controls may still be listed (a <style> block exists on the page).
+    stylesheet_unverified: bool = False
 
     @property
     def complete(self) -> bool:
@@ -155,6 +159,11 @@ class ActionSurface:
             line += (
                 f"; {self.hidden_controls} control(s) hidden by CSS "
                 "(display:none/visibility) and not actionable"
+            )
+        if self.stylesheet_unverified:
+            line += (
+                "; no engine for this page: inline/[hidden]/details hiding was "
+                "applied, but stylesheet-hidden controls cannot be verified"
             )
         return line
 
@@ -272,14 +281,38 @@ def _role_of(node: Node, kind: str) -> str:
 
 
 def _inline_hidden(node: Node) -> bool:
-    """The element's own style attribute hides it. This is the no-engine
-    fallback only — stylesheet rules and hidden ancestors need the cascade,
-    which the engine consults in Session.action_surface()."""
-    style = (node.attributes.get("style") or "").replace(" ", "").lower()
+    """The element is hidden by its own markup, without an engine cascade:
+    inline display:none/visibility, a [hidden] attribute on the element OR
+    ANY ancestor (UA rule), or content inside a closed <details> that is not
+    the summary. Stylesheet rules need the cascade, which the engine
+    consults in Session.action_surface(); this flag is the no-engine
+    fallback and a first-pass hint when an engine exists."""
+    attrs = node.attributes
+    style = (attrs.get("style") or "").replace(" ", "").lower()
     if "display:none" in style:
         return True
     if "visibility:hidden" in style or "visibility:collapse" in style:
         return True
+    # [hidden] on the element or any ancestor hides the subtree (UA rule).
+    # NOTE: the engine path can still reveal such an element when author CSS
+    # overrides the UA rule (#x[hidden] { display: block }) — the engine
+    # cascade is consulted before this flag is trusted.
+    p = node
+    while p is not None:
+        if "hidden" in (p.attributes or {}):
+            return True
+        p = p.parent
+    # Closed <details>: only the summary (and its contents) stays visible.
+    passed_summary = False
+    p = node
+    while p is not None:
+        tag = (p.tag or "").lower()
+        if tag == "summary":
+            passed_summary = True
+        if tag == "details" and "open" not in (p.attributes or {}):
+            if not passed_summary:
+                return True
+        p = p.parent
     return False
 
 
