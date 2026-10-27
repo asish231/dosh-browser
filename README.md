@@ -1,4 +1,4 @@
-# webresearch
+# Webresearch
 
 Browser **for LLM agents**, not humans.
 
