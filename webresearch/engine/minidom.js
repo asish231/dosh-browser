@@ -6228,7 +6228,15 @@
     global.__receiveMessage = function (data, origin, targetOrigin) {
       if (targetOrigin && targetOrigin !== "*") {
         var myOrigin = (global.location && global.location.origin) || "";
-        if (myOrigin && targetOrigin !== myOrigin) {
+        /* targetOrigin may be given as a full URL ('https://host/path') — the
+           spec compares ORIGINS, so parse a URL down to its origin instead
+           of a naive string compare (which dropped every URL-form target
+           message; same bug class the runtime delivery once had). */
+        var wantOrigin = String(targetOrigin);
+        if (wantOrigin.indexOf("/") > 0) {
+          try { wantOrigin = new URL(wantOrigin).origin; } catch (e) {}
+        }
+        if (myOrigin && wantOrigin !== myOrigin) {
           return false;
         }
       }
