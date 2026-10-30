@@ -391,8 +391,17 @@ engine-heavy passes (suite 254s -> ~263-275s).
   string-compared (wrong origins still dropped). Verified end to end:
   parent → child delivery, reply, direct parent message, and URL-form
   targeting all work through a real act() pass; 6 regressions in
-  tests/test_frame_reply.py. Remaining in this area: frames re-fetch and
-  re-run their scripts on every action pass (init messages repeat).
+  tests/test_frame_reply.py. **Frame lifecycle across action passes
+  FIXED** — `load_frames(cached=...)` reuses unchanged frames with their
+  live QuickJS contexts (identity = load-time parent ref + resolved URL /
+  srcdoc); changed src, changed srcdoc, and removed iframes fetch fresh or
+  drop out; new parent→frame messages are pumped into the live frame ctx
+  (no document re-run); child→parent messages deliver exactly once via a
+  per-frame delivered cursor (load-time delivery marks the cursor in
+  read.py). 8 regressions in tests/test_frame_reuse.py (no re-fetch,
+  init-once, state persists across passes, live pump + reply, src swap
+  fetches only the new frame, removal drops out, same-object reuse, and
+  back() reuse). Suite 488 passed.
 - **MCP**: error-path results (unknown tool, bad args) bypass token
   accounting; the legacy `_iter_refs` fallback hash is still value-inclusive
   (it can never resolve inspect-issued form-field refs — it errors honestly

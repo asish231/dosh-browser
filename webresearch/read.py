@@ -281,6 +281,11 @@ async def read_live(
                         result = result.model_copy(update={"body": html})
                 except Exception:
                     pass
+            # Load-time messages are delivered now; the per-frame cursor
+            # marks them consumed so the first action pass (which reuses
+            # live frames instead of re-running them) does not replay them.
+            for frame in frames:
+                frame.delivered_count = len(frame.post_messages)
     captcha = await inspect_captcha(
         html,
         result.final_url or url,
