@@ -748,7 +748,7 @@
        no click (programmatic el.click() included), fires no listeners, and
        never navigates. Before this guard, a disabled submit button produced
        a real HTTP submit and disabled buttons ran their click listeners. */
-    if (this.disabled && (tag === "input" || tag === "button" || tag === "select"
+    if (__controlDisabled(this) && (tag === "input" || tag === "button" || tag === "select"
         || tag === "textarea" || tag === "option" || tag === "fieldset")) {
       return false;
     }
@@ -900,6 +900,41 @@
     while (n && n !== form) {
       if (n.disabled) return true;
       if (n.nodeName === "legend") return false;
+      n = n.parentNode;
+    }
+    return false;
+  }
+  /* Spec: a control is disabled if it carries the disabled attribute OR it
+     lives inside a disabled <fieldset> (first <legend>'s contents are exempt).
+     Used by the engine interaction lanes so fieldset-disabled descendants are
+     not actuated by page JS or agent drives. */
+  function __controlDisabled(node) {
+    if (!node) return false;
+    if (node.hasAttribute && node.hasAttribute("disabled")) return true;
+    var n = node.parentNode;
+    while (n && n.nodeName) {
+      var nTag = (n.nodeName || "").toLowerCase();
+      if (nTag === "fieldset" && n.hasAttribute && n.hasAttribute("disabled")) {
+        var firstLegend = null;
+        if (n.childNodes) {
+          for (var li = 0; li < n.childNodes.length; li++) {
+            var cn = n.childNodes[li];
+            if (cn && cn.nodeName && (cn.nodeName || "").toLowerCase() === "legend") {
+              firstLegend = cn; break;
+            }
+          }
+        }
+        var inLegend = false;
+        if (firstLegend) {
+          var cur = node;
+          while (cur && cur !== n) {
+            if (cur === firstLegend) { inLegend = true; break; }
+            cur = cur.parentNode;
+          }
+        }
+        if (!inLegend) return true;
+      }
+      if (nTag === "body" || nTag === "html" || n === n.parentNode) break;
       n = n.parentNode;
     }
     return false;
@@ -6394,7 +6429,7 @@
     }
     /* Disabled form controls never receive typed input. */
     var elTag = el.nodeName.toLowerCase();
-    if (el.disabled && (elTag === "input" || elTag === "textarea" || elTag === "select")) {
+    if (__controlDisabled(el) && (elTag === "input" || elTag === "textarea" || elTag === "select")) {
       return false;
     }
     if (typeof el.focus === "function") el.focus();
@@ -6480,7 +6515,7 @@
     if (!el) return false;
     if (stealth !== undefined) global.__stealthMode = !!stealth;
     if (el.nodeName === "select") {
-      if (el.disabled) return false;
+      if (__controlDisabled(el)) return false;
       /* Typing into a select means choosing an option (by value, then by
          visible text) — never appending text to a value that is derived
          from the chosen option. A bare activate just focuses it. */
@@ -6556,7 +6591,7 @@
     var out = [];
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
-      if (el.disabled) continue;
+      if (__controlDisabled(el)) continue;
       var ti = el.getAttribute("tabindex");
       if (ti && Number(ti) < 0) continue;
       out.push(el);
@@ -6572,7 +6607,7 @@
     if (!el) return false;
     /* Disabled form controls are not focusable and receive no key events. */
     var pkTag = el.nodeName.toLowerCase();
-    if (el.disabled && (pkTag === "input" || pkTag === "textarea" || pkTag === "select" || pkTag === "button")) {
+    if (__controlDisabled(el) && (pkTag === "input" || pkTag === "textarea" || pkTag === "select" || pkTag === "button")) {
       return false;
     }
     if (typeof el.focus === "function" && el.nodeName.toLowerCase() !== "body") el.focus();

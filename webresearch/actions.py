@@ -322,13 +322,38 @@ def _disabled(node: Node) -> bool:
         return True
     if attrs.get("aria-disabled") == "true":
         return True
-    parent = node.parent
-    hops = 0
-    while parent is not None and hops < 4:
-        if "disabled" in parent.attributes:
-            return True
-        parent = parent.parent
-        hops += 1
+    # Spec: a disabled <fieldset> disables its descendant form controls,
+    # except those inside its first <legend>.
+    cur = node
+    while cur is not None and cur.parent is not None:
+        parent = cur.parent
+        ptag = (getattr(parent, "tag", "") or "").lower()
+        if ptag == "fieldset" and "disabled" in (getattr(parent, "attributes", {}) or {}):
+            # The legend that is a direct child of this fieldset and an
+            # ancestor of node (if any).
+            child_of_fieldset = None
+            a = node
+            while a is not None and a is not parent:
+                if a.parent is parent:
+                    child_of_fieldset = a
+                    break
+                a = a.parent
+            # Only the FIRST legend child of the fieldset is exempt.
+            first_legend = None
+            fc = getattr(parent, "first_child", None)
+            while fc is not None:
+                if (getattr(fc, "tag", "") or "").lower() == "legend":
+                    first_legend = fc
+                    break
+                fc = getattr(fc, "next", None)
+            in_legend = (
+                child_of_fieldset is not None
+                and first_legend is not None
+                and child_of_fieldset is first_legend
+            )
+            if not in_legend:
+                return True
+        cur = parent
     return False
 
 

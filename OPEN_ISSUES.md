@@ -348,9 +348,7 @@ engine-heavy passes (suite 254s -> ~263-275s).
   -1 with nothing chosen, first selected wins otherwise); out-of-range
   selectedIndex deselects per spec (was: snap back to the first option).
   10 regressions in tests/test_option_api.py. Still open in this area:
-  the engine lane does not disable fieldset-disabled descendants for
-  page-JS flows (act() catches them via the surface; wire excludes them
-  since round 2 — the engine click/type lanes still act on them);
+   **fieldset-disabled descendants FIXED** (engine lanes consult __controlDisabled; actions.py narrowed to fieldset propagation with legend exemption); 5 regressions in tests/test_fieldset_disabled_engine.py.
   parse-time radio exclusivity not applied (two `checked` attrs in one
   group both read checked — wire is safe by collection order).
 - **URL serializer/parsing edges**: `%20` instead of `+` for spaces in the
