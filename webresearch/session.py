@@ -789,16 +789,23 @@ class Session:
                     self.client,
                     parent_headers=self.current_tab.headers,
                     parent_messages=js_info.get("post_messages"),
+                    cached=self.frame_documents,
                 )
                 if new_html
                 else self.frame_documents
             )
-            child_msgs = [
-                pm
-                for f in frames
-                for pm in f.post_messages
-                if pm.get("target") in {"parent", "top", "reply", "*", ""}
-            ]
+            # Same-document pass: reuse live frames; deliver each frame's
+            # messages to the parent exactly once (cursor).
+            child_msgs: list[dict] = []
+            for f in frames:
+                pms = f.post_messages
+                if len(pms) > f.delivered_count:
+                    child_msgs.extend(
+                        pm
+                        for pm in pms[f.delivered_count :]
+                        if pm.get("target") in {"parent", "top", "reply", "*", ""}
+                    )
+                    f.delivered_count = len(pms)
             if child_msgs and js_ran:
                 # Replies (e.source.postMessage — the standard cross-frame
                 # reply form) carry the child's origin in msg["origin"] (the
@@ -1653,16 +1660,25 @@ resolve a selector directly.
                 self.client,
                 parent_headers=self.current_tab.headers,
                 parent_messages=js_info.get("post_messages"),
+                cached=self.frame_documents,
             )
             if new_html
             else self.frame_documents
         )
-        child_msgs = [
-            pm
-            for f in frames
-            for pm in f.post_messages
-            if pm.get("target") in {"parent", "top", "reply", "*", ""}
-        ]
+        # Frames stay alive across action passes now; each frame's messages
+        # are delivered to the parent exactly once (the per-frame cursor),
+        # instead of the whole frame tree re-running and re-sending its
+        # init messages on every click/scroll/type.
+        child_msgs: list[dict] = []
+        for f in frames:
+            pms = f.post_messages
+            if len(pms) > f.delivered_count:
+                child_msgs.extend(
+                    pm
+                    for pm in pms[f.delivered_count :]
+                    if pm.get("target") in {"parent", "top", "reply", "*", ""}
+                )
+                f.delivered_count = len(pms)
         if child_msgs and js_ran:
             # Replies (e.source.postMessage — the standard cross-frame reply
             # form) must reach the parent like parent/top-targeted messages;

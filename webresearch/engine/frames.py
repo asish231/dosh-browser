@@ -64,6 +64,15 @@ class FrameDocument:
     html: str = ""
     js_info: dict = field(default_factory=dict)
     error: str = ""
+    # Identity captured at load time for reuse matching on later passes:
+    # pre-redirect resolved URL, raw iframe src, raw srcdoc content.
+    origin_url: str = ""
+    seed_src: str = ""
+    seed_srcdoc: str = ""
+    # Cursor: how many of this frame's post_messages have already been
+    # delivered to the parent. Frames are reused across action passes now,
+    # so without it every pass would re-deliver the frame's init messages.
+    delivered_count: int = 0
 
     @property
     def js_ran(self) -> bool:
@@ -213,6 +222,53 @@ def _decode_data_url(url: str) -> tuple[str, str]:
     return raw.decode("utf-8", errors="replace"), content_type
 
 
+def _frame_inbox(
+    ref: str,
+    document_url: str,
+    parent_url: str,
+    parent_messages: list[dict] | None,
+) -> list[dict]:
+    """Filter the parent's postMessages down to the ones addressed to one frame.
+
+    Recipient identity: "*", ""/"self", the frame's ref, or its (resolved)
+    URL. Origin constraint: targetOrigin must be "*" or match the frame's
+    origin exactly (scheme/host/port).
+    """
+    if not parent_messages:
+        return []
+    frame_origin = extract_origin(document_url)
+    parent_origin = extract_origin(parent_url)
+    inbox: list[dict] = []
+    for m in parent_messages:
+        # 1. Frame recipient identity
+        target_id = m.get("target") or "*"
+        if target_id not in {"*", "", "self"}:
+            if target_id in {"parent", "top", "reply"}:
+                continue
+            if target_id != ref and target_id != document_url:
+                resolved_target = urljoin(parent_url, target_id)
+                if resolved_target != document_url:
+                    continue
+        # 2. Origin constraint: exact scheme/host/port comparison
+        target_orig = m.get("target_origin") or m.get("origin") or "*"
+        if target_orig not in {"*", "", "/"}:
+            expected_origin = extract_origin(target_orig)
+            if expected_origin and expected_origin != frame_origin:
+                continue
+        msg_copy = dict(m)
+        msg_copy["origin"] = m.get("origin") or parent_origin
+        inbox.append(msg_copy)
+    return inbox
+
+
+def _doc_identity(doc: FrameDocument) -> str:
+    """Stable per-document identity for reuse matching: the pre-redirect
+    resolved URL for src frames, the srcdoc content for srcdoc frames."""
+    if doc.seed_srcdoc:
+        return f"srcdoc:{hash(doc.seed_srcdoc)}"
+    return doc.origin_url or doc.url
+
+
 async def load_frames(
     html: str,
     url: str,
@@ -224,8 +280,25 @@ async def load_frames(
     synthetic_captcha: bool = True,
     parent_headers: dict | None = None,
     parent_messages: list[dict] | None = None,
+    cached: list[FrameDocument] | None = None,
 ) -> list[FrameDocument]:
-    """Fetch a bounded, flat frame tree with parent refs."""
+    """Fetch a bounded, flat frame tree with parent refs.
+
+    With ``cached`` — the frame documents already loaded for THIS document,
+    as on an action pass — unchanged frames are REUSED, not re-fetched and
+    re-run: their live QuickJS contexts, DOM state, and accumulated
+    postMessages persist between actions exactly like the parent page's
+    context does. Only frames whose identity changed (new or moved src,
+    changed srcdoc, removed iframe) are fetched fresh, and new parent
+    messages are delivered into the reused frame's live context instead of
+    replaying its whole document.
+    """
+    # Reuse index: (parent ref at load time, identity) -> cached document.
+    cache: dict[tuple[str, str], FrameDocument] = {}
+    if cached:
+        for doc in cached:
+            cache[(doc.parent_ref, _doc_identity(doc))] = doc
+
     queue = _discover_seeds(
         html,
         url,
@@ -235,6 +308,10 @@ async def load_frames(
     )
     documents: list[FrameDocument] = []
     seen: set[tuple[str, str]] = set()
+    # New positional ref -> load-time ref for reused documents; nested seeds
+    # look up their cache entries under the parent's LOAD-TIME ref.
+    new_to_old: dict[str, str] = {}
+    reused: list[FrameDocument] = []
 
     while queue and len(documents) < max_frames:
         seed = queue.pop(0)
@@ -245,6 +322,46 @@ async def load_frames(
         seen.add(identity)
 
         ref = f"f{len(documents) + 1}"
+
+        # Reuse lookup: same identity under the same parent. Depth-1 frames
+        # are keyed under the root parent (""); nested frames under their
+        # parent's load-time ref.
+        hit: FrameDocument | None = None
+        if cached is not None:
+            parent_old = "" if seed.parent_ref == "" else new_to_old.get(seed.parent_ref)
+            if parent_old is not None:
+                ident = f"srcdoc:{hash(seed.srcdoc)}" if seed.srcdoc else frame_url
+                hit = cache.get((parent_old, ident))
+
+        if hit is not None:
+            # REUSE: the frame is alive -- keep its ctx, DOM, and messages.
+            # Only the positional ref and parent wiring are refreshed.
+            old_ref = hit.ref
+            hit.ref = ref
+            hit.parent_ref = seed.parent_ref
+            hit.depth = seed.depth
+            if seed.title:
+                hit.title = seed.title
+            if seed.name:
+                hit.name = seed.name
+            documents.append(hit)
+            new_to_old[ref] = old_ref
+            reused.append(hit)
+            # Nested frames come from the reused document's current html:
+            # present children are matched against the cache next round,
+            # removed ones drop out, new ones fetch fresh.
+            if hit.html and seed.depth < max_depth:
+                queue.extend(
+                    _discover_seeds(
+                        hit.html,
+                        hit.url,
+                        parent_ref=ref,
+                        depth=seed.depth + 1,
+                        synthetic_captcha=synthetic_captcha,
+                    )
+                )
+            continue
+
         document = FrameDocument(
             ref=ref,
             parent_ref=seed.parent_ref,
@@ -252,6 +369,9 @@ async def load_frames(
             title=seed.title,
             name=seed.name,
             depth=seed.depth,
+            origin_url=frame_url,
+            seed_src=seed.src,
+            seed_srcdoc=seed.srcdoc,
         )
         try:
             frame_headers: dict | None = None
@@ -297,30 +417,7 @@ async def load_frames(
                 document.error = f"unsupported frame URL scheme: {urlparse(frame_url).scheme}"
 
             if document.html and "html" in document.content_type.lower() and js != "never":
-                frame_origin = extract_origin(document.url)
-                parent_origin = extract_origin(url)
-                frame_inbox = []
-                for m in (parent_messages or []):
-                    # 1. Frame recipient identity
-                    target_id = m.get("target") or "*"
-                    if target_id not in {"*", "", "self"}:
-                        if target_id in {"parent", "top", "reply"}:
-                            continue
-                        if target_id != ref and target_id != document.url:
-                            resolved_target = urljoin(url, target_id)
-                            if resolved_target != document.url:
-                                continue
-
-                    # 2. Origin constraint: exact scheme/host/port comparison
-                    target_orig = m.get("target_origin") or m.get("origin") or "*"
-                    if target_orig not in {"*", "", "/"}:
-                        expected_origin = extract_origin(target_orig)
-                        if expected_origin and expected_origin != frame_origin:
-                            continue
-
-                    msg_copy = dict(m)
-                    msg_copy["origin"] = m.get("origin") or parent_origin
-                    frame_inbox.append(msg_copy)
+                frame_inbox = _frame_inbox(ref, document.url, url, parent_messages)
                 document.html, frame_js = await run_scripts(
                     document.html,
                     document.url,
@@ -344,6 +441,40 @@ async def load_frames(
                     synthetic_captcha=synthetic_captcha,
                 )
             )
+
+    # Parent -> frame messages for REUSED frames are delivered into the
+    # live context (no document re-run): the frame keeps its state, message
+    # handlers run and may reply, and the pump's fresh postMessages
+    # accumulate on the document for the session's child -> parent cursor.
+    if reused and parent_messages:
+        for doc in reused:
+            frame_ctx = doc.js_info.get("ctx")
+            if frame_ctx is None:
+                continue
+            inbox = _frame_inbox(doc.ref, doc.url, url, parent_messages)
+            if not inbox:
+                continue
+            try:
+                pumped_html, pump_info = await run_scripts(
+                    doc.html,
+                    doc.url,
+                    client,
+                    force=True,
+                    messages=inbox,
+                    ctx=frame_ctx,
+                )
+                doc.html = pumped_html or doc.html
+                doc.js_info.setdefault("post_messages", []).extend(
+                    pump_info.get("post_messages") or []
+                )
+                extra_errors = int(pump_info.get("errors") or 0)
+                if extra_errors:
+                    doc.js_info["errors"] = int(doc.js_info.get("errors") or 0) + extra_errors
+                    doc.js_info.setdefault("error_messages", []).extend(
+                        (pump_info.get("error_messages") or [])[:5]
+                    )
+            except Exception as exc:
+                doc.error = f"{type(exc).__name__}: {exc}"[:500]
 
     return documents
 
