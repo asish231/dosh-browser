@@ -309,6 +309,13 @@ def _inline_hidden(node: Node) -> bool:
         if tag == "dialog" and "open" not in (p.attributes or {}):
             return True
         p = p.parent
+    # Closed [popover]: contents are hidden by UA rule [popover]:not(:popover-open) { display: none }.
+    p = node
+    while p is not None:
+        attrs = p.attributes or {}
+        if "popover" in attrs and "open" not in attrs:
+            return True
+        p = p.parent
     # Closed <details>: only the summary (and its contents) stays visible.
     passed_summary = False
     p = node

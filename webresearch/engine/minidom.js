@@ -201,6 +201,26 @@
       if (n5) this.appendChild(n5);
     }
   };
+  Node.prototype.contains = function (other) {
+    if (!other) return false;
+    var n = other;
+    while (n) {
+      if (n === this) return true;
+      n = n.parentNode;
+    }
+    return false;
+  };
+  Object.defineProperty(Node.prototype, "isConnected", {
+    get: function () {
+      var n = this;
+      while (n) {
+        if (n.nodeType === 9) return true;
+        n = n.parentNode;
+      }
+      return false;
+    },
+    configurable: true
+  });
   Object.defineProperty(Node.prototype, "ownerDocument", {
     get: function () {
       if (this.nodeType === 9) return null;
@@ -1810,7 +1830,7 @@
       /* visibility participates in the cascade: checkVisibility() must see
          stylesheet visibility:hidden, which the old template dropped. */
       visibility: null,
-      opacity: null
+      opacity: "1"
     };
     rules.forEach(function (r) {
       r.sel.split(",").forEach(function (s) {
@@ -1849,6 +1869,10 @@
         var dn = el;
         while (dn) {
           if (dn.nodeName === "dialog" && !(dn.hasAttribute && dn.hasAttribute("open"))) {
+            disp = "none";
+            break;
+          }
+          if (dn.hasAttribute && dn.hasAttribute("popover") && !(dn.hasAttribute && dn.hasAttribute("open"))) {
             disp = "none";
             break;
           }
@@ -2344,19 +2368,25 @@
   };
   /* ---- checkVisibility ----
      Consults the real cascade (__computedStyle over collected rules), not
-     just inline styles — display:none by stylesheet rule counts, and
-     visibility:hidden anywhere on the ancestor chain counts. */
+     just inline styles — display:none by stylesheet rule counts.
+     Per CSSOM spec:
+     - Always checks display: none (and connection to document).
+     - Only checks visibility: hidden/collapse if opts.checkVisibilityCSS is true.
+     - Only checks opacity: 0 if opts.checkOpacity is true. */
   Element.prototype.checkVisibility = function (opts) {
     opts = opts || {};
     var doc = this.ownerDocument || global.document;
+    if (!this.isConnected && (!doc || !doc.contains(this))) return false;
     var rules = doc ? __collectStyleRules(doc) : [];
     var n = this;
     while (n && n.nodeType === 1) {
       var cs = __computedStyle(n, rules, 16);
       if ((cs.display || "").toLowerCase() === "none") return false;
-      var vis = (cs.visibility || "").toLowerCase();
-      if (vis === "hidden" || vis === "collapse") return false;
-      if (opts.checkOpacity && Number(cs.opacity) === 0) return false;
+      if (opts.checkVisibilityCSS) {
+        var vis = (cs.visibility || "").toLowerCase();
+        if (vis === "hidden" || vis === "collapse") return false;
+      }
+      if (opts.checkOpacity && cs.opacity != null && cs.opacity !== "" && Number(cs.opacity) === 0) return false;
       n = n.parentNode;
     }
     return true;
@@ -2378,7 +2408,7 @@
       var hidden = false;
       try {
         var el = global.document.querySelector(sels[i]);
-        if (el && typeof el.checkVisibility === "function" && !el.checkVisibility()) hidden = true;
+        if (el && typeof el.checkVisibility === "function" && !el.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })) hidden = true;
       } catch (e) { hidden = false; }
       out.push(hidden);
     }
@@ -2398,9 +2428,44 @@
   /* ---- Popover API subset ----
      beforetoggle is cancelable (a page may prevent showing); toggle carries
      newState/oldState like the spec. Rendering state rides the open
-     attribute (there is no top layer). */
+     attribute (there is no top layer).
+     Complies with HTML Popover spec:
+     - Throws NotSupportedError if element lacks popover attribute.
+     - Throws InvalidStateError if already showing or disconnected when showing.
+     - Throws InvalidStateError if already hidden when hiding.
+     - Auto popovers close other open auto popovers on show (light dismiss). */
   Element.prototype.showPopover = function () {
-    if (this.__popoverOpen) return;
+    if (!this.hasAttribute || !this.hasAttribute("popover")) {
+      throw new (global.DOMException || Error)(
+        "Failed to execute 'showPopover' on 'Element': Not supported on elements that do not have a valid 'popover' attribute.",
+        "NotSupportedError"
+      );
+    }
+    if (this.__popoverOpen) {
+      throw new (global.DOMException || Error)(
+        "Failed to execute 'showPopover' on 'Element': The element is already showing.",
+        "InvalidStateError"
+      );
+    }
+    var doc = this.ownerDocument || global.document;
+    if (!this.isConnected && (!doc || !doc.contains(this))) {
+      throw new (global.DOMException || Error)(
+        "Failed to execute 'showPopover' on 'Element': The element is not connected to a document.",
+        "InvalidStateError"
+      );
+    }
+    var popVal = (this.getAttribute("popover") || "").toLowerCase();
+    var isAuto = (popVal === "" || popVal === "auto");
+    if (isAuto && doc) {
+      doc.__openAutoPopovers = doc.__openAutoPopovers || [];
+      var list = doc.__openAutoPopovers.slice();
+      for (var i = list.length - 1; i >= 0; i--) {
+        var other = list[i];
+        if (other !== this && other.__popoverOpen && (!other.contains || !other.contains(this))) {
+          try { other.hidePopover(); } catch (e) {}
+        }
+      }
+    }
     var ev = new global.Event("beforetoggle", { bubbles: true, cancelable: true });
     ev.oldState = "closed";
     ev.newState = "open";
@@ -2408,13 +2473,35 @@
     if (ev.defaultPrevented) return;
     this.__popoverOpen = true;
     this.setAttribute("open", "");
+    if (isAuto && doc) {
+      doc.__openAutoPopovers = doc.__openAutoPopovers || [];
+      if (doc.__openAutoPopovers.indexOf(this) < 0) {
+        doc.__openAutoPopovers.push(this);
+      }
+    }
     var t = new global.Event("toggle", { bubbles: true });
     t.oldState = "closed";
     t.newState = "open";
     this.dispatchEvent(t);
   };
   Element.prototype.hidePopover = function () {
-    if (!this.__popoverOpen) return;
+    if (!this.hasAttribute || !this.hasAttribute("popover")) {
+      throw new (global.DOMException || Error)(
+        "Failed to execute 'hidePopover' on 'Element': Not supported on elements that do not have a valid 'popover' attribute.",
+        "NotSupportedError"
+      );
+    }
+    if (!this.__popoverOpen) {
+      throw new (global.DOMException || Error)(
+        "Failed to execute 'hidePopover' on 'Element': The element is not showing.",
+        "InvalidStateError"
+      );
+    }
+    var doc = this.ownerDocument || global.document;
+    if (doc && doc.__openAutoPopovers) {
+      var idx = doc.__openAutoPopovers.indexOf(this);
+      if (idx >= 0) doc.__openAutoPopovers.splice(idx, 1);
+    }
     this.__popoverOpen = false;
     this.removeAttribute("open");
     var t = new global.Event("toggle", { bubbles: true });
@@ -2423,12 +2510,36 @@
     this.dispatchEvent(t);
   };
   Element.prototype.togglePopover = function (prefer) {
+    if (!this.hasAttribute || !this.hasAttribute("popover")) {
+      throw new (global.DOMException || Error)(
+        "Failed to execute 'togglePopover' on 'Element': Not supported on elements that do not have a valid 'popover' attribute.",
+        "NotSupportedError"
+      );
+    }
     if (prefer === undefined) {
       if (this.__popoverOpen) this.hidePopover();
       else this.showPopover();
-    } else if (prefer) this.showPopover();
-    else this.hidePopover();
+    } else if (prefer) {
+      if (!this.__popoverOpen) this.showPopover();
+    } else {
+      if (this.__popoverOpen) this.hidePopover();
+    }
   };
+  Object.defineProperty(Element.prototype, "popover", {
+    get: function () {
+      if (!this.hasAttribute || !this.hasAttribute("popover")) return null;
+      var v = (this.getAttribute("popover") || "").toLowerCase();
+      return (v === "manual") ? "manual" : "auto";
+    },
+    set: function (v) {
+      if (v === null || v === undefined) {
+        if (typeof this.removeAttribute === "function") this.removeAttribute("popover");
+      } else {
+        if (typeof this.setAttribute === "function") this.setAttribute("popover", String(v));
+      }
+    },
+    configurable: true
+  });
   Object.defineProperty(Element.prototype, "popoverOpen", {
     get: function () { return !!this.__popoverOpen; },
     configurable: true
@@ -3965,6 +4076,7 @@
   global.history = {
     length: 1,
     state: null,
+    _scrollRestoration: "auto",
     _stack: [],
     pushState: function (state, title, url) {
       var abs = "";
@@ -4026,6 +4138,17 @@
       global.__WR_HISTORY_MOVE = (global.__WR_HISTORY_MOVE || 0) + d;
     }
   };
+  Object.defineProperty(global.history, "scrollRestoration", {
+    get: function () { return this._scrollRestoration || "auto"; },
+    set: function (val) {
+      val = String(val);
+      if (val === "auto" || val === "manual") {
+        this._scrollRestoration = val;
+      }
+    },
+    configurable: true,
+    enumerable: true
+  });
   function _dispatchWheel(dx, dy) {
     var tNow = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
     var we = (typeof global.WheelEvent === "function")
@@ -5716,20 +5839,40 @@
       /* Geolocation: an agent browser has no location hardware. The honest
          answer is PERMISSION_DENIED — same as a real browser with location
          blocked — never invented coordinates. */
-      geolocation: {
-        getCurrentPosition: function (success, error) {
-          if (typeof error === "function") {
-            error({ code: 1, message: "User has denied permission to use positioning" });
+      geolocation: (function () {
+        var _nextWatchId = 1;
+        var _activeWatches = {};
+        return {
+          getCurrentPosition: function (success, error) {
+            if (typeof error === "function") {
+              error({
+                code: 1,
+                message: "User has denied permission to use positioning",
+                PERMISSION_DENIED: 1,
+                POSITION_UNAVAILABLE: 2,
+                TIMEOUT: 3
+              });
+            }
+          },
+          watchPosition: function (success, error) {
+            var id = _nextWatchId++;
+            _activeWatches[id] = true;
+            if (typeof error === "function") {
+              error({
+                code: 1,
+                message: "User has denied permission to use positioning",
+                PERMISSION_DENIED: 1,
+                POSITION_UNAVAILABLE: 2,
+                TIMEOUT: 3
+              });
+            }
+            return id;
+          },
+          clearWatch: function (id) {
+            delete _activeWatches[Number(id)];
           }
-        },
-        watchPosition: function (success, error) {
-          if (typeof error === "function") {
-            error({ code: 1, message: "User has denied permission to use positioning" });
-          }
-          return 0;
-        },
-        clearWatch: function () {}
-      },
+        };
+      })(),
       /* Service worker container: register() resolves with a registration so
          feature-detecting pages proceed; actual SW analysis/installation is
          host-side (sw.py regex + strategy simulation) and navigator.serviceWorker
@@ -5738,15 +5881,27 @@
       serviceWorker: {
         controller: null,
         ready: Promise.resolve({
-          active: { scope: "/", state: "activated", unregister: function () { return Promise.resolve(true); } }
+          active: { scope: "/", state: "activated", scriptURL: "", unregister: function () { return Promise.resolve(true); } }
         }),
         register: function (scriptUrl, options) {
+          var base = (global.location && global.location.href) || "about:blank";
+          var absScript = "";
+          try {
+            absScript = new URL(String(scriptUrl || ""), base).href;
+          } catch (e) {
+            absScript = String(scriptUrl || "");
+          }
           var scope = (options && options.scope) || "/";
           return Promise.resolve({
             scope: scope,
             installing: null,
             waiting: null,
-            active: { scope: scope, state: "activated", scriptURL: String(scriptUrl || ""), unregister: function () { return Promise.resolve(true); } },
+            active: {
+              scope: scope,
+              state: "activated",
+              scriptURL: absScript,
+              unregister: function () { return Promise.resolve(true); }
+            },
             unregister: function () { return Promise.resolve(true); }
           });
         },
@@ -6792,6 +6947,13 @@
           dlg.dispatchEvent(cancelEv);
           if (!cancelEv.defaultPrevented && typeof dlg.close === "function") {
             dlg.close();
+          }
+        }
+        var escDoc = global.document;
+        if (escDoc && escDoc.__openAutoPopovers && escDoc.__openAutoPopovers.length > 0) {
+          var topPop = escDoc.__openAutoPopovers[escDoc.__openAutoPopovers.length - 1];
+          if (topPop && topPop.__popoverOpen && typeof topPop.hidePopover === "function") {
+            try { topPop.hidePopover(); } catch (e) {}
           }
         }
       }

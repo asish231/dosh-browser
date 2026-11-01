@@ -397,10 +397,13 @@ engine-heavy passes (suite 254s -> ~263-275s).
   dragstart-listener heuristic (a non-draggable element with a dragstart
   listener gets a native DnD sequence — a real browser fires none) is a
   disclosed deviation.
-- **Small APIs**: geolocation watchPosition ids not unique; serviceWorker
-  register scriptURL not resolved absolute; checkVisibility always consults
-  visibility (spec: only with checkVisibilityCSS:true); popover missing
-  InvalidStateError/NotSupportedError cases and auto-close-of-others.
+- **Small APIs**: **FIXED** — geolocation watchPosition returns unique
+  monotonic integer IDs & clearWatch works; serviceWorker.register resolves
+  scriptURL to absolute URL; Popover API throws NotSupportedError/InvalidStateError
+  per spec, auto-closes open auto popovers, hides closed popovers from action surface,
+  and dismisses on Escape; history.scrollRestoration exists with "auto" default and
+  "manual" toggle; checkVisibility only checks visibility when checkVisibilityCSS is true,
+  and opacity when checkOpacity is true. 6 regressions (tests/test_small_apis.py).
 - **Hidden controls**: **FIXED in round 3** (see below).
 - **Frames**: **FIXED in round 3** — `e.source.postMessage` replies
   (target 'reply') now pass the session's message pumps and reach the parent
@@ -435,6 +438,7 @@ engine-heavy passes (suite 254s -> ~263-275s).
 
 ## Verified working — do not re-file
 
+- Small APIs hardening: geolocation watchPosition unique IDs & clearWatch, serviceWorker.register absolute scriptURL resolution, Popover API exception/auto-close/light-dismiss compliance, history.scrollRestoration, and checkVisibility({ checkVisibilityCSS, checkOpacity }).
 - Zero phantom horizontal scroll: body layout box sized for viewport margins, preventing the 8px bodyMargin shift from inflating document scroll extent; documentElement.scrollWidth and body.scrollWidth accurately reflect content extent.
 - HTMLDialogElement subsystem: showModal() throws InvalidStateError when already open, <form method="dialog"> closes dialog with submitter returnValue, press_key("escape") fires cancelable cancel event and closes if not defaultPrevented, closed <dialog> hidden from checkVisibility() and action surface.
 - ArrowUp/ArrowDown on a focused select changes selection and fires events.
