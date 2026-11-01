@@ -415,9 +415,6 @@ engine-heavy passes (suite 254s -> ~263-275s).
   (it can never resolve inspect-issued form-field refs — it errors honestly
   instead); `press_key`'s stale-ref error text still describes the old
   value-sensitive refs.
-- **Scroll**: every page gets ~8px of phantom horizontal scroll (the body
-  box is shifted by its margin and counted in the extent); body.scrollWidth
-  returns the box width, not the content extent.
 - **Perf**: content_root's 2-sibling no-main pages still drop a sibling
   (below the 3+ container threshold — pre-existing subtraction model).
 - **Storage**: no `storage` events in other same-origin tabs (spec fires
@@ -428,6 +425,8 @@ engine-heavy passes (suite 254s -> ~263-275s).
 
 ## Verified working — do not re-file
 
+- Zero phantom horizontal scroll: body layout box sized for viewport margins, preventing the 8px bodyMargin shift from inflating document scroll extent; documentElement.scrollWidth and body.scrollWidth accurately reflect content extent.
+- HTMLDialogElement subsystem: showModal() throws InvalidStateError when already open, <form method="dialog"> closes dialog with submitter returnValue, press_key("escape") fires cancelable cancel event and closes if not defaultPrevented, closed <dialog> hidden from checkVisibility() and action surface.
 - ArrowUp/ArrowDown on a focused select changes selection and fires events.
 - Checkbox click toggling (no double-toggle artifact).
 - Frame→parent postMessage replay at load time (correct origins);
