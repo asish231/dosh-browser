@@ -11,6 +11,8 @@
 > targetOrigin, and the option-element API (36 regressions across
 > tests/test_visibility_truth.py, test_frame_reply.py, test_option_api.py;
 > suite at 471 passed). Commits: 6a6c493..0a342a3 + the round-3 commits.
+> Round 4 (2026-11-01): HTMLDialogElement subsystem and zero-phantom scroll +
+> body.scrollWidth content extent (commits: 4d33e4f, f20708d; suite at 501 passed).
 >
 > Rule from AGENTS.md still applies: a capability gap is a bug report against
 > `minidom.js`, never a reason to reach for a browser binary.
@@ -65,7 +67,11 @@ All previously `typeof undefined` with zero stubs; each now has a regression:
 - **HTMLDialogElement** — showModal/close/returnValue/open + close event;
   registry hoisted out of `__load` (it ran AFTER hydration and re-created
   constructors per pass), so `instanceof` holds for parsed AND created
-  elements.
+  elements. *Follow-up (4d33e4f)*: **RESOLVED** — showModal throws
+  InvalidStateError when already open, `<form method="dialog">` closes with
+  submitter's returnValue, press_key("escape") dispatches cancelable cancel event,
+  and closed `<dialog:not([open])>` is hidden from checkVisibility() and action
+  surface. 10 regressions (tests/test_dialog_api.py).
 - **History API** — pushState/replaceState create/update real session entries
   (same DOM, new URL — SPA semantics); back/forward/go restore the target
   entry, rebuild the ctx, and dispatch popstate with the destination's pushed
@@ -103,6 +109,10 @@ All previously `typeof undefined` with zero stubs; each now has a regression:
 scrollWidth/scrollHeight (the stale clientWidth stub that silently overrode
 them is removed). Live: 5000px page `scrollTo(4000,0)` → 3728 (=5008−1280).
 7 regressions.
+*Follow-up (f20708d)*: **RESOLVED** — eliminated ~8px phantom horizontal scroll
+where the body box was shifted by its margin and counted in the extent;
+`body.scrollWidth` and `body.scrollHeight` now return content extent matching
+`documentElement`. 10 regressions (tests/test_p2_scroll_frames.py).
 
 ### P2-5. CSS-hidden controls still actionable — **FIXED** (c9cd30a)
 `action_surface()` asks the engine cascade (`__hiddenCheck`) — inline
