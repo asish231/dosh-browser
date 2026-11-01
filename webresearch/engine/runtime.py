@@ -1222,6 +1222,14 @@ async def run_scripts(
         move = int(float(str(move_raw))) if move_raw else 0
         if move:
             info["history_move"] = move
+            # Consume: the counter is a "moves since last drain" queue. The
+            # live ctx keeps it after the read, so a same-document traversal
+            # (which drains the live ctx directly) would re-consume the same
+            # move and traverse twice.
+            try:
+                ctx.eval("globalThis.__WR_HISTORY_MOVE = 0; true")
+            except Exception:
+                pass
     except Exception:
         pass
     # Login wall detection: surface the wall as a first-class object so the
@@ -1275,6 +1283,17 @@ async def run_scripts(
         drained = ctx.eval("__drainStorage()")
         if drained:
             info["storage"] = json.loads(str(drained))
+    except Exception:
+        pass
+    # Drain the recorded storage MUTATIONS too (ops with old/new values), so
+    # the session can broadcast `storage` events to other same-origin tabs —
+    # the plain drain above loses which keys changed and what they used to be.
+    try:
+        changes = ctx.eval("__takeStorageChanges()")
+        if changes:
+            parsed = json.loads(str(changes))
+            if isinstance(parsed, dict) and (parsed.get("local") or parsed.get("session")):
+                info["storage_changes"] = parsed
     except Exception:
         pass
     return out, info

@@ -1835,11 +1835,21 @@
     return id * 100 + cl * 10 + tag;
   }
   function __normalizeProp(k) {
-    if (k === "font-size") return "fontSize";
-    if (k === "flex-direction") return "flexDirection";
-    if (k === "justify-content") return "justifyContent";
-    if (k === "align-items") return "alignItems";
-    return k;
+    var key = String(k == null ? "" : k);
+    if (!key || key.indexOf("--") === 0) return key;
+    if (key === "font-size") return "fontSize";
+    if (key === "flex-direction") return "flexDirection";
+    if (key === "justify-content") return "justifyContent";
+    if (key === "align-items") return "alignItems";
+    /* Declaration keys arrive kebab-case from every real source (stylesheet
+       text, the style ATTRIBUTE, computed inline declarations); the cascade
+       template is a JS-property (camelCase) table. Without this mapping the
+       multi-word declarations all missed the template and were dropped:
+       computed fontWeight/backgroundColor/overflowY read as undefined, and a
+       stylesheet `overflow-y: auto` container was invisible to the scroll
+       lane (which must know a box is scrollable). */
+    if (key.indexOf("-") < 0) return key;
+    return key.replace(/-([a-z0-9])/g, function (_m, c) { return c.toUpperCase(); });
   }
   function __computedStyle(el, rules, parentFont) {
     var st = {
@@ -1959,6 +1969,13 @@ borderSpacing: null,
     for (var k2 in inline) {
       var prop2 = __normalizeProp(k2);
       if (prop2 in st) st[prop2] = inline[k2];
+    }
+    /* overflow is a shorthand: resolve the longhands the scroll lane and page
+       code read (getComputedStyle(el).overflowY), unless a longhand already
+       set them. */
+    if (st.overflow != null) {
+      if (st.overflowX == null) st.overflowX = st.overflow;
+      if (st.overflowY == null) st.overflowY = st.overflow;
     }
     var fontSize = parentFont || 16;
     if (st.fontSize != null) {
@@ -2127,7 +2144,7 @@ var pos = (st.position || "").toLowerCase();
         children.forEach(function (c) {
           var ccs = __computedStyle(c, rules, cs.fontSize);
           if (ccs.display === "none") {
-            c.__box = { x: 0, y: 0, width: 0, height: 0 };
+            __clearBoxes(c);
             layout.boxes++;
             return;
           }
@@ -2172,7 +2189,7 @@ var pos = (st.position || "").toLowerCase();
         children.forEach(function (c, idx) {
           var ccs = __computedStyle(c, rules, cs.fontSize);
           if (ccs.display === "none") {
-            c.__box = { x: 0, y: 0, width: 0, height: 0 };
+            __clearBoxes(c);
             layout.boxes++;
             return;
           }
@@ -2258,7 +2275,7 @@ var pos = (st.position || "").toLowerCase();
           if (c.nodeType === 3) { pushRun(targetEl, __nodeText(c), fontSize); return; }
           if (c.nodeType !== 1) return;
           var ccs = __computedStyle(c, rules, fontSize);
-          if (ccs.display === "none") { c.__box = { x: 0, y: 0, width: 0, height: 0 }; return; }
+          if (ccs.display === "none") { __clearBoxes(c); return; }
           if (ccs.position === "absolute" || ccs.position === "fixed") {
             layoutAbsolute(c, ccs, x, cursor, contentW, 0);
             return;
@@ -2284,7 +2301,7 @@ var pos = (st.position || "").toLowerCase();
         if (c.nodeType === 3) { pushRun(el, __nodeText(c), cs.fontSize); return; }
         if (c.nodeType !== 1) return;
         var ccs = __computedStyle(c, rules, cs.fontSize);
-        if (ccs.display === "none") { c.__box = { x: 0, y: 0, width: 0, height: 0 }; layout.boxes++; return; }
+        if (ccs.display === "none") { __clearBoxes(c); layout.boxes++; return; }
         if (ccs.position === "absolute" || ccs.position === "fixed") {
           layoutAbsolute(c, ccs, x, cursor, contentW, 0);
           return;
@@ -2327,13 +2344,26 @@ var pos = (st.position || "").toLowerCase();
       layout.boxes++;
       return { bottom: y + h, w: w };
     }
+    function __clearBoxes(n) {
+      if (!n || (n.nodeType !== 1 && n.nodeType !== 9)) return;
+      /* null, not a zero box: a null box is skipped by the body-margin shift
+         (so hidden elements report the spec's all-zero rect, not 8,8), skipped
+         by hit-testing and the extent walk, and falls back to zeros in
+         getBoundingClientRect/__elementContentSize/__maxScrollOffset. */
+      n.__box = null;
+      n.__contentExtent = null;
+      (n.childNodes || []).forEach(function (c) { if (c.nodeType === 1) __clearBoxes(c); });
+    }
     function layoutBlock(el, x, y, availW, parentFont) {
-      if (__NON_RENDERED[el.nodeName]) { el.__box = { x: 0, y: 0, width: 0, height: 0 }; return { bottom: y, w: 0 }; }
+      if (__NON_RENDERED[el.nodeName]) { __clearBoxes(el); return { bottom: y, w: 0 }; }
       if (el.nodeName === "body" && availW === vw) {
         availW = Math.max(0, vw - 16);
       }
       var cs = __computedStyle(el, rules, parentFont);
-      if (cs.display === "none") { el.__box = { x: 0, y: 0, width: 0, height: 0 }; return { bottom: y, w: 0 }; }
+      /* A hidden subtree must not keep the boxes from the previous layout pass:
+         a stale box is a phantom the agent can scroll to, hit-test, or drag
+         onto, even though nothing renders there. */
+      if (cs.display === "none") { __clearBoxes(el); return { bottom: y, w: 0 }; }
       var margin = __parseSides(cs.margin, availW, cs.fontSize);
       var padding = __parseSides(cs.padding, availW, cs.fontSize);
       var w = __parsePx(cs.width, availW, cs.fontSize);
@@ -2378,15 +2408,26 @@ var pos = (st.position || "").toLowerCase();
        scrollWidth/scrollHeight semantics. */
     try {
       var __maxR = 0, __maxB = 0;
+      /* Bottom-up so every box also learns its own subtree extent: that is the
+         element-level scrollHeight/scrollWidth (a 640px child inside a 200px
+         overflow:auto box is 640, not 200) and the clamp for its scrollTop. */
       (function __walkExtent(n) {
-        if (!n) return;
+        if (!n) return { r: 0, b: 0 };
+        var r = 0, b = 0;
         if (n.__box) {
-          var r = n.__box.x + n.__box.width;
-          var b = n.__box.y + n.__box.height;
-          if (r > __maxR) __maxR = r;
-          if (b > __maxB) __maxB = b;
+          r = n.__box.x + n.__box.width;
+          b = n.__box.y + n.__box.height;
         }
-        (n.childNodes || []).forEach(function (c) { if (c.nodeType === 1) __walkExtent(c); });
+        (n.childNodes || []).forEach(function (c) {
+          if (c.nodeType !== 1) return;
+          var sub = __walkExtent(c);
+          if (sub.r > r) r = sub.r;
+          if (sub.b > b) b = sub.b;
+        });
+        if (n.__box) n.__contentExtent = { right: r, bottom: b };
+        if (r > __maxR) __maxR = r;
+        if (b > __maxB) __maxB = b;
+        return { r: r, b: b };
       })(root);
       doc.__scrollExtent = { width: __maxR, height: __maxB };
     } catch (e) {}
@@ -2416,9 +2457,15 @@ var pos = (st.position || "").toLowerCase();
   Object.defineProperty(Element.prototype, "clientWidth", { get: function () { return this.getBoundingClientRect().width; } });
   Object.defineProperty(Element.prototype, "clientHeight", { get: function () { return this.getBoundingClientRect().height; } });
   /* scrollWidth/scrollHeight: for the documentElement and body these are the full
-     document scroll extents (laid-out boxes may overflow the viewport);
-     for any other element the box dims (per-element overflow is not
-     tracked — disclosed approximation). */
+     document scroll extents (laid-out boxes may overflow the viewport); for any
+     other element they are the element's own subtree extent, which is what makes
+     a nested overflow container report its hidden content instead of its box. */
+  function __elementContentSize(el, axis) {
+    var b = el.__box || { width: 0, height: 0 };
+    var ext = el.__contentExtent;
+    if (axis === "y") return ext ? Math.max(b.height, ext.bottom - b.y) : b.height;
+    return ext ? Math.max(b.width, ext.right - b.x) : b.width;
+  }
   Object.defineProperty(Element.prototype, "scrollWidth", {
     get: function () {
       var doc = this.ownerDocument || global.document;
@@ -2429,8 +2476,7 @@ var pos = (st.position || "").toLowerCase();
           return Math.max(b.width, doc.__scrollExtent.width);
         }
       }
-      var b = this.__box || { width: 0 };
-      return b.width;
+      return __elementContentSize(this, "x");
     },
     configurable: true
   });
@@ -2444,45 +2490,239 @@ var pos = (st.position || "").toLowerCase();
           return Math.max(b.height, doc.__scrollExtent.height);
         }
       }
-      var b = this.__box || { height: 0 };
-      return b.height;
+      return __elementContentSize(this, "y");
     },
     configurable: true
   });
-  /* ---- scrollIntoView family ----
-     Real scroll-to-element against the block-flow geometry: computes the
-     target scroll position from the element's laid-out box, clamps to the
-     document extent, and drives the same _doScroll lane as wheel scrolling
-     (scroll + IntersectionObserver side effects included). */
-  Element.prototype.scrollIntoView = function (arg) {
-    var opts = (arg && typeof arg === "object") ? arg : {};
-    var block = opts.block || (arg === false ? "end" : "start");
-    var doc = this.ownerDocument || global.document;
+  /* ---- nested scroll containers ----
+     CSSOM View: an element establishes a scrolling box when its used overflow is
+     auto/scroll/hidden (hidden is not user-scrollable but IS programmatically
+     scrollable); overflow:visible/clip does not scroll. `overflow-y: auto` only
+     reaches this lane because __normalizeProp maps the kebab declaration onto the
+     camelCase cascade template. */
+  function __overflowAxes(el) {
+    var doc = el.ownerDocument || global.document;
+    var cs = __computedStyle(el, doc ? __collectStyleRules(doc) : [], el.__layoutFont || 16);
+    var ox = String(cs.overflowX || cs.overflow || "").toLowerCase();
+    var oy = String(cs.overflowY || cs.overflow || "").toLowerCase();
+    return { x: ox, y: oy };
+  }
+  function __scrollableOverflowValue(v) {
+    return v === "auto" || v === "scroll" || v === "hidden" || v === "overlay";
+  }
+  function __isScrollContainer(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var a = __overflowAxes(el);
+    return __scrollableOverflowValue(a.y) || __scrollableOverflowValue(a.x);
+  }
+  function __maxScrollOffset(el, axis) {
+    var b = el.__box || { width: 0, height: 0 };
+    if (axis === "y") return Math.max(0, __elementContentSize(el, "y") - b.height);
+    return Math.max(0, __elementContentSize(el, "x") - b.width);
+  }
+  function __dispatchElementScroll(el) {
+    if (typeof global.Event !== "function") return;
+    try {
+      el.dispatchEvent(new global.Event("scroll", { bubbles: false, isTrusted: true }));
+    } catch (e) {}
+  }
+  /* Returns true when the offset actually moved. Non-containers stay at 0, as
+     the spec requires (there is no scrolling box to move). */
+  function __setElementScroll(el, left, top) {
+    if (!el || el.nodeType !== 1) return false;
+    var doc = el.ownerDocument || global.document;
     if (doc) __ensureLayout(doc);
-    var b = this.__box || { x: 0, y: 0, width: 0, height: 0 };
-    var vh = (typeof global.innerHeight === "number" && global.innerHeight > 0) ? global.innerHeight : 720;
-    var cur = scrollState ? scrollState.y : 0;
-    var target = cur;
-    if (block === "start") target = b.y;
-    else if (block === "center") target = b.y - (vh - b.height) / 2;
-    else if (block === "end") target = b.y + b.height - vh;
-    else if (block === "nearest") {
-      var top = b.y, bottom = b.y + b.height;
-      if (top >= cur && bottom <= cur + vh) return; // already fully visible
-      target = (top < cur) ? top : Math.max(bottom - vh, top - (vh - b.height));
+    if (!__isScrollContainer(el)) {
+      el.__scrollLeft = 0;
+      el.__scrollTop = 0;
+      return false;
     }
-    var clamped = _clampScroll(scrollState ? scrollState.x : 0, target);
-    _doScroll(clamped[0], clamped[1]);
+    var nx = Math.round(Math.max(0, Math.min(Number(left) || 0, __maxScrollOffset(el, "x"))));
+    var ny = Math.round(Math.max(0, Math.min(Number(top) || 0, __maxScrollOffset(el, "y"))));
+    var moved = nx !== (Number(el.__scrollLeft) || 0) || ny !== (Number(el.__scrollTop) || 0);
+    el.__scrollLeft = nx;
+    el.__scrollTop = ny;
+    if (moved) {
+      __dispatchElementScroll(el);
+      try { _notifyIntersections(); } catch (e) {}
+    }
+    return moved;
+  }
+  function __isRootScrollTarget(el) {
+    var doc = el.ownerDocument || global.document;
+    return !!(doc && (doc.documentElement === el || doc.body === el));
+  }
+  Object.defineProperty(Element.prototype, "scrollTop", {
+    get: function () {
+      if (__isRootScrollTarget(this)) return scrollState ? scrollState.y : 0;
+      return Number(this.__scrollTop) || 0;
+    },
+    set: function (v) {
+      if (__isRootScrollTarget(this)) { _doScroll(scrollState ? scrollState.x : 0, v); return; }
+      __setElementScroll(this, Number(this.__scrollLeft) || 0, v);
+    },
+    configurable: true
+  });
+  Object.defineProperty(Element.prototype, "scrollLeft", {
+    get: function () {
+      if (__isRootScrollTarget(this)) return scrollState ? scrollState.x : 0;
+      return Number(this.__scrollLeft) || 0;
+    },
+    set: function (v) {
+      if (__isRootScrollTarget(this)) { _doScroll(v, scrollState ? scrollState.y : 0); return; }
+      __setElementScroll(this, v, Number(this.__scrollTop) || 0);
+    },
+    configurable: true
+  });
+  Element.prototype.scrollTo = function (x, y) {
+    if (x && typeof x === "object") { y = x.top; x = x.left; }
+    if (__isRootScrollTarget(this)) {
+      _doScroll(x == null ? (scrollState ? scrollState.x : 0) : x,
+                y == null ? (scrollState ? scrollState.y : 0) : y);
+      return;
+    }
+    __setElementScroll(this,
+      x == null ? (Number(this.__scrollLeft) || 0) : x,
+      y == null ? (Number(this.__scrollTop) || 0) : y);
+  };
+  Element.prototype.scroll = Element.prototype.scrollTo;
+  Element.prototype.scrollBy = function (x, y) {
+    if (x && typeof x === "object") { y = x.top; x = x.left; }
+    if (__isRootScrollTarget(this)) {
+      _doScroll((scrollState ? scrollState.x : 0) + (Number(x) || 0),
+                (scrollState ? scrollState.y : 0) + (Number(y) || 0));
+      return;
+    }
+    __setElementScroll(this,
+      (Number(this.__scrollLeft) || 0) + (Number(x) || 0),
+      (Number(this.__scrollTop) || 0) + (Number(y) || 0));
+  };
+  /* ---- scrollIntoView family ----
+     Scrolls every scrolling box between the element and the viewport, nearest
+     container first, then the document. Ancestor scrolling moves the element
+     relative to the viewport, so its document target is offset by the total
+     container travel. An element with no rendered box (display:none, hidden
+     ancestor, detached) is not a scroll target at all — the old code scrolled
+     the window to (0,0) for exactly those, which put a phantom position in
+     front of the agent. */
+  function __scrollContainerChain(el) {
+    var doc = el.ownerDocument || global.document;
+    var chain = [];
+    var n = el.parentNode;
+    while (n && n.nodeType === 1) {
+      if (doc && (n === doc.documentElement || n === doc.body)) break;
+      if (__isScrollContainer(n)) chain.push(n);
+      n = n.parentNode;
+    }
+    return chain;
+  }
+  function __alignOffset(mode, targetStart, targetSize, viewSize, current) {
+    if (mode === "center") return targetStart - (viewSize - targetSize) / 2;
+    if (mode === "end") return targetStart + targetSize - viewSize;
+    if (mode === "nearest") {
+      if (targetStart >= current && targetStart + targetSize <= current + viewSize) return current;
+      if (targetStart < current) return targetStart;
+      return targetStart + targetSize - viewSize;
+    }
+    return targetStart;
+  }
+  function __smoothElementScroll(el, targetLeft, targetTop, steps) {
+    steps = Math.max(3, Math.min(25, Number(steps) || 8));
+    var startLeft = Number(el.__scrollLeft) || 0;
+    var startTop = Number(el.__scrollTop) || 0;
+    for (var i = 1; i <= steps; i++) {
+      var progress = i / steps;
+      var ease = progress < 0.5 ? 2 * progress * progress : -1 + (4 - 2 * progress) * progress;
+      __setElementScroll(el, startLeft + (targetLeft - startLeft) * ease, startTop + (targetTop - startTop) * ease);
+      if (typeof global.__advanceClock === "function") global.__advanceClock(12);
+    }
+  }
+  function __scrollIntoViewInternal(el, opts, ifNeeded) {
+    var doc = el.ownerDocument || global.document;
+    if (!doc || !el.isConnected) return;
+    __ensureLayout(doc);
+    var b = el.__box || { x: 0, y: 0, width: 0, height: 0 };
+    if (!b || (b.width <= 0 && b.height <= 0)) return;
+    var cs = __computedStyle(el, __collectStyleRules(doc), el.__layoutFont || 16);
+    if ((cs.display || "").toLowerCase() === "none") return;
+    var block = opts.block || (ifNeeded ? "nearest" : "start");
+    var inline = opts.inline || (ifNeeded ? "nearest" : "nearest");
+    var smooth = String(opts.behavior || "auto").toLowerCase() === "smooth";
+    var accX = 0, accY = 0;
+    var chain = __scrollContainerChain(el);
+    for (var i = 0; i < chain.length; i++) {
+      var c = chain[i];
+      var cb = c.__box;
+      if (!cb) continue;
+      var curTop = Number(c.__scrollTop) || 0;
+      var curLeft = Number(c.__scrollLeft) || 0;
+      var wantTop = __alignOffset(block, b.y - accY - cb.y, b.height, cb.height, curTop);
+      var wantLeft = __alignOffset(inline, b.x - accX - cb.x, b.width, cb.width, curLeft);
+      wantTop = Math.max(0, Math.min(wantTop, __maxScrollOffset(c, "y")));
+      wantLeft = Math.max(0, Math.min(wantLeft, __maxScrollOffset(c, "x")));
+      var dTop = wantTop - curTop;
+      var dLeft = wantLeft - curLeft;
+      if (dTop !== 0 || dLeft !== 0) {
+        if (smooth) __smoothElementScroll(c, wantLeft, wantTop, 8);
+        else __setElementScroll(c, wantLeft, wantTop);
+      }
+      accY += wantTop;
+      accX += wantLeft;
+    }
+    var vh = (typeof global.innerHeight === "number" && global.innerHeight > 0) ? global.innerHeight : 720;
+    var vw = (typeof global.innerWidth === "number" && global.innerWidth > 0) ? global.innerWidth : 1280;
+    var curDocY = scrollState ? scrollState.y : 0;
+    var curDocX = scrollState ? scrollState.x : 0;
+    var targetY = b.y - accY;
+    var targetX = b.x - accX;
+    var wantDocY = __alignOffset(block, targetY, b.height, vh, curDocY);
+    var wantDocX = __alignOffset(inline, targetX, b.width, vw, curDocX);
+    var clamped = _clampScroll(wantDocX, wantDocY);
+    if (Math.round(clamped[0]) === Math.round(curDocX) && Math.round(clamped[1]) === Math.round(curDocY)) return;
+    if (smooth && typeof global.__scrollSmooth === "function") global.__scrollSmooth(clamped[0], clamped[1]);
+    else _doScroll(clamped[0], clamped[1]);
+  }
+  Element.prototype.scrollIntoView = function (arg) {
+    __scrollIntoViewInternal(this, (arg && typeof arg === "object") ? arg : (arg === false ? { block: "end" } : {}), false);
     return undefined;
   };
-  Element.prototype.scrollIntoViewIfNeeded = function (arg) {
-    var doc = this.ownerDocument || global.document;
-    if (doc) __ensureLayout(doc);
-    var b = this.__box || { x: 0, y: 0, width: 0, height: 0 };
+/* Fully visible = the element's on-screen rect (after every scrolling
+     ancestor's clip) fits inside each container's window AND the document
+     viewport. scrollIntoViewIfNeeded() is a no-op exactly then. */
+  function __fullyVisible(el) {
+    var doc = el.ownerDocument || global.document;
+    if (!doc || !el.isConnected) return false;
+    __ensureLayout(doc);
+    var b = el.__box;
+    if (!b || (b.width <= 0 && b.height <= 0)) return true;
+    var accTop = 0, accLeft = 0;
+    var chain = __scrollContainerChain(el);
+    for (var i = 0; i < chain.length; i++) {
+      var c = chain[i];
+      var cb = c.__box;
+      if (!cb) continue;
+      var posTop = b.y - accTop - cb.y - (Number(c.__scrollTop) || 0);
+      var posLeft = b.x - accLeft - cb.x - (Number(c.__scrollLeft) || 0);
+      if (posTop < 0 || posLeft < 0 || posTop + b.height > cb.height || posLeft + b.width > cb.width) return false;
+      accTop += Number(c.__scrollTop) || 0;
+      accLeft += Number(c.__scrollLeft) || 0;
+    }
     var vh = (typeof global.innerHeight === "number" && global.innerHeight > 0) ? global.innerHeight : 720;
-    var cur = scrollState ? scrollState.y : 0;
-    if (b.y >= cur && b.y + b.height <= cur + vh) return; // visible: no-op
-    this.scrollIntoView(arg && typeof arg === "object" ? arg : { block: "nearest" });
+    var vw = (typeof global.innerWidth === "number" && global.innerWidth > 0) ? global.innerWidth : 1280;
+    var curY = scrollState ? scrollState.y : 0;
+    var curX = scrollState ? scrollState.x : 0;
+    var onTop = b.y - accTop, onLeft = b.x - accLeft;
+    return onTop >= curY && onLeft >= curX && onTop + b.height <= curY + vh && onLeft + b.width <= curX + vw;
+  }
+  /* WebKit semantics: centerIfNeeded defaults to true — a not-fully-visible
+     element is CENTERED; false scrolls the minimum (nearest). Either way it
+     is a strict no-op when the element is already fully visible. */
+  Element.prototype.scrollIntoViewIfNeeded = function (centerIfNeeded) {
+    if (__fullyVisible(this)) return;
+    var center = (centerIfNeeded === undefined) ? true : !!centerIfNeeded;
+    __scrollIntoViewInternal(this,
+      center ? { block: "center", inline: "center" } : { block: "nearest", inline: "nearest" },
+      false);
   };
   /* ---- checkVisibility ----
      Consults the real cascade (__computedStyle over collected rules), not
@@ -3321,8 +3561,34 @@ var pos = (st.position || "").toLowerCase();
     var r = el.getBoundingClientRect();
     var vh = global.innerHeight || 720;
     var vw = global.innerWidth || 1280;
-    return (r.bottom - scrollState.y) > 0 && (r.top - scrollState.y) < vh &&
-           (r.right - scrollState.x) > 0 && (r.left - scrollState.x) < vw;
+    var top = r.top, left = r.left, bottom = r.bottom, right = r.right;
+    /* Every scrolling-box ancestor clips its content. Box coordinates are
+       document-absolute in this engine, so a container's visible window in that
+       same space is [box.y + scrollTop, + clientHeight]: an element scrolled out
+       of an overflow:auto pane is NOT intersecting, even though its document
+       box still lands inside the viewport. */
+    var doc = el.ownerDocument || global.document;
+    var n = el.parentNode;
+    while (doc && n && n.nodeType === 1) {
+      if (n === doc.documentElement || n === doc.body) break;
+      if (n.__box && __isScrollContainer(n)) {
+        var winTop = n.__box.y + (Number(n.__scrollTop) || 0);
+        var winLeft = n.__box.x + (Number(n.__scrollLeft) || 0);
+        var winBottom = winTop + n.__box.height;
+        var winRight = winLeft + n.__box.width;
+        if (top < winTop) top = winTop;
+        if (left < winLeft) left = winLeft;
+        if (bottom > winBottom) bottom = winBottom;
+        if (right > winRight) right = winRight;
+      }
+      n = n.parentNode;
+    }
+    /* Clipping can fully collapse the rect (element scrolled out of the pane):
+       an empty visible rect is NOT an intersection, even when the element's
+       document box still lands inside the viewport. */
+    if (bottom <= top || right <= left) return false;
+    return (bottom - scrollState.y) > 0 && (top - scrollState.y) < vh &&
+           (right - scrollState.x) > 0 && (left - scrollState.x) < vw;
   }
 
   function _notifyIntersections() {
@@ -4252,6 +4518,131 @@ var decl = new CSSStyleDeclaration(el);
      spec; the absolute URL is resolved against the CURRENT location
      BEFORE the location is updated (the old order resolved relative URLs
      twice: 'sub/page' from /deep/dir/page became .../sub/sub/page). */
+/* ---- Structured-clone subset for history state ----
+     history.pushState/replaceState state objects cross the engine→host→engine
+     boundary (the session snapshots them; a restore replays them into a fresh
+     ctx). JSON.stringify silently DEGRADED that crossing: undefined-valued
+     keys vanished, Dates became strings, NaN/Infinity became null, Maps/Sets/
+     RegExps collapsed, and functions were dropped without the DataCloneError
+     a real browser throws. This codec encodes the structured-clone subset
+     losslessly into JSON-safe envelopes and throws DataCloneError for the
+     values real browsers refuse (functions, symbols, DOM nodes). */
+  function __scCloneError(what) {
+    throw new (global.DOMException || Error)(
+      "Failed to execute 'pushState' on 'History': " + what + " could not be cloned.",
+      "DataCloneError"
+    );
+  }
+  function __scEncode(v, seen) {
+    if (v === undefined) return { __wr_u: 1 };
+    var t = typeof v;
+    if (t === "number") {
+      if (v !== v) return { __wr_n: "NaN" };
+      if (v === Infinity) return { __wr_n: "Infinity" };
+      if (v === -Infinity) return { __wr_n: "-Infinity" };
+      if (v === 0 && 1 / v === -Infinity) return { __wr_n: "-0" };
+      return v;
+    }
+    if (t === "boolean" || t === "string") return v;
+    if (v === null) return null;
+    if (t === "function" || t === "symbol") __scCloneError(t === "function" ? "A function" : "A symbol");
+    if (typeof Node === "function" && v instanceof Node) __scCloneError("A " + (v.nodeName || "node"));
+    seen = seen || new Map();
+    if (seen.has(v)) return { __wr_c: seen.get(v) };
+    var id = seen.size + 1;
+    var enc;
+    if (v instanceof Date) {
+      seen.set(v, id);
+      enc = { __wr_d: v.toISOString() };
+    } else if (v instanceof RegExp) {
+      seen.set(v, id);
+      enc = { __wr_r: [v.source, v.flags] };
+    } else if (v instanceof Map) {
+      seen.set(v, id);
+      var ments = [];
+      v.forEach(function (mv, mk) { ments.push([__scEncode(mk, seen), __scEncode(mv, seen)]); });
+      enc = { __wr_m: ments };
+    } else if (v instanceof Set) {
+      seen.set(v, id);
+      var sents = [];
+      v.forEach(function (sv) { sents.push(__scEncode(sv, seen)); });
+      enc = { __wr_s: sents };
+    } else if (v instanceof Error) {
+      seen.set(v, id);
+      enc = { __wr_e: [v.name, v.message] };
+    } else if (Array.isArray(v)) {
+      seen.set(v, id);
+      var arr = [];
+      for (var ai = 0; ai < v.length; ai++) arr.push(__scEncode(v[ai], seen));
+      /* Wrapped: JSON.stringify drops non-index properties on arrays, so a
+         bare array could not carry __wr_id across the host boundary and
+         cyclic references TO arrays would decode broken. */
+      enc = { __wr_a: arr };
+    } else if (t === "object" && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null)) {
+      seen.set(v, id);
+      var obj = {};
+      for (var ok in v) {
+        if (Object.prototype.hasOwnProperty.call(v, ok)) obj[ok] = __scEncode(v[ok], seen);
+      }
+      enc = obj;
+    } else {
+      __scCloneError("An object of unsupported type " + (v.constructor && v.constructor.name ? v.constructor.name : typeof v));
+    }
+    /* Containers carry their table id so cyclic references decode back into
+       the same object graph (structured clone is a graph clone, not a tree). */
+    if (enc && typeof enc === "object") enc.__wr_id = id;
+    return enc;
+  }
+  global.__structuredCloneEncode = function (v) { return __scEncode(v); };
+  global.__structuredCloneDecode = function (v, table) {
+    table = table || {};
+    if (v === null || typeof v !== "object") return v;
+    if (v.__wr_u === 1) return undefined;
+    if (typeof v.__wr_n === "string") return Number(v.__wr_n);
+    if (typeof v.__wr_d === "string") return new Date(v.__wr_d);
+    if (v.__wr_r) return new RegExp(v.__wr_r[0], v.__wr_r[1]);
+    if (v.__wr_e) {
+      var err = new Error(v.__wr_e[1]);
+      err.name = v.__wr_e[0];
+      return err;
+    }
+    if (typeof v.__wr_c === "number" && table[v.__wr_c] !== undefined) return table[v.__wr_c];
+    var out;
+    if (v.__wr_a) {
+      out = [];
+      if (typeof v.__wr_id === "number") table[v.__wr_id] = out;
+      for (var ai2 = 0; ai2 < v.__wr_a.length; ai2++) out.push(global.__structuredCloneDecode(v.__wr_a[ai2], table));
+      return out;
+    }
+    if (Array.isArray(v)) {
+      out = [];
+      if (typeof v.__wr_id === "number") table[v.__wr_id] = out;
+      for (var di = 0; di < v.length; di++) out.push(global.__structuredCloneDecode(v[di], table));
+      return out;
+    }
+    if (v.__wr_m) {
+      out = new Map();
+      if (typeof v.__wr_id === "number") table[v.__wr_id] = out;
+      for (var mi = 0; mi < v.__wr_m.length; mi++) {
+        out.set(global.__structuredCloneDecode(v.__wr_m[mi][0], table),
+                global.__structuredCloneDecode(v.__wr_m[mi][1], table));
+      }
+      return out;
+    }
+    if (v.__wr_s) {
+      out = new Set();
+      if (typeof v.__wr_id === "number") table[v.__wr_id] = out;
+      for (var si = 0; si < v.__wr_s.length; si++) out.add(global.__structuredCloneDecode(v.__wr_s[si], table));
+      return out;
+    }
+    out = {};
+    if (typeof v.__wr_id === "number") table[v.__wr_id] = out;
+    for (var k in v) {
+      if (k === "__wr_id") continue;
+      if (Object.prototype.hasOwnProperty.call(v, k)) out[k] = global.__structuredCloneDecode(v[k], table);
+    }
+    return out;
+  };
   global.history = {
     get length() {
       var base = (typeof globalThis.__WR_HISTORY_LENGTH === "number" && globalThis.__WR_HISTORY_LENGTH > 0)
@@ -4289,7 +4680,8 @@ var decl = new CSSStyleDeclaration(el);
         if (typeof global._updateLocationQuietly === "function") global._updateLocationQuietly(abs);
         else if (global.location) global.location.href = abs;
         var ser = null;
-        try { ser = (state === undefined) ? null : JSON.parse(JSON.stringify(state == null ? null : state)); } catch (e3) { ser = null; }
+        try { ser = global.__structuredCloneEncode(state == null ? null : state); }
+        catch (e4) { if (e4 && e4.name === "DataCloneError") throw e4; ser = null; }
         global.__WR_PUSHED = global.__WR_PUSHED || [];
         global.__WR_PUSHED.push({ url: abs, state: ser });
       }
@@ -4310,10 +4702,16 @@ var decl = new CSSStyleDeclaration(el);
         this.state = state;
         if (typeof global._updateLocationQuietly === "function") global._updateLocationQuietly(abs2);
         else if (global.location) global.location.href = abs2;
-        global.__WR_REPLACED = { url: abs2, state: state === undefined ? null : state };
+        var ser2 = null;
+        try { ser2 = global.__structuredCloneEncode(state == null ? null : state); }
+        catch (e3) { if (e3 && e3.name === "DataCloneError") throw e3; ser2 = null; }
+        global.__WR_REPLACED = { url: abs2, state: ser2 };
       } else {
         this.state = state;
-        global.__WR_REPLACED = { url: (global.location && global.location.href) || "", state: state === undefined ? null : state };
+        var ser3 = null;
+        try { ser3 = global.__structuredCloneEncode(state == null ? null : state); }
+        catch (e4) { if (e4 && e4.name === "DataCloneError") throw e4; ser3 = null; }
+        global.__WR_REPLACED = { url: (global.location && global.location.href) || "", state: ser3 };
       }
     },
     back: function () { global.__WR_HISTORY_MOVE = (global.__WR_HISTORY_MOVE || 0) - 1; },
@@ -4546,9 +4944,15 @@ var decl = new CSSStyleDeclaration(el);
   var __storageSeed = {};
   try { __storageSeed = (typeof globalThis.__WR_STORAGE_SEED === "object" && globalThis.__WR_STORAGE_SEED) || {}; } catch (e) {}
 
-  function __createStorageStore(seed) {
+  function __createStorageStore(seed, areaName) {
     var store = {};
     var order = [];
+    /* Storage mutations are recorded as change records so the host can
+       broadcast `storage` events to OTHER same-origin tabs (spec: the event
+       fires in every other Document sharing the storage area, never in the
+       one that made the change). Seeding writes are NOT records: only the
+       page-facing API mutations count. */
+    var changes = [];
     if (seed && typeof seed === "object") {
       for (var k in seed) {
         if (Object.prototype.hasOwnProperty.call(seed, k)) {
@@ -4558,6 +4962,11 @@ var decl = new CSSStyleDeclaration(el);
         }
       }
     }
+    function record(entry) {
+      entry.area = areaName;
+      changes.push(entry);
+      if (changes.length > 200) changes.shift();
+    }
     return {
       getItem: function (k) {
         var sk = String(k);
@@ -4565,18 +4974,44 @@ var decl = new CSSStyleDeclaration(el);
       },
       setItem: function (k, v) {
         var sk = String(k);
+        var old = Object.prototype.hasOwnProperty.call(store, sk) ? store[sk] : null;
         if (!Object.prototype.hasOwnProperty.call(store, sk)) order.push(sk);
         store[sk] = String(v);
+        record({ key: sk, oldValue: old, newValue: String(v) });
       },
       removeItem: function (k) {
         var sk = String(k);
+        var old = Object.prototype.hasOwnProperty.call(store, sk) ? store[sk] : null;
         delete store[sk];
         var idx = order.indexOf(sk);
         if (idx >= 0) order.splice(idx, 1);
+        record({ key: sk, oldValue: old, newValue: null });
       },
       clear: function () {
         for (var i = 0; i < order.length; i++) delete store[order[i]];
         order.length = 0;
+        /* clear() fires ONE event with key/oldValue/newValue all null
+           (browser behavior), not one per removed key. */
+        record({ key: null, oldValue: null, newValue: null, op: "clear" });
+      },
+      /* Another tab's change applied quietly: the receiving area must show
+         the new value, but must NOT record it again (the event fires in the
+         OTHER documents only — re-recording here would echo it back). */
+      applyQuiet: function (key, newValue, isClear) {
+        if (isClear) {
+          for (var i = 0; i < order.length; i++) delete store[order[i]];
+          order.length = 0;
+          return;
+        }
+        var sk = String(key);
+        if (newValue === null || newValue === undefined) {
+          delete store[sk];
+          var idx = order.indexOf(sk);
+          if (idx >= 0) order.splice(idx, 1);
+        } else {
+          if (!Object.prototype.hasOwnProperty.call(store, sk)) order.push(sk);
+          store[sk] = String(newValue);
+        }
       },
       key: function (i) {
         var idx = Number(i);
@@ -4589,12 +5024,17 @@ var decl = new CSSStyleDeclaration(el);
           res[order[i]] = store[order[i]];
         }
         return res;
+      },
+      takeChanges: function () {
+        var out = changes;
+        changes = [];
+        return out;
       }
     };
   }
 
-  var __localStore = __createStorageStore(__storageSeed.local);
-  var __sessionStore = __createStorageStore(__storageSeed.session);
+  var __localStore = __createStorageStore(__storageSeed.local, "local");
+  var __sessionStore = __createStorageStore(__storageSeed.session, "session");
 
   global.__drainStorage = function () {
     try { return JSON.stringify({ local: __localStore.drain(), session: __sessionStore.drain() }); }
@@ -4615,6 +5055,39 @@ var decl = new CSSStyleDeclaration(el);
     clear: function () { __sessionStore.clear(); },
     key: function (i) { return __sessionStore.key(i); },
     get length() { return __sessionStore.length; }
+  };
+
+  /* StorageEvent is defined with the other event classes (it needs
+     global.Event's prototype, which does not exist yet at this point in the
+     file). */
+  /* Host -> engine: apply another tab's localStorage change into THIS ctx's
+     area quietly (no re-record -> no echo), then dispatch the `storage` event
+     on window. */
+  global.__applyRemoteStorageChange = function (key, newValue, isClear) {
+    try { __localStore.applyQuiet(key, newValue, !!isClear); } catch (e) {}
+  };
+  global.__dispatchStorageEvent = function (key, oldValue, newValue, url) {
+    try {
+      var ev = new global.StorageEvent("storage", {
+        key: key === undefined ? null : key,
+        oldValue: oldValue === undefined ? null : oldValue,
+        newValue: newValue === undefined ? null : newValue,
+        url: String(url || ""),
+        storageArea: global.localStorage,
+        __trusted: true
+      });
+      var target = global.window || global;
+      if (typeof target.dispatchEvent === "function") target.dispatchEvent(ev);
+    } catch (e) {}
+  };
+  /* Engine -> host: drain the recorded mutations since the last drain. */
+  global.__takeStorageChanges = function () {
+    try {
+      return JSON.stringify({
+        local: __localStore.takeChanges(),
+        session: __sessionStore.takeChanges()
+      });
+    } catch (e) { return "{}"; }
   };
 
   /* In-memory IndexedDB subsystem (zero external dependencies, zero RAM bloat). */
@@ -6617,6 +7090,20 @@ var decl = new CSSStyleDeclaration(el);
     };
     global.WheelEvent.prototype = Object.create(global.UIEvent.prototype);
 
+    /* StorageEvent: fired on OTHER same-origin tabs when localStorage
+       changes (host broadcast). Carries the spec surface: key, oldValue,
+       newValue, url, storageArea. */
+    global.StorageEvent = function (type, init) {
+      global.Event.call(this, type, init);
+      init = init || {};
+      this.key = init.key === undefined ? null : init.key;
+      this.oldValue = init.oldValue === undefined ? null : init.oldValue;
+      this.newValue = init.newValue === undefined ? null : init.newValue;
+      this.url = init.url === undefined ? "" : String(init.url);
+      this.storageArea = init.storageArea === undefined ? null : init.storageArea;
+    };
+    global.StorageEvent.prototype = Object.create(global.Event.prototype);
+
     /* InputEvent: typing used to deliver generic Events with data/inputType
        bolted on; now the class exists for instanceof and feature checks. */
     global.InputEvent = function (type, init) {
@@ -6640,14 +7127,88 @@ var decl = new CSSStyleDeclaration(el);
     /* DataTransfer + DragEvent: native HTML5 drag & drop needs a real
        dataTransfer the dragstart handler can write into and the drop handler
        reads back. Previously both classes were undefined and any
-       draggable=true flow crashed. */
+       draggable=true flow crashed.
+       dropEffect/effectAllowed are validated accessors with the spec's
+       phase model: effectAllowed is settable only in dragstart (a standalone
+       DataTransfer is unrestricted), dropEffect only while negotiating the
+       drop target (dragenter/dragover) — during negotiation a value outside
+       effectAllowed's allowed set is IGNORED (Blink parity), and invalid
+       values never change the attribute. The drag operation itself is
+       negotiated in __executeDrag (default per effectAllowed, handler
+       override, drop only when the operation is not "none"). */
+    var __EA_CANON = {
+      "none": "none", "copy": "copy", "copylink": "copyLink", "copymove": "copyMove",
+      "link": "link", "linkmove": "linkMove", "move": "move", "all": "all",
+      "uninitialized": "uninitialized"
+    };
+    var __DE_CANON = { "none": "none", "copy": "copy", "link": "link", "move": "move" };
+    /* Is `effect` permitted by effectAllowed's allowed-operations set? */
+    global.__effectPermits = function __effectPermits(allowed, effect) {
+      var a = String(allowed || "uninitialized").toLowerCase();
+      var e = String(effect || "none").toLowerCase();
+      if (e === "none") return true;
+      switch (a) {
+        case "none": return false;
+        case "copy": return e === "copy";
+        case "link": return e === "link";
+        case "move": return e === "move";
+        case "copylink": return e === "copy" || e === "link";
+        case "copymove": return e === "copy" || e === "move";
+        case "linkmove": return e === "link" || e === "move";
+        default: return e === "copy" || e === "link" || e === "move";
+      }
+    }
+    /* The user agent's default dropEffect for dragenter/dragover, from the
+       source's declared effectAllowed (spec processing model). */
+    global.__defaultDropEffect = function __defaultDropEffect(allowed) {
+      var a = String(allowed || "uninitialized").toLowerCase();
+      if (a === "none") return "none";
+      if (a === "link" || a === "linkmove") return "link";
+      if (a === "move") return "move";
+      return "copy";
+    }
     global.DataTransfer = function () {
-      this.dropEffect = "none";
-      this.effectAllowed = "uninitialized";
       this.__data = {};
       this.types = [];
       this.items = [];
+      this.__dropEffect = "none";
+      this.__effectAllowed = "uninitialized";
+      /* Lifecycle phase the drag engine sets on THIS transfer: null
+         (standalone new DataTransfer()), "dragstart", "negotiate"
+         (dragenter/dragover), "drop", "dragend". */
+      this.__phase = null;
     };
+    Object.defineProperty(global.DataTransfer.prototype, "dropEffect", {
+      get: function () { return this.__dropEffect; },
+      set: function (v) {
+        var canon = __DE_CANON[String(v).toLowerCase()];
+        /* Invalid values are ignored (attribute unchanged), per spec. */
+        if (!canon) return;
+        /* The source does not choose the operation: sets during dragstart and
+           dragend are ignored. During negotiation the value must also be
+           permitted by effectAllowed. A standalone DataTransfer (no drag)
+           accepts any valid value. */
+        if (this.__phase === "dragstart" || this.__phase === "dragend") return;
+        if (this.__phase === "negotiate" && !__effectPermits(this.__effectAllowed, canon)) return;
+        this.__dropEffect = canon;
+      },
+      configurable: true,
+      enumerable: true
+    });
+    Object.defineProperty(global.DataTransfer.prototype, "effectAllowed", {
+      get: function () { return this.__effectAllowed; },
+      set: function (v) {
+        var canon = __EA_CANON[String(v).toLowerCase()];
+        /* Invalid values leave the attribute unchanged, per spec. */
+        if (!canon) return;
+        /* Only the dragstart handler may declare the allowed effects; a
+           standalone DataTransfer is unrestricted. */
+        if (this.__phase === "negotiate" || this.__phase === "drop" || this.__phase === "dragend") return;
+        this.__effectAllowed = canon;
+      },
+      configurable: true,
+      enumerable: true
+    });
     global.DataTransfer.prototype.setData = function (type, value) {
       /* Spec: the type is converted to ASCII lowercase. */
       type = String(type).toLowerCase();
@@ -7243,20 +7804,25 @@ var decl = new CSSStyleDeclaration(el);
     var mdEv = (typeof global.MouseEvent === "function") ? new global.MouseEvent("mousedown", downInit) : new global.Event("mousedown", downInit);
     el.dispatchEvent(mdEv);
 
-    /* Native HTML5 drag & drop: when the source is draggable (or listens for
-       dragstart), the drag sequence carries a real DataTransfer — dragstart
-       (cancelable: preventDefault aborts), drag per step, dragover/drop on the
-       element under the translated source box, dragend on the source. Pages
-       with only mouse listeners keep the plain pointer lane. */
+    /* Native HTML5 drag & drop: ONLY a draggable=true source initiates it
+       (spec: a real browser fires no DnD for a non-draggable element, even
+       one with dragstart listeners — those pages drive via mouse events; the
+       old dragstart-listener heuristic produced phantom drag sequences).
+       The sequence carries a real DataTransfer — dragstart (cancelable:
+       preventDefault aborts; the source declares effectAllowed), drag per
+       step, dragenter/dragover/drop negotiated on the element under the
+       translated source box, dragend on the source. Pages with only mouse
+       listeners keep the plain pointer lane. */
     var nativeDrag = false;
     var dragDT = null;
-    var wantsNativeDrag = (el.getAttribute("draggable") || "").toLowerCase() === "true"
-      || (el._listeners && el._listeners["dragstart"] && el._listeners["dragstart"].length > 0);
+    var wantsNativeDrag = (el.getAttribute("draggable") || "").toLowerCase() === "true";
     if (wantsNativeDrag && typeof global.DragEvent === "function" && typeof global.DataTransfer === "function") {
       dragDT = new global.DataTransfer();
+      dragDT.__phase = "dragstart";
       var dsInit = { bubbles: true, cancelable: true, isTrusted: true, __trusted: true, clientX: startX, clientY: startY, button: 0, buttons: 1, dataTransfer: dragDT, timeStamp: t };
       var dsEv = new global.DragEvent("dragstart", dsInit);
       el.dispatchEvent(dsEv);
+      dragDT.__phase = null;
       nativeDrag = !dsEv.defaultPrevented;
     }
     /* Innermost laid-out box containing a document-space point. */
@@ -7400,28 +7966,52 @@ var decl = new CSSStyleDeclaration(el);
     if (nativeDrag && typeof global.DragEvent === "function") {
       var endInit = { bubbles: true, cancelable: true, isTrusted: true, __trusted: true, clientX: startX + dx, clientY: startY + dy, button: 0, buttons: 0, dataTransfer: dragDT, timeStamp: t };
       /* Spec: drop is delivered ONLY if the target cancels dragover
-         (preventDefault signals acceptance). The old code fired drop
-         unconditionally — reporting a drop a real browser would never
-         deliver. dragover must also fire only over a real target. */
+         (preventDefault signals acceptance) AND the negotiated drag
+         operation is not "none". The operation is negotiated per the
+         processing model: before dragenter and dragover the user agent
+         initializes dropEffect to the default for the source's declared
+         effectAllowed; the listener may override it (validated: sets
+         outside effectAllowed's allowed set are ignored); a canceled
+         dragover sets the operation to the resulting dropEffect. */
       var dropAccepted = false;
+      var finalEffect = "none";
       if (dragDropTarget) {
         try {
+          dragDT.__phase = "negotiate";
+          dragDT.__dropEffect = __defaultDropEffect(dragDT.__effectAllowed);
           var entEv = new global.DragEvent("dragenter", endInit);
           dragDropTarget.dispatchEvent(entEv);
+          dragDT.__dropEffect = __defaultDropEffect(dragDT.__effectAllowed);
           var ovEv = new global.DragEvent("dragover", endInit);
           dragDropTarget.dispatchEvent(ovEv);
           if (ovEv.defaultPrevented) {
-            dropAccepted = true;
-            dragDropTarget.dispatchEvent(new global.DragEvent("drop", endInit));
+            var eff = dragDT.__dropEffect;
+            if (!__effectPermits(dragDT.__effectAllowed, eff)) {
+              eff = __defaultDropEffect(dragDT.__effectAllowed);
+            }
+            if (eff !== "none") {
+              dropAccepted = true;
+              finalEffect = eff;
+              dragDT.__dropEffect = eff;
+              dragDT.__phase = "drop";
+              dragDropTarget.dispatchEvent(new global.DragEvent("drop", endInit));
+            } else {
+              dragDropTarget.dispatchEvent(new global.DragEvent("dragleave", endInit));
+            }
           } else {
             dragDropTarget.dispatchEvent(new global.DragEvent("dragleave", endInit));
           }
         } catch (e) {}
       }
-      /* dragend always fires on the source (spec), accepted or not. */
+      /* dragend always fires on the source (spec), accepted or not, carrying
+         the negotiated operation in dropEffect: the source learns what
+         happened ("move" means it should remove the original item, etc.). */
+      dragDT.__phase = "dragend";
+      dragDT.__dropEffect = finalEffect;
       try {
         el.dispatchEvent(new global.DragEvent("dragend", endInit));
       } catch (e) {}
+      dragDT.__phase = null;
     }
     return true;
   }
