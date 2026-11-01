@@ -592,7 +592,7 @@ class Session:
         # preventDefault (validation / SPA-handled), respect it and do NOT do
         # the raw HTTP submit; return the JS-mutated page instead.
         js_outcome = await self._dispatch_form_event(n, fields, max_chars)
-        if js_outcome == "prevented":
+        if js_outcome in ("prevented", "dialog") or form.method.upper() == "DIALOG":
             return self.page
 
         # The engine's form.submit() records the LIVE form state in
@@ -771,8 +771,9 @@ class Session:
             nav_url = urljoin(self.url, js_info["navigated"])
             await self.goto(nav_url, max_chars=max_chars)
             return "prevented"
-        if outcome == "prevented":
-            # JS handled submission (validation or SPA). Rebuild page from JS state.
+        if outcome in ("prevented", "dialog"):
+            # JS or dialog handled submission (validation, SPA, or method=dialog).
+            # Rebuild page from JS state.
             js_ran = bool(js_info.get("ran"))
             result = FetchResult(
                 url=self.url,

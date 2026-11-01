@@ -302,6 +302,13 @@ def _inline_hidden(node: Node) -> bool:
         if "hidden" in (p.attributes or {}):
             return True
         p = p.parent
+    # Closed <dialog>: contents are hidden by UA rule dialog:not([open]) { display: none }.
+    p = node
+    while p is not None:
+        tag = (p.tag or "").lower()
+        if tag == "dialog" and "open" not in (p.attributes or {}):
+            return True
+        p = p.parent
     # Closed <details>: only the summary (and its contents) stays visible.
     passed_summary = False
     p = node

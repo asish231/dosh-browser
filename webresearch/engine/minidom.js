@@ -944,6 +944,47 @@
     var action = this.getAttribute("action") || (global.location ? global.location.href : "");
     var method = (this.getAttribute("method") || "GET").toUpperCase();
     var enctype = (this.getAttribute("enctype") || "application/x-www-form-urlencoded").toLowerCase();
+
+    if (submitter && typeof submitter.getAttribute === "function") {
+      var fm = submitter.getAttribute("formmethod");
+      if (fm) method = fm.toUpperCase();
+      var fa = submitter.getAttribute("formaction");
+      if (fa) action = fa;
+      var fe = submitter.getAttribute("formenctype");
+      if (fe) enctype = fe.toLowerCase();
+    }
+
+    /* HTML spec: dialog form submission. Closes the nearest dialog
+       ancestor with the submitter's value and does not submit over the wire. */
+    if (method === "DIALOG") {
+      var dlg = null;
+      var dn = this.parentNode;
+      while (dn) {
+        if (dn.nodeName === "dialog") { dlg = dn; break; }
+        dn = dn.parentNode;
+      }
+      if (!dlg && submitter) {
+        dn = submitter.parentNode;
+        while (dn) {
+          if (dn.nodeName === "dialog") { dlg = dn; break; }
+          dn = dn.parentNode;
+        }
+      }
+      if (dlg && typeof dlg.close === "function") {
+        var retVal = "";
+        if (submitter) {
+          var sVal = (typeof submitter.getAttribute === "function") ? submitter.getAttribute("value") : null;
+          if (sVal != null) {
+            retVal = sVal;
+          } else if (submitter.value != null && submitter.value !== "") {
+            retVal = String(submitter.value);
+          }
+        }
+        dlg.close(retVal);
+      }
+      return;
+    }
+
     var fields = {};
     var formFiles = {};
     /* Spec: disabled form controls — directly or inside a disabled
@@ -1044,13 +1085,15 @@
   };
   Element.prototype.requestSubmit = function (submitter) {
     if (this.nodeName !== "form") return;
-    var ev = (typeof global.Event === "function")
+    var ev = (typeof global.SubmitEvent === "function")
+      ? new global.SubmitEvent("submit", { bubbles: true, cancelable: true, isTrusted: true, submitter: submitter || null })
+      : (typeof global.Event === "function")
       ? new global.Event("submit", { bubbles: true, cancelable: true, isTrusted: true })
       : { type: "submit", target: this, bubbles: true, cancelable: true, isTrusted: true };
     if (submitter) ev.submitter = submitter;
     this.dispatchEvent(ev);
     if (!ev.defaultPrevented) {
-      this.submit();
+      this.submit(submitter);
     }
   };
   Element.prototype.focus = function () {
@@ -1645,7 +1688,7 @@
    * absolute/fixed/relative; units px, %, em, rem, pt.
    * Known simplifications: no floats, no sticky, no flex-wrap or
    * justify/align distribution, no bidi/shaping. Reported via __layoutInfo. */
-  var __BLOCK_TAGS = { address:1, article:1, aside:1, blockquote:1, body:1, br:0, canvas:0, dd:1, div:1, dl:1, dt:1, fieldset:1, figcaption:1, figure:1, footer:1, form:1, h1:1, h2:1, h3:1, h4:1, h5:1, h6:1, header:1, hgroup:1, hr:1, html:1, iframe:0, img:0, input:0, legend:1, li:1, main:1, nav:1, noscript:1, ol:1, option:0, output:0, p:1, pre:1, section:1, select:0, table:1, tbody:1, td:1, textarea:0, tfoot:1, th:1, thead:1, tr:1, ul:1, video:0, button:0 };
+  var __BLOCK_TAGS = { address:1, article:1, aside:1, blockquote:1, body:1, br:0, canvas:0, dd:1, details:1, dialog:1, div:1, dl:1, dt:1, fieldset:1, figcaption:1, figure:1, footer:1, form:1, h1:1, h2:1, h3:1, h4:1, h5:1, h6:1, header:1, hgroup:1, hr:1, html:1, iframe:0, img:0, input:0, legend:1, li:1, main:1, nav:1, noscript:1, ol:1, option:0, output:0, p:1, pre:1, section:1, select:0, table:1, tbody:1, td:1, textarea:0, tfoot:1, th:1, thead:1, tr:1, ul:1, video:0, button:0 };
   var __REPLACED_TAGS = { img:1, iframe:1, canvas:1, video:1, input:1, select:1, textarea:1, button:1, object:1, embed:1 };
   function __parsePx(v, base, fontSize) {
     if (v == null) return null;
@@ -1796,17 +1839,19 @@
     }
     var disp = (st.display || "").toLowerCase();
     if (!disp) {
-      /* UA rules (HTML spec rendering): [hidden] { display: none }, and a
-         closed <details> hides everything except its summary. Author CSS
-         that sets display explicitly wins over these UA rules — matching
-         real cascade order (UA < author). Previously neither was consulted,
-         so [hidden] controls and collapsed-details content were reported
-         visible to checkVisibility and the action surface. */
+      /* UA rules (HTML spec rendering): [hidden] { display: none },
+         dialog:not([open]) { display: none }, and a closed <details> hides
+         everything except its summary. Author CSS that sets display explicitly
+         wins over these UA rules — matching real cascade order (UA < author). */
       if (el.hasAttribute && el.hasAttribute("hidden")) {
         disp = "none";
       } else {
         var dn = el;
         while (dn) {
+          if (dn.nodeName === "dialog" && !(dn.hasAttribute && dn.hasAttribute("open"))) {
+            disp = "none";
+            break;
+          }
           if (dn.nodeName === "details" && !(dn.hasAttribute && dn.hasAttribute("open"))) {
             var up = el;
             var viaSummary = false;
@@ -2573,15 +2618,25 @@
     });
     __DialogCtor.prototype.show = function () {
       if (this.open) return;
+      this.__isModal = false;
       this.setAttribute("open", "");
     };
     __DialogCtor.prototype.showModal = function () {
-      if (this.open) return;
+      if (this.open) {
+        var err = new (global.DOMException || Error)(
+          "Failed to execute 'showModal' on 'HTMLDialogElement': The element already has an 'open' attribute, and therefore cannot be opened modally.",
+          "InvalidStateError"
+        );
+        err.name = "InvalidStateError";
+        throw err;
+      }
+      this.__isModal = true;
       this.setAttribute("open", "");
       this.dispatchEvent(new global.Event("open", { bubbles: false }));
     };
     __DialogCtor.prototype.close = function (returnValue) {
       if (!this.open) return;
+      this.__isModal = false;
       this.removeAttribute("open");
       if (returnValue !== undefined) this.returnValue = String(returnValue);
       var ev = new global.Event("close", { bubbles: false });
@@ -6694,6 +6749,36 @@
           spEv.inputType = "insertText";
           el.dispatchEvent(spEv);
         }
+      } else if (lower === "escape") {
+        /* Spec: pressing Escape on an open dialog fires a cancelable
+           'cancel' event. If not prevented, it closes the dialog. */
+        var dlg = null;
+        var escNode = el;
+        while (escNode) {
+          if (escNode.nodeName === "dialog" && escNode.hasAttribute && escNode.hasAttribute("open")) {
+            dlg = escNode;
+            break;
+          }
+          escNode = escNode.parentNode;
+        }
+        if (!dlg) {
+          var allDlgs = (global.document && typeof global.document.getElementsByTagName === "function")
+            ? global.document.getElementsByTagName("dialog")
+            : [];
+          for (var di = allDlgs.length - 1; di >= 0; di--) {
+            if (allDlgs[di].hasAttribute && allDlgs[di].hasAttribute("open")) {
+              dlg = allDlgs[di];
+              break;
+            }
+          }
+        }
+        if (dlg) {
+          var cancelEv = new global.Event("cancel", { bubbles: false, cancelable: true });
+          dlg.dispatchEvent(cancelEv);
+          if (!cancelEv.defaultPrevented && typeof dlg.close === "function") {
+            dlg.close();
+          }
+        }
       }
     }
 
@@ -6932,12 +7017,17 @@ global.__submitPath = function (path) {
     var ev = new global.Event("submit", { bubbles: true, cancelable: true });
     el.dispatchEvent(ev);
     if (ev.defaultPrevented) return "prevented";
+    var submitter = (el.nodeName === "button" || el.nodeName === "input") ? el : null;
     if (form && typeof form.submit === "function") {
       /* el is the agent-clicked control (a submit button): it is the
          submitter and contributes its own name/value pair. */
-      var submitter = (el.nodeName === "button" || el.nodeName === "input") ? el : null;
       try { form.submit(submitter); } catch (e) {}
     }
+    var fm = form ? (form.getAttribute("method") || "GET").toUpperCase() : "";
+    if (submitter && typeof submitter.getAttribute === "function" && submitter.getAttribute("formmethod")) {
+      fm = submitter.getAttribute("formmethod").toUpperCase();
+    }
+    if (fm === "DIALOG") return "dialog";
     return "submitted";
   };
   global.__submitFormByIndex = function (index) {
@@ -6949,6 +7039,8 @@ global.__submitPath = function (path) {
     form.dispatchEvent(ev);
     if (ev.defaultPrevented) return "prevented";
     if (typeof form.submit === "function") { try { form.submit(); } catch (e) {} }
+    var fm = (form.getAttribute("method") || "GET").toUpperCase();
+    if (fm === "DIALOG") return "dialog";
     return "submitted";
   };
   global.__setFormFields = function (index, fieldsJson) {
