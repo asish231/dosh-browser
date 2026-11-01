@@ -239,8 +239,14 @@ def _iter_refs(nodes: list[tuple[dict, list[int]]]):
         role = _role(node)
         text = _text_of(node)[:120] or attrs.get("value") or attrs.get("title") or attrs.get("name") or attrs.get("aria-label") or ""
         href = attrs.get("href") or attrs.get("src") or ""
+        stable_text = text.strip()[:40]
+        if node.get("t") in ("input", "textarea", "select"):
+            stable_text = (
+                attrs.get("placeholder") or attrs.get("title")
+                or attrs.get("aria-label") or attrs.get("name") or attrs.get("id") or ""
+            )
         digest = hashlib.sha1(
-            "|".join([role, node.get("t") or "", attrs.get("name") or attrs.get("id") or "", text.strip()[:40], href]).encode("utf-8", "ignore")
+            "|".join([role, node.get("t") or "", attrs.get("name") or attrs.get("id") or "", stable_text, href]).encode("utf-8", "ignore")
         ).hexdigest()[:8]
         base = f"e{digest}"
         n = seen.get(base, 0) + 1

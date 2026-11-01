@@ -360,6 +360,7 @@ class Session:
         new_html, js_info = await run_scripts(
             self.html, self.url, self.client, force=True, storage_seed=self._storage_seed(),
             ctx=None,
+            history_length=max(1, len(self.history)),
         )
         self.current_tab.ctx = js_info.get("ctx")
         self._absorb_storage(js_info)
@@ -500,6 +501,7 @@ class Session:
             sprite_endpoint=f"/v1/sessions/{self.id}/captcha/sprite",
             return_js_info=True,
             storage_seed=self._storage_seed(url),
+            history_length=max(1, len(self.history) + 1),
         )
         self.frame_documents = frames
         self.captcha_inspection = captcha
@@ -702,6 +704,7 @@ class Session:
                 self.client,
                 headers=result.headers,
                 storage_seed=self._storage_seed(result.final_url or form.action),
+                history_length=max(1, len(self.history) + 1),
             )
             js_ran = bool(js_info.get("ran"))
             self._absorb_storage(js_info, result.final_url or form.action)
@@ -759,6 +762,7 @@ class Session:
         new_html, js_info = await run_scripts(
             self.html, self.url, self.client, force=True, actions=actions, ctx=self.current_tab.ctx,
             storage_seed=self._storage_seed(),
+            history_length=max(1, len(self.history)),
         )
         self.current_tab.ctx = js_info.get("ctx") or self.current_tab.ctx
         self._absorb_storage(js_info)
@@ -1018,8 +1022,7 @@ class Session:
         action = next((a for a in surface.actions if a.ref == ref), None)
         if action is None:
             raise ValueError(
-                f"no target [{ref}] for key press. Refs are content-addressed and "
-                "change when a field's value changes; re-inspect and use the new ref."
+                f"no target [{ref}] for key press. Re-inspect or query the action surface to obtain a valid ref."
             )
         return await self._apply(
             [{"kind": "press", "selector": action.selector or action.target, "key": key_norm, "stealth": is_stealth}],
@@ -1617,6 +1620,7 @@ resolve a selector directly.
         new_html, js_info = await run_scripts(
             html, self.url, self.client, force=True, actions=actions, ctx=self.current_tab.ctx,
             storage_seed=self._storage_seed(),
+            history_length=max(1, len(self.history)),
         )
         self.current_tab.ctx = js_info.get("ctx") or self.current_tab.ctx
         self._absorb_storage(js_info)

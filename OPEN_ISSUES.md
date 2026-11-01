@@ -12,7 +12,12 @@
 > tests/test_visibility_truth.py, test_frame_reply.py, test_option_api.py;
 > suite at 471 passed). Commits: 6a6c493..0a342a3 + the round-3 commits.
 > Round 4 (2026-11-01): HTMLDialogElement subsystem and zero-phantom scroll +
-> body.scrollWidth content extent (commits: 4d33e4f, f20708d; suite at 501 passed).
+> body.scrollWidth content extent; small APIs hardening; URL/URLSearchParams
+> spec edges (+ space encoding, default port stripping, credentials/schemes,
+> ?a query preservation), history.length session depth, DnD dragenter/dragleave,
+> parse-time & DOM radio exclusivity, localStorage insertion key order, and
+> MCP error token accounting (commits: 4d33e4f, f20708d, 2f16756; 11 new
+> regressions in tests/test_spec_edges_and_fixes.py; suite at 518 passed).
 >
 > Rule from AGENTS.md still applies: a capability gap is a bug report against
 > `minidom.js`, never a reason to reach for a browser binary.
@@ -359,15 +364,9 @@ engine-heavy passes (suite 254s -> ~263-275s).
   selectedIndex deselects per spec (was: snap back to the first option).
   10 regressions in tests/test_option_api.py. Still open in this area:
    **fieldset-disabled descendants FIXED** (engine lanes consult __controlDisabled; actions.py narrowed to fieldset propagation with legend exemption); 5 regressions in tests/test_fieldset_disabled_engine.py.
-  parse-time radio exclusivity not applied (two `checked` attrs in one
-  group both read checked — wire is safe by collection order).
-- **URL serializer/parsing edges**: `%20` instead of `+` for spaces in the
-  application/x-www-form-urlencoded serializer; href getter drops
-  username/password and non-special schemes (mailto:); default port kept
-  in href; `?a` re-serializes as `?a=`; naive base resolution for
-  base-with-query cases.
-- **History**: `history.length` is engine-local (always 1) even when the
-  session owns several entries; `scrollRestoration` undefined; popstate
+  **parse-time & DOM radio exclusivity FIXED in round 4** — last checked radio in tree order wins in forms.py extraction and hydrated DOM; `Element.prototype.form` accessor wired; `el.checked = true` unchecks same-group radios. 2 regressions in tests/test_spec_edges_and_fixes.py.
+- **URL serializer/parsing edges**: **FIXED in round 4** — `+` instead of `%20` for spaces in `application/x-www-form-urlencoded` serializer; default ports (`:80` for `http:`, `:443` for `https:`) stripped from `URL.port` and `URL.host`; valueless query params (`?a`) preserved in `URL.search` and `URL.href` until mutated; credentials (`user:pass@host`) and non-special schemes (`mailto:`) preserved in `URL.href`; `URLSearchParams` object/array initialization supported. 5 regressions in tests/test_spec_edges_and_fixes.py.
+- **History**: `history.length` **FIXED in round 4** — seeded from session history count and increments dynamically on `pushState()` (1 regression in tests/test_spec_edges_and_fixes.py); `scrollRestoration` FIXED in round 4 ("auto" default + "manual" toggle). Remaining: popstate
   state is JSON-round-tripped (structured-clone subset: undefined keys and
   functions silently dropped); load-pass `history.back()` (in a setTimeout
   during page load) is dropped — moves are consumed only on action passes;
@@ -392,8 +391,10 @@ engine-heavy passes (suite 254s -> ~263-275s).
   acceptance per spec); dragging to empty space delivers dragend only (the
   old `|| el` fallback "dropped" on the source's own position); DataTransfer
   types are ASCII-lowercased with case-insensitive setData/getData. 4
-  regressions in tests/test_dnd_gate.py. Still open in this area: no
-  dragenter/dragleave; dropEffect/effectAllowed not negotiated; the
+  regressions in tests/test_dnd_gate.py. **dragenter/dragleave FIXED in round 4**
+  — dragenter dispatched on target before dragover, and dragleave dispatched
+  on rejected drop. 1 regression in tests/test_spec_edges_and_fixes.py.
+  Remaining: dropEffect/effectAllowed not negotiated; the
   dragstart-listener heuristic (a non-draggable element with a dragstart
   listener gets a native DnD sequence — a real browser fires none) is a
   disclosed deviation.
@@ -423,20 +424,31 @@ engine-heavy passes (suite 254s -> ~263-275s).
   init-once, state persists across passes, live pump + reply, src swap
   fetches only the new frame, removal drops out, same-object reuse, and
   back() reuse). Suite 488 passed.
-- **MCP**: error-path results (unknown tool, bad args) bypass token
-  accounting; the legacy `_iter_refs` fallback hash is still value-inclusive
-  (it can never resolve inspect-issued form-field refs — it errors honestly
-  instead); `press_key`'s stale-ref error text still describes the old
-  value-sensitive refs.
+- **MCP**: **FIXED in round 4** — error-path results (unknown tool, bad args,
+  exceptions) route through `_format_result` with `"isError": true`, accurately
+  accounting tokens burned and call metrics (1 regression in tests/test_spec_edges_and_fixes.py);
+  legacy `_iter_refs` input fields made value-independent; `press_key`'s stale-ref
+  error text updated.
 - **Perf**: content_root's 2-sibling no-main pages still drop a sibling
   (below the 3+ container threshold — pre-existing subtraction model).
-- **Storage**: no `storage` events in other same-origin tabs (spec fires
-  them); key() ordering after cross-navigation re-seed follows host seed
-  order, not original set order.
+- **Storage**: **key() insertion ordering FIXED in round 4** — internal
+  order array preserves exact insertion order for `localStorage.key(i)` and
+  `sessionStorage.key(i)` without numerical key sorting (1 regression in
+  tests/test_spec_edges_and_fixes.py). Remaining: no cross-tab `storage` events
+  in other same-origin tabs.
 - Substrate execution depth (Worker/WASM/SW-JS) remains disclosed-not-
   implemented per the round-1 decision; blob: URLs resolve locally.
 
 ## Verified working — do not re-file
+
+- Spec edges & Web APIs hardening (Round 4):
+  - URLSearchParams: space encoded as '+' per application/x-www-form-urlencoded, object/array init supported.
+  - URL: default ports (:80, :443) stripped from port and host, ?a valueless query preserved in search/href until mutated, credentials and non-special schemes preserved in href.
+  - history.length seeded from host session stack and dynamically increments on pushState.
+  - DnD: dragenter and dragleave dispatched around dragover/drop.
+  - Radio exclusivity: last radio with checked attribute in group wins at parse time and hydrated DOM; Element.form accessor wired.
+  - Web Storage: localStorage.key(i) preserves exact insertion order even with integer keys.
+  - MCP: tool call errors formatted with token accounting and isError: true.
 
 - Small APIs hardening: geolocation watchPosition unique IDs & clearWatch, serviceWorker.register absolute scriptURL resolution, Popover API exception/auto-close/light-dismiss compliance, history.scrollRestoration, and checkVisibility({ checkVisibilityCSS, checkOpacity }).
 - Zero phantom horizontal scroll: body layout box sized for viewport margins, preventing the 8px bodyMargin shift from inflating document scroll extent; documentElement.scrollWidth and body.scrollWidth accurately reflect content extent.

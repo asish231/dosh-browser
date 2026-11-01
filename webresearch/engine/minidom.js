@@ -1670,10 +1670,39 @@
     },
     configurable: true
   });
+  Object.defineProperty(Element.prototype, "form", {
+    get: function () {
+      var n = this.parentNode;
+      while (n) {
+        if (n.nodeName === "form") return n;
+        n = n.parentNode;
+      }
+      return null;
+    },
+    configurable: true
+  });
   Object.defineProperty(Element.prototype, "checked", {
     get: function () { return this.attributes.checked != null && this.attributes.checked !== "false"; },
     set: function (v) {
-      if (v) this.attributes.checked = "checked"; else delete this.attributes.checked;
+      if (v) {
+        this.attributes.checked = "checked";
+        if (this.nodeName === "input" && (this.attributes.type || "").toLowerCase() === "radio" && this.attributes.name) {
+          var rname = this.attributes.name;
+          var myForm = this.form;
+          var rscope = myForm || (this.ownerDocument || global.document);
+          if (rscope && typeof rscope.querySelectorAll === "function") {
+            var radios = rscope.querySelectorAll("input[type=radio]");
+            for (var ri = 0; ri < radios.length; ri++) {
+              var ro = radios[ri];
+              if (ro !== this && ro.getAttribute("name") === rname && (myForm ? ro.form === myForm : !ro.form)) {
+                delete ro.attributes.checked;
+              }
+            }
+          }
+        }
+      } else {
+        delete this.attributes.checked;
+      }
       queueMutation("attributes", this, { attributeName: "checked" });
     }
   });
@@ -1830,15 +1859,94 @@
       /* visibility participates in the cascade: checkVisibility() must see
          stylesheet visibility:hidden, which the old template dropped. */
       visibility: null,
-      opacity: "1"
-    };
+      opacity: "1",
+      /* Presentational / text properties participate in the cascade too. The
+         template used to list only layout props, so getComputedStyle() — which
+         reads this same template — returned "" for color/font/text on every
+         element whose color came from a stylesheet (the common case). */
+      color: null,
+      backgroundColor: null,
+      fontFamily: null,
+      fontWeight: null,
+      fontStyle: null,
+      fontVariant: null,
+      fontStretch: null,
+      fontSizeAdjust: null,
+      textAlign: null,
+      textAlignLast: null,
+      lineHeight: null,
+      letterSpacing: null,
+      wordSpacing: null,
+      textIndent: null,
+      textTransform: null,
+      textDecoration: null,
+      textShadow: null,
+      whiteSpace: null,
+      verticalAlign: null,
+      unicodeBidi: null,
+      direction: null,
+      writingMode: null,
+      listStyle: null,
+      listStyleType: null,
+      listStylePosition: null,
+      listStyleImage: null,
+      background: null,
+      backgroundImage: null,
+      backgroundRepeat: null,
+      backgroundPosition: null,
+      backgroundSize: null,
+      backgroundClip: null,
+      backgroundOrigin: null,
+      backgroundAttachment: null,
+      border: null,
+      borderTop: null,
+      borderRight: null,
+      borderBottom: null,
+      borderLeft: null,
+      borderTopColor: null,
+      borderTopStyle: null,
+      borderTopWidth: null,
+      borderRightColor: null,
+      borderRightStyle: null,
+      borderRightWidth: null,
+      borderBottomColor: null,
+      borderBottomStyle: null,
+      borderBottomWidth: null,
+      borderLeftColor: null,
+      borderLeftStyle: null,
+      borderLeftWidth: null,
+      borderRadius: null,
+      borderTopLeftRadius: null,
+      borderTopRightRadius: null,
+      borderBottomLeftRadius: null,
+      borderBottomRightRadius: null,
+      outline: null,
+      outlineColor: null,
+      outlineStyle: null,
+      outlineWidth: null,
+      outlineOffset: null,
+      zIndex: null,
+      overflow: null,
+      overflowX: null,
+      overflowY: null,
+      cursor: null,
+      tableLayout: null,
+      borderCollapse: null,
+borderSpacing: null,
+        captionSide: null,
+        emptyCells: null,
+        boxSizing: null
+      };
     rules.forEach(function (r) {
       r.sel.split(",").forEach(function (s) {
         if (!__matchesSel(el, s)) return;
         var spec = __selSpecificity(s);
         for (var k in r.decls) {
           var prop = __normalizeProp(k);
-          if (!(prop in st)) return;
+          /* Skip unknown properties, do NOT abort the rule: an unrecognized
+             declaration must not suppress the recognized ones that follow it
+             in the same rule (real browsers ignore unknown declarations). */
+          if (!(prop in st)) continue;
           st["__spec_" + prop] = st["__spec_" + prop] || 0;
           if (spec >= st["__spec_" + prop]) {
             st[prop] = r.decls[k];
@@ -1891,25 +1999,35 @@
       }
     }
     if (!disp) disp = (__BLOCK_TAGS[el.nodeName] ? "block" : "inline");
-    var pos = (st.position || "").toLowerCase();
-    var flexDir = (st.flexDirection || "row").toLowerCase();
-    return {
-      display: disp,
-      position: pos,
-      top: st.top,
-      left: st.left,
-      bottom: st.bottom,
-      right: st.right,
-      flexDirection: flexDir,
-      gap: st.gap,
-      width: st.width,
-      height: st.height,
-      margin: st.margin,
-      padding: st.padding,
-      fontSize: fontSize,
-      visibility: st.visibility,
-      opacity: st.opacity
-    };
+var pos = (st.position || "").toLowerCase();
+      var flexDir = (st.flexDirection || "row").toLowerCase();
+      /* Return the full computed property set, not just the layout subset:
+         getComputedStyle() reads this same object, so color/font/text/border
+         must be present or every stylesheet-set property reads as "". */
+      var out = {
+        display: disp,
+        position: pos,
+        top: st.top,
+        left: st.left,
+        bottom: st.bottom,
+        right: st.right,
+        flexDirection: flexDir,
+        gap: st.gap,
+        width: st.width,
+        height: st.height,
+        margin: st.margin,
+        padding: st.padding,
+        fontSize: fontSize,
+        visibility: st.visibility,
+        opacity: st.opacity
+      };
+      for (var pk in st) {
+        if (pk.indexOf("__spec_") === 0) continue;
+        if (pk === "display" || pk === "position" || pk === "flexDirection") continue;
+        if (pk in out) continue;
+        out[pk] = st[pk];
+      }
+      return out;
   }
   /* Authentic proportional character advance ratios for standard system sans-serif (Inter / Roboto / Arial) */
   var __CHAR_ADVANCES = {
@@ -2979,14 +3097,23 @@
     u.protocol = m[1] || "";
     var auth = m[2] || "";
     var host = auth.split("@").pop();
-    u.host = host;
     u.hostname = host.split(":")[0];
     u.port = host.indexOf(":") >= 0 ? host.split(":")[1] : "";
-    u.pathname = m[3] || "/";
+    var defaultPorts = { "http:": "80", "https:": "443", "ws:": "80", "wss:": "443", "ftp:": "21" };
+    if (u.protocol && defaultPorts[u.protocol.toLowerCase()] === u.port) {
+      u.port = "";
+      u.host = u.hostname;
+    } else {
+      u.host = host;
+    }
+    u.pathname = m[3] || (m[2] ? "/" : "");
     u.hash = m[5] || "";
     u.username = auth.indexOf("@") > 0 ? auth.split("@")[0].split(":")[0] : "";
     u.password = auth.indexOf("@") > 0 && auth.split("@")[0].indexOf(":") > 0 ? auth.split("@")[0].split(":")[1] : "";
     return m[4] || "";
+  }
+  function __encodeWwwForm(s) {
+    return encodeURIComponent(String(s == null ? "" : s)).replace(/%20/g, "+");
   }
   function URLImpl(input, base) {
     var raw = String(input == null ? "" : input);
@@ -3002,21 +3129,23 @@
     }
     var self = this;
     var initialSearch = __urlParseInto(this, absolute);
-    /* href/search/origin are live accessors over the parsed fields and the
-       searchParams object, per the spec's URLUtils contract: every
-       searchParams mutation (set/append/delete/sort) is reflected in .href,
-       .search and .toString(), and assigning .search/.href re-parses. The
-       old plain-data href froze at construction, so searchParams writes
-       were silently dropped and every engine-side GET form submit navigated
-       without its query string (a verified P0: session.submit on a GET form
-       fetched the action URL with no query at all). */
+    this._rawSearch = initialSearch;
     this.searchParams = new URLSearchParamsImpl(initialSearch);
+    this.searchParams._parentUrl = this;
     Object.defineProperty(this, "search", {
       get: function () {
+        if (!self.searchParams._dirty && self._rawSearch !== undefined) {
+          return self._rawSearch;
+        }
         var qs = self.searchParams.toString();
         return qs ? "?" + qs : "";
       },
-      set: function (v) { self.searchParams._replace(String(v == null ? "" : v)); },
+      set: function (v) {
+        var str = String(v == null ? "" : v);
+        self._rawSearch = str.charAt(0) === "?" ? str : (str ? "?" + str : "");
+        self.searchParams._replace(str);
+        self.searchParams._dirty = false;
+      },
       configurable: true,
       enumerable: true
     });
@@ -3026,10 +3155,17 @@
       enumerable: true
     });
     Object.defineProperty(this, "href", {
-      get: function () { return self.origin + self.pathname + self.search + (self.hash || ""); },
+      get: function () {
+        var creds = self.username ? (self.username + (self.password ? ":" + self.password : "") + "@") : "";
+        var schemePart = self.protocol ? (self.host ? self.protocol + "//" : self.protocol) : "";
+        var hostPart = self.host ? creds + self.host : "";
+        return schemePart + hostPart + self.pathname + self.search + (self.hash || "");
+      },
       set: function (v) {
         var s = __urlParseInto(self, String(v == null ? "" : v));
+        self._rawSearch = s;
         self.searchParams._replace(s);
+        self.searchParams._dirty = false;
       },
       configurable: true,
       enumerable: true
@@ -3039,9 +3175,28 @@
     this.replace = function (u) { try { global.__WR_NAVIGATED = String(u || ""); } catch (e) {} };
     this.reload = function () {};
   }
-  /* Shared parser for URLSearchParams sources: "?a=1&b=2" -> {a:"1",b:"2"},
+  /* Shared parser for URLSearchParams sources: "?a=1&b=2", [["a","1"]], or {a:"1"},
      with duplicate keys collapsing to arrays. */
   function __spParse(query) {
+    if (typeof query === "object" && query !== null) {
+      var po = {};
+      if (Array.isArray(query)) {
+        query.forEach(function (pair) {
+          if (!pair || pair.length < 2) return;
+          var k = String(pair[0]), v = String(pair[1]);
+          if (po[k] == null) po[k] = v; else if (Array.isArray(po[k])) po[k].push(v); else po[k] = [po[k], v];
+        });
+      } else {
+        for (var ok in query) {
+          if (Object.prototype.hasOwnProperty.call(query, ok)) {
+            var val = query[ok];
+            if (Array.isArray(val)) po[ok] = val.map(String);
+            else po[ok] = String(val == null ? "" : val);
+          }
+        }
+      }
+      return po;
+    }
     var raw = String(query == null ? "" : query).replace(/^\?/, "");
     var p = {};
     raw.split("&").forEach(function (pair) {
@@ -3056,30 +3211,29 @@
   }
   function URLSearchParamsImpl(query) {
     this._p = __spParse(query);
+    this._dirty = false;
     var self = this;
     this.get = function (k) { var v = this._p[k]; return v == null ? null : (Array.isArray(v) ? v[0] : v); };
     this.getAll = function (k) { var v = this._p[k]; return v == null ? [] : (Array.isArray(v) ? v.slice() : [v]); };
     this.has = function (k) { return this._p[k] != null; };
-    /* append/set/delete/sort: the standard mutation surface. A real miss:
-       LinkedIn's interop iframe URL builder called params.append("_l", v)
-       and crashed "not a function" — killing the whole login render. */
+    /* append/set/delete/sort: the standard mutation surface. */
     this.append = function (k, v) {
+      this._dirty = true;
       var cur = this._p[k];
       if (cur == null) this._p[k] = String(v);
       else if (Array.isArray(cur)) cur.push(String(v));
       else this._p[k] = [cur, String(v)];
     };
-    this.set = function (k, v) { this._p[k] = String(v); };
-    this.delete = function (k) { delete this._p[k]; };
+    this.set = function (k, v) { this._dirty = true; this._p[k] = String(v); };
+    this.delete = function (k) { this._dirty = true; delete this._p[k]; };
     this.sort = function () {
+      this._dirty = true;
       var keys = Object.keys(this._p).sort();
       var sorted = {};
       for (var i = 0; i < keys.length; i++) sorted[keys[i]] = this._p[keys[i]];
       this._p = sorted;
     };
-    /* entries/keys/values + iterator: real production code calls
-       Object.fromEntries(params.entries()) (LinkedIn's interop tracking,
-       which crashed "not a function" without them). */
+    /* entries/keys/values + iterator */
     this.entries = function () {
       var out = [];
       for (var k in this._p) {
@@ -3093,8 +3247,6 @@
         forEach: function (fn) { out.forEach(function (pair) { fn(pair[1], pair[0]); }); },
         length: out.length
       };
-      // Object.fromEntries / Array.from consume Symbol.iterator; a bare
-      // next() method is not enough (verified: "value is not iterable").
       iterator[Symbol.iterator] = function () { return iterator; };
       return iterator;
     };
@@ -3119,16 +3271,13 @@
         else fn(v, k);
       }
     };
-    /* Reset the contents in place, keeping object identity: code holding a
-       reference to `url.searchParams` must observe `url.search = "..."` and
-       `url.href = "..."` re-assignments. */
-    this._replace = function (query) { this._p = __spParse(query); };
+    this._replace = function (query) { this._p = __spParse(query); this._dirty = false; };
     this.toString = function () {
       var out = [];
       for (var k in this._p) {
         var v = this._p[k];
-        if (Array.isArray(v)) v.forEach(function (x) { out.push(encodeURIComponent(k) + "=" + encodeURIComponent(x)); });
-        else out.push(encodeURIComponent(k) + "=" + encodeURIComponent(v));
+        if (Array.isArray(v)) v.forEach(function (x) { out.push(__encodeWwwForm(k) + "=" + __encodeWwwForm(x)); });
+        else out.push(__encodeWwwForm(k) + "=" + __encodeWwwForm(v));
       }
       return out.join("&");
     };
@@ -3251,10 +3400,40 @@
   global.ResizeObserver = ResizeObserver;
 
   global.getComputedStyle = function (el) {
-    return (el && el.style) ? el.style : {
-      getPropertyValue: function () { return ""; },
-      length: 0
-    };
+    if (!el) {
+      return { getPropertyValue: function () { return ""; }, length: 0 };
+    }
+    /* A real getComputedStyle returns the CASCADE (stylesheet + inline + UA),
+       not the inline style attribute — the old stub returned el.style, so
+       every computed property read as "" and page JS that queried
+       getComputedStyle().color saw nothing. Build a CSSStyleDeclaration
+       populated from __computedStyle, with the live element as its backing so
+       setProperty/removeProperty keep working on the returned object. */
+var decl = new CSSStyleDeclaration(el);
+      decl.__parsing = true;
+      try {
+        for (var k in decl) {
+          if (!Object.prototype.hasOwnProperty.call(decl, k)) continue;
+          if (k === "_el" || k === "__parsing") continue;
+          delete decl[k];
+        }
+        var doc = el.ownerDocument || global.document;
+        var rules = doc ? __collectStyleRules(doc) : [];
+        var cs = __computedStyle(el, rules, 16);
+        /* Copy every computed property (the template is the source of truth for
+           what the cascade can compute; iterating the result keeps them in
+           sync). camelCase keys are stored as-is on the declaration and
+           getPropertyValue resolves both forms. */
+        for (var pk in cs) {
+          if (pk.indexOf("__spec_") === 0) continue;
+          var v = cs[pk];
+          if (v == null || v === "") continue;
+          decl[pk] = String(v);
+        }
+      } finally {
+        decl.__parsing = false;
+      }
+      return decl;
   };
   global.matchMedia = function (q) {
     return { matches: false, media: String(q || ""), addListener: function () {}, removeListener: function () {}, addEventListener: function () {}, removeEventListener: function () {} };
@@ -4074,7 +4253,13 @@
      BEFORE the location is updated (the old order resolved relative URLs
      twice: 'sub/page' from /deep/dir/page became .../sub/sub/page). */
   global.history = {
-    length: 1,
+    get length() {
+      var base = (typeof globalThis.__WR_HISTORY_LENGTH === "number" && globalThis.__WR_HISTORY_LENGTH > 0)
+        ? globalThis.__WR_HISTORY_LENGTH
+        : 1;
+      return base + (this._stack ? this._stack.length : 0);
+    },
+    set length(v) {},
     state: null,
     _scrollRestoration: "auto",
     _stack: [],
@@ -4360,39 +4545,76 @@
      (same-origin frame storage sharing is not wired). */
   var __storageSeed = {};
   try { __storageSeed = (typeof globalThis.__WR_STORAGE_SEED === "object" && globalThis.__WR_STORAGE_SEED) || {}; } catch (e) {}
-  var storage = {};
-  var __seedL = __storageSeed.local;
-  if (__seedL) {
-    for (var __slk in __seedL) {
-      if (Object.prototype.hasOwnProperty.call(__seedL, __slk)) storage[__slk] = String(__seedL[__slk]);
+
+  function __createStorageStore(seed) {
+    var store = {};
+    var order = [];
+    if (seed && typeof seed === "object") {
+      for (var k in seed) {
+        if (Object.prototype.hasOwnProperty.call(seed, k)) {
+          var sk = String(k);
+          store[sk] = String(seed[k]);
+          if (order.indexOf(sk) < 0) order.push(sk);
+        }
+      }
     }
+    return {
+      getItem: function (k) {
+        var sk = String(k);
+        return Object.prototype.hasOwnProperty.call(store, sk) ? store[sk] : null;
+      },
+      setItem: function (k, v) {
+        var sk = String(k);
+        if (!Object.prototype.hasOwnProperty.call(store, sk)) order.push(sk);
+        store[sk] = String(v);
+      },
+      removeItem: function (k) {
+        var sk = String(k);
+        delete store[sk];
+        var idx = order.indexOf(sk);
+        if (idx >= 0) order.splice(idx, 1);
+      },
+      clear: function () {
+        for (var i = 0; i < order.length; i++) delete store[order[i]];
+        order.length = 0;
+      },
+      key: function (i) {
+        var idx = Number(i);
+        return (idx >= 0 && idx < order.length) ? order[idx] : null;
+      },
+      get length() { return order.length; },
+      drain: function () {
+        var res = {};
+        for (var i = 0; i < order.length; i++) {
+          res[order[i]] = store[order[i]];
+        }
+        return res;
+      }
+    };
   }
-  var sessionStorageStore = {};
-  var __seedS = __storageSeed.session;
-  if (__seedS) {
-    for (var __ssk in __seedS) {
-      if (Object.prototype.hasOwnProperty.call(__seedS, __ssk)) sessionStorageStore[__ssk] = String(__seedS[__ssk]);
-    }
-  }
+
+  var __localStore = __createStorageStore(__storageSeed.local);
+  var __sessionStore = __createStorageStore(__storageSeed.session);
+
   global.__drainStorage = function () {
-    try { return JSON.stringify({ local: storage, session: sessionStorageStore }); }
+    try { return JSON.stringify({ local: __localStore.drain(), session: __sessionStore.drain() }); }
     catch (e) { return "{}"; }
   };
   global.localStorage = {
-    getItem: function (k) { return Object.prototype.hasOwnProperty.call(storage, k) ? storage[k] : null; },
-    setItem: function (k, v) { storage[k] = String(v); },
-    removeItem: function (k) { delete storage[k]; },
-    clear: function () { Object.keys(storage).forEach(function (k) { delete storage[k]; }); },
-    key: function (i) { return Object.keys(storage)[i] || null; },
-    get length() { return Object.keys(storage).length; }
+    getItem: function (k) { return __localStore.getItem(k); },
+    setItem: function (k, v) { __localStore.setItem(k, v); },
+    removeItem: function (k) { __localStore.removeItem(k); },
+    clear: function () { __localStore.clear(); },
+    key: function (i) { return __localStore.key(i); },
+    get length() { return __localStore.length; }
   };
   global.sessionStorage = {
-    getItem: function (k) { return Object.prototype.hasOwnProperty.call(sessionStorageStore, k) ? sessionStorageStore[k] : null; },
-    setItem: function (k, v) { sessionStorageStore[k] = String(v); },
-    removeItem: function (k) { delete sessionStorageStore[k]; },
-    clear: function () { Object.keys(sessionStorageStore).forEach(function (k) { delete sessionStorageStore[k]; }); },
-    key: function (i) { return Object.keys(sessionStorageStore)[i] || null; },
-    get length() { return Object.keys(sessionStorageStore).length; }
+    getItem: function (k) { return __sessionStore.getItem(k); },
+    setItem: function (k, v) { __sessionStore.setItem(k, v); },
+    removeItem: function (k) { __sessionStore.removeItem(k); },
+    clear: function () { __sessionStore.clear(); },
+    key: function (i) { return __sessionStore.key(i); },
+    get length() { return __sessionStore.length; }
   };
 
   /* In-memory IndexedDB subsystem (zero external dependencies, zero RAM bloat). */
@@ -5728,6 +5950,33 @@
       doc.appendChild(doc.body);
     }
     global.document = doc;
+    try {
+      var allRadios = doc.querySelectorAll("input[type=radio]");
+      var radioGroups = {};
+      for (var ri = 0; ri < allRadios.length; ri++) {
+        var r = allRadios[ri];
+        var rname = r.getAttribute("name");
+        if (!rname) continue;
+        var rform = r.form || null;
+        var groupKey = (rform ? ("form_" + rform._id) : "doc") + ":" + rname;
+        if (!radioGroups[groupKey]) radioGroups[groupKey] = [];
+        radioGroups[groupKey].push(r);
+      }
+      for (var gk in radioGroups) {
+        var group = radioGroups[gk];
+        var lastChecked = null;
+        for (var gi = 0; gi < group.length; gi++) {
+          if (group[gi].hasAttribute("checked")) lastChecked = group[gi];
+        }
+        if (lastChecked) {
+          for (var gj = 0; gj < group.length; gj++) {
+            if (group[gj] !== lastChecked && group[gj].hasAttribute("checked")) {
+              delete group[gj].attributes.checked;
+            }
+          }
+        }
+      }
+    } catch (e) {}
     try {
       Object.defineProperty(doc, "cookie", {
         get: function () {
@@ -7157,11 +7406,15 @@
       var dropAccepted = false;
       if (dragDropTarget) {
         try {
+          var entEv = new global.DragEvent("dragenter", endInit);
+          dragDropTarget.dispatchEvent(entEv);
           var ovEv = new global.DragEvent("dragover", endInit);
           dragDropTarget.dispatchEvent(ovEv);
           if (ovEv.defaultPrevented) {
             dropAccepted = true;
             dragDropTarget.dispatchEvent(new global.DragEvent("drop", endInit));
+          } else {
+            dragDropTarget.dispatchEvent(new global.DragEvent("dragleave", endInit));
           }
         } catch (e) {}
       }

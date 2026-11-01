@@ -245,6 +245,7 @@ async def run_scripts(
     messages: list[dict] | None = None,
     ctx: Context | None = None,
     storage_seed: dict | None = None,
+    history_length: int = 1,
 ) -> tuple[str, dict]:
     """Execute page scripts against mini-DOM. Returns (html, info)."""
     info: dict = {
@@ -272,6 +273,11 @@ async def run_scripts(
         if storage_seed:
             try:
                 ctx.eval(f"globalThis.__WR_STORAGE_SEED = {json.dumps(storage_seed)}; true")
+            except Exception:
+                pass
+        if history_length > 1:
+            try:
+                ctx.eval(f"globalThis.__WR_HISTORY_LENGTH = {int(history_length)}; true")
             except Exception:
                 pass
         ctx.eval(MINIDOM_JS)

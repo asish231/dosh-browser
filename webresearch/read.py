@@ -208,6 +208,7 @@ async def read_live(
     chromium_session: object | None = None,
     return_js_info: bool = False,
     storage_seed: dict | None = None,
+    history_length: int = 1,
 ) -> tuple:
     """Fetch (+ QuickJS + frames) → page model and live agent state. Pure from-scratch engine, no Chromium."""
     result = await fetch(url, client=client)
@@ -215,7 +216,7 @@ async def read_live(
     js_info: dict | None = None
     js_ran = False
     if result.kind == "html" and js != "never":
-        html, js_info = await run_scripts(html, result.final_url or url, client, force=(js == "always"), headers=result.headers, storage_seed=storage_seed)
+        html, js_info = await run_scripts(html, result.final_url or url, client, force=(js == "always"), headers=result.headers, storage_seed=storage_seed, history_length=history_length)
         js_ran = bool(js_info.get("ran"))
         result = result.model_copy(update={"body": html, "kind": "html", "content_type": "text/html"})
 
@@ -229,7 +230,7 @@ async def read_live(
             js_ran = False
             # Re-run scripts on the resolved page
             if result.kind == "html" and js != "never":
-                html, js_info = await run_scripts(html, result.final_url or url, client, force=(js == "always"), headers=result.headers, storage_seed=storage_seed)
+                html, js_info = await run_scripts(html, result.final_url or url, client, force=(js == "always"), headers=result.headers, storage_seed=storage_seed, history_length=history_length)
                 js_ran = bool(js_info.get("ran"))
                 result = result.model_copy(update={"body": html, "kind": "html", "content_type": "text/html"})
 
