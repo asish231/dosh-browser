@@ -363,9 +363,17 @@ engine-heavy passes (suite 254s -> ~263-275s).
   during page load) is dropped — moves are consumed only on action passes;
   history restore re-executes the destination's scripts, so a page that
   pushStates on load re-pushes after back().
-- **Dialog**: no cancel event (ESC), no InvalidStateError on double-show,
-  `form[method=dialog]` submit does not close the dialog; focus trap and
-  top layer disclosed-absent.
+- **Dialog**: **FIXED** — `showModal()` throws `InvalidStateError` when already open
+  (while `show()` is a silent no-op); `form[method=dialog]` (and submitter
+  `formmethod=dialog`) closes the nearest dialog ancestor with the submitter's
+  value and does not submit over the wire; `requestSubmit(submitter)` threads the
+  submitter; Escape key (`press_key('escape')`) dispatches a cancelable `cancel`
+  event and closes the dialog when not prevented (`cancel` listeners can
+  `preventDefault()` to keep it open); closed `<dialog>` elements and their
+  descendants are hidden by UA cascade (`dialog:not([open]) { display: none }`)
+  and excluded from the action surface; `session.submit()` on dialog forms
+  updates the page without HTTP traffic. 10 regressions in `tests/test_dialog_api.py`.
+  Disclosed approximation: focus trap and top layer remain disclosed-absent.
 - **scrollIntoView**: `behavior:'smooth'` is synchronous (no animation);
   no scrollable-ancestor support (scrolls the document); `ifNeeded` does
   nearest instead of centering; `display:none` target scrolls to phantom.
