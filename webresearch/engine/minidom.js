@@ -2187,6 +2187,9 @@
     }
     function layoutBlock(el, x, y, availW, parentFont) {
       if (__NON_RENDERED[el.nodeName]) { el.__box = { x: 0, y: 0, width: 0, height: 0 }; return { bottom: y, w: 0 }; }
+      if (el.nodeName === "body" && availW === vw) {
+        availW = Math.max(0, vw - 16);
+      }
       var cs = __computedStyle(el, rules, parentFont);
       if (cs.display === "none") { el.__box = { x: 0, y: 0, width: 0, height: 0 }; return { bottom: y, w: 0 }; }
       var margin = __parseSides(cs.margin, availW, cs.fontSize);
@@ -2270,14 +2273,20 @@
   Object.defineProperty(Element.prototype, "offsetHeight", { get: function () { return this.getBoundingClientRect().height; } });
   Object.defineProperty(Element.prototype, "clientWidth", { get: function () { return this.getBoundingClientRect().width; } });
   Object.defineProperty(Element.prototype, "clientHeight", { get: function () { return this.getBoundingClientRect().height; } });
-  /* scrollWidth/scrollHeight: for the documentElement these are the full
+  /* scrollWidth/scrollHeight: for the documentElement and body these are the full
      document scroll extents (laid-out boxes may overflow the viewport);
      for any other element the box dims (per-element overflow is not
      tracked — disclosed approximation). */
   Object.defineProperty(Element.prototype, "scrollWidth", {
     get: function () {
       var doc = this.ownerDocument || global.document;
-      if (doc) { __ensureLayout(doc); if (doc.documentElement === this && doc.__scrollExtent) return doc.__scrollExtent.width; }
+      if (doc) {
+        __ensureLayout(doc);
+        if ((doc.documentElement === this || doc.body === this) && doc.__scrollExtent) {
+          var b = this.__box || { width: 0 };
+          return Math.max(b.width, doc.__scrollExtent.width);
+        }
+      }
       var b = this.__box || { width: 0 };
       return b.width;
     },
@@ -2286,7 +2295,13 @@
   Object.defineProperty(Element.prototype, "scrollHeight", {
     get: function () {
       var doc = this.ownerDocument || global.document;
-      if (doc) { __ensureLayout(doc); if (doc.documentElement === this && doc.__scrollExtent) return doc.__scrollExtent.height; }
+      if (doc) {
+        __ensureLayout(doc);
+        if ((doc.documentElement === this || doc.body === this) && doc.__scrollExtent) {
+          var b = this.__box || { height: 0 };
+          return Math.max(b.height, doc.__scrollExtent.height);
+        }
+      }
       var b = this.__box || { height: 0 };
       return b.height;
     },

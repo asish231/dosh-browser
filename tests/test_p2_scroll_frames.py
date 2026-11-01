@@ -27,10 +27,27 @@ TALL_PAGE = """<html><body>
 <script>window.__ready=1;</script>
 </body></html>"""
 
+NORMAL_PAGE = """<html><body>
+<div>Normal content</div>
+<script>window.__ready=1;</script>
+</body></html>"""
+
+MARGIN0_PAGE = """<html><body style="margin: 0;">
+<div style="width: 100%;">Full width content</div>
+<script>window.__ready=1;</script>
+</body></html>"""
+
 
 def _client() -> httpx.AsyncClient:
     def handler(req: httpx.Request):
-        body = TALL_PAGE if req.url.path == "/tall" else WIDE_PAGE
+        if req.url.path == "/tall":
+            body = TALL_PAGE
+        elif req.url.path == "/normal":
+            body = NORMAL_PAGE
+        elif req.url.path == "/margin0":
+            body = MARGIN0_PAGE
+        else:
+            body = WIDE_PAGE
         return httpx.Response(200, text=body, headers={"content-type": "text/html"})
 
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -64,6 +81,50 @@ async def test_document_scroll_width_aliases_documentelement():
     assert ctx.eval(
         "document.scrollWidth === document.documentElement.scrollWidth"
     )
+
+
+@pytest.mark.asyncio
+async def test_body_scroll_extent_reflects_content_not_box_width():
+    ctx = await _ctx("/wide")
+    body_sw = ctx.eval("document.body.scrollWidth")
+    de_sw = ctx.eval("document.documentElement.scrollWidth")
+    assert body_sw > 4900, f"body.scrollWidth must reflect 5000px content extent, got {body_sw}"
+    assert body_sw == de_sw
+
+    ctx_tall = await _ctx("/tall")
+    body_sh = ctx_tall.eval("document.body.scrollHeight")
+    de_sh = ctx_tall.eval("document.documentElement.scrollHeight")
+    assert body_sh > 2500, f"body.scrollHeight must reflect 3000px content extent, got {body_sh}"
+    assert body_sh == de_sh
+
+
+@pytest.mark.asyncio
+async def test_clean_page_has_zero_phantom_horizontal_scroll():
+    ctx = await _ctx("/normal")
+    de_sw = ctx.eval("document.documentElement.scrollWidth")
+    body_sw = ctx.eval("document.body.scrollWidth")
+    assert de_sw == 1280, f"documentElement.scrollWidth must be 1280 (no phantom 8px), got {de_sw}"
+    assert body_sw == 1280, f"body.scrollWidth must be 1280 (no phantom 8px), got {body_sw}"
+
+    # Verify horizontal scroll clamps strictly to 0
+    got = ctx.eval(
+        "(function(){scrollTo(100, 0); return [scrollX, scrollY].join(',');})()"
+    )
+    assert got == "0,0", f"normal page must clamp horizontal scroll to 0, got {got}"
+
+
+@pytest.mark.asyncio
+async def test_styled_body_margin0_has_zero_phantom_horizontal_scroll():
+    ctx = await _ctx("/margin0")
+    de_sw = ctx.eval("document.documentElement.scrollWidth")
+    body_sw = ctx.eval("document.body.scrollWidth")
+    assert de_sw == 1280, f"documentElement.scrollWidth must be 1280, got {de_sw}"
+    assert body_sw == 1280, f"body.scrollWidth must be 1280, got {body_sw}"
+
+    got = ctx.eval(
+        "(function(){scrollTo(50, 0); return [scrollX, scrollY].join(',');})()"
+    )
+    assert got == "0,0", f"margin:0 page must clamp horizontal scroll to 0, got {got}"
 
 
 # ---------------------------------------------------------------------------
