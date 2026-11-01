@@ -167,6 +167,14 @@ def content_root(tree: HTMLParser) -> Node | None:
             chain.append(node)
             node = node.parent
         chains.append(chain)
+    # Ancestor TAGS per candidate (cheap string sets). LexborNode == on an
+    # ancestor-scale node costs ~90us (it works on the larger subtree), so the
+    # nesting test below must not compare a row against body/html wrappers:
+    # it pre-filters on tags and only pays the node comparison when a
+    # sibling's tag actually appears among the ancestors (a nested duplicate).
+    anc_tags: list[set[str]] = []
+    for ch in chains:
+        anc_tags.append({str(n.tag or "").lower() for n in ch[1:] if getattr(n, "tag", None)})
     container_tags: set[str] = set()
     for ch in chains:
         for anc in ch[1:]:
@@ -176,32 +184,77 @@ def content_root(tree: HTMLParser) -> Node | None:
     best: Node | None = None
     best_key: tuple[int, int, int, int] | None = None
     for idx, (priority, candidate, (words, headings, blocks)) in enumerate(candidates):
-        # Descendant candidates (their scores are this candidate's nested
-        # content — subtracted below unless this is a list container).
-        descendant_scores: list[tuple[int, int, int]] = []
+        # Candidate indexes strictly inside this one.
+        descendant_idx: list[int] = []
         if str(candidate.tag or "").lower() in container_tags:
-            for ydx, (_op, _other, other_score) in enumerate(candidates):
+            for ydx in range(len(candidates)):
                 if ydx == idx:
                     continue
                 for anc in chains[ydx][1:]:
                     if _same_node(anc, candidate):
-                        descendant_scores.append(other_score)
+                        descendant_idx.append(ydx)
                         break
-        if len(descendant_scores) >= 3:
-            # List pages (GitHub trending, HN, product grids) repeat the SAME
-            # landmark tag many times as siblings: a candidate with three or
-            # more candidate descendants is their CONTAINER, not a wrapper
-            # around one duplicate. Subtracting every descendant emptied
-            # <main> on such pages and crowned a single <article> row, so ACD
-            # read one repo card and dropped its siblings. Nested-duplicate
-            # pages (a promo card inside the real content) still subtract
-            # normally.
-            pass
-        else:
-            for other_words, other_headings, other_blocks in descendant_scores:
-                words = max(0, words - other_words)
-                headings = max(0, headings - other_headings)
-                blocks = max(0, blocks - other_blocks)
+        if descendant_idx:
+            # Split the descendants into top-level siblings and NESTED
+            # duplicates: a descendant contained in another descendant is a
+            # duplicate of it (a promo card inside the real article), not a
+            # sibling of it.
+            nested: set[int] = set()
+            for a in descendant_idx:
+                a_anc_tags = anc_tags[a]
+                for b in descendant_idx:
+                    if a == b:
+                        continue
+                    b_node = candidates[b][1]
+                    b_tag = str(b_node.tag or "").lower()
+                    if b_tag not in a_anc_tags:
+                        continue
+                    for anc in chains[a][1:]:
+                        if _same_node(anc, b_node):
+                            nested.add(a)
+                            break
+            top_level = [i for i in descendant_idx if i not in nested]
+            keep_union = False
+            if len(top_level) >= 2:
+                # Co-equal repeated siblings (list pages, multi-post indexes):
+                # the same landmark tag repeated as siblings. The container
+                # is their WRAPPER, not a competitor — keeping the union is
+                # the honest projection. Three or more same-tag siblings are
+                # a list (GitHub trending, product grids) at any size mix;
+                # exactly TWO siblings also keep the union when their scores
+                # are balanced (two posts of a no-<main> blog index — the
+                # old 3+ threshold dropped the second post entirely). A
+                # grossly unbalanced pair is a real article plus a promo
+                # card: subtract, the dominant landmark wins.
+                tags = {str(candidates[i][1].tag or "").lower() for i in top_level}
+                same_tag = len(tags) == 1
+                balanced_pair = True
+                if len(top_level) == 2:
+                    sibling_words = sorted(candidates[i][2][0] for i in top_level)
+                    balanced_pair = (
+                        sibling_words[0] > 0 and sibling_words[0] * 8 >= sibling_words[-1]
+                    )
+                keep_union = same_tag and balanced_pair
+            if keep_union:
+                # Subtract only the nested duplicates: the wrapper keeps the
+                # siblings' co-equal union (which it truly contains) minus any
+                # promo card nested inside one of them.
+                for ydx in sorted(nested):
+                    other_words, other_headings, other_blocks = candidates[ydx][2]
+                    words = max(0, words - other_words)
+                    headings = max(0, headings - other_headings)
+                    blocks = max(0, blocks - other_blocks)
+            else:
+                # Mixed tags (a promo <article> next to the document <main>)
+                # or badly unbalanced siblings (one real article plus tiny
+                # promo cards): the nested/peer landmarks are competitors,
+                # so the container scores only what is its OWN. This is what
+                # lets <main> outrank <body> on pages that wrap everything.
+                for ydx in descendant_idx:
+                    other_words, other_headings, other_blocks = candidates[ydx][2]
+                    words = max(0, words - other_words)
+                    headings = max(0, headings - other_headings)
+                    blocks = max(0, blocks - other_blocks)
         key = (words, headings, blocks, priority)
         if best is None or (best_key is not None and key > best_key):
             best = candidate

@@ -145,12 +145,20 @@ async def test_engine_back_restores_and_fires_popstate():
     await session.act(back, max_chars=20_000)
 
     assert session.url == f"{BASE}/home", "history.back() must land on the previous entry"
+    assert len(session.history) == 2, "same-document back() must not add entries"
+    assert session.index == 0
     pop = session.current_tab.ctx.eval("window.__ps.join(' ;; ')")
     assert pop, "popstate must fire after an engine-driven back()"
     assert "path:/home" in pop, pop
-    assert "v:home" in pop, pop
-    line = [l for l in session.html.splitlines() if 'id="v"' in l]
-    assert "home" in (line[0] if line else ""), "the restored DOM is the previous entry's"
+    # Same-document traversal keeps the LIVE document and JS heap (real
+    # browser semantics): the DOM mutation made before the push is still
+    # there — the listener (this test page's included) would be responsible
+    # for reverting it. The old assertion (v:home) encoded the rebuild
+    # artifact: the pre-push DOM replayed by script re-execution.
+    assert "v:pushed" in pop, pop
+    # And the pushState script must NOT have re-run (no re-push): the engine
+    # sees exactly one push and the session history is unchanged.
+    assert session.current_tab.ctx.eval("history.length") == 2
 
 
 # ---------------------------------------------------------------------------
