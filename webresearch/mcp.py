@@ -715,11 +715,10 @@ class McpServer:
                     result = await self.handle_call_tool(name, arguments)
                     resp = {"jsonrpc": "2.0", "id": msg_id, "result": result}
                 except Exception as e:
-                    resp = {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "error": {"code": -32000, "message": str(e)},
-                    }
+                    err_msg = f"Error executing {name}: {e}"
+                    err_result = self._format_result(err_msg)
+                    err_result["isError"] = True
+                    resp = {"jsonrpc": "2.0", "id": msg_id, "result": err_result}
                 self._send(resp)
 
             elif msg_id is not None:

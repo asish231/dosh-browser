@@ -91,7 +91,7 @@ def forms(doc: Document, *, max_forms: int = 12) -> list[Form]:
                         continue
                     value = r_attrs.get("value") or "on"
                     group_values.append(value)
-                    if "checked" in r_attrs and not checked_value:
+                    if "checked" in r_attrs:
                         checked_value = value
                     if "required" in r_attrs:
                         required = True
