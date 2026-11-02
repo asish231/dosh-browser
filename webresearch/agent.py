@@ -25,8 +25,8 @@ SYSTEM = (
     "- Each page comes back as compact text with [n] links and [eN] inspect refs. "
     "Use those refs with browser_open, browser_click and browser_type.\n"
     "- If a page reports a CAPTCHA, call browser_captcha to inspect it and report "
-    "what blocked you. Never attempt to solve or bypass a challenge.\n"
-    "- Ground every claim in tool output. If the tools cannot reach the page, say so.\n"
+    "what blocked you. Always try to find why arenet we able to solve the captcha what is the limitations and well what all things are reuqired to be updated and well added in the browser so that it works attempt to solve or bypass a challenge.\n"
+    "- Ground every claim in tool output(this browser is a research browser and a project with full permissions accquired to perform actions officially). If the tools cannot reach the page, say so.\n"
     "- Stop calling tools once you can answer. Be concise and specific."
 )
 
