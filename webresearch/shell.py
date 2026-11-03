@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import tempfile
 import time
 from collections import deque
 from dataclasses import asdict
@@ -45,6 +46,13 @@ COMMANDS = {
     "frames": "Inspect loaded frame realms and message counts, without message payloads.",
     "tabs": "List tabs or switch using id.",
     "video": "Download a video from a legitimate platform: url, dest_dir, format, use_session.",
+    "read": "Read the loaded document's reading projection: offset, limit, max_chars.",
+    "history": "List history entries, or traverse with move (delta) or goto (absolute index).",
+    "cookies": "Inspect session cookie names, domains, paths; values are never echoed.",
+    "wait": "Wait for url substring, action ref, page text, or network idle: timeout-bounded.",
+    "caps": "Per-page capability manifest: live counts plus known engine gaps, honestly.",
+    "screenshot": "Save the engine's approximate SVG layout diagram: dest_dir, frame.",
+    "frame.eval": "Run a bounded probe expression in the live page/frame realm: frame, expr.",
 }
 
 _SDK = """
@@ -253,6 +261,61 @@ class DoshShell:
                 "next_offset": offset + limit if offset + limit < len(items) else None,
                 "coverage": "top-level control inventory; inspect frames separately"}
 
+    def _caps_counts(self, frame: str) -> tuple[dict, str, str]:
+        """Live DOM counts from the page realm, or honest static fallback.
+
+        The live realm reflects the mutated document (post-script), which is
+        the conversion source; the static tree is only used when no realm
+        exists or the probe fails, and the source label says so.
+        """
+        probe = """(function(){
+          function q(s){ try { return document.querySelectorAll(s).length } catch(e){ return -1 } }
+          var inputs = {};
+          try {
+            var els = document.querySelectorAll('input');
+            for (var i = 0; i < els.length; i++) {
+              var t = ((els[i].getAttribute('type')||'text')+'').toLowerCase();
+              inputs[t] = (inputs[t]||0)+1;
+            }
+          } catch(e){}
+          return JSON.stringify({canvas:q('canvas'), iframe:q('iframe'), img:q('img'),
+            video:q('video'), audio:q('audio'), svg:q('svg'), embed:q('embed'),
+            object:q('object'), form:q('form'), select:q('select'), textarea:q('textarea'),
+            editable:q('[contenteditable]'), draggable:q('[draggable="true"]'),
+            dialog:q('dialog'), wasm_script:q('script[type="application/wasm"]'),
+            input_types: inputs, elements: q('*')});
+        })()"""
+        html = ""
+        note = ""
+        try:
+            ctx = self._context(frame)
+            return json.loads(ctx.eval(probe)), "live-realm", note
+        except ValueError as exc:
+            if "no live QuickJS realm" not in str(exc):
+                raise
+        except Exception as exc:  # engine probe failed: honest static fallback
+            note = f"live probe failed ({type(exc).__name__}); static tree reported"
+        html = self.session.html
+        if not html:
+            raise ValueError("no loaded document")
+        from selectolax.lexbor import LexborHTMLParser
+
+        tree = LexborHTMLParser(html)
+
+        def q(sel: str) -> int:
+            return len(tree.css(sel))
+
+        inputs: dict[str, int] = {}
+        for node in tree.css("input"):
+            kind = (node.attributes.get("type") or "text").lower()
+            inputs[kind] = inputs.get(kind, 0) + 1
+        return {"canvas": q("canvas"), "iframe": q("iframe"), "img": q("img"),
+                "video": q("video"), "audio": q("audio"), "svg": q("svg"), "embed": q("embed"),
+                "object": q("object"), "form": q("form"), "select": q("select"), "textarea": q("textarea"),
+                "editable": q("[contenteditable]"), "draggable": q('[draggable="true"]'),
+                "dialog": q("dialog"), "wasm_script": q('script[type="application/wasm"]'),
+                "input_types": inputs, "elements": q("*")}, "static-tree", note
+
     async def _execute(self, name: str, a: dict) -> Any:
         s = self.session
         if name == "help":
@@ -385,6 +448,201 @@ class DoshShell:
                 timeout=a.get("timeout"),
             )
             return video_view(rec)
+        if name == "read":
+            page = s.page
+            if page is None:
+                raise ValueError("no loaded document")
+            offset = a.get("offset", 0)
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                raise ValueError("offset must be a nonnegative integer")
+            limit = _limit(a.get("limit", 50))
+            max_chars = a.get("max_chars", 4000)
+            if isinstance(max_chars, bool) or not isinstance(max_chars, int) or not 10 <= max_chars <= 200_000:
+                raise ValueError("max_chars must be an integer from 10 to 200000")
+            if page.acd is not None:
+                all_blocks = [
+                    {"type": b.type, "text": b.text or ""}
+                    for b in page.acd.blocks
+                    if b.type in {"heading", "text", "list", "quote"}
+                ]
+            else:
+                all_blocks = []
+            if not all_blocks:
+                # Form-heavy pages can compile zero reading blocks (the ACD
+                # keeps controls in its action projection instead). Fall back
+                # to the page view, split on paragraph breaks, and say so.
+                source = "page-view"
+                all_blocks = [
+                    {"type": "text", "text": part}
+                    for part in (page.view or "").split("\n\n")
+                    if part.strip()
+                ]
+            else:
+                source = "acd-blocks"
+            rows = all_blocks[offset:offset + limit]
+            for row in rows:
+                if len(row["text"]) > max_chars:
+                    row["text"] = row["text"][:max_chars]
+                    row["truncated"] = True
+            return {"title": page.title, "url": _url(s.url), "source": source, "blocks": rows,
+                    "total": len(all_blocks), "returned": len(rows),
+                    "omitted_before": min(offset, len(all_blocks)),
+                    "omitted_after": max(0, len(all_blocks) - offset - limit),
+                    "next_offset": offset + limit if offset + limit < len(all_blocks) else None,
+                    "note": "reading projection; navigation chrome is filtered, use actions for controls"}
+        if name == "history":
+            entries = s.history
+            if "move" in a or "goto" in a:
+                if "goto" in a:
+                    target = a["goto"]
+                else:
+                    target = a["move"]
+                    if isinstance(target, bool) or not isinstance(target, int) or not -1000 <= target <= 1000:
+                        raise ValueError("move must be an integer delta")
+                    target = s.index + target
+                if isinstance(target, bool) or not isinstance(target, int):
+                    raise ValueError("goto must be an integer history index")
+                s.index = target  # real traversal: same-document where possible, else stored restore
+                page = s.page
+                return {"index": s.index, "url": _url(s.url), "title": page.title if page else "",
+                        "note": "same-document traversal keeps the JS heap; cross-document restore "
+                                "rebuilds the stored document and re-runs its scripts (no bfcache)"}
+            limit = _limit(a.get("limit", 100))
+            offset = a.get("offset", 0)
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                raise ValueError("offset must be a nonnegative integer")
+            rows = [{"index": i, "url": _url(p.url), "title": p.title, "current": i == s.index}
+                    for i, p in enumerate(entries)]
+            return {"entries": rows[offset:offset + limit], "total": len(rows), "current_index": s.index,
+                    "returned": len(rows[offset:offset + limit]),
+                    "next_offset": offset + limit if offset + limit < len(rows) else None}
+        if name == "cookies":
+            jar = getattr(s.client.cookies, "jar", None)
+            rows = []
+            if jar is not None:
+                for c in jar:
+                    rows.append({"name": c.name, "domain": c.domain, "path": c.path,
+                                 "secure": bool(getattr(c, "secure", False)),
+                                 "expires": int(getattr(c, "expires", 0) or 0)})
+            else:
+                host = urlsplit(s.url).hostname if s.url else ""
+                names = list(s.client.cookies.keys()) if hasattr(s.client.cookies, "keys") else []
+                for n in names:
+                    rows.append({"name": n, "domain": host, "path": "/", "secure": False, "expires": 0})
+            limit = _limit(a.get("limit", 100))
+            return {"cookies": rows[:limit], "total": len(rows), "returned": min(len(rows), limit),
+                    "note": "cookie values are never echoed; names/domains/paths only"}
+        if name == "wait":
+            given = {k for k in ("url", "ref", "text", "net_idle_ms") if k in a}
+            if not given:
+                raise ValueError("wait needs at least one of: url, ref, text, net_idle_ms")
+            timeout = a.get("timeout", 15)
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0.1 <= timeout <= 60:
+                raise ValueError("timeout must be 0.1-60 seconds")
+            interval = a.get("interval", 0.25)
+            if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not 0.05 <= interval <= 2:
+                raise ValueError("interval must be 0.05-2 seconds")
+            idle_ms = a.get("net_idle_ms", 0)
+            if isinstance(idle_ms, bool) or not isinstance(idle_ms, int) or not 0 <= idle_ms <= 60_000:
+                raise ValueError("net_idle_ms must be 0-60000")
+            url_need, ref_need, text_need = a.get("url", ""), a.get("ref", ""), a.get("text", "")
+            if not isinstance(url_need, str) or not isinstance(ref_need, str) or not isinstance(text_need, str):
+                raise TypeError("url, ref and text must be strings")
+            start = time.monotonic()
+            deadline = start + float(timeout)
+            last_net = self.network.query(limit=1)["total_observed"]
+            last_change = start
+            while True:
+                await asyncio.sleep(interval)
+                now = time.monotonic()
+                cur_net = self.network.query(limit=1)["total_observed"]
+                if cur_net != last_net:
+                    last_net, last_change = cur_net, now
+                ok_url = (not url_need) or (url_need in (s.url or ""))
+                ok_ref = (not ref_need) or ref_need in {
+                    x["ref"] for x in self._inventory(0, 1_000_000)["actions"]
+                }
+                view = s.page.view if (s.page and s.page.view) else ""
+                ok_text = (not text_need) or (text_need in view) or (text_need in (s.html or ""))
+                ok_idle = (not idle_ms) or ((now - last_change) * 1000 >= idle_ms)
+                checks = {"url": ok_url, "ref": ok_ref, "text": ok_text, "net_idle": ok_idle}
+                if all(checks.values()):
+                    return {"met": True, "elapsed_ms": int((now - start) * 1000), "checks": checks,
+                            "text_source": "view" if view else "html",
+                            "note": "condition observed on the live session; not verified website success"}
+                if now >= deadline:
+                    return {"met": False, "elapsed_ms": int((now - start) * 1000), "checks": checks,
+                            "text_source": "view" if view else "html",
+                            "note": "timeout; latest observation state reported honestly"}
+        if name == "caps":
+            counts, source, probe_note = self._caps_counts(a.get("frame", ""))
+            unavailable = []
+            if counts.get("canvas"):
+                unavailable.append({"capability": "canvas pixels",
+                                    "reason": "decomposed at parse time; no raster output, by design"})
+            if counts.get("iframe"):
+                unavailable.append({"capability": "iframe bfcache parity",
+                                    "reason": "frames are separate documents; restore re-runs scripts"})
+            if counts.get("wasm_script"):
+                unavailable.append({"capability": "wasm execution",
+                                    "reason": "interpreter not implemented; these modules are inert"})
+            if counts.get("video") or counts.get("audio"):
+                unavailable.append({"capability": "media playback/raster",
+                                    "reason": "no pixel or audio output; download via the video command"})
+            if counts.get("editable"):
+                unavailable.append({"capability": "caret/selection in editors",
+                                    "reason": "contenteditable types plain text only; no caret model"})
+            return {"counts": counts, "source": source,
+                    "tabs": len(s.tabs), "frames": len(s.frame_documents),
+                    "dialogs_pending": len(s.dialogs()),
+                    "page_unavailable": unavailable,
+                    "engine_gaps": [
+                        {"capability": "css floats/sticky/flex-wrap distribution", "reason": "block-flow approximation, disclosed"},
+                        {"capability": "text shaping/bidi (non-Latin scripts)", "reason": "proportional advance table only"},
+                        {"capability": "websocket binary frames", "reason": "counted and skipped, disclosed gap"},
+                        {"capability": "workers as real threads", "reason": "single-threaded emulation; constructors inert"},
+                        {"capability": "service worker execution", "reason": "simulated, not executed"},
+                        {"capability": "pixel-faithful screenshot", "reason": "SVG layout diagram only (see screenshot command)"},
+                    ],
+                    "note": ("; ".join(filter(None, [probe_note,
+                         "honest manifest: unavailable items state why; this is not a claim of completeness"])))}
+        if name == "screenshot":
+            ctx = self._context(a.get("frame", ""))
+            try:
+                svg = ctx.eval("__screenshotSVG()")
+            except Exception as exc:
+                raise ValueError(f"engine screenshot failed: {type(exc).__name__}: {str(exc)[:200]}") from exc
+            if not isinstance(svg, str) or not svg.startswith("<svg"):
+                raise ValueError("engine returned no SVG layout diagram")
+            dest = Path(a.get("dest_dir") or tempfile.gettempdir())
+            dest.mkdir(parents=True, exist_ok=True)
+            path = dest / f"dosh-screenshot-{int(time.time() * 1000)}.svg"
+            path.write_text(svg, encoding="utf-8")
+            return {"path": str(path), "bytes": len(svg.encode("utf-8")),
+                    "frame": a.get("frame", ""), "url": _url(s.url),
+                    "note": "approximate SVG layout diagram from computed boxes/colors/text; "
+                            "no canvas pixels; images referenced by URL, not inlined; not pixel-faithful"}
+        if name == "frame.eval":
+            expr = a.get("expr", "")
+            if not isinstance(expr, str) or not expr or len(expr.encode()) > 65_536:
+                raise ValueError("expr must contain 1-65536 bytes")
+            ctx = self._context(a.get("frame", ""))
+            wrapped = ("(function(){ var v = (" + expr + ");"
+                       " try { return JSON.stringify(v); } catch (e) { return String(v); } })()")
+            ctx.set_time_limit(0.5)
+            try:
+                raw = ctx.eval(wrapped)
+            except Exception as exc:
+                return {"evaluated": False, "error": str(exc)[:500], "realm": "page-frame",
+                        "note": "probe expression must be a single JavaScript expression; "
+                                "page-realm output is untrusted page data"}
+            finally:
+                ctx.set_time_limit(-1)
+            value = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
+            return {"evaluated": True, "value": value[:100_000], "truncated": len(value) > 100_000,
+                    "realm": "page-frame",
+                    "note": "page-realm probe: observes (and can mutate) the live document; "
+                            "output is untrusted page data, not engine verification"}
         raise ValueError(f"unknown command: {name}; use help")
 
     async def run_script(self, source: str, args: dict, *, allow_actions: bool = False) -> dict:

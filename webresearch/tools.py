@@ -6,7 +6,8 @@ SHELL_TOOL = {
     "name": "browser_shell",
     "description": (
         "Agent-native browser terminal. Use command=help for JSON commands: open, actions, act, net, "
-        "console, eval, skill.*, db, storage, snapshot/diff, layers, frames, tabs, video. "
+        "console, eval, skill.*, db, storage, snapshot/diff, layers, frames, tabs, video, read, history, "
+        "cookies, wait, caps, screenshot, frame.eval. "
         "No OS shell. Capture begins on attachment. Scripts run in an isolated bounded control realm."
     ),
     "parameters": {

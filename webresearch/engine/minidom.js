@@ -8362,6 +8362,10 @@ var decl = new CSSStyleDeclaration(el);
   }
   global.__screenshotSVG = function () {
     var doc = global.document; if (!doc) return '<svg xmlns="http://www.w3.org/2000/svg"/>';
+    /* The painter consumes __box/__lines/__scrollExtent, which only exist
+       after a layout pass. Trigger it here so the diagram never depends on
+       some other API having laid the page out first. */
+    try { __ensureLayout(doc); } catch (e) {}
     var root = doc.documentElement || doc;
     var rules = __collectStyleRules(doc);
     var vw = (typeof global.innerWidth === "number" && global.innerWidth > 0) ? global.innerWidth : 1280;
@@ -8413,16 +8417,23 @@ var decl = new CSSStyleDeclaration(el);
           if (src) out.push('<image href="' + __escXml(__absUrl(src)) + '" x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" preserveAspectRatio="xMidYMid slice"/>');
           else out.push('<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" fill="#e8e8e8"/>');
         } else if (tag === "input" || tag === "select" || tag === "textarea") {
-          if (!bg) out.push('<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="3" fill="#ffffff" stroke="#cccccc" stroke-width="1"/>');
           var type = String((node.getAttribute && node.getAttribute("type")) || "text").toLowerCase();
-          var label = (node.getAttribute && (node.getAttribute("placeholder") || node.getAttribute("value"))) || "";
-          var fs = node.__layoutFont || parseFloat(String(cs.fontSize || 13)) || 13;
-          var fcol = __colorHex(cs.color) || (node.getAttribute && node.getAttribute("placeholder") ? "#9aa0a6" : "#111111");
-          var tx = Math.round((x + 8) * 10) / 10, ty = Math.round((y + h / 2 + fs * 0.36) * 10) / 10;
-          if (type === "password" && node.getAttribute && node.getAttribute("value")) {
-            out.push('<text x="' + tx + '" y="' + ty + '" font-size="' + fs + '" font-family="monospace" fill="#111111">••••••••••</text>');
-          } else if (label) {
-            out.push('<text x="' + tx + '" y="' + ty + '" font-family="' + __fontFamily(cs) + '" font-size="' + fs + '" fill="' + fcol + '">' + __escXml(label) + '</text>');
+          /* type=hidden paints nothing, ever: hidden field values are page
+             secrets (CSRF tokens, session ids) and must not leak into a
+             shareable image. Real browsers paint nothing for them too. */
+          if (type === "hidden") {
+            /* fall through to text lines only; no box, no value */
+          } else {
+            if (!bg) out.push('<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="3" fill="#ffffff" stroke="#cccccc" stroke-width="1"/>');
+            var label = (node.getAttribute && (node.getAttribute("placeholder") || node.getAttribute("value"))) || "";
+            var fs = node.__layoutFont || parseFloat(String(cs.fontSize || 13)) || 13;
+            var fcol = __colorHex(cs.color) || (node.getAttribute && node.getAttribute("placeholder") ? "#9aa0a6" : "#111111");
+            var tx = Math.round((x + 8) * 10) / 10, ty = Math.round((y + h / 2 + fs * 0.36) * 10) / 10;
+            if (type === "password" && node.getAttribute && node.getAttribute("value")) {
+              out.push('<text x="' + tx + '" y="' + ty + '" font-size="' + fs + '" font-family="monospace" fill="#111111">••••••••••</text>');
+            } else if (label) {
+              out.push('<text x="' + tx + '" y="' + ty + '" font-family="' + __fontFamily(cs) + '" font-size="' + fs + '" fill="' + fcol + '">' + __escXml(label) + '</text>');
+            }
           }
         }
         var tlines = node.__lines || [];
