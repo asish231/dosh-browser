@@ -16,7 +16,9 @@ pub mod session;
 pub mod types;
 mod content;
 mod links;
-pub mod acd;
+mod acd;
+pub mod forms;
+pub mod actions;
 
 use doshgentv8_core::{DoshEngine, HostSeam};
 use sha2::{Digest, Sha256, Sha384, Sha512};
