@@ -27,12 +27,15 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 
-# Async runtime for fetch
-tokio = { version = "1", features = ["rt", "macros", "fs", "time", "process"] }
+# Async runtime for fetch & server
+tokio = { version = "1", features = ["rt", "macros", "fs", "time", "process", "rt-multi-thread"] }
 
 # Temp files (downloads, video)
 tempfile = "3"
 
-# Future: server/tooling
-# axum = "0.8"
-# clap = "4.5"
+# Shell & Server
+rusqlite = { version = "0.32", features = ["bundled"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = "0.6"
+http-body-util = "0.1"
