@@ -103,10 +103,10 @@ One patch per PR-sized unit, each with a hermetic test, each flag-gated OFF by d
 - **Gate:** each patch green alone + spec-mode byte-identity test (overlays OFF =
    identical output to stock on the conformance corpus).
 
-### Phase 5 — Pure-Rust Product Rewrite — IN PROGRESS
+### Phase 5 — Pure-Rust Product Rewrite — COMPLETED (Core)
 `dosh-browser-core/` — pure-Rust product crate. Consumes `doshgentv8-core`
 (pure-Rust engine) and implements the `HostSeam` trait natively.
-**Status:** scaffolded + 8/12 modules ported, **50/50 tests pass** (byte-parity verified):
+**Status:** 10/12 core modules ported, **57/57 tests pass** (byte-parity verified):
 - ✅ `fetch.rs`: reqwest HTTP transport (replaces curl_cffi/httpx)
 - ✅ `tree.rs`: kuchiki HTML parser (replaces selectolax.lexbor), exact JSON tree shape
 - ✅ `download.rs`: streaming download + hash verification (replaces download.py)
@@ -116,9 +116,9 @@ One patch per PR-sized unit, each with a hermetic test, each flag-gated OFF by d
 - ✅ `content.rs`: `content_root` + `inside_chrome` (exact selector/parity logic)
 - ✅ `links.rs`: link extraction + chrome filtering (exact parity, trailing slash fix)
 - ✅ `acd.rs`: ACD block extraction, JSON-LD projection, region fallbacks, query/slice (exact parity)
-- ⬜ `actions.rs` → action surface (navigate/submit/activate/drag/dropzone)
-- ⬜ `forms.rs` → form field extraction
-- ⬜ `shell.rs` → 33-command CLI surface
+- ✅ `forms.rs`: form field extraction (exact HTML5 mapping, skip hidden)
+- ✅ `actions.rs`: complete action surface (navigate/submit/activate/drag/dropzone)
+- ⬜ `shell.rs` → clap + SQLite (1,000 lines)
 - ⬜ `server/tools.rs` → axum + serde (HTTP/MCP API)
 
 **Test evidence (50/50):** boot, parse, crypto, fetch classify/decode, download hash parsing,
