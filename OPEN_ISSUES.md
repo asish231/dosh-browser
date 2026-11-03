@@ -66,8 +66,25 @@
 
 ## Open Issues
 
-None. All five registered issues are fixed (see Fixed below). The four
-disclosed substrate boundaries below remain by design.
+None of the five registered engine issues remain open. One test-interaction failure
+was root-caused and fixed (2026-11-03):
+
+- `tests/test_port_transfer.py::test_port_transfer_roundtrip` — passed in isolation
+  (6/6) but failed deterministically in full-suite runs (2/2, signature
+  `port_unrouted: 1, port_wires: 0`). Root cause: `frames.py`'s `_ctx_nonce()`
+  cached per-context nonces in a dict keyed by `id(ctx)`; CPython reuses `id()`s
+  after GC, so a fresh QuickJS context could inherit a DEAD context's nonce and
+  every cross-realm port transfer addressed `<nonce>:<id>` unrouted. The heap
+  layout that produces the address collision only occurs under full-suite
+  allocation churn, which is why isolated runs never reproduced it. Fix: the nonce
+  is read fresh from the live context on every call (no cache), and
+  `runtime.py`'s durable per-context postMessage queues are keyed by the
+  context nonce (`_post_queue_key`) instead of `id(ctx)` — the same reuse class
+  could have delivered a dead context's pending posts into a fresh realm.
+  Regression-pinned by `tests/test_ctx_identity_hygiene.py` without relying on
+  allocator luck (nonce mutation must be followed by fresh reads).
+
+The four disclosed substrate boundaries below remain by design.
 
 ---
 

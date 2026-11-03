@@ -225,10 +225,27 @@ _CTX_POST_INBOX: dict[int, list[dict]] = {}
 _CTX_POST_UID: dict[int, int] = {}
 
 
+def _post_queue_key(ctx) -> str:
+    """Stable per-CONTEXT key for the durable postMessage queues.
+
+    The context nonce (uuid4, injected once per JS context, kept across
+    passes) — NOT id(ctx): CPython reuses id()s after GC, and this process
+    creates hundreds of short-lived contexts. An id()-keyed durable queue
+    lets a fresh context inherit a dead context's pending posts (ghost
+    traffic delivered into a realm that never produced it) — the same
+    address-reuse bug class as the _ctx_nonce cache removed from frames.py.
+    """
+    try:
+        nonce = str(ctx.eval("String(globalThis.__WR_CTX_KEY || '')") or "")
+    except Exception:
+        nonce = ""
+    return nonce if nonce else f"id:{id(ctx)}"
+
+
 def take_pending_posts(ctx) -> list[dict]:
     """Take the postMessages this context produced outside any run_scripts
     pass. Callers own routing them; entries leave the queue exactly once."""
-    inbox = _CTX_POST_INBOX.get(id(ctx))
+    inbox = _CTX_POST_INBOX.get(_post_queue_key(ctx))
     if not inbox:
         return []
     taken = inbox[:]
@@ -369,7 +386,7 @@ async def run_scripts(
     # vanished. The queue now lives on the context: run_scripts still sees it
     # through its own info dict, and drain_pending_posts() hands the rest to
     # the routing layers.
-    _this_inbox = _CTX_POST_INBOX.setdefault(id(ctx), [])
+    _this_inbox = _CTX_POST_INBOX.setdefault(_post_queue_key(ctx), [])
 
     def host_post_message_handler(data, origin="*", target="parent", sender_origin="", ports_json="") -> None:
         # Binary channel payloads (typed arrays) hex-encode inside the clone
@@ -379,9 +396,10 @@ async def run_scripts(
         s_orig = str(sender_origin).strip() if sender_origin else _extract_origin(url)
         # Monotonic per-CONTEXT id (not per-call: restarts made entries from
         # different passes collide, and uid-based dedup dropped live traffic).
-        _CTX_POST_UID[id(ctx)] = _CTX_POST_UID.get(id(ctx), 0) + 1
+        _qkey = _post_queue_key(ctx)
+        _CTX_POST_UID[_qkey] = _CTX_POST_UID.get(_qkey, 0) + 1
         entry = {
-            "uid": _CTX_POST_UID[id(ctx)],
+            "uid": _CTX_POST_UID[_qkey],
             "data": data_str,
             "origin": s_orig,
             "target_origin": str(origin)[:500],
@@ -1646,7 +1664,7 @@ async def run_scripts(
     # so strike them from the context's durable queue. What remains is traffic
     # from DIRECT evals, which take_pending_posts() hands to the routers.
     try:
-        inbox = _CTX_POST_INBOX.get(id(ctx))
+        inbox = _CTX_POST_INBOX.get(_post_queue_key(ctx))
         if inbox:
             produced_ids = {id(m) for m in info["post_messages"]}
             inbox[:] = [m for m in inbox if id(m) not in produced_ids]

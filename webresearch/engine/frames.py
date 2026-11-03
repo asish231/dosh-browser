@@ -328,25 +328,27 @@ def _target_matches_frame(msg: dict, doc: FrameDocument, parent_url: str) -> boo
     return False
 
 
-_NONCE_CACHE: dict[int, str] = {}
-
-
 def _ctx_nonce(ctx) -> str:
     """The context nonce the runtime injected (`globalThis.__WR_CTX_KEY`).
 
     Cross-realm port endpoints are addressed as "<nonce>:<localId>"; the
-    nonce qualifies a realm-local port table globally. Cached per context
-    object identity — contexts outlive page actions.
+    nonce qualifies a realm-local port table globally.
+
+    Read fresh on every call — NO id(ctx)-keyed cache. CPython reuses
+    id()s after GC, and this function outlives single pages (the full test
+    suite exercises hundreds of short-lived contexts), so a cached entry
+    keyed by id(ctx) can belong to a DEAD context whose address a new
+    context reuses. One stale nonce makes every cross-realm port transfer
+    in that context unroutable (port_unrouted, port_wires=0) — observed as
+    a deterministic full-suite-only failure that no isolated run
+    reproduced. The eval is a tiny string read; correctness over cache.
     """
     if ctx is None:
         return ""
-    key = id(ctx)
-    if key not in _NONCE_CACHE:
-        try:
-            _NONCE_CACHE[key] = str(ctx.eval("String(globalThis.__WR_CTX_KEY || '')") or "")
-        except Exception:
-            _NONCE_CACHE[key] = ""
-    return _NONCE_CACHE[key]
+    try:
+        return str(ctx.eval("String(globalThis.__WR_CTX_KEY || '')") or "")
+    except Exception:
+        return ""
 
 
 def _resolver(parent_ctx, frames: list[FrameDocument]):
