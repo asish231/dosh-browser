@@ -175,7 +175,7 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | Bounded control-realm `eval` | `shell.py:run_script` | In shell tests | ✅ Run JS with action/reading projection, strict limits |
 | Skills registry | `shell.py:ShellStore` + SQLite | In shell tests | ✅ Save/run/delete skills with SHA-256 pinning |
 | Snapshot & diff | `shell.py:snapshot/diff` | In shell tests | ✅ Evidence snapshot of controls, not VM checkpoint |
-| `open`, `actions`, `act`, `net.*`, `console`, `eval`, `skill.*`, `db`, `storage`, `snapshot`/`diff`, `layers`, `frames`, `tabs`, `video`, `read`, `history`, `cookies`, `wait`, `caps`, `screenshot`, `frame.eval` | `shell.py` | All commands tested | ✅ 30 commands fully connected |
+| `open`, `actions`, `act`, `net.*`, `console`, `eval`, `skill.*`, `db`, `storage`, `snapshot`/`diff`, `layers`, `frames`, `tabs`, `video`, `read`, `history`, `cookies`, `wait`, `caps`, `screenshot`, `frame.eval`, `ref`, `trace`, `watch` | `shell.py` | All commands tested | ✅ 33 commands fully connected |
 | Binary WebSockets (count & skip) | `engine/ws.py` | Disclosed | ❌ Implementation exists, flagged as unimplemented |
 | WASM interpreter | `engine/wasm.py` | ❌ Not yet built | ❌ Unimplemented |
 | Unified SQL DB (history+cookies+storage+ledger) | ❌ | | ❌ Unimplemented |

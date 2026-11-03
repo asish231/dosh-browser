@@ -581,6 +581,71 @@
   global.MutationObserver = MutationObserver;
   global.WebKitMutationObserver = MutationObserver;
   global.__queueMutation = queueMutation;
+
+  /* Host watch lane: a bounded mutation log for the shell's `watch` command.
+     The observer is installed by the HOST, never by page scripts — page code
+     cannot read this log, and this log never surfaces in the page-realm API.
+     Records are compact descriptors (tag#id.class strings), not live nodes:
+     stale references cannot leak out of the engine. */
+  var __wrWatch = { obs: null, log: [], seq: 0, cap: 500, enabled: false };
+  function __wrWatchDesc(node) {
+    try {
+      if (!node) return "null";
+      if (node.nodeType !== 1) return String(node.nodeName || "text");
+      var d = String(node.nodeName || "").toLowerCase();
+      var id = node.id || (node.getAttribute && node.getAttribute("id"));
+      if (id) d += "#" + id;
+      var cls = node.getAttribute && node.getAttribute("class");
+      if (cls && String(cls).trim()) d += "." + String(cls).trim().split(/\s+/)[0];
+      return d;
+    } catch (e) { return "unknown"; }
+  }
+  global.__wrWatchInstall = function () {
+    var doc = global.document;
+    var root = doc && (doc.body || doc.documentElement);
+    if (!root) return JSON.stringify({ ok: false, reason: "no document to observe" });
+    if (__wrWatch.obs) { try { __wrWatch.obs.disconnect(); } catch (e) {} __wrWatch.obs = null; }
+    __wrWatch.log = [];
+    __wrWatch.seq = 0;
+    __wrWatch.enabled = true;
+    var obs = new MutationObserver(function (records) {
+      for (var i = 0; i < records.length; i++) {
+        var r = records[i];
+        var rec = { seq: ++__wrWatch.seq, type: r.type, target: __wrWatchDesc(r.target),
+                    attribute: r.attributeName || null,
+                    oldValue: r.oldValue == null ? null : String(r.oldValue).slice(0, 200),
+                    added: [], removed: [] };
+        var add = r.addedNodes || [];
+        for (var j = 0; j < add.length && j < 20; j++) rec.added.push(__wrWatchDesc(add[j]));
+        var rem = r.removedNodes || [];
+        for (var k = 0; k < rem.length && k < 20; k++) rec.removed.push(__wrWatchDesc(rem[k]));
+        __wrWatch.log.push(rec);
+        if (__wrWatch.log.length > __wrWatch.cap) __wrWatch.log.shift();
+      }
+    });
+    obs.observe(root, { childList: true, subtree: true, attributes: true,
+                        attributeOldValue: true, characterData: true, characterDataOldValue: true });
+    __wrWatch.obs = obs;
+    return JSON.stringify({ ok: true, cap: __wrWatch.cap });
+  };
+  global.__wrWatchDrain = function (after, limit) {
+    after = Number(after) || 0;
+    limit = Math.min(Number(limit) || 50, 200);
+    var out = [];
+    for (var i = 0; i < __wrWatch.log.length; i++) {
+      if (__wrWatch.log[i].seq > after) {
+        out.push(__wrWatch.log[i]);
+        if (out.length >= limit) break;
+      }
+    }
+    return JSON.stringify({ records: out, latest_seq: __wrWatch.seq,
+                            enabled: __wrWatch.enabled, retained: __wrWatch.log.length });
+  };
+  global.__wrWatchDisable = function () {
+    if (__wrWatch.obs) { try { __wrWatch.obs.disconnect(); } catch (e) {} __wrWatch.obs = null; }
+    __wrWatch.enabled = false;
+    return JSON.stringify({ ok: true, retained: __wrWatch.log.length });
+  };
   Object.defineProperty(Node.prototype, "firstChild", {
     get: function () { return this.childNodes[0] || null; }
   });
