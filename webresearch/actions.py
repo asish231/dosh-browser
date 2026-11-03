@@ -102,6 +102,11 @@ class Action:
     kind: str  # 'navigate' | 'submit' | 'activate' | 'drag' | 'dropzone' | 'embed'
     role: str
     label: str
+    # URL-free content digest: the identity tracker's handle. The ref binds
+    # identity to the document URL and churns with it (cookie redirects,
+    # pushState); `stable` is content-only and survives the churn, so an agent
+    # can re-resolve the same control on a re-loaded page via `ref {stable}`.
+    stable: str = ""
     target: str = ""  # url for navigate, form index for submit, selector for drag
     # For a form field: the `name` an HTTP submit would send it under, plus a CSS
     # selector for the element itself. Both are needed and they are not
@@ -384,14 +389,15 @@ def _checked(node: Node) -> bool | None:
     return None
 
 
-def _stable_ref(doc_url: str, node: Node, index: int) -> str:
-    """Content-addressed ref: stable across reorderings of unrelated elements.
+def _content_identity(node: Node, index: int) -> str:
+    """The element's own description: identity without any document URL.
 
-    Identity is the element's own description, never its position, so inserting
-    a banner does not invalidate every ref on the page. Distinguishing
-    attributes are included because repeated controls (six one-digit audio
-    boxes, a radio group) differ by nothing else and would otherwise collapse
-    onto a single ref.
+    This is the identity-tracker core. The action ``ref`` binds this identity
+    to the document URL (so different pages never collide), but the identity
+    itself is URL-free — which is exactly what makes it survive the URL churn
+    (ASP.NET cookie redirects, pushState rewrites) that invalidates every
+    URL-bound ref. ``Action.stable`` exposes this URL-free digest so an agent
+    can re-resolve "the same control" on a re-loaded page.
     """
     attrs = node.attributes
     distinguishing = [
@@ -415,8 +421,26 @@ def _stable_ref(doc_url: str, node: Node, index: int) -> str:
     )
     if not identity.strip("|"):
         identity = f"anon-{index}"
-    digest = hashlib.sha1(f"{doc_url}|{identity}".encode()).hexdigest()[:8]
+    return identity
+
+
+def _stable_ref(doc_url: str, node: Node, index: int) -> str:
+    """Content-addressed ref: stable across reorderings of unrelated elements.
+
+    Identity is the element's own description, never its position, so inserting
+    a banner does not invalidate every ref on the page. Distinguishing
+    attributes are included because repeated controls (six one-digit audio
+    boxes, a radio group) differ by nothing else and would otherwise collapse
+    onto a single ref.
+    """
+    digest = hashlib.sha1(f"{doc_url}|{_content_identity(node, index)}".encode()).hexdigest()[:8]
     return f"a{digest}"
+
+
+def _stable_id(node: Node, index: int) -> str:
+    """URL-free content digest: the same control, same stable id, any URL."""
+    digest = hashlib.sha1(_content_identity(node, index).encode()).hexdigest()[:8]
+    return f"s{digest}"
 
 
 def _escape_ident(value: str) -> str:
@@ -636,6 +660,7 @@ def collect(html: str, url: str, *, max_actions: int = 200) -> ActionSurface:
         ordered.append(
             Action(
                 ref=_stable_ref(url, node, index),
+                stable=_stable_id(node, index),
                 kind=kind,
                 role=_role_of(node, kind),
                 label=label,

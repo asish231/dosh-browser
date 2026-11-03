@@ -53,6 +53,9 @@ COMMANDS = {
     "caps": "Per-page capability manifest: live counts plus known engine gaps, honestly.",
     "screenshot": "Save the engine's approximate SVG layout diagram: dest_dir, frame.",
     "frame.eval": "Run a bounded probe expression in the live page/frame realm: frame, expr.",
+    "ref": "Re-resolve a stable id (from an action's stable field) to the current page's ref.",
+    "trace": "Act on a ref and return the causal bundle: DOM delta, network, console, dialogs.",
+    "watch": "Subscribe to engine mutations: enable, then drain records with after/limit.",
 }
 
 _SDK = """
@@ -168,6 +171,21 @@ def _limit(value: Any, maximum: int = 1000) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
         raise ValueError(f"limit must be an integer from 1 to {maximum}")
     return value
+
+
+_READING_TYPES = {"heading", "text", "list", "quote", "code", "table"}
+
+
+def _reading_text(block) -> str:
+    """Render an ACD block for the reading projection.
+
+    The ACD has six block types; dropping any of them silently loses content:
+    code and table blocks are exactly what code-heavy and data-heavy pages are
+    made of. Table rows render as pipe-joined lines, one per row.
+    """
+    if block.type == "table":
+        return "\n".join(" | ".join(row) for row in (block.rows or []) if row)
+    return block.text or ""
 
 
 class DoshShell:
@@ -459,14 +477,14 @@ class DoshShell:
             max_chars = a.get("max_chars", 4000)
             if isinstance(max_chars, bool) or not isinstance(max_chars, int) or not 10 <= max_chars <= 200_000:
                 raise ValueError("max_chars must be an integer from 10 to 200000")
+            all_blocks = []
             if page.acd is not None:
-                all_blocks = [
-                    {"type": b.type, "text": b.text or ""}
-                    for b in page.acd.blocks
-                    if b.type in {"heading", "text", "list", "quote"}
-                ]
-            else:
-                all_blocks = []
+                for b in page.acd.blocks:
+                    if b.type not in _READING_TYPES:
+                        continue
+                    rendered = _reading_text(b)
+                    if rendered:
+                        all_blocks.append({"type": b.type, "text": rendered})
             if not all_blocks:
                 # Form-heavy pages can compile zero reading blocks (the ACD
                 # keeps controls in its action projection instead). Fall back
@@ -643,6 +661,81 @@ class DoshShell:
                     "realm": "page-frame",
                     "note": "page-realm probe: observes (and can mutate) the live document; "
                             "output is untrusted page data, not engine verification"}
+        if name == "ref":
+            stable = a.get("stable", "")
+            if not isinstance(stable, str) or not stable:
+                raise ValueError("ref needs a stable id (from an action's stable field)")
+            matches = [x for x in self._inventory(0, 1_000_000)["actions"] if x.get("stable") == stable]
+            if not matches:
+                raise ValueError(f"no action with stable id {stable} on this document")
+            if len(matches) > 1:
+                return {"stable": stable, "ambiguous": True, "matches": matches,
+                        "note": "repeated identical controls share one identity; disambiguate with the ref directly"}
+            hit = matches[0]
+            return {"stable": stable, "ref": hit["ref"], "kind": hit["kind"], "label": hit["label"],
+                    "disabled": hit["disabled"], "hidden": hit["hidden"],
+                    "note": "URL-free identity re-resolved onto the current document; "
+                            "the ref changes with URL churn, the stable id does not"}
+        if name == "trace":
+            if not isinstance(a.get("ref"), str) or not a["ref"]:
+                raise ValueError("trace needs a ref to act on")
+            before = {x["stable"]: x for x in self._inventory(0, 1_000_000)["actions"]}
+            before_net = self.network.query(limit=1)["latest_id"]
+            before_log = self.log_seq
+            page = await s.act(a["ref"], text=a.get("text", ""), dx=a.get("dx"), dy=a.get("dy"))
+            after_list = self._inventory(0, 1_000_000)["actions"]
+            after = {x["stable"]: x for x in after_list}
+            keep = ("ref", "stable", "kind", "label", "disabled", "hidden")
+            added = [{k: x[k] for k in keep if k in x} for x in after.values() if x["stable"] not in before]
+            removed = [{k: x[k] for k in keep if k in x} for x in before.values() if x["stable"] not in after]
+            changed = [{k: x[k] for k in keep if k in x} for x in after.values()
+                       if x["stable"] in before and x != before[x["stable"]]]
+            net = self.network.query(after=before_net, limit=50)
+            log_matches = [e for e in self.logs if e["id"] > before_log]
+            log_rows = [dict(e) for e in log_matches[:50]]
+            if not a.get("values", False):
+                for row in log_rows:
+                    row["message"] = "[withheld; pass values=true to inspect free-form page output]"
+            return {"acted": {"ref": a["ref"], "text": a.get("text", "")},
+                    "page": {"url": _url(page.url), "status": page.status, "title": page.title},
+                    "dom_delta": {"added": added, "removed": removed, "changed": changed,
+                                  "stable_before": len(before), "stable_after": len(after)},
+                    "network": {"records": net["records"], "returned": net["returned"],
+                                "omitted_limit": net["omitted_limit"], "latest_id": net["latest_id"]},
+                    "console": {"events": log_rows, "omitted": max(0, len(log_matches) - 50)},
+                    "dialogs": s.dialogs(),
+                    "note": "one action's full causal footprint; delta is identity-keyed (stable ids), "
+                            "ref churn shows as changed entries, not lost controls"}
+        if name == "watch":
+            ctx = self._context(a.get("frame", ""))
+            if "enable" in a:
+                if not isinstance(a["enable"], bool):
+                    raise ValueError("enable must be boolean")
+                if a["enable"]:
+                    raw = ctx.eval("__wrWatchInstall()")
+                    state = json.loads(raw) if isinstance(raw, str) else {}
+                    if not state.get("ok"):
+                        raise ValueError(state.get("reason", "watch install failed"))
+                    return {"enabled": True, "cap": state.get("cap"),
+                            "note": "drain with watch {after, limit}; delivery is microtask-based, "
+                                    "so records appear after action passes; the log is host-side only"}
+                raw = ctx.eval("__wrWatchDisable()")
+                state = json.loads(raw) if isinstance(raw, str) else {}
+                return {"enabled": False, "retained": state.get("retained"),
+                        "note": "observer disconnected; retained records stay until the next enable resets the log"}
+            after = a.get("after", 0)
+            if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+                raise ValueError("after must be a nonnegative integer")
+            limit = _limit(a.get("limit", 50), maximum=200)
+            raw = ctx.eval(f"__wrWatchDrain({after}, {limit})")
+            data = json.loads(raw) if isinstance(raw, str) else {}
+            records = data.get("records", [])
+            return {"records": records, "latest_seq": data.get("latest_seq", 0),
+                    "enabled": data.get("enabled", False), "retained": data.get("retained", 0),
+                    "returned": len(records),
+                    "next_after": records[-1]["seq"] if records else after,
+                    "omitted_retained": max(0, (data.get("retained", 0)) - len(records)),
+                    "note": "engine MutationObserver records; compact node descriptors, never live nodes"}
         raise ValueError(f"unknown command: {name}; use help")
 
     async def run_script(self, source: str, args: dict, *, allow_actions: bool = False) -> dict:
@@ -657,9 +750,9 @@ class DoshShell:
         actions = [{k: x[k] for k in ("ref", "kind", "label", "disabled", "hidden")} for x in inventory]
         page = self.session.page
         reading = "\n".join(
-                        block.text
+                        _reading_text(block)
                         for block in page.acd.blocks
-                        if block.type in {"heading", "text", "list", "quote"}
+                        if block.type in _READING_TYPES
                     ) if page and page.acd else ""
         payload = json.dumps({"args": args, "text": reading,
                               "actions": actions, "allow_actions": allow_actions})
