@@ -96,9 +96,22 @@ SURROGATES: dict[str, str] = {
 }
 
 
+# Functional challenge providers. A page's own bot-protection widget is not
+# tracking: the script renders the control the page requires in order to
+# submit. Dropping it silently removes the form's captcha from the document,
+# so these hosts bypass the tracker graph and are always fetched.
+FUNCTIONAL_CHALLENGE_MARKERS: tuple[str, ...] = (
+    "google.com/recaptcha/",
+    "recaptcha.net/recaptcha/",
+    "gstatic.com/recaptcha/",
+    "hcaptcha.com/1/api.js",
+    "challenges.cloudflare.com/turnstile/",
+)
+
+
 @dataclass
 class TrackingDecision:
-    status: str  # ALLOWED, SAME_ENTITY_ALLOWED, BLOCKED
+    status: str  # ALLOWED, SAME_ENTITY_ALLOWED, FUNCTIONAL_ALLOWED, BLOCKED
     entity: str = ""
     surrogate: str = ""
 
@@ -202,6 +215,11 @@ class TrackerGraph:
         entity = self.entity_of(req_host)
         if not entity:
             return TrackingDecision("ALLOWED")
+        # A captcha/turnstile bundle is the page's own security control, not a
+        # beacon. Blocking it leaves the form unsubmittable.
+        req_low = request_url.lower()
+        if any(marker in req_low for marker in FUNCTIONAL_CHALLENGE_MARKERS):
+            return TrackingDecision("FUNCTIONAL_ALLOWED", entity)
         if registrable_domain(req_host) == registrable_domain(doc_host):
             return TrackingDecision("ALLOWED", entity)
         doc_entity = self.entity_of(doc_host)

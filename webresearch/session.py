@@ -245,6 +245,15 @@ class Session:
         # Seeded into each fresh engine context and drained back after every
         # JS pass — the engine context itself dies on navigation.
         self._web_storage: dict[str, dict[str, str]] = {}
+        self._shell = None
+
+    @property
+    def shell(self):
+        if self._shell is None:
+            from webresearch.shell import DoshShell
+
+            self._shell = DoshShell(self)
+        return self._shell
 
     def _origin_of(self, url: str) -> str:
         parts = urlsplit(url or "")
@@ -943,37 +952,85 @@ class Session:
                     parent_headers=self.current_tab.headers,
                     parent_messages=js_info.get("post_messages"),
                     cached=self.frame_documents,
+                    parent_ctx=self.current_tab.ctx,
                 )
                 if new_html
                 else self.frame_documents
             )
             # Same-document pass: reuse live frames; deliver each frame's
             # messages to the parent exactly once (cursor).
+            from webresearch.engine.frames import (
+                _route_port_msgs,
+                _resolver,
+                drain_frame_posts,
+                frame_message_roundtrip,
+                is_port_message,
+            )
+
             child_msgs: list[dict] = []
             for f in frames:
+                drain_frame_posts(f)
                 pms = f.post_messages
                 if len(pms) > f.delivered_count:
-                    child_msgs.extend(
-                        pm
-                        for pm in pms[f.delivered_count :]
-                        if pm.get("target") in {"parent", "top", "reply", "*", ""}
-                    )
+                    for pm in pms[f.delivered_count :]:
+                        if pm.get("target") in {"parent", "top", "reply", "*", ""} or is_port_message(pm):
+                            pm = dict(pm)
+                            pm["source_window"] = {"window": "frame", "src": f.seed_src or f.url}
+                            child_msgs.append(pm)
                     f.delivered_count = len(pms)
             if child_msgs and js_ran:
+                # MessagePort traffic (split handshake channels) routes
+                # directly into the owning realm; only window messages ride
+                # the parent lane.
+                port_msgs = [pm for pm in child_msgs if is_port_message(pm)]
+                window_msgs = [pm for pm in child_msgs if not is_port_message(pm)]
+                if port_msgs:
+                    await _route_port_msgs(
+                        port_msgs,
+                        parent_ctx=self.current_tab.ctx,
+                        parent_html=new_html,
+                        parent_url=self.url,
+                        client=self.client,
+                        frames=frames,
+                    )
                 # Replies (e.source.postMessage — the standard cross-frame
                 # reply form) carry the child's origin in msg["origin"] (the
                 # engine records the sender), so the parent's delivery
                 # verifies them like any other message.
-                pumped_html, extra_js = await run_scripts(
-                    new_html, self.url, self.client, force=True, messages=child_msgs,
-                    storage_seed=self._storage_seed(),
+                # Deliver into the LIVE parent context: a fresh context here
+                # rebuilt the page, so every widget reply was recorded into a
+                # throwaway info dict and destroyed — the frame waited forever.
+                if window_msgs:
+                    pumped_html, extra_js = await run_scripts(
+                        new_html, self.url, self.client, force=True, messages=window_msgs,
+                        ctx=self.current_tab.ctx,
+                        storage_seed=self._storage_seed(),
+                        frames=frames,
+                    )
+                    self.current_tab.ctx = extra_js.get("ctx") or self.current_tab.ctx
+                    self._absorb_storage(extra_js)
+                    self._absorb_history(extra_js)
+                    if extra_js.get("navigated"):
+                        js_info["navigated"] = extra_js["navigated"]
+                    if extra_js.get("form_submit"):
+                        js_info["form_submit"] = extra_js["form_submit"]
+                    new_html = pumped_html
+                    result.body = new_html
+                    from webresearch.engine.frames import _wire_received_ports
+
+                    _wire_received_ports(
+                        window_msgs,
+                        receiving_ctx=self.current_tab.ctx,
+                        resolve_ctx_by_nonce=_resolver(self.current_tab.ctx, frames),
+                    )
+                await frame_message_roundtrip(
+                    frames,
+                    parent_ctx=self.current_tab.ctx,
+                    parent_url=self.url,
+                    parent_html=new_html,
+                    client=self.client,
+                    initial_parent_messages=(extra_js.get("post_messages") if window_msgs else []) or [],
                 )
-                if extra_js.get("navigated"):
-                    js_info["navigated"] = extra_js["navigated"]
-                if extra_js.get("form_submit"):
-                    js_info["form_submit"] = extra_js["form_submit"]
-                new_html = pumped_html
-                result.body = new_html
             captcha = await inspect_captcha(
                 new_html,
                 self.url,
@@ -1765,10 +1822,16 @@ resolve a selector directly.
     ) -> Page:
         """Re-run page JS with agent interactions, then rebuild the page model."""
         had_ctx = self.current_tab.ctx is not None
+        frame_contexts = {
+            f.ref: f.js_info.get("ctx")
+            for f in self.frame_documents
+            if f.js_info.get("ctx") is not None
+        }
         new_html, js_info = await run_scripts(
             html, self.url, self.client, force=True, actions=actions, ctx=self.current_tab.ctx,
             storage_seed=self._storage_seed(),
             history_length=max(1, len(self.history)),
+            frame_contexts=frame_contexts,
         )
         self.current_tab.ctx = js_info.get("ctx") or self.current_tab.ctx
         self._absorb_storage(js_info)
@@ -1814,6 +1877,7 @@ resolve a selector directly.
                 parent_headers=self.current_tab.headers,
                 parent_messages=js_info.get("post_messages"),
                 cached=self.frame_documents,
+                parent_ctx=self.current_tab.ctx,
             )
             if new_html
             else self.frame_documents
@@ -1822,33 +1886,80 @@ resolve a selector directly.
         # are delivered to the parent exactly once (the per-frame cursor),
         # instead of the whole frame tree re-running and re-sending its
         # init messages on every click/scroll/type.
+        from webresearch.engine.frames import (
+            _route_port_msgs,
+            _resolver,
+            drain_frame_posts,
+            frame_message_roundtrip,
+            is_port_message,
+        )
+
         child_msgs: list[dict] = []
         for f in frames:
+            drain_frame_posts(f)
             pms = f.post_messages
             if len(pms) > f.delivered_count:
-                child_msgs.extend(
-                    pm
-                    for pm in pms[f.delivered_count :]
-                    if pm.get("target") in {"parent", "top", "reply", "*", ""}
-                )
+                for pm in pms[f.delivered_count :]:
+                    if pm.get("target") in {"parent", "top", "reply", "*", ""} or is_port_message(pm):
+                        # Sender identity: the parent verifies event.source
+                        # against its own iframe contentWindow — an anonymous
+                        # proxy made the recaptcha-setup handshake die silently.
+                        pm = dict(pm)
+                        pm["source_window"] = {"window": "frame", "src": f.seed_src or f.url}
+                        child_msgs.append(pm)
                 f.delivered_count = len(pms)
         if child_msgs and js_ran:
+            # Split MessagePort traffic from the window lane: split handshake
+            # channels route directly into their owning realm.
+            port_msgs = [pm for pm in child_msgs if is_port_message(pm)]
+            window_msgs = [pm for pm in child_msgs if not is_port_message(pm)]
+            if port_msgs:
+                await _route_port_msgs(
+                    port_msgs,
+                    parent_ctx=self.current_tab.ctx,
+                    parent_html=new_html,
+                    parent_url=self.url,
+                    client=self.client,
+                    frames=frames,
+                )
             # Replies (e.source.postMessage — the standard cross-frame reply
             # form) must reach the parent like parent/top-targeted messages;
             # the old filter dropped them.
-            pumped_html, extra_js = await run_scripts(
-                new_html, self.url, self.client, force=True, messages=child_msgs, ctx=self.current_tab.ctx,
-                storage_seed=self._storage_seed(),
+            # Inject frame content during this run so iframe clicks work
+            if window_msgs:
+                pumped_html, extra_js = await run_scripts(
+                    new_html, self.url, self.client, force=True, messages=window_msgs, ctx=self.current_tab.ctx,
+                    storage_seed=self._storage_seed(),
+                    frames=frames,
+                )
+                self.current_tab.ctx = extra_js.get("ctx") or self.current_tab.ctx
+                self._absorb_storage(extra_js)
+                self._absorb_history(extra_js)
+                if extra_js.get("navigated"):
+                    js_info["navigated"] = extra_js["navigated"]
+                if extra_js.get("form_submit"):
+                    js_info["form_submit"] = extra_js["form_submit"]
+                new_html = pumped_html
+                result.body = new_html
+                from webresearch.engine.frames import _wire_received_ports
+
+                _wire_received_ports(
+                    window_msgs,
+                    receiving_ctx=self.current_tab.ctx,
+                    resolve_ctx_by_nonce=_resolver(self.current_tab.ctx, frames),
+                )
+            # The parent's replies to those child messages (and any further
+            # exchanges they trigger) go back into the frames' live contexts:
+            # stopping here left an in-flight widget handshake (recaptcha-setup)
+            # waiting for a reply that was collected but never routed.
+            await frame_message_roundtrip(
+                frames,
+                parent_ctx=self.current_tab.ctx,
+                parent_url=self.url,
+                parent_html=new_html,
+                client=self.client,
+                initial_parent_messages=(extra_js.get("post_messages") if window_msgs else []) or [],
             )
-            self.current_tab.ctx = extra_js.get("ctx") or self.current_tab.ctx
-            self._absorb_storage(extra_js)
-            self._absorb_history(extra_js)
-            if extra_js.get("navigated"):
-                js_info["navigated"] = extra_js["navigated"]
-            if extra_js.get("form_submit"):
-                js_info["form_submit"] = extra_js["form_submit"]
-            new_html = pumped_html
-            result.body = new_html
         captcha = await inspect_captcha(
             new_html,
             self.url,
@@ -1986,6 +2097,357 @@ resolve a selector directly.
         if frame is None:
             raise ValueError(f"no frame [{ref}]")
         return frame
+
+    async def click_captcha_checkbox(self, *, max_chars: int = 8000) -> Page:
+        """Click the reCAPTCHA 'I'm not a robot' checkbox inside the captcha iframe.
+        
+        This finds the reCAPTCHA anchor frame and clicks the checkbox element.
+        Returns the page after the click is processed.
+        """
+        if not self.html:
+            raise ValueError("no current page")
+        if not self.frame_documents:
+            raise ValueError("no frames loaded - navigate first")
+        
+        # Find the reCAPTCHA anchor frame
+        captcha_frame = None
+        for frame in self.frame_documents:
+            if frame.challenge or "recaptcha" in frame.url.lower() or "recaptcha" in frame.html.lower():
+                captcha_frame = frame
+                break
+        
+        if not captcha_frame:
+            raise ValueError("no reCAPTCHA frame found")
+        
+        # Build path by finding the checkbox element in the frame's tree
+        from webresearch.engine.tree import html_to_tree
+        tree = html_to_tree(captcha_frame.html)
+        
+        def find_checkbox_path(node, path=None):
+            """Recursively find the checkbox element and return its path."""
+            if path is None:
+                path = []
+            attrs = node.get("a") or {}
+            class_names = (attrs.get("class") or "").lower()
+            role = (attrs.get("role") or "").lower()
+            tag = node.get("t") or ""
+            
+            # reCAPTCHA checkbox is typically a span/table-cell with checkbox role
+            # or has "recaptcha-checkbox" in class name
+            if role == "checkbox" or "recaptcha-checkbox" in class_names:
+                return path[:]
+            
+            # Also check for the checkbox container
+            if "recaptcha-checkbox" in class_names and "table" in tag:
+                # Look for first non-text child
+                for i, child in enumerate(node.get("c") or []):
+                    if isinstance(child, dict) and child.get("t") != "#text":
+                        return path + [i]
+            
+            # Recurse into children
+            for i, child in enumerate(node.get("c") or []):
+                if isinstance(child, dict):
+                    result = find_checkbox_path(child, path + [i])
+                    if result is not None:
+                        return result
+            return None
+        
+        checkbox_path = find_checkbox_path(tree) or []
+        # Click the document that ran the frame's scripts. The selector hits
+        # the live checkbox in that realm.
+        return await self._apply(
+            [{
+                "kind": "click_frame",
+                "frame_ref": captcha_frame.ref,
+                "frame_path": checkbox_path,
+                "frame_selector": "[role='checkbox'], .recaptcha-checkbox",
+            }],
+            self.html,
+            max_chars,
+        )
+
+    async def solve_recaptcha_v2(self, *, max_rounds: int = 8, models: list[str] | None = None) -> str:
+        """Solve the current page's reCAPTCHA v2 challenge; return a token.
+
+        Drives the challenge protocol (anchor -> reload -> payload ->
+        userverify) over this session's HTTP client with the session's
+        fingerprint and cookies, classifying tiles with the configured
+        vision models (ensemble majority vote). The returned token is a
+        verifiable ``g-recaptcha-response``; whether the SITE accepts it
+        is the site's server-side decision, reported honestly.
+        """
+        if not self.html:
+            raise ValueError("no current page")
+        report = self.captcha()
+        if not report.present:
+            raise ValueError("no CAPTCHA on the current page")
+        site_key = report.site_key
+        if not site_key:
+            raise ValueError("no reCAPTCHA site key on the current page")
+
+        from webresearch.settings import llm_config
+
+        cfg = llm_config("auto")
+        vision_models = models or [
+            m.strip()
+            for m in os.environ.get(
+                "WR_VISION_MODELS",
+                "gemini-3.6-flash, qwen3.5-omni-plus, qwen3-vl-plus, qwen-vl-max, gemini-3.5-flash",
+            ).split(",")
+            if m.strip()
+        ]
+
+        from webresearch.engine.captcha import (
+            RecaptchaV2Error,
+            captcha_view_with_token,
+            solve_recaptcha_v2 as _solve,
+            vision_grid_select,
+            vision_tile_contains,
+        )
+
+        async def tile_contains(tile: bytes, goal: str) -> bool:
+            return await vision_tile_contains(
+                tile,
+                goal,
+                api_key=cfg["api_key"],
+                base_url=cfg["base_url"],
+                model=cfg["model"],
+                models=vision_models,
+            )
+
+        async def grid_select(grid: bytes, goal: str, rows: int, cols: int) -> list[int]:
+            return await vision_grid_select(
+                grid,
+                goal,
+                rows,
+                cols,
+                api_key=cfg["api_key"],
+                base_url=cfg["base_url"],
+                model=cfg["model"],
+                models=vision_models,
+            )
+
+        try:
+            token = await _solve(
+                self.client,
+                site_key=site_key,
+                site_url=self.url,
+                grid_select=grid_select,
+                tile_contains=tile_contains,
+                max_rounds=max_rounds,
+            )
+        except RecaptchaV2Error as exc:
+            raise ValueError(f"reCAPTCHA v2 solve failed: {exc}") from exc
+        # Surface the token in the current inspection so the action surface
+        # reflects reality: the page's g-recaptcha-response is now filled.
+        if self.captcha_inspection is not None and report is not None:
+            report.token = token
+            report.view = captcha_view_with_token(report, token)
+        return token
+
+
+    async def click_captcha_tile(self, tile_index: int | str, *, max_chars: int = 8000) -> Page:
+        """Click a specific tile in the reCAPTCHA image challenge frame."""
+        if not self.html:
+            raise ValueError("no current page")
+        if not self.frame_documents:
+            raise ValueError("no frames loaded - navigate first")
+        
+        # Find the challenge frame (bframe)
+        challenge_frame = None
+        for frame in self.frame_documents:
+            if "bframe" in frame.url.lower() or "imageselect" in frame.html.lower() or "rc-imageselect" in frame.html.lower():
+                challenge_frame = frame
+                break
+        if not challenge_frame and self.captcha_inspection:
+            # Fallback to any frame that's not the anchor
+            for frame in self.frame_documents:
+                if frame.challenge and "anchor" not in frame.html.lower() and getattr(frame, 'ref', '') != "f1":
+                    challenge_frame = frame
+                    break
+        if not challenge_frame and len(self.frame_documents) >= 2:
+            challenge_frame = self.frame_documents[-1]  # Usually the last frame is the challenge
+        
+        if not challenge_frame:
+            raise ValueError("no CAPTCHA challenge frame found")
+        
+        from webresearch.engine.tree import html_to_tree
+        tree = html_to_tree(challenge_frame.html)
+        
+        target_idx = tile_index
+        # Normalize - if it's 1-based from solve results, also try to match
+        try:
+            t = int(str(tile_index))
+            # Try both as-is and t-1 (vision returns 1-based as per our parse)
+            target_candidates = [t, t-1]
+        except Exception:
+            target_candidates = [tile_index]
+            # Try to convert string numbers
+            try:
+                target_candidates = [int(str(tile_index)), int(str(tile_index))-1]
+            except Exception:
+                pass
+        
+        def find_tile_path(node, path=None, candidates=None):
+            if path is None:
+                path = []
+            if candidates is None:
+                candidates = []
+            attrs = node.get("a") or {}
+            class_names = (attrs.get("class") or "").lower()
+            node_id = str(attrs.get("id") or "")
+            
+            # Look for tile elements
+            if "rc-imageselect-tile" in class_names or ("tile" in class_names and "imageselect" in class_names):
+                try:
+                    tid = int(node_id) if node_id.isdigit() else None
+                    if tid is not None and tid in candidates:
+                        return path[:]
+                except Exception:
+                    pass
+                if not candidates and "rc-imageselect-tile" in class_names:
+                    # If no specific target, could return first found - but we need specific
+                    pass
+            
+            for i, child in enumerate(node.get("c") or []):
+                if isinstance(child, dict):
+                    result = find_tile_path(child, path + [i], candidates)
+                    if result is not None:
+                        return result
+            return None
+        
+        tile_path = find_tile_path(tree, candidates=target_candidates)
+        # Build selector
+        try:
+            t = int(str(tile_index))
+            selector = f'[id="{t}"].rc-imageselect-tile, [id="{t}"], .rc-imageselect-tile#{t}, td#{t}.rc-imageselect-tile'
+        except Exception:
+            selector = '.rc-imageselect-tile'
+        return await self._apply(
+            [{
+                "kind": "click_frame",
+                "frame_ref": challenge_frame.ref,
+                "frame_path": tile_path or [],
+                "frame_selector": selector,
+            }],
+            self.html,
+            max_chars,
+        )
+
+    async def click_captcha_tiles(self, tile_indices: list[int] | list[str], *, max_chars: int = 8000) -> Page:
+        """Click multiple tiles in the reCAPTCHA image challenge."""
+        page = None
+        for idx in tile_indices:
+            page = await self.click_captcha_tile(idx, max_chars=max_chars)
+        return page or self.page
+
+    async def click_captcha_verify(self, *, max_chars: int = 8000) -> Page:
+        """Click the verify/submit button in the reCAPTCHA challenge frame."""
+        if not self.html:
+            raise ValueError("no current page")
+        if not self.frame_documents:
+            raise ValueError("no frames loaded - navigate first")
+        
+        challenge_frame = None
+        for frame in self.frame_documents:
+            if "bframe" in frame.url.lower() or "imageselect" in frame.html.lower() or "rc-imageselect" in frame.html.lower() or "verify" in frame.html.lower():
+                challenge_frame = frame
+                break
+        if not challenge_frame and len(self.frame_documents) >= 2:
+            challenge_frame = self.frame_documents[-1]
+        if not challenge_frame:
+            raise ValueError("no CAPTCHA challenge frame found")
+        
+        from webresearch.engine.tree import html_to_tree
+        tree = html_to_tree(challenge_frame.html)
+        
+        def find_verify_path(node, path=None):
+            if path is None:
+                path = []
+            attrs = node.get("a") or {}
+            node_id = str(attrs.get("id") or "").lower()
+            class_names = (attrs.get("class") or "").lower()
+            tag = node.get("t") or ""
+            text = ""
+            # Get text
+            try:
+                from webresearch.engine.tree import walk
+                texts = []
+                for n in walk(node):
+                    if n.get("t") == "#text":
+                        texts.append(n.get("x") or "")
+                text = " ".join(texts).lower()
+            except Exception:
+                pass
+            
+            if "verify" in node_id or "verify" in class_names or tag == "button" and "verify" in text:
+                return path[:]
+            
+            for i, child in enumerate(node.get("c") or []):
+                if isinstance(child, dict):
+                    result = find_verify_path(child, path + [i])
+                    if result is not None:
+                        return result
+            return None
+        
+        verify_path = find_verify_path(tree)
+        return await self._apply(
+            [{
+                "kind": "click_frame",
+                "frame_ref": challenge_frame.ref,
+                "frame_path": verify_path or [],
+                "frame_selector": '#recaptcha-verify-button, button:contains("Verify"), .rc-button-default',
+            }],
+            self.html,
+            max_chars,
+        )
+
+    async def click_captcha_solution(self, solution: dict | object = None, *, max_chars: int = 8000) -> Page:
+        """Click tiles from a captcha solution and submit."""
+        if solution is None:
+            raise ValueError("solution required")
+        # Extract tile indices
+        tiles = []
+        if isinstance(solution, dict):
+            tiles = solution.get("tiles_selected") or solution.get("tiles") or []
+        else:
+            tiles = getattr(solution, "tiles_selected", []) or []
+        indices = []
+        for t in tiles:
+            if isinstance(t, dict):
+                # Try different keys
+                if "tile_id" in t:
+                    # tile_id might be string like "0"
+                    try:
+                        idx = int(t["tile_id"])
+                        # If from our vision model mapping, they store original 1-based? Wait - in our code:
+                        # we take tile_indices from vision (1-based) and map to report.tiles[tile_zero] where tile_zero = idx-1
+                        # So selections store tile_id from report.tiles. The tile_id comes from attrs.get('id') or index.
+                        # But in our test case, tiles are created with id=str(i), so tile_id would be "0","1" etc matching index.
+                        # Also in the solve_captcha code: we add selection with tile_id=tile.id (from report.tiles). 
+                        # And in the test "selected_ids = [s.tile_id for s in result.solution.tiles_selected]; self.assertEqual(selected_ids, ["0", "2", "6"])" - correct, because vision returns [1,3,7] meaning first/third/seventh tile, and we map them back to report.tiles at index (idx-1), so tile_id becomes report.tiles[idx-1].id which is str(idx-1) = "0","2","6". Correct.
+                        indices.append(idx)
+                        continue
+                    except Exception:
+                        pass
+                if "index" in t:
+                    indices.append(int(t["index"]))
+                    continue
+                if "row" in t and "column" in t:
+                    # Can't directly map without tile list, skip
+                    continue
+            elif isinstance(t, (int, str)):
+                try:
+                    indices.append(int(t))
+                    continue
+                except Exception:
+                    pass
+        if indices:
+            page = await self.click_captcha_tiles(indices, max_chars=max_chars)
+            await self.click_captcha_verify(max_chars=max_chars)
+            return page
+        raise ValueError("no tile indices found in solution")
+
 
     def captcha(self) -> CaptchaReport:
         if not self.html:
@@ -2214,6 +2676,8 @@ resolve a selector directly.
         return await web_search_images(query, client=self.client, max_hits=max_hits, engine=engine)
 
     async def close(self) -> None:
+        if self._shell is not None:
+            self._shell.close()
         if self.profile is not None:
             self.profile.save_from_client(self.client)
         await close_impersonated(self.client)

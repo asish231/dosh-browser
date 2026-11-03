@@ -213,6 +213,30 @@ def _pump_jobs(ctx: Context) -> int:
     return done
 
 
+# Per-context postMessage queue, keyed by id(ctx). A real browser's queue
+# belongs to the window, not to whichever script happened to run; the runtime
+# mirror survives across run_scripts passes. Entries are the SAME dicts that
+# run_scripts records in its info["post_messages"]; a pass removes the ones
+# it produced, so what remains is traffic from DIRECT evals (OTP fills,
+# history ops, probes) that used to vanish into a stale info dict.
+_CTX_POST_INBOX: dict[int, list[dict]] = {}
+# Monotonic postMessage ids, per context. Uid-based dedup in the routing
+# layers needs ids unique across ALL passes on a context, not per pass.
+_CTX_POST_UID: dict[int, int] = {}
+
+
+def take_pending_posts(ctx) -> list[dict]:
+    """Take the postMessages this context produced outside any run_scripts
+    pass. Callers own routing them; entries leave the queue exactly once."""
+    inbox = _CTX_POST_INBOX.get(id(ctx))
+    if not inbox:
+        return []
+    taken = inbox[:]
+    # Mutate in place: the host bridge closure holds this exact list.
+    inbox.clear()
+    return taken
+
+
 def _sync_resource_entries(ctx: Context, info: dict) -> None:
     """Push one performance resource-timing entry per subresource this pass
     actually fetched (scripts, in-page fetch/XHR, SW-served): real URLs and
@@ -246,8 +270,18 @@ async def run_scripts(
     ctx: Context | None = None,
     storage_seed: dict | None = None,
     history_length: int = 1,
+    frames: list | None = None,
+    frame_contexts: dict | None = None,
 ) -> tuple[str, dict]:
-    """Execute page scripts against mini-DOM. Returns (html, info)."""
+    """Execute page scripts against mini-DOM. Returns (html, info).
+    
+    Args:
+        frames: Optional list of FrameDocument objects whose content will be
+                injected into corresponding iframe elements.
+        frame_contexts: Live QuickJS contexts for already-loaded frames, keyed
+                by frame ref. A click_frame action runs in that frame's
+                document, the one that executed the frame's scripts.
+    """
     info: dict = {
         "ran": False,
         "scripts": 0,
@@ -255,6 +289,8 @@ async def run_scripts(
         "skipped_modules": 0,
         "errors": 0,
         "error_messages": [],
+        "console": [],
+        "dosh_emits": [],
         "engine": "quickjs",
         "post_messages": [],
         "resource_requests": [],
@@ -273,6 +309,8 @@ async def run_scripts(
         if storage_seed:
             try:
                 ctx.eval(f"globalThis.__WR_STORAGE_SEED = {json.dumps(storage_seed)}; true")
+                if isinstance(storage_seed.get("idb"), dict) and storage_seed["idb"]:
+                    ctx.eval(f"globalThis.__WR_IDB_SEED = {json.dumps(storage_seed['idb'])}; true")
             except Exception:
                 pass
         if history_length > 1:
@@ -281,10 +319,30 @@ async def run_scripts(
             except Exception:
                 pass
         ctx.eval(MINIDOM_JS)
-        ctx.add_callable("host_log", lambda *_a: None)
         ctx.add_callable("host_parse_html", _host_parse_html)
     else:
         reusing_ctx = True
+
+    def _host_log(msg: str = "", level: str = "log", *_extra) -> None:
+        if len(info["console"]) < 500:
+            info["console"].append(
+                {
+                    "level": str(level or "log"),
+                    "message": str(msg or "")[:4000],
+                    "url": url,
+                }
+            )
+
+    ctx.add_callable("host_log", _host_log)
+    # This context's host callable accepts the log LEVEL as a second
+    # argument. Raw contexts (tests, embedders) may register a 1-arg
+    # host_log; QuickJS raises a deferred SystemError on the extra
+    # argument that no JS try/catch can intercept, so the JS side must
+    # only pass the level when the host declared it can receive it.
+    try:
+        ctx.eval("globalThis.__WR_HOST_LOG_TAKES_LEVEL = true")
+    except Exception:
+        pass
 
     # WebSocket host bridge: own-transport RFC 6455 sockets in engine/ws.py.
     from webresearch.engine import ws as _ws
@@ -302,17 +360,45 @@ async def run_scripts(
     sw_records: list[dict] = []
     sw_revalidate_queue: list[str] = []
 
-    def host_post_message_handler(data, origin="*", target="parent", sender_origin="") -> None:
-        data_str = str(data)[:4000]
+    ctx_nonce_holder = {"v": ""}
+    # Per-context postMessage queue. A real browser's postMessage queue
+    # belongs to the WINDOW, not to whichever script happened to run; this
+    # engine's transport used to record posts into the info dict of whatever
+    # run_scripts call registered the bridge — so posts made during any
+    # DIRECT eval (OTP fills, history ops, probes) landed in a stale dict and
+    # vanished. The queue now lives on the context: run_scripts still sees it
+    # through its own info dict, and drain_pending_posts() hands the rest to
+    # the routing layers.
+    _this_inbox = _CTX_POST_INBOX.setdefault(id(ctx), [])
+
+    def host_post_message_handler(data, origin="*", target="parent", sender_origin="", ports_json="") -> None:
+        # Binary channel payloads (typed arrays) hex-encode inside the clone
+        # envelope. 16KB cut those envelopes in half and the far realm
+        # received a truncated string it could not decode.
+        data_str = str(data)[:262144]
         s_orig = str(sender_origin).strip() if sender_origin else _extract_origin(url)
-        info["post_messages"].append(
-            {
-                "data": data_str,
-                "origin": s_orig,
-                "target_origin": str(origin)[:500],
-                "target": str(target),
-            }
-        )
+        # Monotonic per-CONTEXT id (not per-call: restarts made entries from
+        # different passes collide, and uid-based dedup dropped live traffic).
+        _CTX_POST_UID[id(ctx)] = _CTX_POST_UID.get(id(ctx), 0) + 1
+        entry = {
+            "uid": _CTX_POST_UID[id(ctx)],
+            "data": data_str,
+            "origin": s_orig,
+            "target_origin": str(origin)[:500],
+            "target": str(target),
+            # Sender context nonce (one per QuickJS context). Cross-realm port
+            # transfers key off it: it identifies which realm owns an endpoint.
+            "ctx": ctx_nonce_holder["v"],
+        }
+        if ports_json:
+            try:
+                metas = json.loads(str(ports_json))
+                if isinstance(metas, list) and metas:
+                    entry["ports"] = metas
+            except Exception:
+                pass
+        _this_inbox.append(entry)
+        info["post_messages"].append(entry)
         if "cookie" in data_str and "datadome=" in data_str:
             try:
                 parsed = json.loads(data_str)
@@ -530,6 +616,83 @@ async def run_scripts(
                         headers.update(custom_hdrs)
                 except Exception:
                     pass
+            # Selective network rules (block / header / mock) configured by DOSH shell.
+            net_rules = getattr(client, "_dosh_network_rules", None) or []
+            req_method = (method or "GET").upper()
+            for rule in net_rules:
+                if not isinstance(rule, dict) or not rule.get("enabled", True):
+                    continue
+                pat = str(rule.get("pattern") or "")
+                rule_method = str(rule.get("method") or "*").upper()
+                if rule_method not in {"*", "ANY", req_method}:
+                    continue
+                if pat and pat not in abs_url and not re.search(pat, abs_url):
+                    continue
+                r_action = str(rule.get("action") or "").lower()
+                if r_action == "block":
+                    info["resource_requests"].append(
+                        {
+                            "url": abs_url[:2000],
+                            "status": 0,
+                            "content_type": "blocked-by-rule",
+                            "method": req_method,
+                            "request_headers": dict(headers),
+                            "response_headers": {},
+                            "request_body": body[:20000] if body else "",
+                            "body": "",
+                            "bytes": 0,
+                            "initiatorType": "fetch",
+                            "disposition": f"blocked:{rule.get('id', pat)}",
+                        }
+                    )
+                    return json.dumps(
+                        {
+                            "status": 0,
+                            "url": abs_url,
+                            "content_type": "",
+                            "body": "",
+                            "blocked_by_rule": rule.get("id", pat),
+                        }
+                    )
+                if r_action == "header":
+                    extra_h = rule.get("headers") or {}
+                    if isinstance(extra_h, dict):
+                        for hk, hv in extra_h.items():
+                            headers[str(hk)] = str(hv)
+                if r_action == "mock":
+                    m_status = int(rule.get("status", 200))
+                    m_ctype = str(rule.get("content_type") or "application/json")
+                    m_body = str(rule.get("body") or "")
+                    m_data = None
+                    if "json" in m_ctype.lower() or m_body.strip().startswith(("{", "[")):
+                        try:
+                            m_data = json.loads(m_body)
+                        except Exception:
+                            pass
+                    info["resource_requests"].append(
+                        {
+                            "url": abs_url[:2000],
+                            "status": m_status,
+                            "content_type": m_ctype[:200],
+                            "method": req_method,
+                            "request_headers": dict(headers),
+                            "response_headers": {"content-type": m_ctype, "x-dosh-mock": "1"},
+                            "request_body": body[:20000] if body else "",
+                            "data": m_data,
+                            "body": m_body[:50000],
+                            "bytes": len(m_body),
+                            "initiatorType": "fetch",
+                            "disposition": f"mocked:{rule.get('id', pat)}",
+                        }
+                    )
+                    return json.dumps(
+                        {
+                            "status": m_status,
+                            "url": abs_url,
+                            "content_type": m_ctype,
+                            "body": m_body[:800_000],
+                        }
+                    )
             # Service-worker fetch interception by declared strategy.
             sw_rec = sw_for_url(sw_records, abs_url) if (method or "GET").upper() == "GET" else None
             sw_tag = f"{sw_strategy(sw_rec)}:{sw_rec['url']}" if sw_rec is not None else ""
@@ -591,9 +754,15 @@ async def run_scripts(
                     "status": status,
                     "content_type": ctype[:200],
                     "method": method,
+                    "request_headers": dict(headers),
+                    "response_headers": dict(resp_headers),
+                    "request_body": body[:20000] if body else "",
+                    "response_body": text[:50000] if text else "",
                     "data": data_payload,
                     "body": body[:50000] if body else "",
-                    "bytes": len(body or ""),
+                    "bytes": len(raw_bytes) if raw_bytes else len(text or body or ""),
+                    "initiatorType": "fetch",
+                    "disposition": f"sw:{sw_tag}" if sw_tag else "network",
                     **({"sw": sw_tag} if sw_tag else {}),
                 }
             )
@@ -654,11 +823,24 @@ async def run_scripts(
             )
         except Exception:
             pass
+        # A reused context keeps its nonce: transferred port endpoints in
+        # flight must stay addressable across action passes.
+        try:
+            ctx_nonce_holder["v"] = str(ctx.eval("String(globalThis.__WR_CTX_KEY || '')") or "")
+        except Exception:
+            pass
     else:
         ua = client.headers.get("user-agent", "")
         ctx.eval(f"globalThis.__WR_UA = {json.dumps(ua)};")
         ctx.eval("globalThis.__WR_MODS = {};")
         ctx.eval(f"globalThis.__WR_DEVICE = {json.dumps(_device_block())};")
+        # One nonce per JavaScript context. Cross-realm MessagePort transfers
+        # address endpoints as "<nonce>:<localId>"; the port tables are
+        # realm-local, so the nonce qualifies them globally.
+        import uuid as _uuid
+        _nonce = _uuid.uuid4().hex
+        ctx_nonce_holder["v"] = _nonce
+        ctx.eval(f"globalThis.__WR_CTX_KEY = {json.dumps(_nonce)};")
         try:
             from webresearch.engine.csp import trusted_types_config
             _tt = trusted_types_config(
@@ -710,6 +892,30 @@ async def run_scripts(
                             info["blocked_csp_style"] += 1
         payload = json.dumps(tree, ensure_ascii=False)
         ctx.eval(f"__load({payload}, {json.dumps(url)})")
+    
+        # Inject frame content into iframe elements
+        if frames:
+            try:
+                for frame in frames:
+                    if hasattr(frame, 'ref') and hasattr(frame, 'html') and frame.html:
+                        # Escape the HTML for JS
+                        frame_html_escaped = json.dumps(frame.html)
+                        # Try to inject by ref attribute
+                        ctx.eval(f"""(function() {{
+                            var iframes = document.querySelectorAll('iframe');
+                            for (var i = 0; i < iframes.length; i++) {{
+                                var ref = iframes[i].getAttribute('data-ref') || iframes[i].getAttribute('ref') || iframes[i].name;
+                                if (ref === {json.dumps(frame.ref)}) {{
+                                    if (typeof iframes[i].__injectFrameContent === 'function') {{
+                                        iframes[i].__injectFrameContent({frame_html_escaped});
+                                    }}
+                                    break;
+                                }}
+                            }}
+                        }})()""")
+            except Exception as exc:
+                info["errors"] += 1
+                info["error_messages"].append(f"Frame injection failed: {exc}"[:200])
     
         scripts, _ = extract_scripts(html)
         classic: list[dict[str, str]] = []
@@ -779,7 +985,13 @@ async def run_scripts(
                             code = decision.surrogate
                         else:
                             continue
-                    if not code:
+                    # An external <script src> whose element body is only
+                    # whitespace (very common: the tag and </script> on
+                    # separate lines) must still be fetched. Testing the raw
+                    # string treated "\n      \n    " as inline code and
+                    # silently skipped the real bundle.
+                    if not code.strip():
+                        code = ""
                         if csp and not script_source_allowed(csp, external_url=abs_src, page_url=url):
                             info.setdefault("blocked_csp", 0)
                             info["blocked_csp"] += 1
@@ -953,6 +1165,13 @@ async def run_scripts(
             _drain_injected(ctx)
             if not left:
                 break
+        for _ in range(4):
+            try:
+                ctx.eval("__advanceTimerClock(100)")
+            except Exception:
+                break
+            _pump_jobs(ctx)
+            _drain_injected(ctx)
         # End-of-pass intersection evaluation. The engine evaluates IO entries
         # on scroll only, but mutations (lazy-feed appends) also move targets
         # in/out of the viewport between scrolls; real observers re-evaluate
@@ -995,14 +1214,70 @@ async def run_scripts(
             # origin check compare URL-vs-origin and silently drop every
             # parent-to-frame and reply message.
             m_target_origin = json.dumps(msg.get("target_origin") or "*")
+            # Fourth argument: the sender's Window identity. Nested widgets
+            # verify event.source against their own iframe contentWindow;
+            # without a hint the engine hands over an anonymous proxy and
+            # the handshake declines silently (recaptcha-setup died here).
+            m_source = msg.get("source_window")
+            m_source_json = json.dumps(m_source) if m_source is not None else "null"
+            # Fifth argument: transferred MessagePort metadata. The receiver
+            # materializes proxy ends and publishes their ids; the caller then
+            # rewires the sender's kept ends so both directions of the split
+            # channel can talk (reCAPTCHA answers its handshake via a port).
+            m_ports_json = json.dumps(msg.get("ports") or [])
+            m_target = str(msg.get("target") or "")
             try:
-                ctx.eval(
-                    f"if (typeof window !== 'undefined' && typeof window.__receiveMessage === 'function') window.__receiveMessage({m_data}, {m_origin}, {m_target_origin});"
-                )
+                if m_target.startswith("port:"):
+                    # Port-channel traffic: deliver straight into the owning
+                    # realm's port inbox, not the window lane. A port message
+                    # that went through __receiveMessage would fail every
+                    # listener's event.source identity check and handshake
+                    # channels would fall silent after one hop.
+                    _, _, m_local = m_target.rpartition(":")
+                    try:
+                        m_local_id = int(m_local)
+                    except ValueError:
+                        m_local_id = 0
+                    if m_local_id > 0:
+                        m_sender_nonce = json.dumps(str(msg.get("ctx") or ""))
+                        ctx.eval(
+                            f"if (typeof globalThis.__wrPortReceive === 'function') globalThis.__wrPortReceive({m_local_id}, {m_data}, {m_sender_nonce}, {m_ports_json});"
+                        )
+                else:
+                    ctx.eval(
+                        f"if (typeof window !== 'undefined' && typeof window.__receiveMessage === 'function') window.__receiveMessage({m_data}, {m_origin}, {m_target_origin}, {m_source_json}, {m_ports_json});"
+                    )
+                if msg.get("ports"):
+                    try:
+                        recv_ids = json.loads(ctx.eval("JSON.stringify(globalThis.__WR_LAST_PORTS || [])"))
+                        msg["recv_ports"] = recv_ids
+                    except Exception:
+                        pass
             except Exception as exc:
                 record_error(exc)
         _pump_jobs(ctx)
         _drain_injected(ctx)
+        # A delivered message's handler may schedule timers (widget reply
+        # chains, async init). The main pass drains timers before this block,
+        # so without a drain here those callbacks stay pending until some
+        # later pass — from the message receiver's perspective the sender
+        # never replied. Bounded like the main loop.
+        for _ in range(MAX_TIMER_PASSES):
+            try:
+                left = ctx.eval("__drainTimers()")
+            except Exception:
+                break
+            _pump_jobs(ctx)
+            _drain_injected(ctx)
+            if not left:
+                break
+        for _ in range(4):
+            try:
+                ctx.eval("__advanceTimerClock(100)")
+            except Exception:
+                break
+            _pump_jobs(ctx)
+            _drain_injected(ctx)
 
     # Apply agent interactions against the live (post-hydration) DOM.
     if actions:
@@ -1053,6 +1328,42 @@ async def run_scripts(
                         if isinstance(target, str)
                         else f"__clickPath({_json.dumps(target)}, {str(stealth).lower()})"
                     )
+                elif kind == "click_frame":
+                    # The fetched frame is its own realm. Clicking the parent
+                    # iframe's empty contentDocument never reaches the script
+                    # that loaded with the frame.
+                    frame_ref = (action or {}).get("frame_ref") or ""
+                    frame_path = (action or {}).get("frame_path") or []
+                    frame_selector = (action or {}).get("frame_selector") or ""
+                    fctx = (frame_contexts or {}).get(frame_ref)
+                    if fctx is not None:
+                        if frame_selector:
+                            ok = fctx.eval(
+                                f"__click({_json.dumps(frame_selector)})"
+                            )
+                        else:
+                            ok = fctx.eval(
+                                f"__clickPath({_json.dumps(frame_path)}, {str(stealth).lower()})"
+                            )
+                        # Jobs, then a short timer step. The anchor reports the click
+                        # from a 20ms timer. Firing every queued timer here also
+                        # runs the 5s abort and the checkbox leaves loading
+                        # before the parent has answered.
+                        _pump_jobs(fctx)
+                        try:
+                            # Several short ticks. The anchor's click report is a
+                            # chain of 20ms timers. One tick leaves the next 20ms
+                            # queued, so the parent never sees the click. Eight
+                            # ticks stay under the 5s abort.
+                            for _ in range(8):
+                                fctx.eval("__advanceTimerClock(100)")
+                                _pump_jobs(fctx)
+                        except Exception:
+                            pass
+                    else:
+                        ok = ctx.eval(
+                            f"__clickInFrame({_json.dumps(frame_ref)}, {_json.dumps(frame_path)}, {str(stealth).lower()})"
+                        )
                 elif kind == "submit":
                     ok = ctx.eval(f"__submitPath({_json.dumps(path)})")
                     info.setdefault("submit_outcome", str(ok))
@@ -1135,6 +1446,16 @@ async def run_scripts(
             _drain_injected(ctx)
             if not left:
                 break
+        # A short virtual tick so a widget's 20ms follow-up (the anchor
+        # reporting a click) still runs. The multi-second abort timers stay
+        # queued so they cannot clear the checkbox before a reply arrives.
+        for _ in range(4):
+            try:
+                ctx.eval("__advanceTimerClock(100)")
+            except Exception:
+                break
+            _pump_jobs(ctx)
+            _drain_injected(ctx)
         # Same end-of-pass intersection evaluation for action passes.
         try:
             ctx.eval("__notifyIntersections(); true")
@@ -1277,6 +1598,31 @@ async def run_scripts(
     info["ran"] = ran > 0
     info["scripts"] = ran
     info["ctx"] = ctx
+    # Drain console logs, dosh.emit telemetry, and IndexedDB databases.
+    try:
+        c_raw = ctx.eval("typeof __drainConsoleLogs === 'function' ? __drainConsoleLogs() : '[]'")
+        if c_raw:
+            c_items = json.loads(str(c_raw))
+            if isinstance(c_items, list) and c_items and not info.get("console"):
+                info["console"] = c_items
+    except Exception:
+        pass
+    try:
+        e_raw = ctx.eval("typeof __drainDoshEmits === 'function' ? __drainDoshEmits() : '[]'")
+        if e_raw:
+            e_items = json.loads(str(e_raw))
+            if isinstance(e_items, list) and e_items:
+                info["dosh_emits"] = e_items
+    except Exception:
+        pass
+    try:
+        idb_raw = ctx.eval("typeof __drainIndexedDB === 'function' ? __drainIndexedDB() : '{}'")
+        if idb_raw:
+            idb_parsed = json.loads(str(idb_raw))
+            if isinstance(idb_parsed, dict) and idb_parsed:
+                info["indexed_db"] = idb_parsed
+    except Exception:
+        pass
     # Drain web storage so the caller can persist it at session level; the
     # engine context dies on the next navigation, but the values must not.
     try:
@@ -1296,6 +1642,22 @@ async def run_scripts(
                 info["storage_changes"] = parsed
     except Exception:
         pass
+    # Hand off this pass's postMessages: they travel in info["post_messages"],
+    # so strike them from the context's durable queue. What remains is traffic
+    # from DIRECT evals, which take_pending_posts() hands to the routers.
+    try:
+        inbox = _CTX_POST_INBOX.get(id(ctx))
+        if inbox:
+            produced_ids = {id(m) for m in info["post_messages"]}
+            inbox[:] = [m for m in inbox if id(m) not in produced_ids]
+    except Exception:
+        pass
+    observer = getattr(client, "_dosh_runtime_observer", None)
+    if observer is not None:
+        try:
+            observer(info, url)
+        except Exception as exc:
+            info["observer_error"] = type(exc).__name__
     return out, info
 
 

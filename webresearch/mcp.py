@@ -298,6 +298,19 @@ TOOLS = [
         },
     },
     {
+        "name": "browser_solve_recaptcha",
+        "description": "Solve the current page's reCAPTCHA v2 challenge through the challenge protocol "
+        "(anchor -> reload -> payload -> userverify) with vision tile classification. Returns whether a "
+        "g-recaptcha-response token was obtained (never the token itself). Server-side acceptance is the "
+        "site's decision.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_rounds": {"type": "integer", "default": 8, "description": "Challenge rounds to attempt"},
+            },
+        },
+    },
+    {
         "name": "browser_add_captcha_token",
         "description": "Add a captcha token to session cookies for retrying blocked requests.",
         "inputSchema": {
@@ -344,6 +357,13 @@ TOOLS = [
         },
     },
 ]
+
+from copy import deepcopy
+
+from webresearch.tools import SHELL_TOOL
+
+TOOLS.append({"name": SHELL_TOOL["name"], "description": SHELL_TOOL["description"],
+              "inputSchema": deepcopy(SHELL_TOOL["parameters"])})
 
 # session_id uniformity: the server hosts one shared session, so the
 # parameter is accepted EVERYWHERE (an agent passing "default" to any tool
@@ -412,6 +432,13 @@ class McpServer:
 
     async def handle_call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         session = await self._get_session()
+
+        if name == "browser_shell":
+            result = await session.shell.execute(args["command"], args.get("arguments"))
+            formatted = self._format_result(json.dumps(result, ensure_ascii=False))
+            if not result["ok"]:
+                formatted["isError"] = True
+            return formatted
 
         if name == "browser_search":
             query = args.get("query", "")
@@ -617,6 +644,26 @@ class McpServer:
             if session.captcha_inspection is None:
                 return self._format_result("No captcha detected on current page.")
             return self._format_result(session.captcha_inspection.report.view)
+
+        elif name == "browser_solve_recaptcha":
+            max_rounds = int(args.get("max_rounds", 8))
+            try:
+                token = await session.solve_recaptcha_v2(max_rounds=max_rounds)
+                return self._format_result(
+                    f"RECAPTCHA SOLVED: g-recaptcha-response obtained ({len(token)} chars). "
+                    "The token is staged on the session's captcha report; submit the form "
+                    "to see whether the site accepts it. "
+                    f"Current page: {session.url}"
+                )
+            except ValueError as exc:
+                return self._format_result(f"browser_solve_recaptcha failed: {exc}")
+
+        elif name == "browser_click_captcha":
+            try:
+                page = await session.click_captcha_checkbox(max_chars=int(args.get("max_chars", 8000)))
+                return self._format_result(page.view)
+            except ValueError as exc:
+                return self._format_result(f"browser_click_captcha failed: {exc}")
 
         elif name == "browser_add_captcha_token":
             token = args.get("token", "")

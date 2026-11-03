@@ -32,6 +32,16 @@ architecture — the opposite of this one. Do not follow it.
 The engine exists to be small, inspectable, and free of a 150MB browser
 dependency. A single `import playwright` undoes the point of the project.
 
+## No shortcuts, no "too hard"
+
+There is no token budget and no time budget. Build anything from scratch when
+the task requires it — new subsystems, new algorithms, new files are expected
+work, not a last resort. Never assume a task is too hard, never look for the
+easy way around, and never substitute an approximation for the real
+implementation. The hard path is the job: invent it, implement it natively, test
+it hermetically from real captured markup. Stating a limitation honestly is
+acceptable; faking around it is not.
+
 ## Research, reference code, and native compilation
 
 This is research toward an LLM-native browser. External browser source may be
@@ -134,13 +144,125 @@ Be honest about these rather than working around them silently.
 | Inline `onclick=` attributes | Wired: constructor compiles `on*` attributes into listeners (minidom.js Element). |
 | Canvas / iframe pixels | Never reach the agent. Both are decomposed at parse time (`parse.py`). |
 | Trusted CDP input | Does not exist and must not be added. |
-| Cross-origin frame messaging | Frames are fetched as separate documents; there is no real `postMessage` handshake between them. |
+| Cross-origin frame messaging | Frames are fetched as separate documents; `postMessage` traffic is routed between live frame contexts and the parent (`engine/frames.py`): window messages and split MessagePort channels both directions, with a per-frame delivery cursor, port proxy materialization, and sender-identity resolution (`event.source` matches the parent's own iframe `contentWindow`). A posted STRING over a port/window lane arrives as that exact string (structured-clone contract; only the `\u0001wrsc` prefix decodes). A loaded frame fires `load` on its iframe element in the owning realm. Disclosed: obfuscated widget channel keys derived inside their own VM (e.g. reCAPTCHA's botguard-keyed anchor channel) can still decline in-VM; the reCAPTCHA v2 challenge is solved through the documented HTTP protocol lane instead. |
+| reCAPTCHA v2 challenge solving | Native protocol solver (`engine/captcha.py`, `session.solve_recaptcha_v2`, MCP `browser_solve_recaptcha`): anchor → `api2/reload` (protobuf body, reason=fi) → `payload` (grid image) → per-tile crop classification by an ensemble majority of vision models → `replaceimage` for dynamic tiles → `userverify`; an embedded rresp means rejected and the loop replays with the next challenge until a passing token is issued. Verified end-to-end against a live widget: token accepted by the site's server (the AKTU ERP login redirected to the student portal). Token is never echoed, only its presence and length; site-side acceptance is the site's decision, reported honestly. |
 | Fingerprint parity | TLS JA3/JA4 matches Chrome 124 via `curl_cffi` (both page fetch and subresource `host_fetch` lanes); Sec-Fetch-* headers computed from origin relationship; Sec-CH-UA client hints; enriched `navigator.*` device block (hardwareConcurrency, deviceMemory, screen, timezone, platform); inter-submit delay in login flows mimics human timing. |
 | Injected script execution | Scripts added to the DOM at runtime via `appendChild`/`prepend` (SPA chunk injection) are detected and executed: `src` scripts are fetched and evaled, inline scripts evaled directly, ESM auto-detected for both; `DocumentFragment` children flatten per spec. (Was dead until the 2026-10-27 re-audit: the detector compared `nodeName === "SCRIPT"` against lowercase engine names.) Failures are surfaced as JS console errors. |
 | ESM module translator | Real production bundles parse: regex-after-keyword detection (`return/^\d:/` no longer swallows 681 chars), line-comment cap bounds URL-string desyncs, default-only imports (`import X from "..."`) rewrite, `import.meta` replaced in real code and template interpolations via a template-aware string mask, and QuickJS Annex-B regex compatibility (`\-` → `\x2d`, `\;` `\,` dropped — `\\` preserved) for u-flagged classes. Verified against LinkedIn's 66-module graph: 0 parse failures (was 5). |
 | Login submit fallback | When a page's submit control is inert in the engine (form-less React SPAs), `browser_login(submit_url=..., username_field=..., password_field=...)` POSTs credentials directly with page cookies + CSRF. Honest verdicts either way. |
 
 Say "this needs a real browser" plainly when it is true. Do not paper over it.
+
+## Current implementation status
+
+### Completed & wired (uncommitted as of this audit)
+
+| Component | Location | Tests | Status |
+|---|---|---|---|
+| DoshShell (terminal command surface) | `webresearch/shell.py` | `tests/test_shell.py` (738 lines, 111 dedicated passes) | ✅ Implemented, HTTP/MCP/CLI entry points connected |
+| NetworkLedger + causal attachment | `telemetry.py`, session hooks | `tests/test_telemetry.py` (472 lines) | ✅ Implemented, observes every `resource_request` from pass |
+| 5-stratum occlusion inspector (`__inspectLayers`) | `minidom.js:8936` | See `test_engine_apis.py` | ✅ Implemented, wired to `browser_layers` |
+| Console log capture (per-realm) | `runtime.py:292,327` | In shell tests | ✅ Implemented, available via `browser_console` |
+| Frame/postMessage data pipeline | `engine/frames.py`, `runtime.py` | In frame tests | ✅ Live traffic recorded & filtered by to/sender |
+| Bounded control-realm `eval` | `shell.py:run_script` | In shell tests | ✅ Run JS with action/reading projection, strict limits |
+| Skills registry | `shell.py:ShellStore` + SQLite | In shell tests | ✅ Save/run/delete skills with SHA-256 pinning |
+| Snapshot & diff | `shell.py:snapshot/diff` | In shell tests | ✅ Evidence snapshot of controls, not VM checkpoint |
+| `open`, `actions`, `act`, `net.*`, `console`, `skill.*`, `db`, `storage`, `layers`, `frames`, `tabs` | `shell.py` | All commands tested | ✅ 22 commands fully connected |
+| Binary WebSockets (count & skip) | `engine/ws.py` | Disclosed | ❌ Implementation exists, flagged as unimplemented |
+| WASM interpreter | `engine/wasm.py` | ❌ Not yet built | ❌ Unimplemented |
+| Unified SQL DB (history+cookies+storage+ledger) | ❌ | | ❌ Unimplemented |
+| Element identity tracker | `engine/identity.py` | ❌ | ❌ Unimplemented |
+| Causal trace stream (action→Δ→net→console) | `telemetry.py` + `shell.py` | ❌ | ❌ Wired but needs full pass integration |
+| Mutation subscription stream | `engine/delta.py` | ❌ | ❌ Unimplemented |
+| Capability manifest per page | ❌ | | ❌ Unimplemented |
+| rAF frame clock | `minidom.js` (shim) | | ⚠️ Exists as `setTimeout` shim |
+| CSS transitions & keyframes | ❌ | | ❌ Unimplemented |
+| Sticky/flex-wrap/floats | ⚠️ | | ⚠️ Pending |
+
+### Not yet invented / explicitly out of scope
+- **OS shell** — never build one; this is a browser terminal, not a POSIX shell.
+- **Full WASM engine** — only for opcodes required by real challenge modules.
+- **Workers as threads** — single-threaded emulation is the intended substrate.
+- **bfcache** — serviced via documented rebuild, not live heap.
+
+---
+
+## Required Inventions Roadmap
+
+### Legend
+- **Status**: `UNAVENGED` (not implemented), `WIRE` (built but not connected), `BUILD` (partial but needs hard work)
+- **Priority**: `P0` (foundational), `P1` (major capability), `P2` (important), `P3` (polish)
+
+### Layer 0 — Transport & Network
+| Invention | Current State | Status |
+|---|---|---|
+| Fingerprint parity (JA3/JA4, Sec-Fetch, CH-UA, navigator block) | `fetch.py` implementation | ✅ HAVE |
+| Causally-linked network ledger (action→pass→request) | `telemetry.py` ready, causal link missing | `WIRE` + invent `caused_by` |
+| Request rule engine (mock/block/redirect) | Consumed at `runtime.py:611` | `WIRE` |
+| Cookie/site-data partitioning model (third-party isolation) | Not implemented | `INVENT` |
+
+### Layer 1 — Document & Runtime
+| Invention | Current State | Status |
+|---|---|---|
+| HTML→DOM with script ordering, mutated-document truth | `minidom.js` | ✅ HAVE |
+| ESM module graph translator (66-module LinkedIn graph verified) | `engine/modules.py` | ✅ HAVE |
+| Runtime-injected script execution | `runtime.py` | ✅ HAVE |
+| **Scoped WASM interpreter** (opcode subset real challenge modules use + hermetic tests) | Not built | `INVENT` — biggest engine hole |
+| WebSocket binary frames | Counted & skipped | `INVENT` (currently counted & skipped) |
+| Worker substrate decision: real threads vs honest single-thread emulation with real message queues | Inert constructors | `DECIDE + INVENT` |
+| Service worker real execution (SW JS runs, navigation intercepted) | Python simulation | `INVENT` or keep simulation with disclosure |
+| **Element identity tracker** — stable refs surviving re-renders | Not implemented | `INVENT` |
+
+### Layer 2 — Layout, Geometry, Text
+| Invention | Current State | Status |
+|---|---|---|
+| Block-flow + flex + grid + per-element overflow scrolling | `minidom.js` | ✅ HAVE |
+| Sticky → flex-wrap distribution → floats → bidi | Layout engine | `INVENT`, in that order |
+| Text metrics upgrade (real advance tables, shaping-lite) | Approximate | `PARTIAL → INVENT` |
+| Caret + selection model (editors, selection DnD) | Plain text only | `INVENT` |
+| Real rAF frame clock (today: `setTimeout(fn,16)` shim) | `minidom.js` | `INVENT` |
+| CSS transitions/keyframes timing engine | None | `INVENT` |
+| **Occlusion-gated clicks** — inspector exists, clicks bypass collision (`OPEN_ISSUES.md:245`) | `__inspectLayers` built, clicks unapproved | `WIRE + INVENT gate` |
+| Canvas/media structural decomposition (never pixel raster) | None | `PARTIAL → INVENT` |
+
+### Layer 3 — Session & State
+| Invention | Current State | Status |
+|---|---|---|
+| Multi-tab history, live same-doc traversal, stored documents | `session.py` | ✅ HAVE |
+| Dialogs, uploads, downloads, named keys, WS text | `shell.py` commands | ✅ HAVE |
+| IndexedDB store + per-pass drain | `runtime.py` | `HAVE/PARTIAL` |
+| localStorage/sessionStorage + cross-tab storage events | `runtime.py` | ✅ HAVE |
+| **Unified SQL state DB** (history+cookies+storage+ledger) with snapshots/diffs/rollbacks | Not implemented | `INVENT` (sqlite3) |
+| **Deterministic replay engine** (ledger + snapshots + seeds) | Not implemented | `INVENT` |
+| bfcache parity | Documented rebuild, no live heap | `HAVE-as-disclosed` |
+
+### Layer 4 — Adversarial Robustness
+| Invention | Current State | Status |
+|---|---|---|
+| Tracker graph + surrogates + hash-pinned remote lists | `engine/trackers.py` | ✅ HAVE |
+| Challenge solvers (captcha family, DataDome, CT, OTP) | `engine/captcha.py`, `session.solve_*` | ✅ HAVE, keep upgrading |
+| Bot-guard handshake (postMessage port lane) | Uncommitted work | `IN PROGRESS` — `tmp_scripts/` |
+| Honeypot/decoy detection | `__inspectLayers` | `BUILT, WIRE` |
+| Human timing model, generalized beyond login | `runtime.py` mimics delays | `HAVE → EXTEND` |
+
+### Layer 5 — Agent-Native Projections *(the differentiator — nobody else can build these)*
+| Invention | Current State | Status |
+|---|---|---|
+| Reading projection (layout-aware) | `content.py` | ✅ HAVE, upgrade |
+| Action surface: complete inventory, labels, honest coverage | `shell.py` inventory | ✅ HAVE, upgrade w/ identity refs |
+| Per-realm console tool (parent + every frame) | `runtime.py:console`, `shell.console` | `CAPTURED, WIRE` |
+| **Multi-realm eval** (run JS in a chosen frame's context) | Not implemented | `INVENT` |
+| Frame/postMessage debugger projection (lanes, addressing, bodies) | `frames.py`, `runtime.py` | `DATA FLOWS, WIRE` |
+| **Causal trace**: action → DOM delta → network → console | Partial data | `INVENT` — flagship |
+| **Mutation subscription stream** (deltas instead of re-reads) | Not implemented | `INVENT` |
+| Capability manifest per page ("unavailable — and why", formalized) | `OPEN_ISSUES.md` | `PARTIAL → INVENT` |
+| **Skills registry** (persistent site procedures across sessions) | Partial: `shell.skill_*` | `INVENT` |
+| DoshShell terminal as thin projection over all of the above | `shell.py` | `INVENT` (last, thinnest) |
+
+### Layer 6 — Interfaces
+MCP server, CLI, HTTP API: `tools.py`, `dispatch.py`, `mcp.py`, `cli.py` - **HAVE**. Keep tool contract stable across upgrades.
+
+---
 
 ## Engineering rules learned the hard way
 

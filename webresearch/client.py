@@ -75,3 +75,13 @@ class Client:
         r = await self._http.post("/v1/invoke", json={"name": name, "arguments": arguments})
         r.raise_for_status()
         return r.json()
+
+
+    async def click_captcha_tile(self, session_id: str, tile_index: int) -> dict:
+        return await self.invoke("browser_click_captcha_tile", session_id=session_id, tile_index=tile_index)
+
+    async def click_captcha_tiles(self, session_id: str, tile_indices: list[int]) -> dict:
+        return await self.invoke("browser_click_captcha_tiles", session_id=session_id, tile_indices=tile_indices)
+
+    async def click_captcha_verify(self, session_id: str) -> dict:
+        return await self.invoke("browser_click_captcha_verify", session_id=session_id)

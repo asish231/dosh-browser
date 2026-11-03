@@ -331,10 +331,70 @@ def test_domexception():
     assert data["code"] == 18
 
 
+def test_clear_timeout_cancels_later_timer():
+    ctx = _ctx()
+    raw = ctx.eval(
+        "(function(){"
+        "var hit = {early:0, late:0, kept:0, cancelled:0};"
+        "var late = setTimeout(function(){ hit.late += 1; }, 20);"
+        "setTimeout(function(){ hit.kept += 1; }, 20);"
+        "setTimeout(function(){ hit.early += 1; clearTimeout(late); }, 0);"
+        "var stray = setTimeout(function(){ hit.cancelled += 1; }, 5);"
+        "clearTimeout(stray);"
+        "__drainTimers();"
+        "var mid = {early:hit.early, late:hit.late, kept:hit.kept, cancelled:hit.cancelled};"
+        "__advanceTimerClock(20);"
+        "mid.afterLate = hit.late;"
+        "mid.afterKept = hit.kept;"
+        "return JSON.stringify(mid);"
+        "})()"
+    )
+    data = json.loads(str(raw))
+    assert data["early"] == 1
+    assert data["late"] == 0
+    assert data["kept"] == 0
+    assert data["cancelled"] == 0
+    assert data["afterLate"] == 0
+    assert data["afterKept"] == 1
+
+
+def test_short_timer_runs_before_abort_timer():
+    """A 20ms click-report timer runs on a short tick. A 5s abort does not."""
+    ctx = _ctx()
+    raw = ctx.eval(
+        "(function(){"
+        "var hit = {soon:0, late:0};"
+        "setTimeout(function(){ hit.soon += 1; }, 20);"
+        "setTimeout(function(){ hit.late += 1; }, 5000);"
+        "__advanceTimerClock(100);"
+        "return JSON.stringify(hit);"
+        "})()"
+    )
+    assert json.loads(str(raw)) == {"soon": 1, "late": 0}
+
+
 def test_structured_clone():
     ctx = _ctx()
     r = ctx.eval("JSON.stringify(structuredClone({a: [1, 2], b: {c: 3}}))")
     assert json.loads(str(r)) == {"a": [1, 2], "b": {"c": 3}}
+    raw = ctx.eval(
+        "(function(){"
+        "var u = new Uint8Array([1, 2, 250, 0, 255]);"
+        "var c = structuredClone(u);"
+        "var b = structuredClone(u.buffer);"
+        "return JSON.stringify({"
+        "u8: c instanceof Uint8Array && c.buffer !== u.buffer,"
+        "bytes: Array.prototype.slice.call(c),"
+        "ab: b instanceof ArrayBuffer,"
+        "abBytes: Array.prototype.slice.call(new Uint8Array(b))"
+        "});"
+        "})()"
+    )
+    cloned = json.loads(str(raw))
+    assert cloned["u8"] is True
+    assert cloned["bytes"] == [1, 2, 250, 0, 255]
+    assert cloned["ab"] is True
+    assert cloned["abBytes"] == [1, 2, 250, 0, 255]
 
 
 def test_suppressederror_weakref_finalizationregistry():
@@ -504,3 +564,25 @@ def test_csp_nonce_authorizes_inline():
     assert script_source_allowed(csp, inline_code="x()", nonce="abc123") is True
     assert script_source_allowed(csp, inline_code="x()", nonce="other") is False
     assert script_source_allowed(csp, external_url="https://static.licdn.com/x.js") is True
+
+
+def test_window_origin_and_document_base_uri():
+    """reCAPTCHA reads window.origin and document.baseURI when binding the
+    anchor channel. Both have to match the loaded document URL."""
+    ctx = _ctx()
+    raw = ctx.eval("""
+    __load({t:"document", c:[]}, "https://erp.aktu.ac.in/login.aspx");
+    JSON.stringify({
+      origin: window.origin,
+      loc: location.origin,
+      base: document.baseURI,
+      domain: document.domain,
+      host: location.hostname
+    })
+    """)
+    got = json.loads(str(raw))
+    assert got["origin"] == "https://erp.aktu.ac.in"
+    assert got["origin"] == got["loc"]
+    assert got["base"] == "https://erp.aktu.ac.in/login.aspx"
+    assert got["domain"] == "erp.aktu.ac.in"
+    assert got["host"] == got["domain"]
