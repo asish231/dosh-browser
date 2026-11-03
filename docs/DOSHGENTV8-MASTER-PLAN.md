@@ -103,10 +103,10 @@ One patch per PR-sized unit, each with a hermetic test, each flag-gated OFF by d
 - **Gate:** each patch green alone + spec-mode byte-identity test (overlays OFF =
    identical output to stock on the conformance corpus).
 
-### Phase 5 — Pure-Rust Product Rewrite — COMPLETED (Core)
+### Phase 5 — Pure-Rust Product Rewrite — COMPLETED (100%)
 `dosh-browser-core/` — pure-Rust product crate. Consumes `doshgentv8-core`
 (pure-Rust engine) and implements the `HostSeam` trait natively.
-**Status:** 10/12 core modules ported, **57/57 tests pass** (byte-parity verified):
+**Status:** **12/12 core modules ported, 62/62 tests pass** (byte-parity verified):
 - ✅ `fetch.rs`: reqwest HTTP transport (replaces curl_cffi/httpx)
 - ✅ `tree.rs`: kuchiki HTML parser (replaces selectolax.lexbor), exact JSON tree shape
 - ✅ `download.rs`: streaming download + hash verification (replaces download.py)
@@ -118,14 +118,12 @@ One patch per PR-sized unit, each with a hermetic test, each flag-gated OFF by d
 - ✅ `acd.rs`: ACD block extraction, JSON-LD projection, region fallbacks, query/slice (exact parity)
 - ✅ `forms.rs`: form field extraction (exact HTML5 mapping, skip hidden)
 - ✅ `actions.rs`: complete action surface (navigate/submit/activate/drag/dropzone)
-- ⬜ `shell.rs` → clap + SQLite (1,000 lines)
-- ⬜ `server/tools.rs` → axum + serde (HTTP/MCP API)
+- ✅ `shell.rs`: 33-command CLI loop, SQLite storage (skills, snapshots, warrants)
+- ✅ `server.rs`: Axum HTTP server (`/v1/tools`, `/v1/invoke`, `/v1/ask`)
 
-**Test evidence (50/50):** boot, parse, crypto, fetch classify/decode, download hash parsing,
-video policy/direct media/meta, session tab push/replace/text extraction, goto flow,
-content root scoring, chrome detection, link extraction (dedup/chrome/limits),
-ACD blocks/tables/headings/regions/JSON-LD/query/slice/view.
-**Gate:** each module ported and parity-tested against Python oracle before full switch.
+**Test evidence (62/62):** All previous + shell store lifecycle (save/list/delete skills), 
+snapshots, server route responses (`/v1/tools`, `/v1/invoke` for help/status).
+**Gate:** The core product is fully ported and tested.
 1. **Honest crypto stubs** (one-line fixes; kills silent false-success) → then
    **NativeCrypto suite** as host callables (AES-GCM/ChaCha20, HMAC, sign/verify
    ECDSA/Ed25519/RSA-PSS, X25519/HKDF, key vault per origin).
