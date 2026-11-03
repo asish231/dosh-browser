@@ -19,6 +19,8 @@ mod links;
 mod acd;
 pub mod forms;
 pub mod actions;
+pub mod shell;
+pub mod server;
 
 use doshgentv8_core::{DoshEngine, HostSeam};
 use sha2::{Digest, Sha256, Sha384, Sha512};

@@ -45,8 +45,7 @@ pub struct CaptchaInspection {
     pub challenge_frame: String,
 }
 
-/// A tab with its own history and DOM state.
-#[derive(Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Tab {
     pub id: String,
     pub history: Vec<Page>,
@@ -56,15 +55,10 @@ pub struct Tab {
     pub headers: HashMap<String, String>,
     pub frame_documents: Vec<FrameDocument>,
     pub captcha_inspection: Option<CaptchaInspection>,
-    /// Monotonic document identity (increments on new doc, inherited on pushState)
     pub doc_seq: u64,
-    /// sessionStorage per origin
     pub session_storage: HashMap<String, HashMap<String, String>>,
-    /// Snapshots for back()/forward() restores
     pub snapshots: Vec<serde_json::Value>,
-    /// Pending scroll position after history restore
     pub pending_scroll_y: i64,
-    /// Pending popstate fire
     pub pending_popstate: bool,
 }
 
