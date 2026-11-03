@@ -1320,9 +1320,10 @@ async def run_scripts(
                 if kind == "type":
                     text = (action or {}).get("text") or ""
                     delays = generate_human_typing_delays(text) if stealth else False
+                    nth = int((action or {}).get("occurrence", 1) or 1)
                     if selector:
                         ok = ctx.eval(
-                            f"__activateSelector({_json.dumps(selector)}, {_json.dumps(text)}, {_json.dumps(delays)}, {str(stealth).lower()})"
+                            f"__activateSelector({_json.dumps(selector)}, {_json.dumps(text)}, {_json.dumps(delays)}, {str(stealth).lower()}, {nth})"
                         )
                     else:
                         ok = ctx.eval(
@@ -1332,17 +1333,19 @@ async def run_scripts(
                     dx = (action or {}).get("dx", 220.0)
                     dy = (action or {}).get("dy", 0.0)
                     steps = int((action or {}).get("steps", 16 if stealth else 3))
+                    nth = int((action or {}).get("occurrence", 1) or 1)
                     trajectory = generate_human_drag_steps(float(dx), float(dy)) if stealth else None
                     target = selector or path
                     ok = ctx.eval(
-                        f"__dragSelector({_json.dumps(target)}, {dx}, {dy}, {steps}, {_json.dumps(trajectory)}, {str(stealth).lower()})"
+                        f"__dragSelector({_json.dumps(target)}, {dx}, {dy}, {steps}, {_json.dumps(trajectory)}, {str(stealth).lower()}, {nth})"
                         if isinstance(target, str)
                         else f"__dragPath({_json.dumps(target)}, {dx}, {dy}, {steps}, {_json.dumps(trajectory)}, {str(stealth).lower()})"
                     )
                 elif kind == "activate":
                     target = selector or path
+                    nth = int((action or {}).get("occurrence", 1) or 1)
                     ok = ctx.eval(
-                        f"__activateSelector({_json.dumps(target)}, null, false, {str(stealth).lower()})"
+                        f"__activateSelector({_json.dumps(target)}, null, false, {str(stealth).lower()}, {nth})"
                         if isinstance(target, str)
                         else f"__clickPath({_json.dumps(target)}, {str(stealth).lower()})"
                     )

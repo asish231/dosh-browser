@@ -123,6 +123,18 @@ class Action:
     hidden: bool = False
     frame: str = ""  # set when the control lives inside an iframe document
     notes: str = ""
+    # Privilege class for agent awareness and future gating (audit upgrade #5):
+    # "read" observes (navigation GETs another page), "mutate" drives page
+    # state, "privileged" handles credentials (password fields, credential
+    # submits). Labels only today — no action is blocked on this class yet;
+    # gating waits for the bridge design.
+    effect: str = "mutate"
+    # Document-order occurrence among identical siblings (audit upgrade #1):
+    # 1 for a unique control or the first sibling; 2, 3… for later siblings
+    # that share one content identity. The engine dispatch honors it so a
+    # suffixed ref (~2) reaches the second sibling, not the first match of
+    # the shared selector.
+    occurrence: int = 1
 
     @property
     def callable_without_engine(self) -> bool:
@@ -424,6 +436,15 @@ def _content_identity(node: Node, index: int) -> str:
     return identity
 
 
+def _effect_of(kind: str, role: str) -> str:
+    """Privilege class per the upgrade audit: read / mutate / privileged."""
+    if role == "password":
+        return "privileged"
+    if kind == "navigate":
+        return "read"
+    return "mutate"
+
+
 def _stable_ref(doc_url: str, node: Node, index: int) -> str:
     """Content-addressed ref: stable across reorderings of unrelated elements.
 
@@ -657,12 +678,14 @@ def collect(html: str, url: str, *, max_actions: int = 200) -> ActionSurface:
         elif tag in EMBED_TAGS:
             notes = "content is a separate document; read its source"
 
+        role = _role_of(node, kind)
         ordered.append(
             Action(
                 ref=_stable_ref(url, node, index),
                 stable=_stable_id(node, index),
                 kind=kind,
-                role=_role_of(node, kind),
+                role=role,
+                effect=_effect_of(kind, role),
                 label=label,
                 target=target,
                 field_name=(
@@ -676,6 +699,25 @@ def collect(html: str, url: str, *, max_actions: int = 200) -> ActionSurface:
                 notes=notes,
             )
         )
+
+    # Identical siblings (no id/name/value/aria-label/text to tell them
+    # apart) share one content identity and therefore one ref; first-match
+    # wins in act() made every sibling after the first unreachable — a
+    # phantom-control bug (audit upgrade #1, reproduced live: two identical
+    # buttons shared a16f85141). Disambiguate by document-order occurrence:
+    # the first keeps the bare ref (backward compatible), later siblings get
+    # ~2, ~3… on BOTH ref and stable, so every control is individually
+    # addressable and the suffix is deterministic for the same document
+    # regardless of URL (it survives the URL churn stable ids exist for).
+    seen: dict[str, int] = {}
+    for action in ordered:
+        base = action.ref
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        action.occurrence = n
+        if n > 1:
+            action.ref = f"{base}~{n}"
+            action.stable = f"{action.stable}~{n}"
 
     surface.engine_only = sum(
         1 for a in ordered if not a.callable_without_engine

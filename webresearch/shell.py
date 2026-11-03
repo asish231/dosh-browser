@@ -38,6 +38,7 @@ COMMANDS = {
     "skill.list": "List saved skills without executing them.",
     "skill.run": "Run name on an allowed origin; mutations require allow_actions=true again.",
     "skill.delete": "Delete a saved skill by name.",
+    "skill.update": "Extend or set a skill's warrant expiry: name, expires_in seconds (0 = permanent).",
     "db": "Read-only SQL over skills and snapshots: sql, params, limit.",
     "storage": "Inspect page storage metadata (values=false by default).",
     "snapshot": "Save a redacted document/control evidence snapshot; not a VM checkpoint.",
@@ -50,7 +51,7 @@ COMMANDS = {
     "history": "List history entries, or traverse with move (delta) or goto (absolute index).",
     "cookies": "Inspect session cookie names, domains, paths; values are never echoed.",
     "wait": "Wait for url substring, action ref, page text, or network idle: timeout-bounded.",
-    "caps": "Per-page capability manifest: live counts plus known engine gaps, honestly.",
+    "caps": "Per-page capability manifest: live counts plus known engine gaps; export=path writes it to disk.",
     "screenshot": "Save the engine's approximate SVG layout diagram: dest_dir, frame.",
     "frame.eval": "Run a bounded probe expression in the live page/frame realm: frame, expr.",
     "ref": "Re-resolve a stable id (from an action's stable field) to the current page's ref.",
@@ -94,15 +95,27 @@ class ShellStore:
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS skills (
                 name TEXT PRIMARY KEY, source TEXT NOT NULL, sha256 TEXT NOT NULL,
-                origins TEXT NOT NULL, allow_actions INTEGER NOT NULL, version INTEGER NOT NULL
+                origins TEXT NOT NULL, allow_actions INTEGER NOT NULL, version INTEGER NOT NULL,
+                warrant_expires REAL
             );
             CREATE TABLE IF NOT EXISTS snapshots (
                 id INTEGER PRIMARY KEY, created REAL NOT NULL, tab_id TEXT NOT NULL,
                 url TEXT NOT NULL, evidence TEXT NOT NULL
             );
         """)
+        # Warrant TTL migration (upgrade audit #2): persistent workspaces
+        # created before the column need it added; CREATE TABLE IF NOT
+        # EXISTS does not touch existing tables, so ALTER explicitly.
+        try:
+            self.conn.execute("ALTER TABLE skills ADD COLUMN warrant_expires REAL")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
-    def save_skill(self, name: str, source: str, origins: list[str], allow_actions: bool) -> dict:
+    def save_skill(
+        self, name: str, source: str, origins: list[str], allow_actions: bool,
+        expires_in: float | None = None,
+    ) -> dict:
         if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}", name):
             raise ValueError("skill name must be 1-64 letters, digits, dots, underscores or hyphens")
         if not isinstance(source, str) or not source or len(source.encode()) > 65536:
@@ -111,13 +124,47 @@ class ShellStore:
             raise ValueError("allow_actions must be boolean")
         if not isinstance(origins, list) or not origins or not all(isinstance(o, str) and _origin(o) == o for o in origins):
             raise ValueError("origins must be explicit HTTP(S) origins without paths or wildcards")
+        warrant_expires = self._warrant_expiry(expires_in)
         digest = hashlib.sha256(source.encode()).hexdigest()
         with self.conn:
             self.conn.execute("""
-                INSERT INTO skills VALUES (?, ?, ?, ?, ?, 1)
+                INSERT INTO skills (name, source, sha256, origins, allow_actions, version, warrant_expires)
+                VALUES (?, ?, ?, ?, ?, 1, ?)
                 ON CONFLICT(name) DO UPDATE SET source=excluded.source, sha256=excluded.sha256,
-                origins=excluded.origins, allow_actions=excluded.allow_actions, version=skills.version+1
-            """, (name, source, digest, json.dumps(origins), int(allow_actions)))
+                origins=excluded.origins, allow_actions=excluded.allow_actions,
+                warrant_expires=excluded.warrant_expires, version=skills.version+1
+            """, (name, source, digest, json.dumps(origins), int(allow_actions), warrant_expires))
+        return {k: v for k, v in self.skill(name).items() if k != "source"}
+
+    @staticmethod
+    def _warrant_expiry(expires_in: float | None) -> float | None:
+        """Absolute expiry timestamp from a seconds-from-now TTL.
+
+        None -> permanent (the pre-TTL behavior, unchanged). 0 -> also
+        permanent (an explicit clear via skill.update). Positive -> now +
+        seconds. Negative/bool/non-numeric are rejected.
+        """
+        if expires_in is None:
+            return None
+        if isinstance(expires_in, bool) or not isinstance(expires_in, (int, float)):
+            raise ValueError("expires_in must be a nonnegative number of seconds")
+        if expires_in < 0:
+            raise ValueError("expires_in must be a nonnegative number of seconds")
+        if expires_in == 0:
+            return None
+        return time.time() + float(expires_in)
+
+    def update_skill_warrant(self, name: str, expires_in: float) -> dict:
+        """Extend, set, or clear a skill's warrant expiry (audit upgrade #2).
+
+        Scope changes are NOT handled here: origins are the skill's scope and
+        re-saving with new origins is the existing versioned path — a
+        separate update command would blur which revision authorized what.
+        """
+        self.skill(name)  # raises unknown skill
+        warrant_expires = self._warrant_expiry(expires_in)
+        with self.conn:
+            self.conn.execute("UPDATE skills SET warrant_expires=? WHERE name=?", (warrant_expires, name))
         return {k: v for k, v in self.skill(name).items() if k != "source"}
 
     def skill(self, name: str) -> dict:
@@ -382,14 +429,24 @@ class DoshShell:
         if name == "eval":
             return await self.run_script(a["source"], a.get("args", {}), allow_actions=a.get("allow_actions", False))
         if name == "skill.save":
-            return self.store.save_skill(a["name"], a["source"], a["origins"], a.get("allow_actions", False))
+            return self.store.save_skill(
+                a["name"], a["source"], a["origins"], a.get("allow_actions", False),
+                expires_in=a.get("expires_in"),
+            )
         if name == "skill.list":
-            return self.store.query("SELECT name,sha256,origins,allow_actions,version FROM skills ORDER BY name", [],
-                                    _limit(a.get("limit", 100)))
+            return self.store.query(
+                "SELECT name,sha256,origins,allow_actions,version,warrant_expires FROM skills ORDER BY name",
+                [], _limit(a.get("limit", 100)))
         if name == "skill.run":
             skill = self.store.skill(a["name"])
             if _origin(s.url) not in json.loads(skill["origins"]):
                 raise ValueError("skill origin does not match the loaded document")
+            expires = skill.get("warrant_expires")
+            if expires and time.time() > float(expires):
+                raise ValueError(
+                    f"skill warrant expired ({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(expires)))} UTC-local); "
+                    "extend with skill.update {name, expires_in} or re-save the skill"
+                )
             if not isinstance(a.get("allow_actions", False), bool):
                 raise ValueError("allow_actions must be boolean")
             if skill["allow_actions"] and not a.get("allow_actions", False):
@@ -400,6 +457,11 @@ class DoshShell:
             with self.store.conn:
                 cur = self.store.conn.execute("DELETE FROM skills WHERE name=?", (a["name"],))
             return {"deleted": bool(cur.rowcount)}
+        if name == "skill.update":
+            expires_in = a.get("expires_in", 0)
+            if isinstance(expires_in, bool) or not isinstance(expires_in, (int, float)) or expires_in < 0:
+                raise ValueError("expires_in must be a nonnegative number of seconds (0 = permanent)")
+            return self.store.update_skill_warrant(a["name"], expires_in)
         if name == "db":
             return self.store.query(a.get("sql", "SELECT name FROM sqlite_master WHERE type='table'"),
                                     a.get("params", []), _limit(a.get("limit", 100)))
@@ -610,20 +672,30 @@ class DoshShell:
             if counts.get("editable"):
                 unavailable.append({"capability": "caret/selection in editors",
                                     "reason": "contenteditable types plain text only; no caret model"})
-            return {"counts": counts, "source": source,
-                    "tabs": len(s.tabs), "frames": len(s.frame_documents),
-                    "dialogs_pending": len(s.dialogs()),
-                    "page_unavailable": unavailable,
-                    "engine_gaps": [
-                        {"capability": "css floats/sticky/flex-wrap distribution", "reason": "block-flow approximation, disclosed"},
-                        {"capability": "text shaping/bidi (non-Latin scripts)", "reason": "proportional advance table only"},
-                        {"capability": "websocket binary frames", "reason": "counted and skipped, disclosed gap"},
-                        {"capability": "workers as real threads", "reason": "single-threaded emulation; constructors inert"},
-                        {"capability": "service worker execution", "reason": "simulated, not executed"},
-                        {"capability": "pixel-faithful screenshot", "reason": "SVG layout diagram only (see screenshot command)"},
-                    ],
-                    "note": ("; ".join(filter(None, [probe_note,
-                         "honest manifest: unavailable items state why; this is not a claim of completeness"])))}
+            manifest = {"url": _url(s.url), "counts": counts, "source": source,
+                        "tabs": len(s.tabs), "frames": len(s.frame_documents),
+                        "dialogs_pending": len(s.dialogs()),
+                        "page_unavailable": unavailable,
+                        "engine_gaps": [
+                            {"capability": "css floats/sticky/flex-wrap distribution", "reason": "block-flow approximation, disclosed"},
+                            {"capability": "text shaping/bidi (non-Latin scripts)", "reason": "proportional advance table only"},
+                            {"capability": "websocket binary frames", "reason": "counted and skipped, disclosed gap"},
+                            {"capability": "workers as real threads", "reason": "single-threaded emulation; constructors inert"},
+                            {"capability": "service worker execution", "reason": "simulated, not executed"},
+                            {"capability": "pixel-faithful screenshot", "reason": "SVG layout diagram only (see screenshot command)"},
+                        ],
+                        "note": ("; ".join(filter(None, [probe_note,
+                             "honest manifest: unavailable items state why; this is not a claim of completeness"])))}
+            if a.get("export"):
+                export_path = Path(str(a["export"]))
+                if not export_path.is_absolute():
+                    raise ValueError("export path must be absolute")
+                export_path.parent.mkdir(parents=True, exist_ok=True)
+                payload = json.dumps(manifest, indent=2, ensure_ascii=False)
+                export_path.write_text(payload, encoding="utf-8")
+                return {**manifest, "exported_to": str(export_path),
+                        "exported_bytes": len(payload.encode("utf-8"))}
+            return manifest
         if name == "screenshot":
             ctx = self._context(a.get("frame", ""))
             try:
@@ -670,7 +742,9 @@ class DoshShell:
                 raise ValueError(f"no action with stable id {stable} on this document")
             if len(matches) > 1:
                 return {"stable": stable, "ambiguous": True, "matches": matches,
-                        "note": "repeated identical controls share one identity; disambiguate with the ref directly"}
+                        "note": "repeated identical controls share one content identity; "
+                                "identical siblings carry document-order suffixes (~2, ~3…) "
+                                "on both ref and stable — address the suffixed ref directly"}
             hit = matches[0]
             return {"stable": stable, "ref": hit["ref"], "kind": hit["kind"], "label": hit["label"],
                     "disabled": hit["disabled"], "hidden": hit["hidden"],

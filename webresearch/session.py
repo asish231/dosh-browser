@@ -1813,6 +1813,7 @@ resolve a selector directly.
                         "dx": dx if dx is not None else 220.0,
                         "dy": dy if dy is not None else 0.0,
                         "stealth": stealth,
+                        "occurrence": action.occurrence,
                     }
                 ],
                 self.html,
@@ -1821,12 +1822,14 @@ resolve a selector directly.
         elif action.kind in {"activate", "submit"}:
             if text:
                 return await self._apply(
-                    [{"kind": "type", "selector": selector, "text": text, "stealth": stealth}],
+                    [{"kind": "type", "selector": selector, "text": text, "stealth": stealth,
+                      "occurrence": action.occurrence}],
                     self.html,
                     max_chars,
                 )
             return await self._apply(
-                [{"kind": "activate", "selector": selector, "stealth": stealth}],
+                [{"kind": "activate", "selector": selector, "stealth": stealth,
+                  "occurrence": action.occurrence}],
                 self.html,
                 max_chars,
             )
