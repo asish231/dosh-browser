@@ -2,7 +2,26 @@
 
 from __future__ import annotations
 
+SHELL_TOOL = {
+    "name": "browser_shell",
+    "description": (
+        "Agent-native browser terminal. Use command=help for JSON commands: open, actions, act, net, "
+        "console, eval, skill.*, db, storage, snapshot/diff, layers, frames, tabs. "
+        "No OS shell. Capture begins on attachment. Scripts run in an isolated bounded control realm."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string"},
+            "command": {"type": "string"},
+            "arguments": {"type": "object"},
+        },
+        "required": ["session_id", "command"],
+    },
+}
+
 TOOLS: list[dict] = [
+    {"type": "function", "function": SHELL_TOOL},
     {
         "type": "function",
         "function": {
@@ -393,6 +412,103 @@ TOOLS: list[dict] = [
                     },
                 },
                 "anyOf": [{"required": ["session_id"]}, {"required": ["url"]}],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_click_captcha",
+            "description": (
+                "Click the 'I'm not a robot' checkbox in a reCAPTCHA challenge. "
+                "Finds the captcha iframe and clicks the checkbox element inside it. "
+                "Use after browser_captcha confirms a reCAPTCHA is present."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session to click captcha in.",
+                    },
+                    "max_chars": {"type": "integer", "default": 8000},
+                },
+                "required": ["session_id"],
+            },
+        },
+    },
+
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_click_captcha_tile",
+            "description": (
+                "Click a specific tile in a reCAPTCHA image-select challenge. "
+                "Use after browser_captcha_solve returns tile selections."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "tile_index": {"type": "integer", "description": "Tile index to click (1-based or 0-based as returned)."},
+                    "max_chars": {"type": "integer", "default": 8000},
+                },
+                "required": ["session_id", "tile_index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_click_captcha_tiles",
+            "description": (
+                "Click multiple tiles in a reCAPTCHA image-select challenge. "
+                "Pass tile indices from browser_captcha_solve results."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "tile_indices": {"type": "array", "items": {"type": "integer"}, "description": "Tile indices to click."},
+                    "max_chars": {"type": "integer", "default": 8000},
+                },
+                "required": ["session_id", "tile_indices"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_click_captcha_verify",
+            "description": (
+                "Click the Verify/Submit button in a reCAPTCHA image-select challenge after selecting tiles."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "max_chars": {"type": "integer", "default": 8000},
+                },
+                "required": ["session_id"],
+            },
+        },
+    },
+
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_click_captcha_solution",
+            "description": (
+                "Click tiles from a solve result and submit the captcha challenge."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "solution": {"type": "object", "description": "Solution dict from browser_captcha_solve"},
+                    "max_chars": {"type": "integer", "default": 8000},
+                },
+                "required": ["session_id", "solution"],
             },
         },
     },

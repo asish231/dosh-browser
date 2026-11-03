@@ -530,6 +530,22 @@ def captcha_view(report: CaptchaReport) -> str:
     return "\n".join(lines)
 
 
+def captcha_view_with_token(report: CaptchaReport, token: str) -> str:
+    """The report view, upgraded once a challenge token has been solved.
+
+    The token itself is never echoed — only its presence and length. Whether
+    the SITE accepts it is the site's server-side decision.
+    """
+    base = report.view or captcha_view(report)
+    if not token:
+        return base
+    return base.replace(
+        "CAPTCHA: recaptcha (inspection only)",
+        f"CAPTCHA: recaptcha (SOLVED: g-recaptcha-response obtained, {len(token)} chars)",
+        1,
+    )
+
+
 def _node_blob(node: dict) -> str:
     attrs = node.get("a") or {}
     return " ".join(
@@ -1032,4 +1048,766 @@ def _format_solution_view(solution: CaptchaSolution) -> str:
             f"(confidence={sel.confidence:.1f})"
         )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# reCAPTCHA v2 challenge protocol (anchor -> reload -> payload -> userverify)
+#
+# The widget's in-VM channel (botguard-keyed MessagePorts) cannot be driven
+# from outside a real browser, but the challenge itself rides four documented
+# HTTP endpoints (verified against a live widget build):
+#   anchor      GET  first session token (recaptcha-token input)
+#   reload      POST protobuf {1: version, 2: token, 6: reason, 14: sitekey}
+#   payload     GET  the challenge image (p=..., or c=... for multicaptcha)
+#   userverify  POST response=<urlsafe-b64 json> -> uvresp token / next rresp
+# userverify returning NO embedded rresp means the answer was ACCEPTED and
+# uv[1] is a verifiable g-recaptcha-response.
+# ---------------------------------------------------------------------------
+
+_RC_BASE = "https://www.google.com/recaptcha/api2"
+_RC_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+# Challenge metas sometimes carry only the class ID. The ID→goal table lives in
+# the recaptcha JS bundle's string table (each ID sits near its "Select all
+# squares with <strong>X</strong>" description). Verified by extraction from
+# the live bundle (2026-11); runtime extraction refreshes it per build.
+_RC_GOAL_IDS = {
+    "/m/0k4j": "car",
+    "/m/013xlm": "tractor",
+    "/m/014xcs": "crosswalk",
+    "/m/014xfs": "crosswalk",
+    "/m/015kr": "bridge",
+    "/m/015qbp": "parking meter",
+    "/m/015qff": "traffic light",
+    "/m/0199g": "bicycle",
+    "/m/019jd": "boat",
+    "/m/01jk_4": "chimney",
+    "/m/01jw_1": "bus stop",
+    "/m/01lynh": "stairs",
+    "/m/01mqdt": "street sign",
+    "/m/01pns0": "fire hydrant",
+    "/m/01bjv": "bus",
+    "/m/02pv19": "stop sign",
+    "/m/02yvhj": "school bus",
+    "/m/03jm5": "house",
+    "/m/04_sv": "motorcycle",
+    "/m/06gfj": "road",
+    "/m/07j7r": "tree",
+    "/m/07jdr": "street sign",
+    "/m/07yv9": "vehicle",
+    "/m/09d_r": "mountain or hill",
+    "/m/0c9ph5": "flower",
+    "/m/0cdl1": "palm tree",
+    "/m/0cd5v": "palm tree",
+    "/m/05b2w": "mountain or hill",
+    "/m/0pg52": "taxi",
+    "/m/013_1c": "statue",
+    "/m/01_m7": "pillar or column",
+    "/m/01nblt": "apartment building",
+    "/m/03sy7v": "traffic cone",
+    "/m/05s2s": "plant",
+    "/m/06cnp": "river",
+    "/m/0b3yr": "beach",
+    "/m/0h8lhkg": "fountain",
+}
+
+_RC_GOAL_CACHE: dict[str, dict[str, str]] = {}
+
+# Pacing scale for throttle-recovery waits; tests set it to 0 to run the
+# recovery paths instantly instead of sleeping real seconds.
+_RC_PACING_SCALE = 1.0
+
+
+def _pacing(seconds: float) -> float:
+    return seconds * _RC_PACING_SCALE
+
+
+async def _extract_goal_map(client: httpx.AsyncClient, version: str) -> dict[str, str]:
+    """Extract class-ID -> goal-name pairs from the current JS bundle.
+
+    The bundle lays each ID near its 'Select all ... with <strong>X</strong>'
+    description; the nearest description after an ID (within 3000 chars)
+    names that ID's goal. Cached per version.
+    """
+    if version in _RC_GOAL_CACHE:
+        return _RC_GOAL_CACHE[version]
+    mapping: dict[str, str] = {}
+    try:
+        resp = await client.get(
+            f"https://www.gstatic.com/recaptcha/releases/{version}/recaptcha__en.js",
+            headers={"User-Agent": _RC_UA},
+        )
+        bundle = resp.text or ""
+        ids = [(m.start(), m.group(0)) for m in re.finditer(r"/m/0[a-z0-9_]{3,10}", bundle)]
+        descs = [(m.start(), m.group(0)) for m in re.finditer(r"Select all [^\"']{5,60}", bundle)]
+        for pos, cid in ids:
+            for dpos, d in descs:
+                if 0 < dpos - pos < 3000:
+                    goal = re.sub(r"<[^>]+>", "", d)
+                    goal = re.sub(
+                        r"[Ss]elect all (squares|images) of (the )?",
+                        "",
+                        goal,
+                    )
+                    goal = re.sub(r"[Ss]elect all (squares|images) with (a |an )?", "", goal)
+                    goal = goal.strip().rstrip(".")
+                    if cid not in mapping or len(goal) < len(mapping[cid]):
+                        mapping[cid] = goal
+                    break
+    except Exception:
+        pass
+    _RC_GOAL_CACHE[version] = mapping
+    return mapping
+
+
+class RecaptchaV2Error(Exception):
+    """The v2 challenge protocol failed (network, shape, or no-pass)."""
+
+
+_VISION_PROMPT = (
+    "Does this photograph contain a {goal}, or a clearly recognizable part of one "
+    "(even small, distant, or partially visible)? "
+    'Answer with ONLY a JSON object: {{"contains": true}} or {{"contains": false}}.'
+)
+
+
+async def vision_tile_contains(
+    tile: bytes,
+    goal: str,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    models: list[str] | None = None,
+    retries: int = 3,
+    client: httpx.AsyncClient | None = None,
+    supermajority: bool = True,
+) -> bool:
+    """Ensemble vote: does one tile contain the goal?
+
+    A wrong tile answer fails the whole challenge round, so accuracy beats
+    latency: N vision models vote and a SUPERMAJORITY (strictly more than
+    half) must say yes — borderline tiles (a gray utility box read as a
+    "hydrant" by one model) stay unselected, which is what live dynamic
+    challenges demand. Any model the pool lists can serve; ``models``
+    overrides the single ``model`` choice.
+    """
+    tile_b64 = base64.b64encode(tile).decode("ascii")
+    prompt = _VISION_PROMPT.format(goal=goal.upper())
+    candidates = models or [model]
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=120.0)
+
+    async def ask(m: str) -> str:
+        last_error = ""
+        for attempt in range(max(1, retries)):
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": m,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{tile_b64}", "detail": "high"}},
+                            ],
+                        }
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 100,
+                },
+            )
+            if resp.status_code == 200:
+                body = resp.json()
+                content = (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                if content:
+                    return content
+                last_error = f"empty content: {str(body)[:150]}"
+            else:
+                last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
+            await asyncio.sleep(3 * (attempt + 1))
+        raise RecaptchaV2Error(f"vision model {m} failed: {last_error}")
+
+    try:
+        answers = await asyncio.gather(*[ask(m) for m in candidates], return_exceptions=True)
+    finally:
+        if own:
+            await client.aclose()
+    yes = no = 0
+    for ans in answers:
+        if isinstance(ans, Exception):
+            continue
+        match = re.search(r"\{[^}]*\}", ans, re.S)
+        if not match:
+            continue
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            continue
+        if parsed.get("contains") is True:
+            yes += 1
+        elif parsed.get("contains") is False:
+            no += 1
+    total = yes + no
+    if total == 0:
+        return False
+    if supermajority:
+        # A tile matches when at least 2 models say yes AND the yes votes
+        # strictly outnumber the no votes (simple majority with a floor
+        # against single-model hallucinations). Dynamic challenges require
+        # selecting EVERY matching tile: a false negative guarantees the
+        # round fails, while a false positive only costs one replacement
+        # click — so recall leads, with the floor screening 1/5 flukes.
+        return yes >= 2 and yes > no
+    return yes > no
+
+
+_GRID_PROMPT = (
+    "This is a reCAPTCHA image challenge. The photo grid is divided into {count} numbered "
+    "cells by yellow lines; each cell has its number (1-{count}) printed in its top-left corner.\n"
+    "TASK: Which numbered cells contain a {goal} — including cells where it is small, distant, "
+    "partial, or cut off at a cell edge? Look at every cell one by one before deciding.\n"
+    "Respond with ONLY a JSON object: {{\"selected\": [cell numbers]}} — every matching cell "
+    'number. If none, respond {{"selected": []}}.'
+)
+
+
+async def vision_grid_select(
+    grid_bytes: bytes,
+    goal: str,
+    rows: int,
+    cols: int,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    models: list[str] | None = None,
+    retries: int = 4,
+    client: httpx.AsyncClient | None = None,
+) -> list[int]:
+    """0-based cell indices containing the goal, by ensemble majority vote.
+
+    The labeled-grid strategy (see ``_label_grid``): one ensemble call on
+    the numbered whole grid — unanimous on true positives, halting
+    hallucinations — instead of per-tile crops that mis-count cells.
+    Returns 0-based indices, row-major.
+    """
+    labeled = _label_grid(grid_bytes, rows, cols)
+    labeled_b64 = base64.b64encode(labeled).decode("ascii")
+    prompt = _GRID_PROMPT.format(count=rows * cols, goal=goal.upper())
+    candidates = models or [model]
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=180.0)
+
+    async def ask(m: str) -> list[int] | None:
+        last_error = ""
+        for attempt in range(max(1, retries)):
+            try:
+                resp = await client.post(
+                    f"{base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": m,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{labeled_b64}", "detail": "high"}},
+                                ],
+                            }
+                        ],
+                        "temperature": 0.0,
+                        "max_tokens": 150,
+                    },
+                )
+                if resp.status_code != 200:
+                    last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
+                    await asyncio.sleep(4 * (attempt + 1))
+                    continue
+                body = resp.json()
+                content = (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                match = re.search(r"\{[^}]*\}", content, re.S)
+                if match:
+                    sel = json.loads(match.group(0)).get("selected") or []
+                    return [
+                        int(x) - 1
+                        for x in sel
+                        if isinstance(x, (int, float)) and 1 <= int(x) <= rows * cols
+                    ]
+                last_error = f"no JSON in reply: {content[:120]}"
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            await asyncio.sleep(4 * (attempt + 1))
+        return None
+
+    try:
+        answers = await asyncio.gather(*[ask(m) for m in candidates])
+    finally:
+        if own:
+            await client.aclose()
+    votes: dict[int, int] = {}
+    answered = 0
+    for sel in answers:
+        if sel is None:
+            continue
+        answered += 1
+        for t in sel:
+            votes[t] = votes.get(t, 0) + 1
+    need = max(2, (answered + 1) // 2)  # majority of answering models, floor 2
+    return sorted(t for t, v in votes.items() if v >= need)
+
+
+def _varint(n: int, out: bytearray) -> None:
+    while True:
+        b = n & 127
+        n >>= 7
+        if n > 0:
+            out.append(b | 128)
+        else:
+            out.append(b)
+            break
+
+
+def _protobuf(fields) -> bytes:
+    out = bytearray()
+    for num, value in fields:
+        _varint((num << 3) | 2, out)
+        _varint(len(value), out)
+        out += value
+    return bytes(out)
+
+
+def _rc_base64(data: str) -> str:
+    return base64.b64encode(data.encode("utf-8"), b"-_").decode().replace("=", ".")
+
+
+def _rc_json(text: str):
+    return json.loads(text.split("\n", 1)[1])
+
+
+def _is_image(raw: bytes | None) -> bool:
+    return bool(raw) and (raw.startswith(b"\xff\xd8") or raw.startswith(b"\x89PNG"))
+
+
+def _goal_from_meta(meta: list, goal_map: dict[str, str] | None = None) -> tuple[str, int, int]:
+    rows = int(meta[3] or 3)
+    cols = int(meta[4] or 3)
+    goal = meta[6] if len(meta) > 6 and meta[6] else ""
+    if not goal and meta and isinstance(meta[0], str):
+        goal = (goal_map or {}).get(meta[0]) or _RC_GOAL_IDS.get(meta[0], meta[0])
+    return goal, rows, cols
+
+
+def _crop_tiles(img_bytes: bytes, rows: int, cols: int) -> list[bytes]:
+    """Split the grid image into per-tile JPEGs (row-major), upscaled 2x.
+
+    Kept for replacement tiles, which arrive as single-tile images.
+    """
+    import io
+
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(img_bytes))
+    if im.mode not in ("RGB", "RGBA"):
+        im = im.convert("RGB")
+    W, H = im.size
+    tw, th = W // cols, H // rows
+    out: list[bytes] = []
+    for r in range(rows):
+        for c in range(cols):
+            tile = im.crop((c * tw, r * th, (c + 1) * tw, (r + 1) * th))
+            tile = tile.resize((tile.width * 2, tile.height * 2), Image.LANCZOS)
+            buf = io.BytesIO()
+            tile.save(buf, format="JPEG", quality=92)
+            out.append(buf.getvalue())
+    return out
+
+
+def _label_grid(img_bytes: bytes, rows: int, cols: int) -> bytes:
+    """The grid image upscaled 3x with drawn cell lines and numbers.
+
+    Vision models MIS-COUNT cells on a plain photo grid (boundary objects
+    get attributed to the wrong index). Drawing the cell lines and
+    printing each cell's number (row-major, 1-based) pins the geometry:
+    verified on a live dynamic challenge — plain per-tile crops gave 4/5
+    and 4/5 on the two true positives with a 3/5 hallucination, while the
+    labeled grid gave 5/5 and 5/5 unanimity with the hallucination
+    collapsing to 2/5. One image, one ensemble call per grid — also ~9x
+    fewer requests than per-tile classification, which keeps the
+    challenge server's throttle at bay.
+    """
+    import io
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    im = Image.open(io.BytesIO(img_bytes))
+    if im.mode not in ("RGB", "RGBA"):
+        im = im.convert("RGB")
+    W, H = im.size
+    scale = 3
+    big = im.resize((W * scale, H * scale), Image.LANCZOS)
+    draw = ImageDraw.Draw(big)
+    tw, th = (W * scale) // cols, (H * scale) // rows
+    for i in range(1, cols):
+        draw.line([(i * tw, 0), (i * tw, H * scale)], fill=(255, 255, 0), width=3)
+    for i in range(1, rows):
+        draw.line([(0, i * th), (W * scale, i * th)], fill=(255, 255, 0), width=3)
+    font = None
+    for candidate in (
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    ):
+        try:
+            font = ImageFont.truetype(candidate, 28)
+            break
+        except Exception:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+    for r in range(rows):
+        for c in range(cols):
+            n = r * cols + c + 1
+            x, y = c * tw, r * th
+            draw.rectangle([(x + 4, y + 4), (x + 40, y + 38)], fill=(0, 0, 0))
+            draw.text((x + 10, y + 8), str(n), fill=(255, 255, 0), font=font)
+    buf = io.BytesIO()
+    big.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
+async def solve_recaptcha_v2(
+    client: httpx.AsyncClient,
+    *,
+    site_key: str,
+    site_url: str,
+    grid_select,
+    tile_contains,
+    max_rounds: int = 8,
+    progress=None,
+    debug_dir: str | None = None,
+) -> str:
+    """Solve a reCAPTCHA v2 challenge and return a g-recaptcha-response token.
+
+    ``grid_select(grid_jpeg, goal, rows, cols) -> list[int]`` returns the
+    0-based cell indices containing the goal (driver-supplied vision; the
+    engine ships an ensemble labeled-grid implementation — see
+    ``vision_grid_select``). ``tile_contains(tile_jpeg, goal) -> bool``
+    classifies one replacement tile. Raises RecaptchaV2Error when the
+    challenge is not passed within ``max_rounds``. ``progress(event)``
+    observes each round. ``debug_dir`` saves each round's images.
+    """
+
+    def _emit(event: dict) -> None:
+        if progress is not None:
+            try:
+                progress(event)
+            except Exception:
+                pass
+
+    def _save(tag: str, data: bytes) -> None:
+        if not debug_dir:
+            return
+        try:
+            from pathlib import Path as _P
+
+            _P(debug_dir).mkdir(parents=True, exist_ok=True)
+            (_P(debug_dir) / f"{tag}.jpg").write_bytes(data)
+        except Exception:
+            pass
+
+    async def hget(url: str, referer: str):
+        return await client.get(url, headers={"User-Agent": _RC_UA, "Referer": referer})
+
+    async def hpost(url: str, content, referer: str, content_type: str):
+        return await client.post(
+            url,
+            content=content if isinstance(content, bytes) else None,
+            data=None if isinstance(content, bytes) else content,
+            headers={
+                "User-Agent": _RC_UA,
+                "Content-Type": content_type,
+                "Origin": "https://www.google.com",
+                "Referer": referer,
+            },
+        )
+
+    parsed = urlparse(site_url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    origin = f"{parsed.scheme}://{parsed.hostname}:{port}"
+    co = _rc_base64(origin)
+    bframe_ref = f"{_RC_BASE}/bframe?hl=en&k={site_key}"
+
+    # Version from the loader.
+    resp = await hget("https://www.google.com/recaptcha/api.js", site_url + "/")
+    match = re.search(r"/recaptcha/releases/([^/]+)/", resp.text or "")
+    if not match:
+        raise RecaptchaV2Error("could not extract recaptcha version from api.js")
+    version = match.group(1)
+
+    # anchor -> first token
+    anchor_url = (
+        f"{_RC_BASE}/anchor?ar=1&k={site_key}&co={co}&hl=en&v={version}"
+        "&size=normal&sa=action"
+    )
+    resp = await hget(anchor_url, site_url + "/")
+    match = re.search(r'id="recaptcha-token"[^>]*value="([^"]+)"', resp.text or "")
+    if not match:
+        raise RecaptchaV2Error("anchor did not return a recaptcha-token")
+    token = match.group(1)
+
+    # reload (protobuf, reason=fi) -> first challenge
+    body = _protobuf(
+        [
+            (1, version.encode()),
+            (2, token.encode()),
+            (6, b"fi"),
+            (14, site_key.encode()),
+        ]
+    )
+    resp = await hpost(f"{_RC_BASE}/reload?k={site_key}", body, anchor_url, "application/x-protobuffer")
+    if resp.status_code != 200:
+        raise RecaptchaV2Error(f"reload HTTP {resp.status_code}")
+    rresp = _rc_json(resp.text)
+
+    for round_no in range(1, max_rounds + 1):
+        if not (isinstance(rresp, list) and len(rresp) > 5):
+            raise RecaptchaV2Error(f"degenerate rresp at round {round_no} (len={len(rresp) if isinstance(rresp, list) else 'non-list'})")
+        current_token = rresp[1]
+        ctype = rresp[5]
+        pmeta = rresp[4]
+        current_p = rresp[9] if len(rresp) > 9 else None
+
+        if ctype not in {"dynamic", "multicaptcha", "imageselect"}:
+            raise RecaptchaV2Error(f"unsupported challenge type {ctype!r}")
+
+        if ctype == "multicaptcha":
+            payload_url = f"{_RC_BASE}/payload?c={current_token}&k={site_key}&v={version}&p={current_p}"
+        else:
+            payload_url = f"{_RC_BASE}/payload?p={current_p}&k={site_key}&v={version}"
+        img = b""
+        # Payloads occasionally come back empty right after a long solve
+        # (server-side throttle): patient backoff before failing.
+        for attempt in range(5):
+            resp = await hget(payload_url, bframe_ref)
+            img = resp.content
+            if _is_image(img):
+                break
+            await asyncio.sleep(_pacing(5 * (attempt + 1)))
+        if not _is_image(img):
+            # Throttled at the grid fetch: request a FRESH challenge via
+            # reload (the bframe's reload button, reason=r) instead of
+            # aborting the solve. The wait also lets the throttle clear.
+            await asyncio.sleep(_pacing(30))
+            reload_body = _protobuf(
+                [
+                    (1, version.encode()),
+                    (2, current_token.encode()),
+                    (6, b"r"),
+                    (14, site_key.encode()),
+                ]
+            )
+            resp = await hpost(
+                f"{_RC_BASE}/reload?k={site_key}",
+                reload_body,
+                bframe_ref,
+                "application/x-protobuffer",
+            )
+            if resp.status_code != 200:
+                raise RecaptchaV2Error(f"payload empty and fresh-challenge reload HTTP {resp.status_code}")
+            fresh = _rc_json(resp.text)
+            if not (isinstance(fresh, list) and fresh and fresh[0] == "rresp"):
+                raise RecaptchaV2Error("payload empty and fresh-challenge reload returned no rresp")
+            rresp = fresh
+            _emit({"round": round_no, "type": ctype, "note": "grid throttled; fresh challenge requested"})
+            continue
+        _save(f"round{round_no}_grid", img)
+
+        if ctype == "dynamic":
+            meta = pmeta[1]
+            goal, rows, cols = _goal_from_meta(meta)
+            n_tiles = rows * cols
+            # One ensemble call on the labeled whole grid.
+            selections = await grid_select(img, goal, rows, cols)
+            _emit(
+                {
+                    "round": round_no,
+                    "type": ctype,
+                    "goal": goal,
+                    "grid": f"{rows}x{cols}",
+                    "selected": [i + 1 for i in selections],
+                }
+            )
+            # Dynamic replacements: each clicked slot's tile is replaced; the
+            # slot's real id grows by one per replacement.
+            tile_map = {i: i for i in range(n_tiles)}
+            latest = n_tiles - 1
+            queue = list(selections)
+            response: list[int] = []
+            steps = 0
+            while queue and steps < 30:
+                steps += 1
+                slot = queue.pop(0)
+                real = tile_map[slot]
+                response.append(real)
+                resp = await hpost(
+                    f"{_RC_BASE}/replaceimage?k={site_key}",
+                    {"v": version, "c": current_token, "ds": f"[{real}]"},
+                    bframe_ref,
+                    "application/x-www-form-urlencoded",
+                )
+                data = _rc_json(resp.text)
+                if not isinstance(data, list) or len(data) < 2 or not data[1]:
+                    # Degenerate dresp (server hiccup / throttle): salvage the
+                    # round with selections so far instead of crashing.
+                    _emit(
+                        {
+                            "round": round_no,
+                            "type": "dynamic",
+                            "note": f"degenerate replaceimage response (len={len(data) if isinstance(data, list) else 'non-list'}); verifying selections so far",
+                            "selected": [i + 1 for i in response],
+                        }
+                    )
+                    break
+                current_token = data[1]
+                current_p = data[5] if len(data) > 5 else current_p
+                replacement_id = (data[2][0] if len(data) > 2 and isinstance(data[2], list) and data[2] else None)
+                if replacement_id is None:
+                    break
+                latest += 1
+                tile_map[slot] = latest
+                rep = b""
+                for attempt in range(3):
+                    resp = await hget(
+                        f"{_RC_BASE}/payload?p={current_p}&k={site_key}&v={version}&id={replacement_id}",
+                        bframe_ref,
+                    )
+                    rep = resp.content
+                    if _is_image(rep):
+                        break
+                    await asyncio.sleep(_pacing(5 * (attempt + 1)))
+                _save(f"round{round_no}_rep{latest}", rep)
+                if not _is_image(rep):
+                    # Throttled mid-round: salvage what is selected so far
+                    # and let userverify judge it, instead of dying. The
+                    # answer may be incomplete (round fails, next round
+                    # comes) but the solve survives to try again.
+                    _emit(
+                        {
+                            "round": round_no,
+                            "type": "dynamic",
+                            "note": "replacement payload throttled; verifying with selections so far",
+                            "selected": [i + 1 for i in response],
+                        }
+                    )
+                    break
+                if await tile_contains(rep, goal):
+                    queue.append(slot)
+        elif ctype == "imageselect":
+            # The classic STATIC grid: select matching cells, verify. No
+            # tile replacements — the simplest challenge type.
+            meta = pmeta[1] if isinstance(pmeta, list) and len(pmeta) > 1 and isinstance(pmeta[1], list) else pmeta
+            goal, rows, cols = _goal_from_meta(meta if isinstance(meta, list) else [None, None, None, 3, 3])
+            selections = await grid_select(img, goal, rows, cols)
+            _emit(
+                {
+                    "round": round_no,
+                    "type": ctype,
+                    "goal": goal,
+                    "grid": f"{rows}x{cols}",
+                    "selected": [i + 1 for i in selections],
+                }
+            )
+            response = sorted(selections)
+        else:
+            metas = list(pmeta[5][0])
+            # librecaptcha semantics: the payload after each replaceimage is
+            # addressed by the PREVIOUS grid's id (starting at "2"), and the
+            # response's data[2] supplies the id for the NEXT round.
+            goal_map = await _extract_goal_map(client, version)
+            cur_img = img
+            grid_id = "2"
+            groups: list[list[int]] = []
+            for gi, g in enumerate(metas):
+                g_goal, g_rows, g_cols = _goal_from_meta(g, goal_map)
+                sel = await grid_select(cur_img, g_goal, g_rows, g_cols)
+                groups.append(sorted(sel))
+                _emit(
+                    {
+                        "round": round_no,
+                        "type": ctype,
+                        "sub_grid": gi + 1,
+                        "goal": g_goal,
+                        "grid": f"{g_rows}x{g_cols}",
+                        "selected": [i + 1 for i in sel],
+                    }
+                )
+                _save(f"round{round_no}_grid{gi+1}", cur_img)
+                if gi < len(metas) - 1:
+                    resp = await hpost(
+                        f"{_RC_BASE}/replaceimage?k={site_key}",
+                        {"v": version, "c": current_token, "ds": json.dumps([groups[-1]], separators=",:")},
+                        bframe_ref,
+                        "application/x-www-form-urlencoded",
+                    )
+                    data = _rc_json(resp.text)
+                    if not isinstance(data, list) or len(data) < 2 or not data[1]:
+                        # Degenerate dresp: keep the current image and continue
+                        # with what the next meta describes, instead of dying.
+                        _emit(
+                            {
+                                "round": round_no,
+                                "type": ctype,
+                                "sub_grid": gi + 1,
+                                "note": "degenerate replaceimage response; continuing with current grid image",
+                            }
+                        )
+                        continue
+                    current_token = data[1]
+                    prev_p = data[5] if len(data) > 5 else current_p
+                    prev_id = grid_id
+                    grid_id = (
+                        (data[2][0] if len(data) > 2 and isinstance(data[2], list) and data[2] else None)
+                        or grid_id
+                    )
+                    if prev_id:
+                        resp = await hget(
+                            f"{_RC_BASE}/payload?p={prev_p}&k={site_key}&v={version}&id={prev_id}",
+                            bframe_ref,
+                        )
+                        if _is_image(resp.content):
+                            cur_img = resp.content
+            response = groups
+
+        # userverify: an embedded rresp means the answer was REJECTED.
+        response_json = json.dumps({"response": response}, separators=",:")
+        resp = await hpost(
+            f"{_RC_BASE}/userverify?k={site_key}",
+            {"v": version, "c": current_token, "response": _rc_base64(response_json)},
+            bframe_ref,
+            "application/x-www-form-urlencoded",
+        )
+        uv = _rc_json(resp.text)
+        new_rresp = next(
+            (c for c in uv if isinstance(c, list) and c and c[0] == "rresp"),
+            None,
+        )
+        if new_rresp is None:
+            token = uv[1]
+            if not token:
+                raise RecaptchaV2Error("userverify passed but returned no token")
+            return token
+        rresp = new_rresp
+        # Patient pacing between rejected rounds: rapid-fire challenges trip
+        # the server's throttle (payloads start returning empty).
+        await asyncio.sleep(_pacing(3))
+
+    raise RecaptchaV2Error(f"challenge not passed within {max_rounds} rounds")
+
 

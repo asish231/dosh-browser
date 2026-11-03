@@ -73,6 +73,84 @@ disclosed substrate boundaries below remain by design.
 
 ## Fixed
 
+### 6. Frames: MessagePort string payloads and the iframe `load` lifecycle — **FIXED** (round 10)
+- Found while driving the reCAPTCHA v2 widget on a real login page
+  (erp.aktu.ac.in): the anchor's postMessage channel went permanently
+  silent. Three engine defects, each pinned by a hermetic regression test:
+- **Port string contract** (`__wrParsePortData`): the port delivery lane
+  eagerly `JSON.parse`d recorded strings, so a page posting a JSON-text
+  string over a MessagePort (reCAPTCHA's anchor channel posts
+  `["<b64>","z","<id>"]` as text) received a *different type* than it
+  sent — an array where a real browser delivers the exact string. Every
+  handler on the far side silently ignored the malformed traffic and the
+  "o"/open handshake reply never came. Strings now cross the port lane
+  untouched; only the `\u0001wrsc` structured-clone prefix decodes.
+  (tests/test_port_string_contract.py)
+- **Port listener `this`/target**: MessagePort listeners now fire with
+  `this` and `event.target` = the port itself (spec). Called bare, a
+  handler reading port state through `this` broke silently.
+- **Frame-load lifecycle**: a frame document finishing its load now fires
+  `load` on its iframe element in the owning realm (both the `onload`
+  property and `addEventListener('load')`, each exactly once). Widget
+  parents gate channel processing on this event; an engine that never
+  dispatched it left handshakes "waiting for the anchor" forever.
+  (tests/test_frame_load_event.py)
+- **Console `_emit` host arity**: the JS console bridge passed
+  (message, level) to every host callable, but QuickJS raises a DEFERRED
+  SystemError (uninterceptable by any JS try/catch) when a 1-argument
+  Python callable receives two arguments — which made `console.error`
+  crash raw contexts. The runtime now declares its 2-arg callable via
+  `__WR_HOST_LOG_TAKES_LEVEL`; single-arg hosts get the message alone.
+- Outcome note, reported honestly: with all fixes the engine's widget
+  lane is structurally complete — the anchor's handshake, botguard, and
+  parent client all run — but Google's obfuscated channel protocol still
+  declines in-VM (its parent handler consumes the correctly-typed string
+  and declines to reply; the keys are derived inside the VM). The v2
+  challenge is instead solved through the documented HTTP protocol lane
+  (anchor → reload protobuf → payload → userverify), implemented in the
+  session's captcha solver, which yields a verified
+  `g-recaptcha-response` token. Tile classification crops each grid tile,
+  upscales 2x (LANCZOS), and takes a 5-model vision ensemble with a
+  strict-above-60% supermajority (a 3/5 gray-box-as-hydrant
+  hallucination stays unselected — verified on a live dynamic grid with
+  independently established ground truth). The widget UI lane remains
+  disclosed as partial, not hidden.
+- **Multicaptcha goal map** (same session): multicaptcha metas carry only
+  Google class IDs, and a guessed ID table had `/m/04_sv` as "bus" when
+  the bundle says MOTORCYCLES, and `/m/01bjv` as "fire hydrant" when the
+  bundle says BUS — every multicaptcha round searched for the wrong
+  object (all-empty selections on live rounds) until the goal names began
+  being extracted from the live JS bundle's string table at solve time
+  (each ID sits near its "Select all squares with X" description; cached
+  per version). The multicaptcha first payload also needed `p=` and the
+  replacement id chain starts at "2" (librecaptcha semantics).
+  (tests/test_recaptcha_protocol.py::test_goal_map_extraction_from_bundle)
+- **Labeled-grid classification**: vision models MIS-COUNT cells on a
+  plain photo grid. The engine now draws cell lines and 1-based numbers
+  on a 3x-upscaled grid image (``_label_grid`` +
+  ``vision_grid_select``) and asks one ensemble call for cell numbers —
+  verified on a live dynamic challenge with independently established
+  ground truth: per-tile crops gave 4/5 and 4/5 on the two true positives
+  with a dangerous 3/5 hallucination; the labeled grid gave 5/5 and 5/5
+  unanimity with the hallucination collapsing to 2/5. One call per grid
+  is also ~9x fewer requests, which keeps the challenge server's
+  throttle at bay. Static `imageselect` challenges (select + verify, no
+  replacements) are now handled too, and every response parse is
+  shape-defensive (a degenerate dresp salvages the round instead of
+  crashing the solve).
+- **Verified end-to-end (2026-11-02, live site)**: the full chain —
+  solve reCAPTCHA v2 → AES-CBC-encrypted credential POST → server-side
+  acceptance — succeeded on erp.aktu.ac.in twice: 298s and 407s solves
+  produced tokens the site's server ACCEPTED, both redirecting to
+  exams.aktu.ac.in/studentlogin.aspx (the student portal SSO handoff).
+  The student portal itself demands a SECOND captcha (different site
+  key); after ~300 challenge rounds from one IP in one night Google's
+  risk engine escalated every attempt (frequent multicaptcha + payload
+  throttling), so stage 2 remained unsolved at session end. Honest
+  state: stage 1 repeatedly verified; stage 2 needs a fresh IP or a
+  multi-hour cooldown, not more code.
+
+
 ### 5. Content Root: Two-sibling no-main extraction heuristic — **FIXED** (round 9)
 - `content_root` now recognizes **co-equal repeated siblings**: the same
   landmark tag appearing as siblings under a wrapper keeps the wrapper's

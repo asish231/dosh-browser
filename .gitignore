@@ -12,7 +12,10 @@ attestation-lab/
 .ruff_cache/
 .pytest_cache/
 tmp/
+tmp_scripts/
+tmp_out/
 agent_native_browser_compiler_research.md
 DOSH_Browser_Mini_Project_Presentation_ORIGINAL_BACKUP.pptx
 win/
 BUSINESS_STRATEGY.md
+research_repos/chromium

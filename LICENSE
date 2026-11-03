@@ -1,0 +1,57 @@
+DOSH Browser software license
+
+Copyright (c) 2026 Asish Kumar Sharma (asishkksharma@gmail.com).
+All rights are reserved by the copyright holder. This software is the sole
+property of Asish Kumar Sharma.
+
+1. Permission required.
+
+   You must obtain prior written permission from the copyright holder
+   (asishkksharma@gmail.com) before you use, copy, reproduce, run, modify,
+   merge, publish, distribute, sublicense, sell, or create derivatives of
+   this software, in whole or in part, for any purpose. Absent such written
+   permission, no license of any kind is granted and all rights are
+   reserved. A written grant may carry its own conditions, and those
+   conditions control.
+
+2. Research and study only.
+
+   Any use the copyright holder permits in writing is strictly for research
+   and study. Evaluation of the software for personal, non-commercial
+   learning purposes counts as research and study; every other use needs an
+   explicit written grant describing that use.
+
+3. No commercial usage.
+
+   Commercial usage is not licensed under any term of this file. You may not
+   sell, rent, lease, license, or offer this software, its source, or its
+   outputs as a product, service, or paid feature. You may not embed public
+   or non-public parts of it into a commercial product, service, pipeline,
+   dataset, or offered capability, whether yours or a third party's. If you
+   hold a written permission that appears to authorize commercial activity,
+   the grant controls only if the copyright holder signed it and named the
+   activity explicitly.
+
+4. Scope.
+
+   "This software" covers the source, engine, tests, scripts, and
+   documentation in this repository. The directories under research_repos/
+   hold third-party projects kept solely as reading material. Those
+   projects keep their own licenses and are not governed by this file.
+   Nothing in this repository grants you rights in their code.
+
+5. No warranty. Provided as is.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
+   NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR
+   ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF, OR IN
+   CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+6. Termination.
+
+   Any permission granted under this file ends automatically if you breach
+   its terms, including any commercial use or use without written
+   permission. On termination you must stop using the software and delete
+   or destroy copies you hold.

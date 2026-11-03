@@ -73,6 +73,165 @@
     }
   }
 
+  /* Runtime-injected scripts (document.createElement('script')) can't be seen
+     by the static extractor. Push them onto a queue that the host drains after
+     each pump pass so dynamically-loaded bundles execute.
+
+     Both appendChild and insertBefore must call this. reCAPTCHA's api.js
+     inserts its client bundle with `firstScript.parentNode.insertBefore(tag,
+     firstScript)`, so an appendChild-only hook left grecaptcha.render
+     undefined and the widget never appeared. */
+  function __noteInjectedScripts(child) {
+    if (!child) return;
+    var __t = (child.nodeName || "").toLowerCase();
+    if (__t !== "script" && __t !== "#document-fragment") return;
+    var scripts;
+    if (__t === "script") scripts = [child];
+    else if (child.querySelectorAll) scripts = child.querySelectorAll("script");
+    else return;
+    for (var s = 0; s < scripts.length; s++) {
+      var el = scripts[s];
+      var info = {
+        src: el.getAttribute("src") || "",
+        text: el.textContent || "",
+        type: (el.getAttribute("type") || "").toLowerCase()
+      };
+      if (info.src || info.text) {
+        globalThis.__WR_INJECTED_SCRIPTS = globalThis.__WR_INJECTED_SCRIPTS || [];
+        globalThis.__WR_INJECTED_SCRIPTS.push(info);
+      }
+    }
+  }
+
+  /* A throwing event listener must be observable. Swallowing it silently made
+     a reCAPTCHA checkbox click look like "nothing happened": the visual state
+     changed, the handler threw, and no network request was ever made. The
+     stack makes "which listener" answerable without re-instrumentation. */
+  function __noteEventListenerError(type, e) {
+    try {
+      globalThis.__WR_EVENT_ERRORS = globalThis.__WR_EVENT_ERRORS || [];
+      if (globalThis.__WR_EVENT_ERRORS.length < 50) {
+        var msg = String((e && e.message) || e);
+        var stack = (e && e.stack) ? " @" + String(e.stack).split("\n").slice(0, 3).join(" | ") : "";
+        globalThis.__WR_EVENT_ERRORS.push(
+          String(type) + ": " + (msg + stack).slice(0, 400)
+        );
+      }
+    } catch (_) {}
+  }
+
+  /* postMessage's second argument is either a targetOrigin string or a
+     WindowPostMessageOptions bag. ReCAPTCHA passes the bag form, which used
+     to stringify to "[object Object]" and made every target message fail the
+     origin check. Spec: an options bag without targetOrigin defaults to "/",
+     meaning "same origin as the sender". */
+  function __resolveTargetOrigin(arg) {
+    if (typeof arg === "string") return arg;
+    if (arg && typeof arg === "object") {
+      if (typeof arg.targetOrigin === "string") return arg.targetOrigin;
+      return "/";
+    }
+    if (arg === undefined || arg === null) return "*";
+    return String(arg);
+  }
+
+  /* Resolve the real Window object a cross-document message came from.
+
+     The runtime router only knows origins and frame URLs, so delivery used to
+     hand every message a fresh anonymous sourceProxy. ReCAPTCHA's parent-side
+     listener (and every other widget that completes a postMessage handshake)
+     compares event.source against the specific Window objects tied to its own
+     iframes — an anonymous proxy fails that identity check silently, which is
+     exactly why the recaptcha-setup handshake never completed here.
+
+     Sender hints are attached by the routing layer:
+       {"window": "parent"}                - sender is this context's parent
+       {"window": "frame", "src": "<url>"} - sender is the iframe with this src
+  */
+  function __resolveSenderSource(hint) {
+    var h = hint;
+    if (typeof h === "string") {
+      try { h = JSON.parse(h); } catch (e) { return null; }
+    }
+    if (!h || typeof h !== "object") return null;
+    if (h.window === "parent") return global.parent || null;
+    if (h.window === "frame") {
+      var want = String(h.src || "");
+      if (!want) return null;
+      var doc = global.document;
+      if (!doc || !doc.querySelectorAll) return null;
+      var frames = doc.querySelectorAll("iframe");
+      var wantCb = (want.match(/[?&]cb=([^&]*)/) || [undefined, ""])[1];
+      var wantPath = String(want).replace(/^https?:\/\/[^/]+/i, "");
+      var best = null;
+      var bestScore = 0;
+      for (var i = 0; i < frames.length; i++) {
+        var se = (frames[i].getAttribute && frames[i].getAttribute("src")) || "";
+        if (!se) continue;
+        var score = 0;
+        if (se === want) score = 1000;
+        else {
+          var seCb = (se.match(/[?&]cb=([^&]*)/) || [undefined, ""])[1];
+          if (wantCb && seCb === wantCb) score = 800;
+          else {
+            var sePath = String(se).replace(/^https?:\/\/[^\/]+/i, "");
+            var sp = sePath.split("?")[0];
+            var wp = wantPath.split("?")[0];
+            if (sp && wp && (sp === wp || wp.indexOf(sp) === 0 || sp.indexOf(wp) === 0)) score = 400;
+          }
+        }
+        if (score > bestScore) { bestScore = score; best = frames[i]; }
+      }
+      if (best && bestScore > 0) {
+        try { return best.contentWindow; } catch (e) { return null; }
+      }
+    }
+    return null;
+  }
+
+  /* Frame-load lifecycle: when a frame's document finishes loading, the
+     iframe ELEMENT in its parent realm fires a `load` event (spec
+     behavior; it does not bubble). Widget parents gate on it —
+     reCAPTCHA's parent client will not process its anchor's channel
+     messages until the anchor iframe's load has fired, so an engine that
+     never dispatches it leaves the widget's handshake permanently
+     "waiting for the anchor" and the checkbox never resolves.
+     Both the onload property and addEventListener('load') handlers run,
+     each exactly once, like a real browser. */
+  global.__wrFireFrameLoad = function (srcAttr) {
+    var doc = global.document;
+    if (!doc || !doc.querySelectorAll) return false;
+    var frames = doc.querySelectorAll("iframe");
+    var want = String(srcAttr || "");
+    var el = null;
+    for (var i = 0; i < frames.length; i++) {
+      var s = (frames[i].getAttribute && frames[i].getAttribute("src")) || "";
+      if (s && (s === want || want.indexOf(s) === 0 || s.indexOf(want) === 0)) {
+        el = frames[i];
+        break;
+      }
+    }
+    if (!el) return false;
+    var loadListeners = (el._listeners && el._listeners.load) ? el._listeners.load.length : 0;
+    try {
+      globalThis.__WR_FRAME_LOADS = globalThis.__WR_FRAME_LOADS || [];
+      if (globalThis.__WR_FRAME_LOADS.length < 20) {
+        globalThis.__WR_FRAME_LOADS.push({
+          src: String((el.getAttribute && el.getAttribute("src")) || "").slice(0, 90),
+          onload: typeof el.onload === "function",
+          listeners: loadListeners
+        });
+      }
+    } catch (eRec) {}
+    var ev = new global.Event("load", { isTrusted: true, __trusted: true });
+    ev.target = el;
+    /* Element.dispatchEvent runs both the addEventListener('load') handlers
+       and the el.onload property — exactly once each, like a real browser.
+       Calling onload manually here as well made every load fire twice. */
+    try { el.dispatchEvent(ev); } catch (e) {}
+    return true;
+  };
+
   Node.prototype.appendChild = function (child) {
     if (!child) return child;
     /* Spec: appending a DocumentFragment inserts its CHILDREN (the fragment
@@ -90,30 +249,10 @@
     this.childNodes.push(child);
     queueMutation("childList", this, { addedNodes: [child] });
     _notifyConnected(child);
-    /* Runtime-injected scripts (document.createElement('script')) can't be seen
-       by the static extractor. Push them onto a queue that the host drains after
-       each pump pass so LinkedIn-style dynamically-loaded ESM bundles execute.
-       Node names in this engine are LOWERCASE ('script'), so the old
+    /* Node names in this engine are LOWERCASE ('script'), so the old
        `=== "SCRIPT"` check never matched and the entire injection lane was
        dead (re-audit 2026-10-27). */
-    var __t = (child.nodeName || "").toLowerCase();
-    if (child && (__t === "script" || (__t === "#document-fragment" && child.querySelectorAll))) {
-      var scripts = [];
-      if (__t === "script") scripts = [child];
-      else scripts = child.querySelectorAll("script");
-      for (var s = 0; s < scripts.length; s++) {
-        var el = scripts[s];
-        var info = {
-          src: el.getAttribute("src") || "",
-          text: el.textContent || "",
-          type: (el.getAttribute("type") || "").toLowerCase()
-        };
-        if (info.src || info.text) {
-          globalThis.__WR_INJECTED_SCRIPTS = globalThis.__WR_INJECTED_SCRIPTS || [];
-          globalThis.__WR_INJECTED_SCRIPTS.push(info);
-        }
-      }
-    }
+    __noteInjectedScripts(child);
     return child;
   };
   Node.prototype.removeChild = function (child) {
@@ -148,6 +287,7 @@
     this.childNodes.splice(i, 0, child);
     queueMutation("childList", this, { addedNodes: [child] });
     _notifyConnected(child);
+    __noteInjectedScripts(child);
     return child;
   };
   Node.prototype.replaceChild = function (neu, old) {
@@ -718,10 +858,10 @@
       ev.currentTarget = node;
       var list = (node._listeners && node._listeners[type]) ? node._listeners[type].slice() : [];
       for (var i = 0; i < list.length; i++) {
-        try { list[i].call(node, ev); } catch (e) {}
+        try { list[i].call(node, ev); } catch (e) { __noteEventListenerError(type, e); }
       }
       if (typeof node["on" + type] === "function") {
-        try { node["on" + type](ev); } catch (e) {}
+        try { node["on" + type](ev); } catch (e) { __noteEventListenerError(type, e); }
       }
       if (!ev.bubbles) break;
       node = node.parentNode;
@@ -2971,6 +3111,30 @@ var pos = (st.position || "").toLowerCase();
     set: function (v) { this._currentScript = v; },
     configurable: true
   });
+  /* document.baseURI / document.domain. reCAPTCHA builds the anchor URL with
+     `new URL(src, document.baseURI)` and reads window.origin. Both were
+     undefined, so the parent stored a bad expected origin and dropped the
+     anchor's recaptcha-setup message. */
+  Object.defineProperty(Document.prototype, "baseURI", {
+    get: function () {
+      var view = this.defaultView || global;
+      try {
+        if (view.location && view.location.href) return String(view.location.href);
+      } catch (e) {}
+      return "";
+    },
+    configurable: true
+  });
+  Object.defineProperty(Document.prototype, "domain", {
+    get: function () {
+      var view = this.defaultView || global;
+      try {
+        if (view.location && view.location.hostname) return String(view.location.hostname);
+      } catch (e) {}
+      return "";
+    },
+    configurable: true
+  });
   Document.prototype.createElement = function (tag, options) {
     var tagLower = String(tag).toLowerCase();
     var isOption = options && options.is ? String(options.is).toLowerCase() : null;
@@ -3137,6 +3301,10 @@ var pos = (st.position || "").toLowerCase();
   Document.prototype.querySelectorAll = Element.prototype.querySelectorAll;
   Document.prototype.querySelector = Element.prototype.querySelector;
   Document.prototype.addEventListener = Element.prototype.addEventListener;
+  /* MS AJAX's DOMContentLoaded bootstrap removes its own listener inside the
+     handler; a Document without removeEventListener made the handler throw
+     before init() and the whole WebForms client machinery stayed dead. */
+  Document.prototype.removeEventListener = Element.prototype.removeEventListener;
   Document.prototype.dispatchEvent = Element.prototype.dispatchEvent;
   Object.defineProperty(Document.prototype, "activeElement", {
     get: function () {
@@ -3301,18 +3469,31 @@ var pos = (st.position || "").toLowerCase();
   }
 
   var timers = [];
+  var __timerSeq = 1;
+  var __timerNow = 0;
+  var __timerDead = {};
+  function __timerDrop(id) {
+    var n = Number(id);
+    if (!n) return;
+    __timerDead[n] = true;
+    timers = timers.filter(function (t) { return t.id !== n; });
+  }
   global.setTimeout = function (fn, ms) {
-    timers.push({ fn: fn, ms: ms || 0 });
-    return timers.length;
+    var id = __timerSeq++;
+    var delay = Number(ms) || 0;
+    timers.push({ id: id, fn: fn, ms: delay, due: __timerNow + delay });
+    return id;
   };
-  global.clearTimeout = function () {};
+  global.clearTimeout = function (id) { __timerDrop(id); };
   global.setInterval = function (fn, ms) {
-    timers.push({ fn: fn, ms: ms || 0, repeat: true });
-    return timers.length;
+    var id = __timerSeq++;
+    var delay = Number(ms) || 0;
+    timers.push({ id: id, fn: fn, ms: delay, due: __timerNow + delay, repeat: true });
+    return id;
   };
-  global.clearInterval = function () {};
+  global.clearInterval = function (id) { __timerDrop(id); };
   global.requestAnimationFrame = function (fn) { return global.setTimeout(fn, 16); };
-  global.cancelAnimationFrame = function () {};
+  global.cancelAnimationFrame = function (id) { __timerDrop(id); };
   global.queueMicrotask = function (fn) {
     if (_nativePromiseResolve) {
       _nativePromiseResolve().then(fn);
@@ -3322,12 +3503,36 @@ var pos = (st.position || "").toLowerCase();
   };
   global.__drainTimers = function () {
     var q = timers.slice(); timers = [];
-    q.sort(function (a, b) { return a.ms - b.ms; });
+    q.sort(function (a, b) { return a.due - b.due || a.id - b.id; });
     q.forEach(function (t) {
+      /* A clearTimeout during an earlier callback must cancel a later one
+         already copied into this batch. The widget's click arms a 20ms
+         abort; the reply cancels it. Running the copy anyway cleared the
+         checkbox after the click. */
+      if (__timerDead[t.id]) return;
+      if (t.due > __timerNow) {
+        timers.push(t);
+        return;
+      }
       try { t.fn(); } catch (e) {}
-      if (t.repeat && timers.length < 2000) timers.push(t);
+      if (t.repeat && !__timerDead[t.id] && timers.length < 2000) {
+        t.due = __timerNow + t.ms;
+        timers.push(t);
+      }
     });
     return timers.length;
+  };
+  /* Release timers whose delay has elapsed on the virtual clock. One
+     __drainTimers pass only runs what is already due, so a 20ms abort does
+     not fire in the same turn as the click that armed it. */
+  global.__advanceTimerClock = function (ms) {
+    __timerNow += Math.max(0, Number(ms) || 0);
+    return global.__drainTimers();
+  };
+  global.__wrTimerDelays = function () {
+    var out = [];
+    for (var i = 0; i < timers.length && out.length < 20; i++) out.push(timers[i].ms);
+    return JSON.stringify(out);
   };
 
   /* Parse an absolute URL string into plain fields on `u`; returns the raw
@@ -4215,8 +4420,13 @@ var decl = new CSSStyleDeclaration(el);
   global.SuppressedError.prototype = Object.create(Error.prototype);
   global.SuppressedError.prototype.constructor = global.SuppressedError;
 
-  /* ---- structuredClone (JSON-deep clone; disclosed: no functions/DOM nodes) ---- */
+  /* structuredClone is installed after the history codec below, which is the
+     implementation. This placeholder keeps the name bound if a script runs
+     before that assignment (it does not). */
   global.structuredClone = function (value) {
+    if (typeof global.__structuredCloneEncode === "function") {
+      return global.__structuredCloneDecode(global.__structuredCloneEncode(value));
+    }
     if (value === undefined) return undefined;
     return JSON.parse(JSON.stringify(value));
   };
@@ -4463,31 +4673,304 @@ var decl = new CSSStyleDeclaration(el);
     decrypt: function () { return Promise.resolve(new ArrayBuffer(0)); }
   };
 
-  /* MessageChannel & MessagePort for macro-task scheduling (React Scheduler) */
+  /* MessageChannel & MessagePort. Beyond local macro-task scheduling
+     (React Scheduler) this now models the transfer spec, because widgets
+     hand a channel end across documents — reCAPTCHA answers its
+     recaptcha-setup handshake only through a transferred port.
+
+     - Every port gets a realm-local id `._id` and lives in `__wrPortTable`,
+       qualified into a global key by `globalThis.__WR_CTX_KEY` (injected by
+       the runtime, one nonce per JavaScript context).
+     - A local channel (both ends in this realm) keeps `_other` wiring: posts
+       into one end fire the other end's listeners (macro task).
+     - A transfer list neuters the sent end in this realm (`._neutered`) and
+       records structured metadata on the outbound message: which end was
+       sent (`from`), which sibling stays here to receive replies (`kept`),
+       and the sender's context nonce (`ctx`).
+     - The receiving realm materializes a PROXY port (`._isProxy`, its posts
+       route back through the host to the kept end), and the runtime calls
+       `__wrPortSetRemote` on the keeping realm once the proxy id is known. */
+  var __wrPortSeq = 0;
+  var __wrPortTable = {};
   function MessagePort() {
-    this._other = null;
+    this._id = ++__wrPortSeq;
+    __wrPortTable[this._id] = this;
+    this._other = null;          /* sibling end, when the channel is local */
+    this._remotePeerKey = null;  /* "<nonce>:<localId>" of the far end once split */
+    this._isProxy = false;       /* true for ends received from another realm */
+    this._peerKey = null;        /* for proxies: where our posts must route */
+    this._neutered = false;      /* transferred away from this realm */
+    this._closed = false;
     this.onmessage = null;
     this._listeners = [];
   }
-  MessagePort.prototype.postMessage = function (data) {
-    var other = this._other;
-    if (!other) return;
-    setTimeout(function () {
-      var evt = new MessageEvent("message", { data: data });
-      if (typeof other.onmessage === "function") other.onmessage(evt);
-      other._listeners.forEach(function (l) {
-        try { l(evt); } catch (e) {}
+  /* Cross-realm payloads arrive as recorded strings; an object posted before
+     serialization travels in the \u0001wrsc structured-clone envelope below.
+     A posted STRING is delivered as that exact string — never re-parsed. */
+  /* Cross-realm postMessage and MessagePort payloads. Strings stay strings
+     (the window lane's existing contract). Everything else goes through the
+     structured-clone codec so ArrayBuffer and typed arrays survive the host
+     hop. JSON.stringify turned those into {} and the far realm could not
+     read a binary channel. */
+  function __wrWireEncode(data) {
+    if (typeof data === "string") return data;
+    try {
+      return "\u0001wrsc" + JSON.stringify(__scEncode(data));
+    } catch (e) {
+      __noteEventListenerError("postMessage.clone", e);
+      try { return JSON.stringify(data); } catch (e2) { return String(data); }
+    }
+  }
+  function __wrWireDecode(data) {
+    if (typeof data === "string" && data.indexOf("\u0001wrsc") === 0) {
+      try { return global.__structuredCloneDecode(JSON.parse(data.slice(5))); }
+      catch (e) { return data; }
+    }
+    return data;
+  }
+  function __wrParsePortData(data) {
+    if (typeof data !== "string") return data;
+    if (data.indexOf("\u0001wrsc") === 0) return __wrWireDecode(data);
+    /* A STRING posted over a MessagePort arrives as that exact string — the
+       structured-clone contract. Eagerly JSON.parse-ing here silently turned
+       JSON-text strings into arrays on delivery, so a widget whose protocol
+       sends JSON-text strings (reCAPTCHA's anchor channel: ["<b64>","z","<id>"])
+       received a DIFFERENT type than it posted and its handlers ignored every
+       message: the "o" (open) handshake reply never came and the checkbox
+       never resolved. Only the \u0001wrsc prefix may decode. */
+    return data;
+  }
+  /* Materialize proxy ends for ports transferred into this realm.
+     Receiver-side address: posts made through a proxy route to
+     "<senderNonce>:<keptId>" — the sibling end left behind by the sender.
+     Module scope: both the port lane and the window lane call it. */
+  function __wrMaterializePorts(portsJson, sink) {
+    var metas = [];
+    try {
+      metas = portsJson ? (typeof portsJson === "string" ? JSON.parse(portsJson) : portsJson) : [];
+    } catch (e) { metas = []; }
+    var ids = [];
+    (metas || []).forEach(function (mt) {
+      if (!mt) return;
+      var p = new MessagePort();
+      p._isProxy = true;
+      p._peerKey = mt.foreignPeer || (String(mt.ctx || "") + ":" + String(mt.kept || mt.from || 0));
+      if (!mt.foreignPeer && (!mt.ctx || !(mt.kept || mt.from))) {
+        /* A transferred end we cannot answer through: inert one-way by
+           design, and the receiver deserves to know why. */
+        __noteEventListenerError("port.transfer", new Error("transfer metadata missing kept-end identity; replies cannot route"));
+      }
+      sink.push(p);
+      ids.push(p._id);
+    });
+    return ids;
+  }
+  /* A port with no receiver QUEUES its messages: real MessagePorts hold
+     them until the far end starts (onmessage set, first 'message' listener,
+     or start()). Firing into the void lost the reCAPTCHA widget's early
+     channel requests — they were delivered before the widget's dispatcher
+     attached and the requests were never answered. */
+  function __wrPortHasReceiver(port) {
+    return (typeof port.onmessage === "function") ||
+           (port._listeners && port._listeners.length > 0) || !!port._started;
+  }
+  function __wrQueuePortMessage(port, item) {
+    port._msgQueue = port._msgQueue || [];
+    if (port._msgQueue.length < 200) {
+      port._msgQueue.push(item);
+    } else {
+      __noteEventListenerError("port.queue", new Error("port message queue overflow; message dropped"));
+    }
+  }
+  function __wrDispatchPort(port, item) {
+    try {
+      var evtPorts = [];
+      if (item.livePorts) {
+        /* Same-realm transfer: the event carries the operational ends. */
+        evtPorts = item.livePorts.filter(function (p) { return p instanceof MessagePort; });
+      } else {
+        /* Nested cross-realm transfer: materialize proxies. */
+        __wrMaterializePorts(item.portsJson, evtPorts);
+      }
+      try { globalThis.__WR_LAST_PORTS = evtPorts.map(function (p) { return p._id; }); } catch (e) {}
+      var evt = new MessageEvent("message", {
+        data: __wrParsePortData(item.data),
+        ports: evtPorts,
+        origin: "",
+        source: null,
+        isTrusted: true,
+        __trusted: true
       });
+      /* Spec: listeners fire with `this` and event.target = the port itself.
+         Called bare, a handler that does `this.postMessage(...)` (or reads
+         port state through `this`) silently broke — and with a null target
+         an `e.target` reply lane never existed. */
+      evt.target = port;
+      var __hitFrom = timers.length;
+      try {
+        globalThis.__WR_PORT_HITS = globalThis.__WR_PORT_HITS || [];
+        if (globalThis.__WR_PORT_HITS.length < 40) {
+          globalThis.__WR_PORT_HITS.push(port._id + " " + (typeof evt.data) + " " + String(evt.data).slice(0, 40));
+        }
+      } catch (eLog) {}
+      if (typeof port.onmessage === "function") {
+        try { port.onmessage.call(port, evt); } catch (e) { __noteEventListenerError("port.onmessage", e); }
+      }
+      port._listeners.slice().forEach(function (l) {
+        try { l.call(port, evt); } catch (e) { __noteEventListenerError("port.message", e); }
+      });
+      try {
+        if (globalThis.__WR_PORT_HITS && timers.length > __hitFrom) {
+          var delays = [];
+          for (var ti = __hitFrom; ti < timers.length && delays.length < 8; ti++) delays.push(timers[ti].ms);
+          globalThis.__WR_PORT_HITS.push("scheduled " + delays.join(","));
+        }
+      } catch (eSched) {}
+    } catch (e) {
+      __noteEventListenerError("port.delivery", e);
+    }
+  }
+  function __wrPostToPort(port, item) {
+    if (!__wrPortHasReceiver(port)) {
+      __wrQueuePortMessage(port, item);
+      return;
+    }
+    __wrDispatchPort(port, item);
+  }
+  function __wrStartPort(port) {
+    if (port._started) return;
+    port._started = true;
+    var q = port._msgQueue;
+    if (q && q.length) {
+      port._msgQueue = [];
+      q.forEach(function (it) { __wrDispatchPort(port, it); });
+    }
+  }
+  function __wrFirePort(port, data, portsJson) {
+    __wrPostToPort(port, { data: data, portsJson: portsJson });
+  }
+  /* postMessage argument shapes that may carry a transfer list:
+     legacy        postMessage(data, [transfer])
+     modern        postMessage(data, targetOrigin, [transfer])
+     options bag   postMessage(data, {targetOrigin, transfer}) */
+  function __wrExtractTransfer(second, third) {
+    if (second instanceof Array) return { ports: second, bag: null };
+    if (third instanceof Array) return { ports: third, bag: null };
+    if (second && typeof second === "object" && second.transfer instanceof Array) {
+      return { ports: second.transfer, bag: second };
+    }
+    return { ports: [], bag: null };
+  }
+  /* Record transfer metadata for the outbound message. "kept" names the
+     sibling that stays in this realm and will receive replies; without it
+     the far side could never answer. Cross-realm sends NEUTER the sent end
+     here (it now belongs to the far realm); the self lane keeps it live —
+     a same-realm transfer hands the receiver a WORKING end (the event's
+     ports are the operational object; neutering them made every loopback
+     handshake receiver hold a dead port). */
+  function __wrPrepareOutPorts(sent, neuter) {
+    if (neuter === undefined) neuter = true;
+    return (sent || []).filter(function (p) { return p instanceof MessagePort; }).map(function (p) {
+      var meta = {
+        from: p._id,
+        ctx: (globalThis.__WR_CTX_KEY || "") + "",
+        kept: p._other ? p._other._id : 0,
+        foreignPeer: p._peerKey || null
+      };
+      if (neuter) p._neutered = true;
+      return meta;
+    });
+  }
+  MessagePort.prototype.postMessage = function (data, second, third) {
+    var self = this;
+    try {
+      globalThis.__WR_PORT_POSTS = (globalThis.__WR_PORT_POSTS || 0) + 1;
+    } catch (eCount) {}
+    if (self._closed) return;
+    if (self._neutered) {
+      /* Transferred away: this end no longer exists from this realm's
+         perspective. Report it; a silent drop hides handshakes that stop. */
+      __noteEventListenerError("port.postMessage", new Error("transferred MessagePort is inert in this realm"));
+      return;
+    }
+    /* Split-channel routing: a KEPT end routes once rewired
+       (_remotePeerKey, set by __wrPortSetRemote after the far side's proxy
+       exists); a PROXY end routes from birth (_peerKey, recorded when the
+       end was materialized). Both address the far realm as
+       "<nonce>:<localId>". */
+    var routeKey = self._remotePeerKey || (self._isProxy ? self._peerKey : null);
+    if (routeKey) {
+      /* Split channel: our posts must reach the far end through the host. */
+      var rt = __wrExtractTransfer(second, third);
+      var payload = __wrWireEncode(data);
+      var portsMeta = "[]";
+      if (rt.ports.length) portsMeta = JSON.stringify(__wrPrepareOutPorts(rt.ports));
+      if (typeof host_post_message === "function") {
+        host_post_message(payload, "*", "port:" + routeKey,
+          (global.location && global.location.origin) || "", portsMeta);
+      }
+      return;
+    }
+    if (self._other && self._other._neutered) {
+      /* The sibling was transferred to another realm but its proxy there is
+         not materialized yet and we have not been rewired to it. A real
+         MessagePort BUFFERS messages until the transferred end starts
+         running in its realm; dropping them here (into the neutered twin's
+         dead local lane) is how the anchor's initial handshake send used to
+         vanish. Queue; __wrPortSetRemote flushes once the far end exists. */
+      var bt = __wrExtractTransfer(second, third);
+      var bPayload = __wrWireEncode(data);
+      var bPorts = bt.ports.length ? JSON.stringify(__wrPrepareOutPorts(bt.ports)) : "[]";
+      self._buffer = self._buffer || [];
+      if (self._buffer.length < 100) {
+        self._buffer.push([bPayload, bPorts]);
+      } else {
+        __noteEventListenerError("port.postMessage", new Error("port buffer overflow; message dropped"));
+      }
+      return;
+    }
+    var other = self._other;
+    if (!other) {
+      __noteEventListenerError("port.postMessage", new Error("no channel peer"));
+      return;
+    }
+    var lt = __wrExtractTransfer(second, third);
+    var livePorts = (lt.ports || []).slice();  /* local transfer: ends stay live */
+    setTimeout(function () {
+      if (other._closed) return;
+      /* Queue-aware delivery: if the peer has not attached a receiver yet,
+         the message waits on the port (spec behavior) instead of dying. */
+      __wrPostToPort(other, { data: data, livePorts: livePorts });
     }, 0);
   };
   MessagePort.prototype.addEventListener = function (type, fn) {
-    if (type === "message") this._listeners.push(fn);
+    if (type === "message") {
+      var wasEmpty = this._listeners.length === 0;
+      this._listeners.push(fn);
+      /* Per spec, the first message listener starts the port; queued
+         messages arrive now, not into the void. */
+      if (wasEmpty) __wrStartPort(this);
+    }
   };
   MessagePort.prototype.removeEventListener = function (type, fn) {
     this._listeners = this._listeners.filter(function (l) { return l !== fn; });
   };
-  MessagePort.prototype.start = function () {};
-  MessagePort.prototype.close = function () {};
+  MessagePort.prototype.start = function () { __wrStartPort(this); };
+  /* Assigning onmessage starts the port (spec). */
+  Object.defineProperty(MessagePort.prototype, "onmessage", {
+    configurable: true,
+    enumerable: true,
+    get: function () { return this._onmessage || null; },
+    set: function (fn) {
+      this._onmessage = (typeof fn === "function") ? fn : null;
+      if (this._onmessage) __wrStartPort(this);
+    }
+  });
+  MessagePort.prototype.close = function () {
+    this._closed = true;
+    this._buffer = null;
+    this._msgQueue = null;
+  };
 
   function MessageChannel() {
     this.port1 = new MessagePort();
@@ -4533,6 +5016,30 @@ var decl = new CSSStyleDeclaration(el);
       "DataCloneError"
     );
   }
+  function __scHexFromBytes(u8) {
+    var parts = new Array(u8.length);
+    for (var i = 0; i < u8.length; i++) {
+      var h = u8[i].toString(16);
+      parts[i] = h.length === 1 ? "0" + h : h;
+    }
+    return parts.join("");
+  }
+  function __scBufFromHex(hex) {
+    var n = (hex.length / 2) | 0;
+    var buf = new ArrayBuffer(n);
+    var view = new Uint8Array(buf);
+    for (var i = 0; i < n; i++) view[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return buf;
+  }
+  function __scTypedCtorName(v) {
+    var names = ["Uint8Array", "Uint8ClampedArray", "Int8Array", "Uint16Array", "Int16Array",
+      "Uint32Array", "Int32Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array"];
+    for (var i = 0; i < names.length; i++) {
+      var C = global[names[i]];
+      if (typeof C === "function" && v instanceof C) return names[i];
+    }
+    return "";
+  }
   function __scEncode(v, seen) {
     if (v === undefined) return { __wr_u: 1 };
     var t = typeof v;
@@ -4570,6 +5077,16 @@ var decl = new CSSStyleDeclaration(el);
     } else if (v instanceof Error) {
       seen.set(v, id);
       enc = { __wr_e: [v.name, v.message] };
+    } else if (__scTypedCtorName(v)) {
+      seen.set(v, id);
+      var bytes = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+      enc = { __wr_ta: [__scTypedCtorName(v), __scHexFromBytes(bytes)] };
+    } else if (typeof ArrayBuffer === "function" && v instanceof ArrayBuffer) {
+      seen.set(v, id);
+      enc = { __wr_ab: __scHexFromBytes(new Uint8Array(v)) };
+    } else if (typeof DataView === "function" && v instanceof DataView) {
+      seen.set(v, id);
+      enc = { __wr_dv: __scHexFromBytes(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)) };
     } else if (Array.isArray(v)) {
       seen.set(v, id);
       var arr = [];
@@ -4605,6 +5122,23 @@ var decl = new CSSStyleDeclaration(el);
       var err = new Error(v.__wr_e[1]);
       err.name = v.__wr_e[0];
       return err;
+    }
+    if (typeof v.__wr_ab === "string") {
+      out = __scBufFromHex(v.__wr_ab);
+      if (typeof v.__wr_id === "number") table[v.__wr_id] = out;
+      return out;
+    }
+    if (v.__wr_ta && typeof v.__wr_ta[1] === "string") {
+      var taBuf = __scBufFromHex(v.__wr_ta[1]);
+      var TA = global[v.__wr_ta[0]];
+      out = (typeof TA === "function") ? new TA(taBuf) : new Uint8Array(taBuf);
+      if (typeof v.__wr_id === "number") table[v.__wr_id] = out;
+      return out;
+    }
+    if (typeof v.__wr_dv === "string") {
+      out = new DataView(__scBufFromHex(v.__wr_dv));
+      if (typeof v.__wr_id === "number") table[v.__wr_id] = out;
+      return out;
     }
     if (typeof v.__wr_c === "number" && table[v.__wr_c] !== undefined) return table[v.__wr_c];
     var out;
@@ -4642,6 +5176,9 @@ var decl = new CSSStyleDeclaration(el);
       if (Object.prototype.hasOwnProperty.call(v, k)) out[k] = global.__structuredCloneDecode(v[k], table);
     }
     return out;
+  };
+  global.structuredClone = function (value) {
+    return global.__structuredCloneDecode(global.__structuredCloneEncode(value));
   };
   global.history = {
     get length() {
@@ -4907,6 +5444,12 @@ var decl = new CSSStyleDeclaration(el);
   global.__mods = global.__mods || {};
   global.__require = function (id) { return global.__mods[id] || {}; };
 
+  global.__WR_CONSOLE_LOGS = global.__WR_CONSOLE_LOGS || [];
+  global.__drainConsoleLogs = function () {
+    var out = (global.__WR_CONSOLE_LOGS || []).slice();
+    global.__WR_CONSOLE_LOGS = [];
+    return JSON.stringify(out);
+  };
   global.console = {
     /* Errors serialize with name+message+stack (real-browser console shape),
        so boundary-captured render failures carry their origin. */
@@ -4919,16 +5462,35 @@ var decl = new CSSStyleDeclaration(el);
       } catch (e) {}
       return String(a);
     },
-    log: function () {
+    _emit: function (level, args) {
+      var msg = Array.prototype.map.call(args, this._fmt).join(" ");
+      try {
+        global.__WR_CONSOLE_LOGS = global.__WR_CONSOLE_LOGS || [];
+        if (global.__WR_CONSOLE_LOGS.length < 500) {
+          global.__WR_CONSOLE_LOGS.push({
+            level: String(level || "log"),
+            message: msg.slice(0, 4000),
+            ts: Date.now()
+          });
+        }
+      } catch (e) {}
       if (typeof host_log === "function") {
-        host_log(Array.prototype.map.call(arguments, this._fmt).join(" "));
+        /* Pass the level only when the host's callable accepts it
+           (runtime sets __WR_HOST_LOG_TAKES_LEVEL). QuickJS raises a
+           DEFERRED SystemError on extra arguments to a 1-arg Python
+           callable — no JS try/catch intercepts it; the error surfaces
+           at the next engine boundary. Single-arg hosts get the message
+           alone, exactly as the engine's own committed contract tests. */
+        if (global.__WR_HOST_LOG_TAKES_LEVEL) host_log(msg, String(level || "log"));
+        else host_log(msg);
       }
     },
-    warn: function () { this.log.apply(this, arguments); },
-    error: function () { this.log.apply(this, arguments); },
-    info: function () { this.log.apply(this, arguments); },
-    debug: function () { this.log.apply(this, arguments); },
-    trace: function () { this.log.apply(this, arguments); }
+    log: function () { this._emit("log", arguments); },
+    warn: function () { this._emit("warn", arguments); },
+    error: function () { this._emit("error", arguments); },
+    info: function () { this._emit("info", arguments); },
+    debug: function () { this._emit("debug", arguments); },
+    trace: function () { this._emit("trace", arguments); }
   };
 
   /* Web storage. The old per-context closures lost everything on the next
@@ -5093,6 +5655,27 @@ var decl = new CSSStyleDeclaration(el);
   /* In-memory IndexedDB subsystem (zero external dependencies, zero RAM bloat). */
   (function () {
     var idbDatabases = {};
+    try {
+      if (typeof globalThis.__WR_IDB_SEED === "object" && globalThis.__WR_IDB_SEED) {
+        idbDatabases = JSON.parse(JSON.stringify(globalThis.__WR_IDB_SEED));
+      }
+    } catch (e) {}
+    global.__drainIndexedDB = function () {
+      try { return JSON.stringify(idbDatabases); } catch (e) { return "{}"; }
+    };
+    global.__seedIndexedDB = function (seedJson) {
+      try {
+        var parsed = typeof seedJson === "string" ? JSON.parse(seedJson) : seedJson;
+        if (parsed && typeof parsed === "object") {
+          for (var dbName in parsed) {
+            if (Object.prototype.hasOwnProperty.call(parsed, dbName)) {
+              idbDatabases[dbName] = parsed[dbName];
+            }
+          }
+        }
+        return true;
+      } catch (e) { return false; }
+    };
 
     function IDBRequest() {
       this.result = undefined;
@@ -5472,15 +6055,34 @@ var decl = new CSSStyleDeclaration(el);
   });
 
   Object.defineProperty(Element.prototype, "contentWindow", {
+    configurable: true,
     get: function () {
       if (this.nodeName.toLowerCase() !== "iframe") return null;
+      try {
+        if (globalThis.__WR_CW_ARM && globalThis.__WR_CW_LOG && globalThis.__WR_CW_LOG.length < 8) {
+          var src = String((this.getAttribute && this.getAttribute("src")) || "");
+          var info = { src: src ? "anchor" : "(empty)", sameEl: this === globalThis.__WR_SRC_EL };
+          try {
+            var caller = arguments.callee.caller;
+            info.caller = caller ? String(caller).slice(0, 180) : "none";
+            info.nargs = caller && caller.arguments ? caller.arguments.length : -1;
+          } catch (eCall) { info.err = String(eCall).slice(0, 80); }
+          globalThis.__WR_CW_LOG.push(info);
+        }
+      } catch (eLog) {}
       if (!this._contentWindow) {
         var self = this;
         var cw = {
-          postMessage: function (data, targetOrigin) {
+          postMessage: function (data, targetOrigin, transfer) {
+            var t = __wrExtractTransfer(targetOrigin, transfer);
             if (typeof host_post_message === "function") {
-              var msgData = (typeof data === "string") ? data : JSON.stringify(data);
-              host_post_message(msgData, String(targetOrigin || "*"), self.getAttribute("src") || "");
+              var msgData = __wrWireEncode(data);
+              var portsMeta = t.ports.length ? JSON.stringify(__wrPrepareOutPorts(t.ports)) : "[]";
+              /* Transferred ports ride the recorded message; the frame's
+                 realm materializes a proxy end and the kept end here learns
+                 the proxy's key from the runtime. */
+              host_post_message(msgData, __resolveTargetOrigin(t.bag || targetOrigin),
+                self.getAttribute("src") || "", (global.location && global.location.origin) || "", portsMeta);
             }
           }
         };
@@ -5514,6 +6116,34 @@ var decl = new CSSStyleDeclaration(el);
       return this._contentDocument;
     }
   });
+
+  /* Inject HTML content into an iframe's contentDocument.
+     This is called from Python to populate iframe content fetched separately. */
+  Element.prototype.__injectFrameContent = function (html) {
+    if (this.nodeName.toLowerCase() !== "iframe") return false;
+    var win = this.contentWindow;
+    if (!win || !win.document) return false;
+    var doc = win.document;
+    // Parse the HTML and rebuild the iframe document
+    // Simple approach: create a div, set innerHTML, move children
+    var container = doc.createElement("div");
+    try {
+      container.innerHTML = html;
+    } catch (e) {
+      // If innerHTML fails, the html might have script tags that need special handling
+      // For now, just return false to indicate failure
+      return false;
+    }
+    // Clear existing content
+    while (doc.body.firstChild) {
+      doc.body.removeChild(doc.body.firstChild);
+    }
+    // Move children from container to body
+    while (container.firstChild) {
+      doc.body.appendChild(container.firstChild);
+    }
+    return true;
+  };
 
   /* Standard Headers implementation */
   function Headers(init) {
@@ -6938,6 +7568,15 @@ var decl = new CSSStyleDeclaration(el);
         doc.location = _loc;
       } catch (e) {}
     }
+    /* window.origin is the document origin (HTML spec). It is not
+       location.origin under another name on the window object; scripts
+       read `window.origin` directly. */
+    Object.defineProperty(global, "origin", {
+      get: function () {
+        try { return (global.location && global.location.origin) || ""; } catch (e) { return ""; }
+      },
+      configurable: true
+    });
     global.Node = Node;
     global.Element = Element;
     global.HTMLElement = Element;
@@ -7069,7 +7708,13 @@ var decl = new CSSStyleDeclaration(el);
       this.data = init && init.data;
       this.origin = (init && init.origin) || "";
       this.lastEventId = (init && init.lastEventId) || "";
-      this.source = (init && init.source) || global.parent || global;
+      /* Port deliveries pass source:null. A missing source on a window
+         message still falls back to parent; an explicit null must stay null,
+         or a port handler treats the event as a cross-window message and
+         drops it. */
+      this.source = (init && Object.prototype.hasOwnProperty.call(init, "source"))
+        ? init.source
+        : (global.parent || global);
       this.ports = (init && init.ports) || [];
     };
     global.MessageEvent.prototype = Object.create(global.Event.prototype);
@@ -7339,43 +7984,162 @@ var decl = new CSSStyleDeclaration(el);
       var index = listeners.indexOf(fn);
       if (index >= 0) listeners.splice(index, 1);
     };
+    /* Introspection: without it an agent can only observe that a page did not
+       react to an event, never which handler declined it or why. */
+    global.__WR_windowListeners = function (type) {
+      return (windowListeners[String(type)] || []).slice();
+    };
     global.dispatchEvent = function (event) {
+      var origCall = Function.prototype.call;
+      if (event && event.type === "message") {
+        Function.prototype.call = function () {
+          try { return origCall.apply(this, arguments); }
+          catch (err) {
+            globalThis.__WR_INNER_THROWS = globalThis.__WR_INNER_THROWS || [];
+            if (globalThis.__WR_INNER_THROWS.length < 6) {
+              globalThis.__WR_INNER_THROWS.push(String((err && err.message) || err).slice(0, 180));
+            }
+            throw err;
+          }
+        };
+      }
       (windowListeners[event.type] || []).slice().forEach(function (fn) {
-        try { fn.call(global, event); } catch (e) {}
+        try {
+          var ret = fn.call(global, event);
+          if (event && event.type === "message") {
+            globalThis.__WR_MSG_RETURNS = globalThis.__WR_MSG_RETURNS || [];
+            if (globalThis.__WR_MSG_RETURNS.length < 8) {
+              globalThis.__WR_MSG_RETURNS.push({
+                ret: ret == null ? String(ret) : typeof ret,
+                post: !!(ret && ret.postMessage)
+              });
+            }
+          }
+        } catch (e) {
+          /* A throwing window listener is reported, not swallowed. Silent
+             suppression hid a real reCAPTCHA handshake failure: the parent's
+             message handler threw and the anchor waited forever. */
+          try {
+            globalThis.__WR_EVENT_ERRORS = globalThis.__WR_EVENT_ERRORS || [];
+            globalThis.__WR_EVENT_ERRORS.push(
+              String(event && event.type) + ": " + String((e && e.message) || e)
+            );
+          } catch (_) {}
+        }
       });
+      if (event && event.type === "message") Function.prototype.call = origCall;
       return true;
     };
-    global.postMessage = function (data, origin) {
-      var targetOrigin = String(origin != null ? origin : "*");
+    /* postMessage's second argument is either a targetOrigin string or a
+     WindowPostMessageOptions bag. ReCAPTCHA passes the bag form, which used
+     to stringify to "[object Object]" and made every target message fail the
+     origin check. Spec: an options bag without targetOrigin defaults to "/". */
+
+  global.postMessage = function (data, origin, transfer) {
+      var t = __wrExtractTransfer(origin, transfer);
+      var targetOrigin = t.bag ? __resolveTargetOrigin(t.bag) : __resolveTargetOrigin(origin);
       var senderOrigin = (global.location && global.location.origin) || "";
-      var msgData = (typeof data === "string") ? data : JSON.stringify(data);
+      var msgData = __wrWireEncode(data);
+      var portsMeta = t.ports.length ? JSON.stringify(__wrPrepareOutPorts(t.ports, false)) : "[]";
       if (typeof host_post_message === "function") {
-        host_post_message(msgData, targetOrigin, "self", senderOrigin);
+        host_post_message(msgData, targetOrigin, "self", senderOrigin, portsMeta);
       }
       if (targetOrigin !== "*" && targetOrigin !== "/" && targetOrigin !== senderOrigin) {
         return;
       }
+      /* Self lane: the transferred ends stay in this realm, so the event
+         carries the LIVE port objects (a real browser hands the receiver a
+         fresh working end bound to the same channel; keeping the original
+         operational is the same-realm equivalent). The anchor's loopback
+         handshake receiver posts through exactly this end. */
       Promise.resolve().then(function () {
         global.dispatchEvent(new global.MessageEvent("message", {
           data: data,
           origin: senderOrigin,
-          source: global
+          source: global,
+          ports: t.ports.filter(function (p) { return p instanceof MessagePort; }),
+          isTrusted: true,
+          __trusted: true
         }));
       });
     };
     global.parent = {
-      postMessage: function (data, origin) {
-        var targetOrigin = String(origin != null ? origin : "*");
+      postMessage: function (data, origin, transfer) {
+        var t = __wrExtractTransfer(origin, transfer);
+        var targetOrigin = t.bag ? __resolveTargetOrigin(t.bag) : __resolveTargetOrigin(origin);
         var senderOrigin = (global.location && global.location.origin) || "";
-        var msgData = (typeof data === "string") ? data : JSON.stringify(data);
+        var msgData = __wrWireEncode(data);
+        /* Transferred ports ride along on the recorded message so the router
+           can split the channel: the receiving realm gets a proxy end and the
+           kept end here learns the proxy's key once it exists. */
+        var portsMeta = t.ports.length ? JSON.stringify(__wrPrepareOutPorts(t.ports)) : "[]";
         if (typeof host_post_message === "function") {
-          host_post_message(msgData, targetOrigin, "parent", senderOrigin);
+          host_post_message(msgData, targetOrigin, "parent", senderOrigin, portsMeta);
         }
       }
     };
     global.top = global.parent;
     global.self = global;
-    global.__receiveMessage = function (data, origin, targetOrigin) {
+    global.__wrPortReceive = function (localId, data, senderNonce, portsJson) {
+      var port = __wrPortTable[localId | 0];
+      if (!port || port._closed) return false;
+      __wrFirePort(port, data, portsJson);
+      return true;
+    };
+    /* After the far side's proxy exists, the kept end learns where posts go. */
+    global.__wrPortSetRemote = function (localId, peerKey) {
+      var port = __wrPortTable[localId | 0];
+      if (!port) return false;
+      port._remotePeerKey = String(peerKey || "");
+      /* Flush everything the kept end posted while the far proxy did not yet
+         exist — the port's buffer, exactly like a real MessagePort that
+         queues messages until the transferred end starts running. */
+      var buf = port._buffer;
+      if (buf && buf.length && port._remotePeerKey) {
+        var senderOrigin = (global.location && global.location.origin) || "";
+        var items = buf.slice();
+        port._buffer = [];
+        items.forEach(function (item) {
+          if (typeof host_post_message === "function") {
+            host_post_message(item[0], "*", "port:" + port._remotePeerKey, senderOrigin, item[1]);
+          }
+        });
+      }
+      return true;
+    };
+    /* Honest introspection for the agent surface: a split channel's state,
+       including whether the far side's handler ever attached. */
+    global.__wrPortInfo = function (localId) {
+      var p = __wrPortTable[localId | 0];
+      if (!p) return "null";
+      return JSON.stringify({
+        id: p._id,
+        isProxy: !!p._isProxy,
+        neutered: !!p._neutered,
+        closed: !!p._closed,
+        hasOnmessage: typeof p.onmessage === "function",
+        listeners: p._listeners.length,
+        remote: p._remotePeerKey || p._peerKey || null,
+        buffered: (p._buffer || []).length,
+        queued: (p._msgQueue || []).length,
+        started: !!p._started
+      });
+    };
+    global.__wrPortOnmessageSrc = function (localId) {
+      var p = __wrPortTable[localId | 0];
+      return (p && typeof p.onmessage === "function") ? String(p.onmessage) : "null";
+    };
+    global.__wrPortListenerSrc = function (localId, idx) {
+      var p = __wrPortTable[localId | 0];
+      var l = p && p._listeners && p._listeners[idx | 0];
+      return (typeof l === "function") ? String(l) : "null";
+    };
+    /* Live port object access: lets the agent (and diagnostics) observe and
+       drive split channels the page established. */
+    global.__wrPortObject = function (localId) {
+      return __wrPortTable[localId | 0] || null;
+    };
+    global.__receiveMessage = function (data, origin, targetOrigin, sourceWindow, portsJson) {
       if (targetOrigin && targetOrigin !== "*") {
         var myOrigin = (global.location && global.location.origin) || "";
         /* targetOrigin may be given as a full URL ('https://host/path') — the
@@ -7383,10 +8147,25 @@ var decl = new CSSStyleDeclaration(el);
            of a naive string compare (which dropped every URL-form target
            message; same bug class the runtime delivery once had). */
         var wantOrigin = String(targetOrigin);
+        /* "/" is the options-bag default and means "same origin as the
+           sender", so resolve it against the recorded sender origin. */
+        if (wantOrigin === "/") wantOrigin = String(origin || "");
         if (wantOrigin.indexOf("/") > 0) {
           try { wantOrigin = new URL(wantOrigin).origin; } catch (e) {}
         }
         if (myOrigin && wantOrigin !== myOrigin) {
+          try {
+            globalThis.__WR_WINDOW_MSGS = globalThis.__WR_WINDOW_MSGS || [];
+            if (globalThis.__WR_WINDOW_MSGS.length < 12) {
+              globalThis.__WR_WINDOW_MSGS.push({
+                data: String(data).slice(0, 40),
+                origin: String(origin || ""),
+                want: String(wantOrigin),
+                mine: String(myOrigin),
+                dropped: true
+              });
+            }
+          } catch (eDrop) {}
           return false;
         }
       }
@@ -7394,22 +8173,95 @@ var decl = new CSSStyleDeclaration(el);
         postMessage: function (replyData, replyOrigin) {
           var repTarget = String(replyOrigin != null ? replyOrigin : "*");
           var repSender = (global.location && global.location.origin) || "";
-          var repMsgData = (typeof replyData === "string") ? replyData : JSON.stringify(replyData);
+          var repMsgData = __wrWireEncode(replyData);
           if (typeof host_post_message === "function") {
             host_post_message(repMsgData, repTarget, "reply", repSender);
           }
         }
       };
+      var resolvedSource = __resolveSenderSource(sourceWindow);
+      /* Transferred ports: materialize proxy ends in this realm and publish
+         their ids so the runtime can rewire the sender's kept ends. */
+      var recvPorts = [];
+      var recvIds = __wrMaterializePorts(portsJson, recvPorts);
+      try {
+        recvPorts = new Proxy(recvPorts, {
+          get: function (t, k) {
+            if (k === "length" || k === "0") {
+              globalThis.__WR_PORT_READS = globalThis.__WR_PORT_READS || [];
+              var bit = String(k);
+              if (k === "0" && t[0]) bit += ":id" + t[0]._id + " on=" + (typeof t[0].onmessage) + " ls=" + (t[0]._listeners ? t[0]._listeners.length : 0) + " q=" + ((t[0]._msgQueue || []).length);
+              if (globalThis.__WR_PORT_READS.length < 8) globalThis.__WR_PORT_READS.push(bit);
+            }
+            var v = t[k];
+            return typeof v === "function" ? v.bind(t) : v;
+          }
+        });
+      } catch (eProxy) {}
+      try { globalThis.__WR_LAST_PORTS = recvIds; } catch (e) {}
+      try {
+        globalThis.__WR_WINDOW_MSGS = globalThis.__WR_WINDOW_MSGS || [];
+        if (globalThis.__WR_WINDOW_MSGS.length < 12) {
+          var matched = null;
+          var frames = (global.document && global.document.querySelectorAll)
+            ? global.document.querySelectorAll("iframe") : [];
+          for (var fi = 0; fi < frames.length; fi++) {
+            if (frames[fi].contentWindow === resolvedSource) {
+              matched = fi;
+              try { globalThis.__WR_SRC_EL = frames[fi]; } catch (eEl) {}
+            }
+          }
+          globalThis.__WR_WINDOW_MSGS.push({
+            data: String(__wrWireDecode(data)).slice(0, 40),
+            origin: String(origin || ""),
+            ports: recvPorts.length,
+            source: resolvedSource ? (matched == null ? "other" : "iframe" + matched) : "none",
+            dropped: false
+          });
+        }
+      } catch (eRec) {}
       Promise.resolve().then(function () {
+        try { globalThis.__WR_CW_ARM = true; globalThis.__WR_CW_LOG = []; } catch (eArm) {}
         global.dispatchEvent(new global.MessageEvent("message", {
-          data: data,
+          data: __wrWireDecode(data),
           origin: String(origin || ""),
-          source: sourceProxy
+          source: resolvedSource || sourceProxy,
+          ports: recvPorts,
+          isTrusted: true,
+          __trusted: true
         }));
+        try { globalThis.__WR_CW_ARM = false; } catch (eArm2) {}
       });
       return true;
     };
-    global.frames = [];
+    global.frames = new Proxy({}, {
+      /* Spec: window.frames supports NAMED access to child frame windows
+         (window.frames["bframe"] → that iframe's contentWindow) plus a
+         length. The bundle's channel machinery addresses frames by name
+         through the parent's collection (parent.frames[name]); an empty
+         array made every such lookup undefined. */
+      get: function (_t, k) {
+        if (k === "length") {
+          return (global.document && global.document.querySelectorAll)
+            ? global.document.querySelectorAll("iframe").length : 0;
+        }
+        if (typeof k !== "string") return undefined;
+        var doc = global.document;
+        if (!doc || !doc.querySelectorAll) return undefined;
+        var iframes = doc.querySelectorAll("iframe");
+        for (var i = 0; i < iframes.length; i++) {
+          var f = iframes[i];
+          var nm = (f.getAttribute && (f.getAttribute("name") || f.getAttribute("id"))) || "";
+          if (nm === k) {
+            try { return f.contentWindow; } catch (e) { return undefined; }
+          }
+        }
+        return undefined;
+      },
+      has: function (_t, k) {
+        return typeof this.get === "function" && this.get(_t, k) !== undefined;
+      }
+    });
     global.innerWidth = 1280;
     global.innerHeight = 720;
     return true;
@@ -7448,6 +8300,49 @@ var decl = new CSSStyleDeclaration(el);
 
   global.__clickPath = function (path, stealth) {
     var el = global.__byPath(path);
+    if (!el) return false;
+    if (stealth !== undefined) global.__stealthMode = !!stealth;
+    if (typeof el.__nativeClick === "function") el.__nativeClick();
+    else if (typeof el.click === "function") el.click();
+    else el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true, __trusted: true }));
+    return true;
+  };
+
+  /* Click an element inside an iframe.
+     frameRef: the iframe's ref (e.g., "f1") or index
+     path: the path to the element within the iframe's document */
+  global.__clickInFrame = function (frameRef, path, stealth) {
+    var iframe = null;
+    // Try to find the iframe by ref attribute or by index
+    if (typeof frameRef === "string") {
+      // Look for iframe with matching ref attribute
+      var iframes = global.document.querySelectorAll("iframe");
+      for (var i = 0; i < iframes.length; i++) {
+        if (iframes[i].getAttribute("data-ref") === frameRef ||
+            iframes[i].getAttribute("ref") === frameRef ||
+            iframes[i].name === frameRef) {
+          iframe = iframes[i];
+          break;
+        }
+      }
+    } else if (typeof frameRef === "number") {
+      var iframes2 = global.document.querySelectorAll("iframe");
+      if (frameRef >= 0 && frameRef < iframes2.length) {
+        iframe = iframes2[frameRef];
+      }
+    }
+    if (!iframe) return false;
+    var frameDoc = iframe.contentDocument;
+    if (!frameDoc) return false;
+    // Traverse the path within the frame's document
+    var n = frameDoc;
+    if (!n || !path) return null;
+    for (var j = 0; j < path.length; j++) {
+      var kids = __elementChildren(n);
+      n = kids[path[j]] || null;
+      if (!n) return false;
+    }
+    var el = n;
     if (!el) return false;
     if (stealth !== undefined) global.__stealthMode = !!stealth;
     if (typeof el.__nativeClick === "function") el.__nativeClick();
@@ -8162,5 +9057,292 @@ global.__submitPath = function (path) {
     el.dispatchEvent(new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true, timeStamp: tNow }));
     el.dispatchEvent(new global.Event("change", { bubbles: true, cancelable: false, isTrusted: true, timeStamp: tNow + 1 }));
     return true;
+  };
+
+  /* ---- Agent-Native Layer & Topological Occlusion Inspector ---- */
+  function __nodeSelector(el) {
+    if (!el || el.nodeType !== 1) return "";
+    var tag = (el.nodeName || "div").toLowerCase();
+    var id = el.getAttribute && el.getAttribute("id");
+    if (id) return tag + "#" + id;
+    var cls = (el.getAttribute && el.getAttribute("class")) || "";
+    var tokens = cls.trim().split(/\s+/).filter(Boolean).slice(0, 2);
+    if (tokens.length) return tag + "." + tokens.join(".");
+    var name = el.getAttribute && el.getAttribute("name");
+    if (name) return tag + "[name=\"" + name + "\"]";
+    return tag;
+  }
+
+  function __nodeLabel(el) {
+    if (!el || el.nodeType !== 1) return "";
+    var aria = (el.getAttribute && (el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("placeholder") || el.getAttribute("alt"))) || "";
+    if (aria) return String(aria).trim().slice(0, 80);
+    var txt = String(el.textContent || "").replace(/\s+/g, " ").trim();
+    if (txt) return txt.slice(0, 80);
+    return (el.getAttribute && (el.getAttribute("value") || el.getAttribute("name") || el.getAttribute("id"))) || "";
+  }
+
+  global.__inspectLayers = function () {
+    var doc = global.document;
+    if (!doc) return JSON.stringify({ strata: {}, occlusions: [], honeypots: [], scrollers: [] });
+    __ensureLayout(doc);
+    var vw = Number(global.innerWidth) || 1280;
+    var vh = Number(global.innerHeight) || 720;
+    var viewportArea = Math.max(1, vw * vh);
+    var strata = {
+      L0_FLOW: [],
+      L1_CHROME: [],
+      L2_SCROLLER: [],
+      L3_OVERLAY: [],
+      L4_HIDDEN: []
+    };
+    var overlays = [];
+    var interactiveControls = [];
+    var honeypots = [];
+    var scrollers = [];
+    var orderSeq = 0;
+
+    function isInteractive(el) {
+      var tag = (el.nodeName || "").toLowerCase();
+      if (tag === "a" || tag === "button" || tag === "input" || tag === "select" || tag === "textarea" || tag === "summary") return true;
+      var role = (el.getAttribute && (el.getAttribute("role") || "")).toLowerCase();
+      if (role === "button" || role === "link" || role === "checkbox" || role === "menuitem" || role === "tab" || role === "switch" || role === "combobox") return true;
+      if (el.getAttribute && (el.getAttribute("onclick") != null || el.getAttribute("contenteditable") != null)) return true;
+      return false;
+    }
+
+    (function walk(el, ancestorHidden, ancestorOverlay, ancestorChrome) {
+      if (!el || el.nodeType !== 1) return;
+      var seq = ++orderSeq;
+      var tag = (el.nodeName || "").toLowerCase();
+      if (tag === "head" || tag === "script" || tag === "style" || tag === "meta" || tag === "link") return;
+
+      var cs = (typeof global.getComputedStyle === "function") ? global.getComputedStyle(el) : {};
+      var disp = String((cs && cs.display) || "").toLowerCase();
+      var vis = String((cs && cs.visibility) || "").toLowerCase();
+      var op = cs && cs.opacity !== undefined && cs.opacity !== "" ? Number(cs.opacity) : 1;
+      var pos = String((cs && cs.position) || "static").toLowerCase();
+      var zRaw = (cs && cs.zIndex) || "auto";
+      var zIndex = (zRaw === "auto" || zRaw === "" || isNaN(Number(zRaw))) ? 0 : Number(zRaw);
+      var ovX = String((cs && (cs.overflowX || cs.overflow)) || "visible").toLowerCase();
+      var ovY = String((cs && (cs.overflowY || cs.overflow)) || "visible").toLowerCase();
+
+      var attrHidden = (el.hasAttribute && (el.hasAttribute("hidden") || el.hasAttribute("inert"))) ||
+                       ((el.getAttribute && el.getAttribute("aria-hidden")) === "true");
+      var selfHidden = ancestorHidden || disp === "none" || vis === "hidden" || vis === "collapse" || op === 0 || attrHidden;
+
+      var rect = (typeof el.getBoundingClientRect === "function") ? el.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0 };
+      var boxObj = {
+        selector: __nodeSelector(el),
+        tag: tag,
+        label: __nodeLabel(el),
+        x: Math.round(rect.x || 0),
+        y: Math.round(rect.y || 0),
+        width: Math.round(rect.width || 0),
+        height: Math.round(rect.height || 0),
+        position: pos,
+        zIndex: zIndex,
+        order: seq
+      };
+
+      if (selfHidden) {
+        var reason = disp === "none" ? "display:none" : (vis === "hidden" ? "visibility:hidden" : (op === 0 ? "opacity:0" : (attrHidden ? "hidden/aria-hidden/inert" : "ancestor-hidden")));
+        boxObj.reason = reason;
+        if (strata.L4_HIDDEN.length < 60) strata.L4_HIDDEN.push(boxObj);
+        if (isInteractive(el)) {
+          honeypots.push({
+            selector: boxObj.selector,
+            tag: tag,
+            label: boxObj.label,
+            name: (el.getAttribute && el.getAttribute("name")) || "",
+            reason: reason,
+            honeypot_risk: tag === "input" || tag === "textarea" || tag === "button"
+          });
+        }
+        (el.childNodes || []).forEach(function (c) { if (c.nodeType === 1) walk(c, true, ancestorOverlay, ancestorChrome); });
+        return;
+      }
+
+      var role = String((el.getAttribute && el.getAttribute("role")) || "").toLowerCase();
+      var ariaModal = String((el.getAttribute && el.getAttribute("aria-modal")) || "").toLowerCase() === "true";
+      var isDialog = (tag === "dialog" && el.hasAttribute && el.hasAttribute("open")) || role === "dialog" || role === "alertdialog" || ariaModal || !!el.__popoverOpen;
+      var areaRatio = (boxObj.width * boxObj.height) / viewportArea;
+      var isOverlay = isDialog || ((pos === "fixed" || pos === "absolute") && (zIndex >= 10 || areaRatio >= 0.25));
+      var isChrome = !isOverlay && (pos === "fixed" || pos === "sticky" || tag === "nav" || tag === "header" || tag === "footer" || ancestorChrome);
+      var isScroller = (ovY === "auto" || ovY === "scroll" || ovX === "auto" || ovX === "scroll") &&
+                       ((el.scrollHeight > el.clientHeight && el.clientHeight > 0) || (el.scrollWidth > el.clientWidth && el.clientWidth > 0));
+
+      var curOverlay = ancestorOverlay;
+      if (isOverlay && !ancestorOverlay) {
+        curOverlay = boxObj;
+        overlays.push({ el: el, meta: boxObj });
+        if (strata.L3_OVERLAY.length < 40) strata.L3_OVERLAY.push(boxObj);
+      } else if (isScroller) {
+        var scMeta = {
+          selector: boxObj.selector,
+          tag: tag,
+          x: boxObj.x,
+          y: boxObj.y,
+          width: boxObj.width,
+          height: boxObj.height,
+          scrollTop: el.scrollTop || 0,
+          scrollLeft: el.scrollLeft || 0,
+          scrollHeight: el.scrollHeight || boxObj.height,
+          scrollWidth: el.scrollWidth || boxObj.width,
+          remainingY: Math.max(0, (el.scrollHeight || 0) - (el.clientHeight || 0) - (el.scrollTop || 0))
+        };
+        scrollers.push(scMeta);
+        if (strata.L2_SCROLLER.length < 40) strata.L2_SCROLLER.push(scMeta);
+      } else if (isChrome) {
+        if (strata.L1_CHROME.length < 50 && (isInteractive(el) || tag === "nav" || tag === "header" || tag === "footer" || pos === "fixed")) {
+          strata.L1_CHROME.push(boxObj);
+        }
+      } else {
+        if (strata.L0_FLOW.length < 80 && (isInteractive(el) || tag === "form" || tag === "main" || tag === "article" || tag === "section" || /^h[1-6]$/.test(tag))) {
+          strata.L0_FLOW.push(boxObj);
+        }
+      }
+
+      if (isInteractive(el) && boxObj.width > 0 && boxObj.height > 0) {
+        interactiveControls.push({ el: el, meta: boxObj, ownerOverlay: curOverlay });
+      }
+
+      (el.childNodes || []).forEach(function (c) {
+        if (c.nodeType === 1) walk(c, false, curOverlay, isChrome);
+      });
+    })(doc.body || doc.documentElement, false, null, false);
+
+    function containsNode(parent, child) {
+      var cur = child;
+      while (cur) {
+        if (cur === parent) return true;
+        cur = cur.parentNode;
+      }
+      return false;
+    }
+
+    var occlusions = [];
+    for (var i = 0; i < interactiveControls.length; i++) {
+      var item = interactiveControls[i];
+      var cBox = item.meta;
+      var cx = cBox.x + cBox.width / 2;
+      var cy = cBox.y + cBox.height / 2;
+      for (var j = 0; j < overlays.length; j++) {
+        var ov = overlays[j];
+        if (containsNode(ov.el, item.el)) continue;
+        var oBox = ov.meta;
+        var oWins = (oBox.zIndex > cBox.zIndex) || (oBox.zIndex === cBox.zIndex && oBox.order > cBox.order);
+        if (!oWins) continue;
+        if (cx >= oBox.x && cx <= oBox.x + oBox.width && cy >= oBox.y && cy <= oBox.y + oBox.height) {
+          var dismissers = [];
+          try {
+            var btns = ov.el.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit'], a");
+            for (var b = 0; b < btns.length && dismissers.length < 4; b++) {
+              dismissers.push({
+                selector: __nodeSelector(btns[b]),
+                label: __nodeLabel(btns[b])
+              });
+            }
+          } catch (e) {}
+          occlusions.push({
+            control: cBox.selector,
+            label: cBox.label,
+            point: [Math.round(cx), Math.round(cy)],
+            occluded_by: oBox.selector,
+            overlay_z: oBox.zIndex,
+            dismiss_candidates: dismissers
+          });
+          break;
+        }
+      }
+    }
+
+    return JSON.stringify({
+      viewport: { width: vw, height: vh, scrollX: global.scrollX || 0, scrollY: global.scrollY || 0, scrollExtent: doc.__scrollExtent || { width: vw, height: vh } },
+      counts: {
+        L0_FLOW: strata.L0_FLOW.length,
+        L1_CHROME: strata.L1_CHROME.length,
+        L2_SCROLLER: scrollers.length,
+        L3_OVERLAY: overlays.length,
+        L4_HIDDEN: strata.L4_HIDDEN.length,
+        occluded_controls: occlusions.length,
+        honeypot_traps: honeypots.length
+      },
+      strata: strata,
+      scrollers: scrollers,
+      occlusions: occlusions,
+      honeypots: honeypots
+    });
+  };
+
+  /* ---- DOSH In-Realm Agent Scripting SDK (globalThis.dosh) ---- */
+  global.__WR_DOSH_EMITS = [];
+  global.__drainDoshEmits = function () {
+    var out = (global.__WR_DOSH_EMITS || []).slice();
+    global.__WR_DOSH_EMITS = [];
+    return JSON.stringify(out);
+  };
+  global.dosh = {
+    args: {},
+    emit: function (key, value) {
+      global.__WR_DOSH_EMITS = global.__WR_DOSH_EMITS || [];
+      global.__WR_DOSH_EMITS.push({ key: String(key), value: value, ts: Date.now() });
+      return value;
+    },
+    query: function (selector) {
+      if (!global.document || !global.document.querySelectorAll) return [];
+      var nodes = global.document.querySelectorAll(String(selector));
+      return nodes.map(function (el) {
+        var r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0 };
+        return {
+          selector: __nodeSelector(el),
+          tag: (el.nodeName || "").toLowerCase(),
+          id: el.getAttribute("id") || "",
+          className: el.getAttribute("class") || "",
+          text: String(el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 200),
+          value: el.value !== undefined ? el.value : null,
+          href: el.getAttribute("href") || null,
+          rect: { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) },
+          visible: typeof el.checkVisibility === "function" ? el.checkVisibility() : true
+        };
+      });
+    },
+    text: function (selector) {
+      if (!global.document) return "";
+      if (!selector) return String((global.document.body && global.document.body.textContent) || "").replace(/\s+/g, " ").trim();
+      var el = global.document.querySelector(String(selector));
+      return el ? String(el.textContent || "").replace(/\s+/g, " ").trim() : "";
+    },
+    attr: function (selector, name, value) {
+      if (!global.document) return null;
+      var el = global.document.querySelector(String(selector));
+      if (!el) return null;
+      if (value !== undefined) {
+        el.setAttribute(String(name), String(value));
+        return String(value);
+      }
+      return el.getAttribute(String(name));
+    },
+    click: function (selector) {
+      return global.__activateSelector(String(selector), null, false, !!global.__stealthMode);
+    },
+    type: function (selector, text) {
+      return global.__activateSelector(String(selector), String(text == null ? "" : text), false, !!global.__stealthMode);
+    },
+    layers: function () {
+      try { return JSON.parse(global.__inspectLayers()); } catch (e) { return {}; }
+    },
+    storage: function () {
+      var st = {};
+      try { st = JSON.parse(global.__drainStorage()); } catch (e) {}
+      var idb = {};
+      try { idb = JSON.parse(global.__drainIndexedDB()); } catch (e) {}
+      return {
+        local: st.local || {},
+        session: st.session || {},
+        indexedDB: idb,
+        cookie: (global.document && global.document.cookie) || ""
+      };
+    }
   };
 })(this);

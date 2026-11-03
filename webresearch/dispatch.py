@@ -18,6 +18,8 @@ from webresearch.types import CaptchaReport
 
 
 async def invoke(http: httpx.AsyncClient, browser: Browser, name: str, args: dict[str, Any]):
+    if name == "browser_shell":
+        return await browser.get(args["session_id"]).shell.execute(args["command"], args.get("arguments"))
     if name == "browser_search":
         engine = args.get("engine") or "auto"
         if engine not in {"auto", "google", "ddg"}:
@@ -198,6 +200,41 @@ async def invoke(http: httpx.AsyncClient, browser: Browser, name: str, args: dic
             url,
             client=http,
             js=args.get("js") or "auto",
+        )
+    if name == "browser_click_captcha":
+        session_id = args.get("session_id")
+        if not session_id:
+            raise ValueError("browser_click_captcha requires session_id")
+        return await browser.get(session_id).click_captcha_checkbox(
+            max_chars=int(args.get("max_chars", 8000))
+        )
+    if name == "browser_click_captcha_tile":
+        session_id = args.get("session_id")
+        if not session_id:
+            raise ValueError("browser_click_captcha_tile requires session_id")
+        return await browser.get(session_id).click_captcha_tile(
+            args.get("tile_index"), max_chars=int(args.get("max_chars", 8000))
+        )
+    if name == "browser_click_captcha_tiles":
+        session_id = args.get("session_id")
+        if not session_id:
+            raise ValueError("browser_click_captcha_tiles requires session_id")
+        return await browser.get(session_id).click_captcha_tiles(
+            args.get("tile_indices") or [], max_chars=int(args.get("max_chars", 8000))
+        )
+    if name == "browser_click_captcha_verify":
+        session_id = args.get("session_id")
+        if not session_id:
+            raise ValueError("browser_click_captcha_verify requires session_id")
+        return await browser.get(session_id).click_captcha_verify(
+            max_chars=int(args.get("max_chars", 8000))
+        )
+    if name == "browser_click_captcha_solution":
+        session_id = args.get("session_id")
+        if not session_id:
+            raise ValueError("browser_click_captcha_solution requires session_id")
+        return await browser.get(session_id).click_captcha_solution(
+            args.get("solution"), max_chars=int(args.get("max_chars", 8000))
         )
     if name == "browser_captcha_solve":
         session_id = args.get("session_id")

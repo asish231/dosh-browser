@@ -64,6 +64,10 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("mcp", help="Run Model Context Protocol (MCP) server over stdio")
 
+    shell_cmd = sub.add_parser("shell", help="Agent-native browser terminal (JSON commands, not an OS shell)")
+    shell_cmd.add_argument("--database", help="Opt-in SQLite workspace for persistent skills and evidence")
+    shell_cmd.add_argument("-c", "--command", action="append", help="Execute command then exit; repeat for a sequence")
+
     profile_cmd = sub.add_parser("profile", help="Manage persistent profiles and cookies")
     p_sub = profile_cmd.add_subparsers(dest="action", required=True)
     p_sub.add_parser("list", help="List available profiles")
@@ -76,6 +80,15 @@ def main(argv: list[str] | None = None) -> None:
     p_clear.add_argument("--name", default="default", help="Profile name")
 
     args = parser.parse_args(argv)
+
+    if args.cmd == "shell":
+        from webresearch.shell import run_terminal
+
+        try:
+            asyncio.run(run_terminal(args.database, args.command))
+        except KeyboardInterrupt:
+            print("cancelled", file=sys.stderr)
+        return
 
     if args.cmd == "mcp":
         from webresearch.mcp import run_mcp_server

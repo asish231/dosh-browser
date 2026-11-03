@@ -555,6 +555,51 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise HTTPException(500, f"captcha solve failed: {exc}") from exc
 
+    @app.post("/v1/sessions/{sid}/captcha/solve-recaptcha-v2", tags=["session", "captcha"])
+    async def api_captcha_solve_v2(sid: str, body: dict) -> dict:
+        """Solve the page's reCAPTCHA v2 through the challenge protocol.
+
+        Returns whether a g-recaptcha-response token was obtained (never the
+        token itself); site-side acceptance is the site's decision.
+        """
+        try:
+            token = await session_or_404(sid).solve_recaptcha_v2(
+                max_rounds=int((body or {}).get("max_rounds", 8)),
+                models=(body or {}).get("models") or None,
+            )
+            return {
+                "solved": True,
+                "token_length": len(token),
+                "note": "g-recaptcha-response obtained; submit the form to test site acceptance.",
+            }
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(500, f"recaptcha v2 solve failed: {exc}") from exc
+
+    @app.post("/v1/sessions/{sid}/captcha/click-tile", tags=["session", "captcha"])
+    async def api_captcha_click_tile(sid: str, body: dict):
+        try:
+            return await session_or_404(sid).click_captcha_tile(body.get("tile_index"), max_chars=int(body.get("max_chars", 8000)))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/v1/sessions/{sid}/captcha/click-tiles", tags=["session", "captcha"])
+    async def api_captcha_click_tiles(sid: str, body: dict):
+        try:
+            return await session_or_404(sid).click_captcha_tiles(body.get("tile_indices") or [], max_chars=int(body.get("max_chars", 8000)))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/v1/sessions/{sid}/captcha/verify", tags=["session", "captcha"])
+    async def api_captcha_verify(sid: str, body: dict | None = None):
+        body = body or {}
+        try:
+            return await session_or_404(sid).click_captcha_verify(max_chars=int(body.get("max_chars", 8000)))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+
     @app.post("/v1/sessions/{sid}/click", response_model=Page, tags=["session"])
     async def api_click(sid: str, body: ClickBody) -> Page:
         try:

@@ -250,31 +250,20 @@ async def read_live(
             js=js,
             parent_headers=result.headers,
             parent_messages=(js_info.get("post_messages") if js_info else None),
+            parent_ctx=(js_info.get("ctx") if js_info else None),
         )
         if js_info and js_info.get("ctx") and frames:
             parent_ctx = js_info["ctx"]
-            child_replies = []
-            for frame in frames:
-                for msg in frame.post_messages:
-                    tgt = msg.get("target", "")
-                    if tgt in {"parent", "top", "reply", "*", ""}:
-                        child_replies.append((msg, frame.url))
-            if child_replies:
-                import json as _json
-                from webresearch.engine.frames import extract_origin
-                from webresearch.engine.runtime import _pump_jobs
+            from webresearch.engine.frames import frame_message_roundtrip
 
-                for msg, frame_url in child_replies:
-                    m_data = _json.dumps(msg.get("data", ""))
-                    m_origin = _json.dumps(extract_origin(frame_url))
-                    m_target = _json.dumps(msg.get("target_origin") or msg.get("target") or "*")
-                    try:
-                        parent_ctx.eval(
-                            f"if (typeof window !== 'undefined' && typeof window.__receiveMessage === 'function') window.__receiveMessage({m_data}, {m_origin}, {m_target});"
-                        )
-                    except Exception:
-                        pass
-                _pump_jobs(parent_ctx)
+            rt_summary = await frame_message_roundtrip(
+                frames,
+                parent_ctx=parent_ctx,
+                parent_url=result.final_url or url,
+                parent_html=html,
+                client=client,
+            )
+            if rt_summary.get("child_delivered") or rt_summary.get("parent_outbound"):
                 try:
                     updated_html = parent_ctx.eval("__serialize()")
                     if updated_html:

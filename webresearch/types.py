@@ -104,6 +104,9 @@ class CaptchaReport(BaseModel):
     hidden_fields: list[str] = Field(default_factory=list)
     note: str = ""
     view: str = ""
+    # A solved g-recaptcha-response when the challenge protocol passed.
+    # Empty means no token has been obtained for THIS page.
+    token: str = ""
 
 
 class CaptchaScript(BaseModel):
