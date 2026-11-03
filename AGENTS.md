@@ -2,6 +2,27 @@
 
 Guidance for AI agents and humans working in this repository.
 
+## Lane status (one source of truth: `webresearch/config.py`)
+
+**Python (`webresearch/`) is the OFFICIAL product.** The full agent browser —
+script execution, captcha solver, login/OTP, frame messaging, video lane, 34
+shell commands, MCP/HTTP/CLI surfaces — with the 840-test suite green. All
+agent surfaces serve this lane.
+
+**Rust (`dosh-browser-core/`) is EXPERIMENTAL.** The pipeline is ported and
+unit-tested (fetch → parse → project → session → shell → server, 62/62
+tests) on the doshgentv8 V8 core, but page script execution is not yet
+wired into `goto()` and the adversarial/agent layers are not ported. Do
+not route production traffic to it, do not present it as the product, and
+do not flip this status until the migration gate passes: full-suite green
+on BOTH engines AND goto() script execution verified against the Python
+oracle. `WR_JS_ENGINE=doshgentv8` selects the (also experimental) V8
+engine lane; the default remains QuickJS.
+
+Every surface must answer "which version is official?" from
+`webresearch/config.py` (`shell product` / `project_status()`), never by
+inference from commit messages.
+
 ## The rule that overrides everything else
 
 **This project builds a browser from scratch. It must not use an existing one.**
