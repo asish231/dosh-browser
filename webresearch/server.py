@@ -140,6 +140,15 @@ class DownloadBody(BaseModel):
     dest_dir: str | None = None
 
 
+class VideoBody(BaseModel):
+    url: str
+    dest_dir: str | None = None
+    format: str | None = None
+    use_session: bool = True
+    max_bytes: int | None = None
+    timeout: float | None = None
+
+
 class LoginBody(BaseModel):
     url: str
     username: str
@@ -707,6 +716,24 @@ def create_app() -> FastAPI:
                 "scanned": rec.scanned,
                 "error": rec.error,
             }
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/v1/sessions/{sid}/video", tags=["session"])
+    async def api_get_video(sid: str, body: VideoBody):
+        try:
+            session = session_or_404(sid)
+            rec = await session.get_video(
+                body.url,
+                dest_dir=body.dest_dir,
+                format=body.format,
+                use_session=body.use_session,
+                max_bytes=body.max_bytes,
+                timeout=body.timeout,
+            )
+            from webresearch.video import video_view
+
+            return video_view(rec)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 

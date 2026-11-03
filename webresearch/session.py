@@ -702,6 +702,38 @@ class Session:
         absolute = url if url.startswith(("http://", "https://")) or not self.url else urljoin(self.url, url)
         return await _download(absolute, self.client, expected=expected, dest_dir=dest_dir)
 
+    async def get_video(
+        self,
+        url: str,
+        *,
+        dest_dir: str | None = None,
+        format: str | None = None,
+        use_session: bool = True,
+        max_bytes: int | None = None,
+        timeout: float | None = None,
+    ):
+        """Download a video through the video lane (direct file or yt-dlp).
+
+        The session's cookies reach the extractor only when use_session is
+        set (default True here: the session's login state is the point of
+        going through the session). Returns video.py's VideoDownload record:
+        path, bytes, sha256, extractor metadata, and honest errors — policy
+        refusals included.
+        """
+        from webresearch.video import DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT
+        from webresearch.video import get_video as _get_video
+
+        absolute = url if url.startswith(("http://", "https://")) or not self.url else urljoin(self.url, url)
+        return await _get_video(
+            absolute,
+            self.client,
+            dest_dir=dest_dir,
+            format=format,
+            use_session=use_session,
+            max_bytes=max_bytes if max_bytes is not None else DEFAULT_MAX_BYTES,
+            timeout=timeout if timeout is not None else DEFAULT_TIMEOUT,
+        )
+
     async def _load_popup_tabs(self, popups: list[dict]) -> None:
         """window.open targets become real tabs; the agent stays on this page."""
         if not popups or self._popup_depth >= 2:

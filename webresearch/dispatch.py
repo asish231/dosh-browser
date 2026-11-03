@@ -135,6 +135,19 @@ async def invoke(http: httpx.AsyncClient, browser: Browser, name: str, args: dic
             "scanned": rec.scanned,
             "error": rec.error,
         }
+    if name == "browser_get_video":
+        session = browser.get(args["session_id"])
+        rec = await session.get_video(
+            args["url"],
+            dest_dir=args.get("dest_dir"),
+            format=args.get("format"),
+            use_session=bool(args.get("use_session", True)),
+            max_bytes=args.get("max_bytes"),
+            timeout=args.get("timeout"),
+        )
+        from webresearch.video import video_view
+
+        return video_view(rec)
     if name == "browser_login":
         return await browser.get(args["session_id"]).login(
             args["url"], args["username"], args["password"]

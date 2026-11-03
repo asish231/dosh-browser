@@ -44,6 +44,7 @@ COMMANDS = {
     "layers": "Inspect approximate layout strata; not authoritative hit testing.",
     "frames": "Inspect loaded frame realms and message counts, without message payloads.",
     "tabs": "List tabs or switch using id.",
+    "video": "Download a video from a legitimate platform: url, dest_dir, format, use_session.",
 }
 
 _SDK = """
@@ -372,6 +373,18 @@ class DoshShell:
             if "id" in a:
                 s.switch_tab(a["id"])
             return [{**t, "url": _url(t["url"])} for t in s.tabs]
+        if name == "video":
+            from webresearch.video import video_view
+
+            rec = await s.get_video(
+                a["url"],
+                dest_dir=a.get("dest_dir"),
+                format=a.get("format"),
+                use_session=bool(a.get("use_session", True)),
+                max_bytes=a.get("max_bytes"),
+                timeout=a.get("timeout"),
+            )
+            return video_view(rec)
         raise ValueError(f"unknown command: {name}; use help")
 
     async def run_script(self, source: str, args: dict, *, allow_actions: bool = False) -> dict:

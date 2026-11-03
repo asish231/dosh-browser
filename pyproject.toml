@@ -17,6 +17,7 @@ dependencies = [
 impersonate = ["curl_cffi>=0.7.0"]
 http2 = ["h2>=4.0"]
 test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+video = ["yt-dlp>=2026.10.26"]
 
 [project.scripts]
 webresearch = "webresearch.cli:main"

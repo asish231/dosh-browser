@@ -6,7 +6,7 @@ SHELL_TOOL = {
     "name": "browser_shell",
     "description": (
         "Agent-native browser terminal. Use command=help for JSON commands: open, actions, act, net, "
-        "console, eval, skill.*, db, storage, snapshot/diff, layers, frames, tabs. "
+        "console, eval, skill.*, db, storage, snapshot/diff, layers, frames, tabs, video. "
         "No OS shell. Capture begins on attachment. Scripts run in an isolated bounded control realm."
     ),
     "parameters": {
@@ -287,6 +287,33 @@ TOOLS: list[dict] = [
                     "url": {"type": "string"},
                     "expected": {"type": "string", "description": "Expected hash (hex or base64, sha256- prefix allowed)"},
                     "dest_dir": {"type": "string", "description": "Optional destination directory"},
+                },
+                "required": ["session_id", "url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_get_video",
+            "description": (
+                "Download a video from a legitimate platform: direct media files stream through "
+                "the session transport; pages and HLS/DASH/platform URLs extract via yt-dlp with "
+                "the session's cookies. Reports path, bytes, sha256, extractor metadata, and "
+                "honest errors. Policy: DRM services and known piracy mirrors are refused; "
+                "absent yt-dlp is reported as a missing capability, never faked. "
+                "No malware verdict engine; the hash is provided instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "url": {"type": "string"},
+                    "dest_dir": {"type": "string", "description": "Optional destination directory"},
+                    "format": {"type": "string", "description": "yt-dlp format selector (default bv*+ba/b)"},
+                    "use_session": {"type": "boolean", "description": "Pass the session's cookies to the extractor (default true)"},
+                    "max_bytes": {"type": "integer", "description": "Byte cap, enforced by the extractor and post-hoc"},
+                    "timeout": {"type": "number", "description": "Extractor subprocess timeout in seconds"},
                 },
                 "required": ["session_id", "url"],
             },

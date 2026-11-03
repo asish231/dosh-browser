@@ -234,6 +234,26 @@ TOOLS = [
         },
     },
     {
+        "name": "browser_get_video",
+        "description": "Download a video from a legitimate platform: direct media files stream through the session "
+        "transport; pages and HLS/DASH/platform URLs extract via yt-dlp with the session's cookies. Reports path, "
+        "bytes, sha256, extractor metadata, honest errors. DRM services and known piracy mirrors are refused; "
+        "absent yt-dlp is reported as a missing capability, never faked.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "url": {"type": "string"},
+                "dest_dir": {"type": "string", "description": "Optional destination directory"},
+                "format": {"type": "string", "description": "yt-dlp format selector (default bv*+ba/b)"},
+                "use_session": {"type": "boolean", "description": "Pass the session's cookies to the extractor (default true)"},
+                "max_bytes": {"type": "integer", "description": "Byte cap enforced by the extractor and post-hoc"},
+                "timeout": {"type": "number", "description": "Extractor subprocess timeout in seconds"},
+            },
+            "required": ["session_id", "url"],
+        },
+    },
+    {
         "name": "browser_login",
         "description": "Log in to a site with credentials obtained from the user. Detects the login form, fills "
         "username/password through the page's own lanes, submits, and returns an honest verdict: verified, "
@@ -588,6 +608,24 @@ class McpServer:
                 "error": rec.error,
             }
             return self._format_result(json.dumps(payload, indent=2))
+
+        elif name == "browser_get_video":
+            try:
+                rec = await session.get_video(
+                    args["url"],
+                    dest_dir=args.get("dest_dir"),
+                    format=args.get("format"),
+                    use_session=bool(args.get("use_session", True)),
+                    max_bytes=args.get("max_bytes"),
+                    timeout=args.get("timeout"),
+                )
+            except KeyError:
+                return self._format_result("browser_get_video failed: url is required")
+            except ValueError as exc:
+                return self._format_result(f"browser_get_video failed: {exc}")
+            from webresearch.video import video_view
+
+            return self._format_result(json.dumps(video_view(rec), indent=2))
 
         elif name == "browser_login":
             try:

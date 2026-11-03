@@ -14,9 +14,14 @@ stub that exists only so imports and old call sites fail loudly.
 Everything must work through:
 
 - **HTTP fetch** (`webresearch/fetch.py`) — the transport
-- **QuickJS mini-DOM** (`webresearch/engine/minidom.js`, `runtime.py`) — our own
-  JavaScript runtime and DOM implementation
+- **Our own DOM** (`webresearch/engine/minidom.js`) + **our JS engine**
 - **Our own DOM event model** — `dispatchEvent`, listeners, bubbling
+
+The JS execution layer may swap between engines: QuickJS is the default for
+the main product; `doshgentv8/` is our own lightly-forked V8 with agentic
+patches (fuel metering, clock injection, capability gates). Both run the
+same `minidom.js` unchanged. Select via `WR_JS_ENGINE` flag. See
+`doshgentv8/README.md` for the fork plan.
 
 If a page cannot be handled this way, the answer is to *implement more of the
 engine*, not to reach for a browser binary. A capability gap is a bug report
@@ -128,6 +133,7 @@ Be honest about these rather than working around them silently.
 
 | Area | State |
 | --- | --- |
+| JS engine | **QuickJS** = default (`webresearch/engine/runtime.py`, `from quickjs import Context`). **doshgentv8** = our own lightly-forked V8 at `doshgentv8/` (Phase 0 bridge via mini-racer prebuilt V8 15.2, `from doshgentv8 import DoshContext`). Same `minidom.js` runs in both; select via `WR_JS_ENGINE` flag. Smoke-proven: 9,494-line minidom boots in V8 with 100% semantic parity on DOM, events, storage, console, timer clock (see `v8_lane/RESULTS.md`). Fork patches pending: fuel metering, host-clock injection, seeded RNG, capability gate, checkpoint callback (all policy overlays, never alter byte-level semantics). Full Rust+PyO3 extension scaffold in `doshgentv8/src/lib.rs`. |
 | Layout / geometry | Real block-flow engine in minidom.js: CSS cascade (tag<class<id<inline), vertical stacking with additive margins, flex (row/column + gap), grid (repeat(N) columns, wrap), position absolute/fixed/relative, text wrap by a proportional per-character advance table, CSS-spec 300x150 replaced defaults; units px/%/em/rem/pt. Per-element overflow scrolling: `overflow:auto\|scroll\|hidden` boxes have real scrollTop/scrollLeft/scrollTo/scrollBy (clamped, non-bubbling scroll events), scrollWidth/scrollHeight from subtree extents, and `scrollIntoView` walks every scrolling ancestor before the document; IntersectionObserver clips to each scrolling box's visible window; hidden subtrees lose their stale boxes. Disclosed approximations: no floats, no sticky, no flex-wrap/justify/align distribution, no bidi/shaping, smooth scroll is stepped-synchronous (no animation-frame loop). Reported via `document.__layoutInfo`. |
 | File upload | Native end to end: `browser_upload`/`browser_act(files=)` sets `el.files` and fires trusted input/change; multipart submits carry the exact bytes. Binary/video/any files travel as base64 (`content_b64`) so payloads are byte-exact; payload cap ~12 MB raw. |
 | Dialogs (alert/confirm/prompt) | Recorded per script pass, reported in the view and via `browser_respond_dialog`. QuickJS is synchronous, so a dialog cannot block: an agent stages an answer, then re-runs the triggering action. Unanswered dialogs honestly report `answered: default`. |
@@ -135,6 +141,7 @@ Be honest about these rather than working around them silently.
 | History API | pushState/replaceState create real session entries (same document, new URL); load-time `history.back()` in a `setTimeout` is consumed by goto/submit; back/forward between pushState entries is a LIVE same-document traversal (ctx/JS heap/DOM persist, popstate into the live ctx, no script re-run, per-entry scroll restore honoring `scrollRestoration`); state round-trips through a structured-clone subset codec (undefined keys, Date, NaN/±Infinity, Map/Set/RegExp, cycles preserved; functions/symbols throw DataCloneError). Disclosed: cross-document restore rebuilds the stored document and re-runs its scripts (no-bfcache parity); traversals chain-bounded at depth 4. |
 | window.open / popups | Recorded and loaded as new session tabs (recursion depth-limited); page scripts receive an inert stub window so they do not crash. The agent stays on the opening page and can `browser_tabs` switch. |
 | File downloads | `browser_download` streams to disk with sha256 and optional hash verification (hex or base64); a navigation that lands on an attachment/binary is saved and reported (path/bytes/hash) instead of parsed as a page. No malware verdict engine — that absence is reported, not hidden. |
+| Video downloads | Two real lanes (`video.py`): direct media files stream through the session transport (cookies, sha256, byte cap); pages/HLS/DASH/platform URLs extract via yt-dlp run as `python -m yt_dlp` pinned to this interpreter (`webresearch[video]` extra), with metadata captured via `--print after_move:%(field)j` and the produced file hashed + size-checked post-hoc. Session cookies reach the extractor (Netscape export) for login-gated content. Policy enforced before any network work: DRM subscription services and known piracy mirrors are refused; the denylists are known-entries gates, not guarantees, and the tool contract says so. Absent yt-dlp is reported as a missing capability, never faked; no malware verdict — sha256 provided. Wired: `browser_get_video` (MCP/dispatch/HTTP) and the shell `video` command. |
 | contenteditable | Detected as `editable` in both inspect and action surfaces; typing lands in textContent with input events carrying `data`/`inputType` so MutationObserver-based editors (Quill/ProseMirror) observe it. Approximation: no caret, plain text only. |
 | Login / OTP | `browser_login` detects the wall (password role in both surfaces), fills+submits via the normal lanes, and returns an honest verdict: verified / otp_required / failed / account_locked / human_only. OTP pages (single input or split digit boxes) become checkpoints: `browser_submit_otp` fills, submits, verifies; max 3 attempts, ~10 min expiry, never guesses codes. `browser_login_state` probes without credentials. Secrets are memory-only: never persisted, never echoed in views/results. Engine never ticks "trust this device". |
 | WebSocket | Hand-rolled RFC 6455 client (`engine/ws.py`, no third-party lib): sync handshake, masked client frames, text frames both ways, ping/pong and close handled; frames deliver on runtime pump passes. Binary frames are counted and skipped (disclosed gap). |

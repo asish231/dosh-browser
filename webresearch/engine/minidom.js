@@ -2220,9 +2220,24 @@ var pos = (st.position || "").toLowerCase();
     return w;
   }
   var __NON_RENDERED = { head:1, style:1, script:1, title:1, meta:1, link:1, template:1, noscript:0 };
+  /* Live DOM nodeName is UPPERCASE ('STYLE'); the map keys are lowercase.
+     Normalize before every lookup or the exclusion never fires. */
+  function __nonRendered(el) { return __NON_RENDERED[String((el && el.nodeName) || '').toLowerCase()]; }
+  try { global.__nonRendered = __nonRendered; } catch (e) {}
   function __ensureLayout(doc) {
     var vw = (typeof global.innerWidth === "number" && global.innerWidth > 0) ? global.innerWidth : 1280;
     if (doc.__layoutCache && doc.__layoutCache.vw === vw && doc.__layoutCache.v === doc.__layoutVersion) return doc.__layoutCache;
+    /* A fresh pass must not inherit __lines from a previous pass (which
+       __clearBoxes now drops, but belt-and-braces for any element that
+       never got cleared, e.g. non-rendered subtrees reached via a prior
+       pass). */
+    (function __resetLines(n) {
+      if (!n) return;
+      if (n.nodeType === 1 || n.nodeType === 9) {
+        n.__lines = null;
+        (n.childNodes || []).forEach(function (c) { __resetLines(c); });
+      }
+    })(doc.documentElement || doc);
     var rules = __collectStyleRules(doc);
     var layout = { vw: vw, v: doc.__layoutVersion || 0, boxes: 0, engine: "block-flow+flex+grid+positioned" };
     function isBlockDisplay(cs) {
@@ -2262,7 +2277,7 @@ var pos = (st.position || "").toLowerCase();
       if (cs.display === "grid" || cs.display === "inline-grid") {
         var gap = __parsePx(cs.gap, contentW, cs.fontSize) || 0;
         var children = (el.childNodes || []).filter(function (c) {
-          return c.nodeType === 1 && !__NON_RENDERED[c.nodeName];
+          return c.nodeType === 1 && !__nonRendered(c);
         });
         var colCount = 1;
         var tmpl = cs.gridTemplateColumns || cs["grid-template-columns"] || "";
@@ -2324,7 +2339,7 @@ var pos = (st.position || "").toLowerCase();
         var totalColW = 0;
         var isCol = (cs.flexDirection === "column");
         var children = (el.childNodes || []).filter(function (c) {
-          return c.nodeType === 1 && !__NON_RENDERED[c.nodeName];
+          return c.nodeType === 1 && !__nonRendered(c);
         });
         children.forEach(function (c, idx) {
           var ccs = __computedStyle(c, rules, cs.fontSize);
@@ -2382,6 +2397,8 @@ var pos = (st.position || "").toLowerCase();
         line.runs.forEach(function (r) { if (r.h > h) h = r.h; });
         if (h <= 0) h = cs.fontSize * 1.2;
         line.runs.forEach(function (r) {
+          var rec = { x: r.x, y: cursor, h: h, text: r.text || "" };
+          (r.el.__lines = r.el.__lines || []).push(rec);
           r.el.__box = { x: r.x, y: cursor, width: r.w, height: h };
           layout.boxes++;
         });
@@ -2398,7 +2415,7 @@ var pos = (st.position || "").toLowerCase();
             if (!line) line = { x: x, w: 0, runs: [] };
             if (line.w + sp > contentW && line.w > 0) flushLine();
             if (!line) line = { x: x, w: 0, runs: [] };
-            line.runs.push({ el: targetEl, x: x + line.w, w: sp, h: fontSize * 1.2 });
+            line.runs.push({ el: targetEl, x: x + line.w, w: sp, h: fontSize * 1.2, text: " " });
             line.w += sp;
             return;
           }
@@ -2406,7 +2423,7 @@ var pos = (st.position || "").toLowerCase();
           if (!line) line = { x: x, w: 0, runs: [] };
           if (line.w + ww > contentW && line.w > 0) flushLine();
           if (!line) line = { x: x, w: 0, runs: [] };
-          line.runs.push({ el: targetEl, x: x + line.w, w: ww, h: fontSize * 1.2 });
+          line.runs.push({ el: targetEl, x: x + line.w, w: ww, h: fontSize * 1.2, text: word });
           line.w += ww;
         });
       }
@@ -2492,10 +2509,11 @@ var pos = (st.position || "").toLowerCase();
          getBoundingClientRect/__elementContentSize/__maxScrollOffset. */
       n.__box = null;
       n.__contentExtent = null;
+      n.__lines = null;
       (n.childNodes || []).forEach(function (c) { if (c.nodeType === 1) __clearBoxes(c); });
     }
     function layoutBlock(el, x, y, availW, parentFont) {
-      if (__NON_RENDERED[el.nodeName]) { __clearBoxes(el); return { bottom: y, w: 0 }; }
+      if (__nonRendered(el)) { __clearBoxes(el); return { bottom: y, w: 0 }; }
       if (el.nodeName === "body" && availW === vw) {
         availW = Math.max(0, vw - 16);
       }
@@ -8296,6 +8314,134 @@ var decl = new CSSStyleDeclaration(el);
   global.__setStealthMode = function (enabled) {
     global.__stealthMode = !!enabled;
     return global.__stealthMode;
+  };
+
+  /* Screenshot: paint the laid-out page as SVG.
+     The layout engine already computed every box, border, computed color and
+     text line (flushLine records __lines per element with absolute x/y).
+     This walks the tree once and emits a real SVG the host can save or
+     rasterize. <img>/background-image hrefs are emitted absolute so the host
+     can rewrite them to data URIs; missing fills default to white. */
+  var __NAMED_COLORS = { black:"#000000", white:"#ffffff", red:"#ff0000", green:"#008000", blue:"#0000ff", gray:"#808080", grey:"#808080", yellow:"#ffff00", orange:"#ffa500", purple:"#800080", navy:"#000080", teal:"#008080", olive:"#808000", maroon:"#800000", lime:"#00ff00", aqua:"#00ffff", silver:"#c0c0c0", pink:"#ffc0cb", brown:"#a52a2a", gold:"#ffd700", coral:"#ff7f50", salmon:"#fa8072", tomato:"#ff6347", khaki:"#f0e68c", plum:"#dda0dd", turquoise:"#40e0d0", transparent:"" };
+  function __colorHex(c) {
+    if (c == null) return null;
+    var s = String(c).trim().toLowerCase();
+    if (!s || s === "transparent" || s === "currentcolor") return null;
+    if (s.indexOf("gradient") >= 0 || s.indexOf("url") >= 0) return null;
+    if (s.charAt(0) === "#") {
+      s = s.slice(1);
+      if (s.length === 3) return "#" + s[0]+s[0] + s[1]+s[1] + s[2]+s[2];
+      if (s.length === 4) return "#" + s[0]+s[0] + s[1]+s[1] + s[2]+s[2];
+      if (s.length === 6) return "#" + s;
+      if (s.length >= 8) return "#" + s.slice(0, 6);
+      return null;
+    }
+    var m = /rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})(?:\s*,\s*([\d.]+))?/i.exec(s);
+    if (m) {
+      var a = m[4] == null ? 1 : parseFloat(m[4]);
+      if (!(a > 0.05)) return null;
+      var hx = function (v) { var h = (Number(v) & 255).toString(16); return h.length === 1 ? "0" + h : h; };
+      return "#" + hx(m[1]) + hx(m[2]) + hx(m[3]);
+    }
+    if (__NAMED_COLORS[s] !== undefined && __NAMED_COLORS[s] !== "") return __NAMED_COLORS[s];
+    return null;
+  }
+  function __escXml(t) {
+    return String(t == null ? "" : t)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function __absUrl(u, base) {
+    try { return new URL(String(u), base || (global.location && global.location.href) || "about:blank").href; }
+    catch (e) { return String(u || ""); }
+  }
+  function __fontFamily(cs) {
+    var f = String(cs.fontFamily || "").toLowerCase();
+    if (/mono|consolas|courier/.test(f)) return "monospace";
+    if (/serif/.test(f) && f.indexOf("sans") < 0) return "serif";
+    return "sans-serif";
+  }
+  global.__screenshotSVG = function () {
+    var doc = global.document; if (!doc) return '<svg xmlns="http://www.w3.org/2000/svg"/>';
+    var root = doc.documentElement || doc;
+    var rules = __collectStyleRules(doc);
+    var vw = (typeof global.innerWidth === "number" && global.innerWidth > 0) ? global.innerWidth : 1280;
+    var H = 720;
+    try {
+      if (doc.__scrollExtent && doc.__scrollExtent.height) H = Math.ceil(doc.__scrollExtent.height);
+    } catch (e) {}
+    var lines = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + vw + ' ' + H + '" width="' + vw + '" height="' + H + '">'];
+    lines.push('<rect width="' + vw + '" height="' + H + '" fill="#ffffff"/>');
+    var fontFallback = 16;
+
+    function paintBorder(cs, x, y, w, h, out) {
+      var edges = [
+        ["borderTopWidth", "borderTopColor", x, y, x + w, y],
+        ["borderRightWidth", "borderRightColor", x + w, y, x + w, y + h],
+        ["borderBottomWidth", "borderBottomColor", x, y + h, x + w, y + h],
+        ["borderLeftWidth", "borderLeftColor", x, y, x, y + h],
+      ];
+      for (var i = 0; i < edges.length; i++) {
+        var e = edges[i];
+        var w0 = parseFloat(String(cs[e[0]] || "")) || 0;
+        if (w0 <= 0) continue;
+        var col = __colorHex(cs[e[1]]) || "#000000";
+        out.push('<line x1="' + e[2] + '" y1="' + e[3] + '" x2="' + e[4] + '" y2="' + e[5] + '" stroke="' + col + '" stroke-width="' + w0 + '"/>');
+      }
+    }
+    function paint(node, out) {
+      if (!node || node.nodeType !== 1) return;
+      var nn = String(node.nodeName || "").toLowerCase();
+      if (nn === "head" || nn === "style" || nn === "script" || nn === "title" || nn === "meta" || nn === "link" || nn === "template" || nn === "noscript") return;
+      var cs = __computedStyle(node, rules, node.__layoutFont || fontFallback);
+      var tag = String(node.nodeName || "").toLowerCase();
+      var b = node.__box;
+      if (b && b.width > 0 && b.height > 0) {
+        var x = Math.round(b.x * 10) / 10, y = Math.round(b.y * 10) / 10;
+        var w = Math.round(b.width * 10) / 10, h = Math.round(b.height * 10) / 10;
+        var radius = parseFloat(String(cs.borderRadius || "0")) || 0;
+        if (radius > 50) radius = 50;
+        var bg = __colorHex(cs.backgroundColor) || __colorHex(cs.background);
+        if (bg) {
+          out.push('<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="' + Math.min(radius, h / 2, w / 2) + '" fill="' + bg + '"/>');
+        } else if (cs.backgroundImage) {
+          var m = /url\(\s*['"]?([^)'"]+)['"]?\s*\)/i.exec(String(cs.backgroundImage));
+          if (m) out.push('<image href="' + __escXml(__absUrl(m[1])) + '" x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" preserveAspectRatio="xMidYMid slice"/>');
+        }
+        paintBorder(cs, x, y, w, h, out);
+        if (tag === "img") {
+          var src = node.getAttribute && node.getAttribute("src");
+          if (src) out.push('<image href="' + __escXml(__absUrl(src)) + '" x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" preserveAspectRatio="xMidYMid slice"/>');
+          else out.push('<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" fill="#e8e8e8"/>');
+        } else if (tag === "input" || tag === "select" || tag === "textarea") {
+          if (!bg) out.push('<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="3" fill="#ffffff" stroke="#cccccc" stroke-width="1"/>');
+          var type = String((node.getAttribute && node.getAttribute("type")) || "text").toLowerCase();
+          var label = (node.getAttribute && (node.getAttribute("placeholder") || node.getAttribute("value"))) || "";
+          var fs = node.__layoutFont || parseFloat(String(cs.fontSize || 13)) || 13;
+          var fcol = __colorHex(cs.color) || (node.getAttribute && node.getAttribute("placeholder") ? "#9aa0a6" : "#111111");
+          var tx = Math.round((x + 8) * 10) / 10, ty = Math.round((y + h / 2 + fs * 0.36) * 10) / 10;
+          if (type === "password" && node.getAttribute && node.getAttribute("value")) {
+            out.push('<text x="' + tx + '" y="' + ty + '" font-size="' + fs + '" font-family="monospace" fill="#111111">••••••••••</text>');
+          } else if (label) {
+            out.push('<text x="' + tx + '" y="' + ty + '" font-family="' + __fontFamily(cs) + '" font-size="' + fs + '" fill="' + fcol + '">' + __escXml(label) + '</text>');
+          }
+        }
+        var tlines = node.__lines || [];
+        for (var i = 0; i < tlines.length; i++) {
+          var ln = tlines[i];
+          if (!ln.text) continue;
+          if (!String(ln.text).trim()) continue; /* whitespace-only runs paint nothing */
+          var fs2 = node.__layoutFont || parseFloat(String(cs.fontSize || 14)) || 14;
+          var fill2 = __colorHex(cs.color) || "#111111";
+          var weight = /bold|[6-9]00/i.test(String(cs.fontWeight || "")) ? "bold" : "normal";
+          var tx2 = Math.round(ln.x * 10) / 10, ty2 = Math.round((ln.y + fs2 * 0.82) * 10) / 10;
+          out.push('<text x="' + tx2 + '" y="' + ty2 + '" font-family="' + __fontFamily(cs) + '" font-size="' + fs2 + '" font-weight="' + weight + '" fill="' + fill2 + '">' + __escXml(ln.text) + '</text>');
+        }
+      }
+      (node.childNodes || []).forEach(function (c) { paint(c, out); });
+    }
+    paint(root, lines);
+    lines.push('</svg>');
+    return lines.join("");
   };
 
   global.__clickPath = function (path, stealth) {
