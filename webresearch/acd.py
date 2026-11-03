@@ -9,6 +9,7 @@ flat markdown blob.
 from __future__ import annotations
 
 import json
+
 from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 from webresearch.content import content_root, inside_chrome
@@ -24,8 +25,27 @@ from webresearch.types import (
 
 BLOCK_SEL = (
     "h1, h2, h3, h4, h5, h6, p, li, pre, blockquote, table, "
-    "[itemprop='description'], [itemprop='reviewBody']"
+    "[itemprop='description'], [itemprop='reviewBody'], "
+    "[itemprop='text'], [itemprop='articleBody'], [itemprop='headline'], "
+    "[itemprop='caption'], [itemprop='abstract']"
 )
+
+# Structural content regions. Modern pages lay content out in div/span cards
+# with no p/h*/li anywhere; a purely tag-driven selector sees nothing there.
+# These heuristic container matches are a FALLBACK pass, not the primary one:
+# a region is projected only when it contains no already-matched semantic
+# content (BLOCK_SEL) inside it — the de-duplicate, don't double-count
+# discipline the action surface already applies. `article`/`[role='article']`
+# are handled here for the same reason: putting them in BLOCK_SEL would
+# double-project every article whose inner p/h* already matched.
+REGION_SEL = (
+    "article, [role='article'], "
+    "[class*='card'], [class*='item'], [class*='post'], [class*='quote'], "
+    "[data-testid*='card']"
+)
+# Region matches are class-attribute heuristics, so a junk floor applies:
+# below this, a match is more likely a crumb/button/label than content.
+REGION_MIN_CHARS = 40
 
 
 def _text(node) -> str:
@@ -73,9 +93,21 @@ def build_acd(
     tree = HTMLParser(html or "")
     root = content_root(tree) or tree.root
     counter = 0
+    blocks_total = 0
+    chrome_skipped = 0
+    budget_hit = False
     if root is not None:
-        for node in root.css(BLOCK_SEL):
+        # Candidate census first: blocks_total is the candidate ceiling, so
+        # the consumer can tell "empty page" from "projection missed it".
+        candidates = root.css(BLOCK_SEL)
+        blocks_total = len(candidates)
+
+        def _emit(block: AcdBlock):
+            blocks.append(block)
+
+        for node in candidates:
             if inside_chrome(node, stop=root):
+                chrome_skipped += 1
                 continue
             tag = node.tag or ""
             if tag == "table":
@@ -90,7 +122,7 @@ def build_acd(
                 if not rows:
                     continue
                 counter += 1
-                blocks.append(
+                _emit(
                     AcdBlock(
                         id=f"b{counter}",
                         type="table",
@@ -98,13 +130,16 @@ def build_acd(
                         locator=_locator(node),
                     )
                 )
+                if len(blocks) >= max_blocks:
+                    budget_hit = True
+                    break
                 continue
             text = _text(node)
             if not text:
                 continue
             counter += 1
             if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-                blocks.append(
+                _emit(
                     AcdBlock(
                         id=f"b{counter}",
                         type="heading",
@@ -114,17 +149,48 @@ def build_acd(
                     )
                 )
             elif tag == "pre":
-                blocks.append(AcdBlock(id=f"b{counter}", type="code", text=text))
+                _emit(AcdBlock(id=f"b{counter}", type="code", text=text))
             elif tag == "li":
-                blocks.append(AcdBlock(id=f"b{counter}", type="list", text=text))
+                _emit(AcdBlock(id=f"b{counter}", type="list", text=text))
             elif tag == "blockquote":
-                blocks.append(AcdBlock(id=f"b{counter}", type="quote", text=text))
-            elif tag == "table":
-                continue
+                _emit(AcdBlock(id=f"b{counter}", type="quote", text=text))
             else:
-                blocks.append(AcdBlock(id=f"b{counter}", type="text", text=text))
+                _emit(AcdBlock(id=f"b{counter}", type="text", text=text))
             if len(blocks) >= max_blocks:
+                budget_hit = True
                 break
+
+        # Region fallback pass: div/span card content the tag-driven selector
+        # cannot see. Innermost region wins; regions whose inner semantic
+        # nodes already matched are skipped (their content is already in
+        # blocks, and re-projecting the wrapper text would double-count).
+        # NOTE: selectolax css() includes the node ITSELF when it matches
+        # the selector (p.css('p') -> [p]), so "contains another region"
+        # must exclude the self-hit; a self-hit's html equals the node's
+        # own html, a descendant's is always a strict substring.
+        if not budget_hit:
+            regions = [
+                node for node in root.css(REGION_SEL)
+                if not inside_chrome(node, stop=root)
+            ]
+
+            def _other_regions(node):
+                return [h for h in node.css(REGION_SEL) if h.html != node.html]
+
+            qualifying = [
+                node for node in regions
+                if not _other_regions(node) and not node.css(BLOCK_SEL)
+                and len(_text(node)) >= REGION_MIN_CHARS
+            ]
+            blocks_total += len(qualifying)
+            for node in qualifying:
+                if len(blocks) >= max_blocks:
+                    budget_hit = True
+                    break
+                text = _text(node)
+                counter += 1
+                _emit(AcdBlock(id=f"b{counter}", type="text", text=text,
+                               locator=_locator(node), role="region"))
 
     # Extract JSON-LD structured data (FAQPage, HowTo, Product, etc.)
     json_ld_data: list[dict] = []
@@ -145,31 +211,33 @@ def build_acd(
             except Exception:
                 continue
 
-    # Project high-value JSON-LD schemas (FAQPage, HowTo) into structured ACD blocks
+    # Project high-value JSON-LD schemas (FAQPage, HowTo, Product) into
+    # structured ACD blocks. Projectables are counted FIRST so blocks_total
+    # stays exact even when the budget truncates the projection.
+    pending: list[dict] = []
+
+    def _pending(**kwargs) -> None:
+        pending.append(kwargs)
+
     for entity in json_ld_data:
-        if len(blocks) >= max_blocks:
-            break
         etype = entity.get("@type")
         if etype == "FAQPage" and isinstance(entity.get("mainEntity"), list):
             for faq in entity["mainEntity"]:
-                if not isinstance(faq, dict) or len(blocks) >= max_blocks:
+                if not isinstance(faq, dict):
                     continue
                 q = str(faq.get("name") or "").strip()
                 ans_obj = faq.get("acceptedAnswer") or {}
                 a = str(ans_obj.get("text") if isinstance(ans_obj, dict) else ans_obj or "").strip()
                 if q and a:
-                    counter += 1
-                    blocks.append(AcdBlock(id=f"b{counter}", type="heading", level=4, text=f"Q: {q}"))
-                    counter += 1
                     clean_a = " ".join(HTMLParser(a).text(separator=" ", strip=True).split()) if "<" in a else a
-                    blocks.append(AcdBlock(id=f"b{counter}", type="text", text=clean_a))
+                    _pending(type="heading", level=4, text=f"Q: {q}")
+                    _pending(type="text", text=clean_a)
         elif etype == "HowTo" and isinstance(entity.get("step"), list):
             howto_name = str(entity.get("name") or "").strip()
-            if howto_name and len(blocks) < max_blocks:
-                counter += 1
-                blocks.append(AcdBlock(id=f"b{counter}", type="heading", level=3, text=howto_name))
+            if howto_name:
+                _pending(type="heading", level=3, text=howto_name)
             for step in entity["step"]:
-                if not isinstance(step, dict) or len(blocks) >= max_blocks:
+                if not isinstance(step, dict):
                     continue
                 s_name = str(step.get("name") or "").strip()
                 s_text = ""
@@ -180,8 +248,35 @@ def build_acd(
                     s_text = step["text"].strip()
                 combined = f"{s_name}: {s_text}" if s_name and s_text else (s_name or s_text)
                 if combined:
-                    counter += 1
-                    blocks.append(AcdBlock(id=f"b{counter}", type="list", text=combined))
+                    _pending(type="list", text=combined)
+        elif etype == "Product":
+            name = str(entity.get("name") or "").strip()
+            description = str(entity.get("description") or "").strip()
+            if name:
+                _pending(type="heading", level=4, text=f"Product: {name}")
+            if description:
+                clean_d = " ".join(HTMLParser(description).text(separator=" ", strip=True).split()) if "<" in description else description
+                _pending(type="text", text=clean_d)
+            offers = entity.get("offers")
+            offer_list = offers if isinstance(offers, list) else [offers] if isinstance(offers, dict) else []
+            for offer in offer_list:
+                if not isinstance(offer, dict):
+                    continue
+                price = str(offer.get("price") or "").strip()
+                currency = str(offer.get("priceCurrency") or "").strip()
+                availability = str(offer.get("availability") or "").strip()
+                if price:
+                    bits = [f"Price: {price} {currency}".strip()]
+                    if availability:
+                        bits.append(availability.rsplit("/", 1)[-1])
+                    _pending(type="text", text=" — ".join(bits))
+    blocks_total += len(pending)
+    for kwargs in pending:
+        if len(blocks) >= max_blocks:
+            budget_hit = True
+            break
+        counter += 1
+        blocks.append(AcdBlock(id=f"b{counter}", **kwargs))
 
     actions: list[AcdAction] = []
     for target in targets:
@@ -197,9 +292,7 @@ def build_acd(
             kind = "embed"
         elif target.role == "button" and target.name.strip().lower() in {"submit", "search"}:
             kind = "submit"
-        elif target.role == "button":
-            kind = "activate"
-        elif target.role in {"checkbox", "label"}:
+        elif target.role == "button" or target.role in {"checkbox", "label"}:
             kind = "activate"
         else:
             kind = "activate"
@@ -249,6 +342,7 @@ def build_acd(
 
     counts = {
         "blocks": len(blocks),
+        "blocks_total": blocks_total,
         "actions": len(actions),
         "actions_total": controls_total,
         "links": len(links),
@@ -259,12 +353,20 @@ def build_acd(
     }
     unavailable: list[str] = []
     if any(a.kind == "drag" for a in actions):
-        unavailable.append("drag: numeric deltas are heuristic without a layout engine")
+        unavailable.append("drag: numeric deltas come from the mini-DOM block-flow layout engine (approximate, not Blink-exact)")
     if any(a.kind == "embed" for a in actions):
-        unavailable.append("embed: iframe pixels/postMessage not available in mini-DOM")
+        unavailable.append("embed: iframe pixels are structurally decomposed, never rastered; frame postMessage lanes are live")
     if controls_total > len(actions):
         unavailable.append(
             f"actions: {controls_total - len(actions)} interactive controls beyond the 80-ref budget did not receive refs"
+        )
+    if chrome_skipped:
+        unavailable.append(
+            f"blocks: {chrome_skipped} candidate content region(s) inside nav/header/footer chrome were skipped"
+        )
+    if budget_hit and blocks_total > len(blocks):
+        unavailable.append(
+            f"blocks: {blocks_total - len(blocks)} candidate content region(s) beyond the {max_blocks}-block budget were not projected"
         )
     return Acd(
         url=url,
@@ -316,6 +418,9 @@ def acd_view(acd: Acd, *, limit: int = 60) -> str:
         lines.append("UNAVAILABLE: " + "; ".join(acd.unavailable[:5]))
     if acd.counts.get("actions_total", 0) > acd.counts.get("actions", 0):
         lines.append(f"ACTIONS: {acd.counts['actions']} of {acd.counts['actions_total']} (budget-truncated)")
+    blocks_total = acd.counts.get("blocks_total", 0)
+    if blocks_total > len(acd.blocks):
+        lines.append(f"BLOCKS: {len(acd.blocks)} of {blocks_total} (some skipped or budget-truncated; see UNAVAILABLE)")
     for block in acd.blocks[:limit]:
         if block.type == "table":
             lines.append(f"[{block.id}] table {len(block.rows)}x{len(block.rows[0]) if block.rows else 0}")
@@ -347,7 +452,24 @@ def query_acd(acd: Acd, term: str, *, limit: int = 40) -> list[AcdBlock]:
 
 
 def slice_acd(acd: Acd, start: str = "", end: str = "", *, limit: int = 120) -> list[AcdBlock]:
+    """Slice blocks between start and end ids (inclusive).
+
+    An unknown id is an ERROR, never a silent fallback: a retrieval API that
+    answers an unknown address with "the first N blocks" returns a confident
+    wrong answer, which is worse than no answer — the agent cannot tell it
+    happened. Callers catch ValueError and surface it honestly.
+    """
     ids = [b.id for b in acd.blocks]
-    i = ids.index(start) if start and start in ids else 0
-    j = ids.index(end) + 1 if end and end in ids else i + limit
+    if start and start not in ids:
+        raise ValueError(
+            f"unknown block id: {start}; valid range is {ids[0]}..{ids[-1]}" if ids
+            else f"unknown block id: {start}; the ACD has no blocks"
+        )
+    if end and end not in ids:
+        raise ValueError(
+            f"unknown block id: {end}; valid range is {ids[0]}..{ids[-1]}" if ids
+            else f"unknown block id: {end}; the ACD has no blocks"
+        )
+    i = ids.index(start) if start else 0
+    j = ids.index(end) + 1 if end else min(i + limit, len(ids))
     return acd.blocks[i:j]
