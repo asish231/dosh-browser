@@ -103,13 +103,29 @@ One patch per PR-sized unit, each with a hermetic test, each flag-gated OFF by d
 - **Gate:** each patch green alone + spec-mode byte-identity test (overlays OFF =
    identical output to stock on the conformance corpus).
 
-### Phase 5 — Agentic inventions on top (the product work, parallel to 3–4) — includes the pure-Rust product rewrite
-When the product rewrites to Rust, it consumes `doshgentv8-core` directly as a
-crate dependency (implementing `HostSeam` natively — no bridge at all); only the
-`doshgentv8/py` facade is deleted. Port product modules incrementally against
-the Python side as the test oracle: `fetch` → `tree/parse` → `runtime seam` →
-`session` → `shell/tools` → `server`.
-Ordered from the verified audit (P0 first — see `AGENTIC-VERIFY-CLASSIFY.md` §7):
+### Phase 5 — Pure-Rust Product Rewrite — IN PROGRESS
+`dosh-browser-core/` — pure-Rust product crate. Consumes `doshgentv8-core`
+(pure-Rust engine) and implements the `HostSeam` trait natively.
+**Status:** scaffolded + 8/12 modules ported, **50/50 tests pass** (byte-parity verified):
+- ✅ `fetch.rs`: reqwest HTTP transport (replaces curl_cffi/httpx)
+- ✅ `tree.rs`: kuchiki HTML parser (replaces selectolax.lexbor), exact JSON tree shape
+- ✅ `download.rs`: streaming download + hash verification (replaces download.py)
+- ✅ `video.rs`: yt-dlp lane + policy gates + metadata (replaces video.py)
+- ✅ `session.rs`: Session/Tab/Page structs, goto loop, history push/replace (core)
+- ✅ `types.rs`: Pydantic equivalents (exact JSON serialization parity)
+- ✅ `content.rs`: `content_root` + `inside_chrome` (exact selector/parity logic)
+- ✅ `links.rs`: link extraction + chrome filtering (exact parity, trailing slash fix)
+- ✅ `acd.rs`: ACD block extraction, JSON-LD projection, region fallbacks, query/slice (exact parity)
+- ⬜ `actions.rs` → action surface (navigate/submit/activate/drag/dropzone)
+- ⬜ `forms.rs` → form field extraction
+- ⬜ `shell.rs` → 33-command CLI surface
+- ⬜ `server/tools.rs` → axum + serde (HTTP/MCP API)
+
+**Test evidence (50/50):** boot, parse, crypto, fetch classify/decode, download hash parsing,
+video policy/direct media/meta, session tab push/replace/text extraction, goto flow,
+content root scoring, chrome detection, link extraction (dedup/chrome/limits),
+ACD blocks/tables/headings/regions/JSON-LD/query/slice/view.
+**Gate:** each module ported and parity-tested against Python oracle before full switch.
 1. **Honest crypto stubs** (one-line fixes; kills silent false-success) → then
    **NativeCrypto suite** as host callables (AES-GCM/ChaCha20, HMAC, sign/verify
    ECDSA/Ed25519/RSA-PSS, X25519/HKDF, key vault per origin).
