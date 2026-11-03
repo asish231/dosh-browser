@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["core", "py"]
+
+[profile.release]
+debug = false
+opt-level = 2

@@ -1,0 +1,4 @@
+# macOS Python extensions resolve CPython symbols from the host interpreter at
+# load time (maturin passes this automatically; raw cargo needs it spelled out).
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]

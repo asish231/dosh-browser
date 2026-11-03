@@ -1,0 +1,10 @@
+[package]
+name = "doshgentv8-core"
+version = "1.0.0"
+edition = "2021"
+description = "Pure-Rust V8 embedding for the dosh-browser engine (no Python here: the host seam is a trait)"
+
+[dependencies]
+# Prebuilt static V8 (aarch64-apple-darwin asset ships with the release);
+# our patched fork drops in later via RUSTY_V8_ARCHIVE without changing this crate.
+v8 = "152.2.0"

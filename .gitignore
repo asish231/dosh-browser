@@ -19,3 +19,13 @@ DOSH_Browser_Mini_Project_Presentation_ORIGINAL_BACKUP.pptx
 win/
 BUSINESS_STRATEGY.md
 research_repos/chromium
+# Build artifacts (never push compiled binaries)
+target/
+*.dylib
+*.so
+*.a
+doshgentv8/target/
+
+# Reference clones (read-only, not our code)
+research_repos/v8/
+research_repos/lightpanda/
