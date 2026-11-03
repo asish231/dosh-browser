@@ -1,0 +1,38 @@
+[package]
+name = "dosh-browser-core"
+version = "1.0.0"
+edition = "2021"
+description = "Pure-Rust dosh-browser product — consumes doshgentv8-core"
+
+[dependencies]
+# The engine: pure Rust, zero Python, proven and tested.
+doshgentv8-core = { path = "../doshgentv8/core" }
+
+# HTTP & transport (replaces curl_cffi / httpx)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "stream"] }
+http = "1.2"
+url = "2.5"
+encoding_rs = "0.8"
+
+# Parsing (replaces selectolax.lexbor)
+kuchiki = "0.8"
+html5ever = "0.27"
+
+# Storage (replaces SQLite for profile, keeps compatibility)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Crypto (replaces hashlib for host_crypto_digest)
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+
+# Async runtime for fetch
+tokio = { version = "1", features = ["rt", "macros", "fs", "time", "process"] }
+
+# Temp files (downloads, video)
+tempfile = "3"
+
+# Future: server/tooling
+# axum = "0.8"
+# clap = "4.5"
