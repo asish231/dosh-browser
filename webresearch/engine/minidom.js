@@ -8660,10 +8660,21 @@ var decl = new CSSStyleDeclaration(el);
     return __dispatchTypeSequence(el, text, delays, stealth);
   };
 
-  global.__activateSelector = function (selector, text, delays, stealth) {
+  global.__activateSelector = function (selector, text, delays, stealth, nth) {
     var el = null;
-    if (global.document.getElementById(selector)) el = global.document.getElementById(selector);
-    else el = global.document.querySelector(selector);
+    nth = Math.max(1, parseInt(nth, 10) || 1);
+    if (nth <= 1) {
+      if (global.document.getElementById(selector)) el = global.document.getElementById(selector);
+      else el = global.document.querySelector(selector);
+    } else {
+      /* Identical siblings share one content identity and therefore one
+         selector; the action surface disambiguates them with document-order
+         occurrence suffixes (~2, ~3...). The Nth match of the selector is the
+         addressed control — first-match-wins here made every sibling after
+         the first unreachable (a phantom-control bug). */
+      var am = global.document.querySelectorAll(selector);
+      el = am && am.length >= nth ? am[nth - 1] : null;
+    }
     if (!el) return false;
     if (stealth !== undefined) global.__stealthMode = !!stealth;
     if (el.nodeName === "select") {
@@ -9133,10 +9144,18 @@ var decl = new CSSStyleDeclaration(el);
     return true;
   }
 
-  global.__dragSelector = function (selector, dx, dy, steps, trajectory, stealth) {
+  global.__dragSelector = function (selector, dx, dy, steps, trajectory, stealth, nth) {
     var el = null;
-    if (global.document.getElementById(selector)) el = global.document.getElementById(selector);
-    else el = global.document.querySelector(selector);
+    nth = Math.max(1, parseInt(nth, 10) || 1);
+    if (nth <= 1) {
+      if (global.document.getElementById(selector)) el = global.document.getElementById(selector);
+      else el = global.document.querySelector(selector);
+    } else {
+      /* Identical siblings share one selector; the surface disambiguates by
+         document-order occurrence. The Nth match is the addressed handle. */
+      var dm = global.document.querySelectorAll(selector);
+      el = dm && dm.length >= nth ? dm[nth - 1] : null;
+    }
     if (!el) return false;
     return __executeDrag(el, dx, dy, steps, trajectory, stealth);
   };
