@@ -1,0 +1,13 @@
+[package]
+name = "doshgentv8-py"
+version = "1.0.0"
+edition = "2021"
+description = "Thin PyO3 facade over doshgentv8-core — the only throwaway piece of the engine (deleted at the pure-Rust product rewrite)"
+
+[lib]
+name = "doshgentv8_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+doshgentv8-core = { path = "../core" }
+pyo3 = { version = "0.30.1", features = ["extension-module"] }
