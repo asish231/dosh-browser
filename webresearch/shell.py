@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 COMMANDS = {
     "help": "List commands and capability limits.",
+    "product": "Which lane is official (python) vs experimental (rust), and the active JS engine.",
     "status": "Current session, tab, document, and capture status.",
     "open": "Load url through the normal owned document lifecycle.",
     "actions": "List controls with explicit pagination coverage.",
@@ -388,10 +389,16 @@ class DoshShell:
                     "capture": "starts when the shell attaches; earlier activity cannot be recovered",
                     "storage": "metadata by default; values and console messages can contain secrets",
                     "rollback": "unsupported: evidence snapshots cannot undo requests, VM state, or server effects"}
+        if name == "product":
+            from webresearch.config import project_status
+            return project_status()
         if name == "status":
+            from webresearch.config import project_status
             return {"session_id": s.id, "tab_id": s.active_tab_id, "url": _url(s.url),
                     "live_realm": s.current_tab.ctx is not None, "persistent_workspace": self.store.persistent,
-                    "network": self.network.query(limit=1)["coverage"], "log_events": self.log_seq}
+                    "network": self.network.query(limit=1)["coverage"], "log_events": self.log_seq,
+                    "product": {"official_lane": project_status()["official_lane"],
+                                "active_js_engine": project_status()["js_engine"]["active"]}}
         if name == "open":
             page = await s.goto(a["url"], js=a.get("js", "always"))
             return {"url": _url(page.url), "status": page.status, "title": page.title, "view": page.view}
