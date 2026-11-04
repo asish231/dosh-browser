@@ -46,6 +46,7 @@ from webresearch.types import (
 
 from webresearch.profile import Profile
 from webresearch.engine.login import MAX_OTP_ATTEMPTS, OtpCheckpoint
+from webresearch.network import DEFAULT_NETWORK_ENGINE, NetworkEngine
 
 DOWNLOAD_CONTENT_TYPES = (
     "application/pdf",
@@ -232,6 +233,7 @@ class Session:
         self.last_used = self.created_at
         self.proxy: str | None = None
         self.stealth: bool = False
+        self.network: NetworkEngine = DEFAULT_NETWORK_ENGINE
         # Per-run agent-visible state from the last JS pass.
         self._last_dialogs: list[dict] = []
         self._last_popups: list[dict] = []

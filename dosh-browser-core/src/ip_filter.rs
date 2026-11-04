@@ -419,3 +419,4 @@ mod tests {
         assert!(filter.check_url(&attack_local).is_err());
     }
 }
+

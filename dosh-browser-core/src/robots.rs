@@ -350,3 +350,4 @@ Sitemap: https://example.com/sitemap.xml
         assert!(store.check_url(&url2, "dosh-browser").await);
     }
 }
+
