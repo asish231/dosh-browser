@@ -86,6 +86,7 @@ pub struct NetworkRecord {
     pub content_type: String,
     pub initiator_type: String,
     pub response_body: Option<String>,
+    pub caused_by: Option<String>,
 }
 
 impl Default for NetworkRecord {
@@ -105,6 +106,7 @@ impl Default for NetworkRecord {
             content_type: String::new(),
             initiator_type: "fetch".to_string(),
             response_body: None,
+            caused_by: None,
         }
     }
 }
@@ -301,10 +303,15 @@ impl NetworkLedger {
                 content_type,
                 initiator_type,
                 response_body,
+                caused_by: map.get("caused_by").and_then(|v| v.as_str()).map(|s| s.to_string()),
             });
             count += 1;
         }
         count
+    }
+
+    pub fn records(&self) -> &[NetworkRecord] {
+        &self.records
     }
 
     pub fn query(&self, after: u64, limit: usize, pattern: &str) -> Value {

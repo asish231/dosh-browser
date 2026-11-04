@@ -263,6 +263,7 @@ class NetworkLedger:
                 "body_state": "disabled" if not self.capture_bodies else "unavailable",
                 "content_type": str(item.get("content_type") or headers.get("content-type", ""))[:200],
                 "initiator_type": str(item.get("initiatorType") or "fetch")[:64],
+                "caused_by": str(item.get("caused_by"))[:128] if item.get("caused_by") else None,
             }
             size = item.get("bytes")
             if isinstance(size, int) and not isinstance(size, bool) and size >= 0:

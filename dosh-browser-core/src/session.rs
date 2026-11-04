@@ -177,6 +177,8 @@ pub struct Session {
     pub network: crate::network::NetworkEngine,
     /// Console event log
     pub console_logs: Vec<serde_json::Value>,
+    /// Content-addressed element identity tracker
+    pub identity_tracker: crate::identity::IdentityTracker,
 }
 
 impl Session {
@@ -200,6 +202,7 @@ impl Session {
             network_ledger: crate::telemetry::NetworkLedger::new(1000, false),
             network: crate::network::NetworkEngine::default(),
             console_logs: Vec::new(),
+            identity_tracker: crate::identity::IdentityTracker::new(),
         }
     }
 
@@ -259,6 +262,7 @@ impl Session {
 
         // 3. Build action targets, links, and frame inventory
         let targets = crate::actions::extract_actions(&html, &result.final_url, 100);
+        self.identity_tracker.update(&targets);
         let links = crate::links::links(&html, &result.final_url, 50);
         let iframes = crate::tree::collect_iframes(&html);
         let frame_infos: Vec<crate::types::FrameInfo> = iframes
@@ -353,6 +357,7 @@ impl Session {
         }
 
         let targets = crate::actions::extract_actions(&final_html, url, 100);
+        self.identity_tracker.update(&targets);
         let links = crate::links::links(&final_html, url, 50);
         let iframes = crate::tree::collect_iframes(&final_html);
         let frame_infos: Vec<crate::types::FrameInfo> = iframes
@@ -429,7 +434,13 @@ impl Session {
         }
 
         let targets = crate::actions::extract_actions(&html, &url, 100);
-        if let Some(target) = targets.into_iter().find(|t| t.ref_id == ref_id) {
+        let effective_ref = if let Ok((resolved, _)) = self.identity_tracker.resolve(ref_id, &targets) {
+            resolved.ref_id.clone()
+        } else {
+            ref_id.to_string()
+        };
+
+        if let Some(target) = targets.into_iter().find(|t| t.ref_id == effective_ref) {
             if target.tag == "a"
                 && !target.href.is_empty()
                 && !target.href.starts_with('#')
@@ -447,7 +458,7 @@ impl Session {
         // Apply action click via Runtime (V8)
         let action_payload = serde_json::json!({
             "type": "click",
-            "ref": ref_id,
+            "ref": effective_ref,
         });
 
         let mut rt = crate::runtime::Runtime::new(self.client.clone(), &url)
@@ -469,9 +480,16 @@ impl Session {
             return Err("No document loaded in session".to_string());
         }
 
+        let targets = crate::actions::extract_actions(&html, &url, 100);
+        let effective_ref = if let Ok((resolved, _)) = self.identity_tracker.resolve(ref_id, &targets) {
+            resolved.ref_id.clone()
+        } else {
+            ref_id.to_string()
+        };
+
         let action_payload = serde_json::json!({
             "type": "type",
-            "ref": ref_id,
+            "ref": effective_ref,
             "text": text,
         });
 
