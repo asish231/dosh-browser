@@ -92,7 +92,7 @@ impl CorsStore {
             .get("access-control-max-age")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5)
-            .min(86400); // capped at 24 hours
+            .min(7200); // capped at 2 hours per WHATWG / Chromium specification
 
         let mut allowed_methods = HashSet::new();
         if let Some(methods_hdr) = headers.get("access-control-allow-methods") {
@@ -228,31 +228,109 @@ pub fn get_origin(url: &Url) -> String {
     )
 }
 
-/// Determine whether a request is a W3C CORS-safelisted simple request.
-fn is_simple_request(method: &str, headers: &HashMap<String, String>) -> bool {
-    // 1. Method must be GET, HEAD, or POST
-    if method != "GET" && method != "HEAD" && method != "POST" {
+/// WHATWG Fetch Specification: CORS-unsafe byte detection.
+/// Controls (0x00-0x08, 0x0A-0x1F, 0x7F) and delimiters `"` `(` `)` `:` `<` `>` `?` `@` `[` `\` `]` `{` `}`.
+pub fn is_cors_unsafe_byte(c: u8) -> bool {
+    matches!(
+        c,
+        0..=0x08
+            | 0x0A..=0x1F
+            | b'"'
+            | b'('
+            | b')'
+            | b':'
+            | b'<'
+            | b'>'
+            | b'?'
+            | b'@'
+            | b'['
+            | b'\\'
+            | b']'
+            | b'{'
+            | b'}'
+            | 0x7F
+    )
+}
+
+/// Verify string contains no CORS-unsafe bytes.
+pub fn has_no_cors_unsafe_bytes(value: &str) -> bool {
+    !value.bytes().any(is_cors_unsafe_byte)
+}
+
+/// Safelisted characters for `Accept-Language` and `Content-Language`.
+pub fn is_safelisted_language_value(value: &str) -> bool {
+    value.bytes().all(|c| {
+        matches!(
+            c,
+            b'0'..=b'9'
+                | b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b' '
+                | b'*'
+                | b','
+                | b'-'
+                | b'.'
+                | b';'
+                | b'='
+        )
+    })
+}
+
+/// Verify whether a Content-Type MIME type is CORS-safelisted.
+pub fn is_safelisted_content_type(value: &str) -> bool {
+    let semi = value.find(';').unwrap_or(value.len());
+    let mime = value[..semi].trim().to_lowercase();
+    (mime == "application/x-www-form-urlencoded"
+        || mime == "multipart/form-data"
+        || mime == "text/plain")
+        && has_no_cors_unsafe_bytes(value)
+}
+
+/// Check if a specific header name and value is CORS-safelisted per WHATWG.
+pub fn is_safelisted_header(name: &str, value: &str) -> bool {
+    // 1. Length constraint: safelisted request header values cannot exceed 128 bytes
+    if value.len() > 128 {
         return false;
     }
 
-    // 2. Headers must only be CORS-safelisted
+    let lk = name.to_lowercase();
+    match lk.as_str() {
+        "accept" => has_no_cors_unsafe_bytes(value),
+        "accept-language" | "content-language" => is_safelisted_language_value(value),
+        "content-type" => is_safelisted_content_type(value),
+        _ => false,
+    }
+}
+
+/// Check if an HTTP method is CORS-safelisted.
+pub fn is_safelisted_method(method: &str) -> bool {
+    let m = method.to_uppercase();
+    m == "GET" || m == "HEAD" || m == "POST"
+}
+
+/// Determine whether a request is a W3C CORS-safelisted simple request.
+pub fn is_simple_request(method: &str, headers: &HashMap<String, String>) -> bool {
+    // 1. Method must be GET, HEAD, or POST
+    if !is_safelisted_method(method) {
+        return false;
+    }
+
+    // 2. Authored headers must only be CORS-safelisted
     for (k, v) in headers {
         let lk = k.to_lowercase();
-        match lk.as_str() {
-            "accept" | "accept-language" | "content-language" => {}
-            "content-type" => {
-                let lv = v.to_lowercase();
-                let mime = lv.split(';').next().unwrap_or("").trim();
-                if mime != "application/x-www-form-urlencoded"
-                    && mime != "multipart/form-data"
-                    && mime != "text/plain"
-                {
-                    return false;
-                }
-            }
-            // Standard user-agent and host headers are handled by browser
-            "user-agent" | "host" | "origin" | "referer" => {}
-            _ => return false,
+        // Skip browser/agent internal infrastructure headers
+        if lk == "user-agent"
+            || lk == "host"
+            || lk == "origin"
+            || lk == "referer"
+            || lk.starts_with("sec-fetch-")
+            || lk.starts_with("sec-ch-ua")
+        {
+            continue;
+        }
+
+        if !is_safelisted_header(&lk, v) {
+            return false;
         }
     }
 
@@ -340,6 +418,52 @@ mod tests {
             CorsGate::validate_response(client, false, &h3),
             Err(CorsError::OriginMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn test_whatwg_unsafe_bytes() {
+        assert!(is_cors_unsafe_byte(0x00));
+        assert!(is_cors_unsafe_byte(0x08));
+        assert!(is_cors_unsafe_byte(0x0A));
+        assert!(is_cors_unsafe_byte(b'"'));
+        assert!(is_cors_unsafe_byte(b'<'));
+        assert!(is_cors_unsafe_byte(b'>'));
+        assert!(is_cors_unsafe_byte(b'{'));
+        assert!(is_cors_unsafe_byte(0x7F));
+
+        assert!(!is_cors_unsafe_byte(b'a'));
+        assert!(!is_cors_unsafe_byte(b'/'));
+        assert!(!is_cors_unsafe_byte(b'*'));
+
+        assert!(!has_no_cors_unsafe_bytes("text/html; charset=\"utf-8\""));
+        assert!(has_no_cors_unsafe_bytes("text/html; charset=utf-8"));
+    }
+
+    #[test]
+    fn test_safelisted_header_length_cap() {
+        let ok_val = "a".repeat(128);
+        let too_long = "a".repeat(129);
+
+        assert!(is_safelisted_header("accept", &ok_val));
+        assert!(!is_safelisted_header("accept", &too_long));
+    }
+
+    #[test]
+    fn test_language_value_validation() {
+        assert!(is_safelisted_language_value("en-US,en;q=0.9,fr;q=0.8"));
+        assert!(!is_safelisted_language_value("en-US\nEvilHeader: true"));
+        assert!(!is_safelisted_language_value("en-US<script>"));
+    }
+
+    #[test]
+    fn test_content_type_safelist_variants() {
+        assert!(is_safelisted_content_type("text/plain"));
+        assert!(is_safelisted_content_type("application/x-www-form-urlencoded; charset=utf-8"));
+        assert!(is_safelisted_content_type("multipart/form-data; boundary=something"));
+
+        // JSON or XML are NOT CORS-safelisted and MUST trigger preflight
+        assert!(!is_safelisted_content_type("application/json"));
+        assert!(!is_safelisted_content_type("application/xml"));
     }
 }
 

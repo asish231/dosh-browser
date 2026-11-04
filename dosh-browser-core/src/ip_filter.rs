@@ -5,11 +5,13 @@
 //! - Loopback addresses (`127.0.0.0/8`, `::1`)
 //! - RFC 1918 private IPv4 networks (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
 //! - Cloud metadata endpoints (`169.254.0.0/16`, e.g. AWS/GCP/Azure `169.254.169.254`)
+//! - NAT64 embedded IPv4 addresses (`64:ff9b::/96`, RFC 6052)
 //! - IPv6 Link-Local (`fe80::/10`) and Unique Local Addresses (`fc00::/7`)
 //! - Local domain suffixes (`.localhost`, `.local`, `.internal`, `.lan`)
-//! - Custom user-defined CIDR blocklists and allowlists.
+//! - DNS Rebinding defense via pre-connect socket/DNS resolution verification
+//! - Custom user-defined CIDR blocklists and allowlists with `-` exemption syntax.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::str::FromStr;
 use url::Url;
 
@@ -122,14 +124,29 @@ pub const PRIVATE_V4: &[CidrV4] = &[
     CidrV4::new([240, 0, 0, 0], 4),      // Reserved & Broadcast
 ];
 
-/// Standard Private IPv6 subnets (Loopback, Link-Local, ULA, Site-Local).
+/// Standard Private IPv6 subnets (Loopback, Link-Local, ULA, Site-Local, Local NAT64).
 pub const PRIVATE_V6: &[CidrV6] = &[
     CidrV6::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 128), // Unspecified ::
     CidrV6::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 128), // Loopback ::1
     CidrV6::new([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 10), // Link-local fe80::/10
     CidrV6::new([0xfc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 7),     // Unique Local Address fc00::/7
     CidrV6::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 10), // Site-local deprecated fec0::/10
+    // 64:ff9b:1::/48 — local-use NAT64, RFC 8215. Blocked whole.
+    CidrV6::new([0, 0x64, 0xff, 0x9b, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 48),
 ];
+
+/// NAT64 Well-Known Prefix: 64:ff9b::/96 (RFC 6052).
+pub const NAT64_PREFIX: [u8; 12] = [0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// Extract embedded IPv4 from NAT64 well-known prefix address.
+pub fn extract_nat64_ipv4(addr: Ipv6Addr) -> Option<Ipv4Addr> {
+    let octets = addr.octets();
+    if octets[0..12] == NAT64_PREFIX {
+        Some(Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]))
+    } else {
+        None
+    }
+}
 
 /// SSRF Filter Error types.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +155,8 @@ pub enum IpFilterError {
     BlockedMetadataService(IpAddr),
     BlockedHostname(String),
     BlockedByCustomCidr(IpAddr),
+    DnsRebindingBlocked(String, IpAddr),
+    DnsResolutionFailed(String),
     InvalidUrl(String),
 }
 
@@ -148,6 +167,10 @@ impl std::fmt::Display for IpFilterError {
             Self::BlockedMetadataService(ip) => write!(f, "SSRF: Blocked cloud metadata request: {}", ip),
             Self::BlockedHostname(h) => write!(f, "SSRF: Request blocked targeting internal hostname: {}", h),
             Self::BlockedByCustomCidr(ip) => write!(f, "SSRF: Request blocked by custom CIDR rule: {}", ip),
+            Self::DnsRebindingBlocked(host, ip) => {
+                write!(f, "SSRF: DNS Rebinding attack blocked! Host '{}' resolved to private IP: {}", host, ip)
+            }
+            Self::DnsResolutionFailed(h) => write!(f, "SSRF: DNS resolution failed for host: {}", h),
             Self::InvalidUrl(msg) => write!(f, "Invalid URL for IP filtering: {}", msg),
         }
     }
@@ -159,6 +182,7 @@ impl std::error::Error for IpFilterError {}
 #[derive(Debug, Clone)]
 pub struct IpFilter {
     pub block_private: bool,
+    pub verify_dns: bool,
     pub custom_block_v4: Vec<CidrV4>,
     pub custom_block_v6: Vec<CidrV6>,
     pub custom_allow_v4: Vec<CidrV4>,
@@ -177,6 +201,7 @@ impl IpFilter {
     pub fn new(block_private: bool) -> Self {
         Self {
             block_private,
+            verify_dns: false,
             custom_block_v4: Vec::new(),
             custom_block_v6: Vec::new(),
             custom_allow_v4: Vec::new(),
@@ -204,9 +229,26 @@ impl IpFilter {
         Ok(())
     }
 
+    /// Parse a comma-separated list of CIDR strings with allowlist '-' prefix support.
+    /// E.g. `"10.0.0.0/8,-10.0.0.42/32,192.168.0.0/16"`
+    pub fn parse_cidr_list(&mut self, cidr_list: &str) -> Result<(), String> {
+        for entry in cidr_list.split(',') {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(allow_part) = trimmed.strip_prefix('-') {
+                self.add_allow_cidr(allow_part)?;
+            } else {
+                self.add_block_cidr(trimmed)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Check if a concrete IP address is allowed.
     pub fn is_ip_allowed(&self, ip: IpAddr) -> Result<(), IpFilterError> {
-        // 1. Check custom allowlists first (explicit user override)
+        // 1. Check custom allowlists first (explicit operator override)
         match ip {
             IpAddr::V4(v4) => {
                 for cidr in &self.custom_allow_v4 {
@@ -257,17 +299,16 @@ impl IpFilter {
                     }
                 }
                 IpAddr::V6(v6) => {
-                    // IPv4-mapped IPv6 ::ffff:a.b.c.d
-                    if let Some(v4) = v6.to_ipv4_mapped() {
-                        if v4 == Ipv4Addr::new(169, 254, 169, 254) {
-                            return Err(IpFilterError::BlockedMetadataService(IpAddr::V4(v4)));
-                        }
-                        for cidr in PRIVATE_V4 {
-                            if cidr.contains(v4) {
-                                return Err(IpFilterError::BlockedPrivateIp(IpAddr::V4(v4)));
-                            }
-                        }
+                    // Check NAT64 embedded IPv4 (64:ff9b::/96)
+                    if let Some(v4) = extract_nat64_ipv4(v6) {
+                        return self.is_ip_allowed(IpAddr::V4(v4));
                     }
+
+                    // Check IPv4-mapped IPv6 ::ffff:a.b.c.d
+                    if let Some(v4) = v6.to_ipv4_mapped() {
+                        return self.is_ip_allowed(IpAddr::V4(v4));
+                    }
+
                     for cidr in PRIVATE_V6 {
                         if cidr.contains(v6) {
                             return Err(IpFilterError::BlockedPrivateIp(ip));
@@ -280,10 +321,15 @@ impl IpFilter {
         Ok(())
     }
 
-    /// Check if a hostname string is allowed. Rejects obvious intranet hostnames
-    /// and resolves IP literals.
+    /// Check if a hostname string is allowed. Rejects obvious intranet hostnames,
+    /// strips IPv6 zone identifiers, and handles IP literals.
     pub fn is_host_allowed(&self, host: &str) -> Result<(), IpFilterError> {
-        let clean = host.trim().trim_start_matches('[').trim_end_matches(']').to_lowercase();
+        let mut clean = host.trim().trim_start_matches('[').trim_end_matches(']').to_lowercase();
+
+        // Strip IPv6 zone ID (e.g. "fe80::1%eth0" -> "fe80::1")
+        if let Some(pos) = clean.find('%') {
+            clean.truncate(pos);
+        }
 
         // Check if host is a literal IP address
         if let Ok(ip) = IpAddr::from_str(&clean) {
@@ -304,6 +350,24 @@ impl IpFilter {
             }
         }
 
+        // If DNS verification is active, resolve hostname to eliminate DNS Rebinding
+        if self.verify_dns {
+            self.check_dns_resolution(&clean)?;
+        }
+
+        Ok(())
+    }
+
+    /// DNS Rebinding defense: resolves hostname and ensures ALL resolved addresses are permitted.
+    pub fn check_dns_resolution(&self, host: &str) -> Result<(), IpFilterError> {
+        let socket_addr_str = format!("{}:80", host);
+        if let Ok(addrs) = socket_addr_str.to_socket_addrs() {
+            for sa in addrs {
+                if let Err(_) = self.is_ip_allowed(sa.ip()) {
+                    return Err(IpFilterError::DnsRebindingBlocked(host.to_string(), sa.ip()));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -350,6 +414,36 @@ mod tests {
     }
 
     #[test]
+    fn test_nat64_embedded_ipv4_blocked() {
+        let filter = IpFilter::default();
+        // 64:ff9b::127.0.0.1
+        let nat64_loopback = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x7f00, 0x0001));
+        assert!(filter.is_ip_allowed(nat64_loopback).is_err());
+
+        // 64:ff9b::169.254.169.254
+        let nat64_metadata = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe));
+        assert!(matches!(filter.is_ip_allowed(nat64_metadata), Err(IpFilterError::BlockedMetadataService(_))));
+    }
+
+    #[test]
+    fn test_zone_id_stripping() {
+        let filter = IpFilter::default();
+        assert!(filter.is_host_allowed("[fe80::1%eth0]").is_err());
+    }
+
+    #[test]
+    fn test_parse_cidr_list_with_allow_syntax() {
+        let mut filter = IpFilter::new(true);
+        filter.parse_cidr_list("10.0.0.0/8,-10.0.0.42/32,192.168.0.0/16").unwrap();
+
+        // 10.0.0.42 is explicitly exempted with '-'
+        assert!(filter.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42))).is_ok());
+
+        // 10.0.0.43 is blocked
+        assert!(filter.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 43))).is_err());
+    }
+
+    #[test]
     fn test_rfc1918_private_subnets_blocked() {
         let filter = IpFilter::default();
         assert!(filter.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(10, 0, 5, 23))).is_err());
@@ -366,15 +460,12 @@ mod tests {
     #[test]
     fn test_ipv6_link_local_and_ula_blocked() {
         let filter = IpFilter::default();
-        // fe80::1
         let link_local = IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
         assert!(filter.is_ip_allowed(link_local).is_err());
 
-        // fc00::1
         let ula = IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1));
         assert!(filter.is_ip_allowed(ula).is_err());
 
-        // Public IPv6 (Google DNS 2001:4860:4860::8888) should pass
         let google_v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888));
         assert!(filter.is_ip_allowed(google_v6).is_ok());
     }
@@ -407,6 +498,22 @@ mod tests {
     }
 
     #[test]
+    fn test_rfc1918_critical_boundaries() {
+        let filter = IpFilter::default();
+        // 172.16.0.0/12 boundaries: 172.15.255.255 (allowed), 172.16.0.0 (blocked), 172.31.255.255 (blocked), 172.32.0.0 (allowed)
+        assert!(filter.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(172, 15, 255, 255))).is_ok());
+        assert!(filter.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0))).is_err());
+        assert!(filter.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(172, 31, 255, 255))).is_err());
+        assert!(filter.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(172, 32, 0, 0))).is_ok());
+
+        // Carrier-Grade NAT 100.64.0.0/10: 100.63.255.255 (allowed), 100.64.0.0 (blocked), 100.127.255.255 (blocked), 100.128.0.0 (allowed)
+        assert!(filter.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(100, 63, 255, 255))).is_ok());
+        assert!(filter.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0))).is_err());
+        assert!(filter.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(100, 127, 255, 255))).is_err());
+        assert!(filter.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 0))).is_ok());
+    }
+
+    #[test]
     fn test_url_check() {
         let filter = IpFilter::default();
         let safe_url = Url::parse("https://example.com/index.html").unwrap();
@@ -419,4 +526,3 @@ mod tests {
         assert!(filter.check_url(&attack_local).is_err());
     }
 }
-

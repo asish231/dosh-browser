@@ -21,26 +21,59 @@ def get_origin(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
 
 
+CORS_UNSAFE_BYTES = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    ord('"'), ord('('), ord(')'), ord(':'), ord('<'), ord('>'), ord('?'), ord('@'),
+    ord('['), ord('\\'), ord(']'), ord('{'), ord('}'), 127
+}
+
+SAFELISTED_LANG_CHARS = set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz *,-.;=")
+
+
+def is_cors_unsafe_byte(b: int) -> bool:
+    return b in CORS_UNSAFE_BYTES
+
+
+def has_no_cors_unsafe_bytes(value: str) -> bool:
+    return not any(b in CORS_UNSAFE_BYTES for b in value.encode("latin-1", errors="replace"))
+
+
+def is_safelisted_language_value(value: str) -> bool:
+    return all(c in SAFELISTED_LANG_CHARS for c in value)
+
+
+def is_safelisted_content_type(value: str) -> bool:
+    mime = value.split(";", 1)[0].strip().lower()
+    return mime in {
+        "application/x-www-form-urlencoded",
+        "multipart/form-data",
+        "text/plain",
+    } and has_no_cors_unsafe_bytes(value)
+
+
+def is_safelisted_header(name: str, value: str) -> bool:
+    if len(value) > 128:
+        return False
+    lk = name.lower()
+    if lk == "accept":
+        return has_no_cors_unsafe_bytes(value)
+    elif lk in {"accept-language", "content-language"}:
+        return is_safelisted_language_value(value)
+    elif lk == "content-type":
+        return is_safelisted_content_type(value)
+    return False
+
+
 def is_simple_request(method: str, headers: dict[str, str]) -> bool:
     upper = method.upper()
     if upper not in {"GET", "HEAD", "POST"}:
         return False
 
-    safelisted_types = {
-        "application/x-www-form-urlencoded",
-        "multipart/form-data",
-        "text/plain",
-    }
-
     for k, v in headers.items():
         lk = k.lower()
-        if lk in {"accept", "accept-language", "content-language", "user-agent", "host", "origin", "referer"}:
+        if lk in {"user-agent", "host", "origin", "referer"} or lk.startswith("sec-fetch-") or lk.startswith("sec-ch-ua"):
             continue
-        elif lk == "content-type":
-            mime = v.lower().split(";", 1)[0].strip()
-            if mime not in safelisted_types:
-                return False
-        else:
+        if not is_safelisted_header(lk, v):
             return False
 
     return True
@@ -57,7 +90,7 @@ class PreflightEntry:
         self.allowed_methods = allowed_methods
         self.allowed_headers = allowed_headers
         self.allow_credentials = allow_credentials
-        self.expires_at = time.time() + min(max_age_secs, 86400.0)
+        self.expires_at = time.time() + min(max_age_secs, 7200.0)
 
     def is_fresh(self) -> bool:
         return time.time() < self.expires_at

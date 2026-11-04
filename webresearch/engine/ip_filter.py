@@ -36,7 +36,10 @@ PRIVATE_V6_NETWORKS = [
     ipaddress.ip_network("fe80::/10"),      # Link-local
     ipaddress.ip_network("fc00::/7"),       # Unique Local Address
     ipaddress.ip_network("fec0::/10"),      # Site-local deprecated
+    ipaddress.ip_network("64:ff9b:1::/48"),  # Local-use NAT64 (RFC 8215)
 ]
+
+NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 BLOCKED_INTERNAL_DOMAINS = (
     "localhost",
@@ -56,12 +59,13 @@ class IpFilterError(Exception):
 
 
 class IpFilter:
-    def __init__(self, block_private: bool | None = None):
+    def __init__(self, block_private: bool | None = None, verify_dns: bool = False):
         import os
         if block_private is None:
             # If WR_ALLOW_PRIVATE_IPS=1 is set (e.g. during local test runs), don't block loopback by default
             block_private = os.environ.get("WR_ALLOW_PRIVATE_IPS") != "1"
         self.block_private = block_private
+        self.verify_dns = verify_dns
         self.custom_block_cidrs: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
         self.custom_allow_cidrs: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 
@@ -72,6 +76,17 @@ class IpFilter:
     def add_allow_cidr(self, cidr_str: str) -> None:
         net = ipaddress.ip_network(cidr_str.strip(), strict=False)
         self.custom_allow_cidrs.append(net)
+
+    def parse_cidr_list(self, cidr_list_str: str) -> None:
+        """Parse comma-separated CIDR entries with '-' prefix allowlist support."""
+        for part in cidr_list_str.split(","):
+            trimmed = part.strip()
+            if not trimmed:
+                continue
+            if trimmed.startswith("-"):
+                self.add_allow_cidr(trimmed[1:])
+            else:
+                self.add_block_cidr(trimmed)
 
     def is_ip_allowed(self, ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:
         """Raise IpFilterError if IP is not permitted, otherwise returns None."""
@@ -94,6 +109,13 @@ class IpFilter:
         ):
             raise IpFilterError(f"SSRF: Blocked cloud metadata request: {ip_obj}")
 
+        # Check NAT64 embedded IPv4 (64:ff9b::/96)
+        if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj in NAT64_PREFIX:
+            # Extract the last 4 bytes as IPv4
+            v4_bytes = ip_obj.packed[12:16]
+            embedded_v4 = ipaddress.IPv4Address(v4_bytes)
+            return self.is_ip_allowed(embedded_v4)
+
         # Handle IPv4-mapped IPv6 (::ffff:127.0.0.1)
         if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
             ip_obj = ip_obj.ipv4_mapped
@@ -110,6 +132,8 @@ class IpFilter:
     def is_host_allowed(self, host: str) -> None:
         """Check hostname or literal IP string against SSRF rules."""
         clean = host.strip().strip("[]").lower()
+        if "%" in clean:
+            clean = clean.split("%")[0]
 
         # Check if literal IP address
         try:
@@ -123,6 +147,23 @@ class IpFilter:
         if self.block_private:
             if clean == "localhost" or any(clean.endswith(d) for d in BLOCKED_INTERNAL_DOMAINS):
                 raise IpFilterError(f"SSRF: Request blocked targeting internal hostname: {clean}")
+
+        if self.verify_dns:
+            self.check_dns_resolution(clean)
+
+    def check_dns_resolution(self, host: str) -> None:
+        """DNS Rebinding defense: resolve host to socket addresses and verify all resolved IPs."""
+        import socket
+        try:
+            addr_info = socket.getaddrinfo(host, 80, proto=socket.IPPROTO_TCP)
+            for _, _, _, _, sockaddr in addr_info:
+                ip_str = sockaddr[0]
+                ip_obj = ipaddress.ip_address(ip_str)
+                self.is_ip_allowed(ip_obj)
+        except socket.gaierror as e:
+            pass
+        except IpFilterError as e:
+            raise IpFilterError(f"SSRF: DNS Rebinding attack blocked! Host '{host}' resolved to private IP: {e}") from e
 
     def check_url(self, url: str) -> None:
         """Validate URL host against SSRF rules."""

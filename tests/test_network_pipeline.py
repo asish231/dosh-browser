@@ -18,12 +18,20 @@ import pytest
 from urllib.parse import urlparse
 
 from webresearch.engine.cache_sqlite import SqliteHttpCache
-from webresearch.engine.cors import CorsGate, CorsError
+from webresearch.engine.cors import (
+    CorsGate,
+    CorsError,
+    is_cors_unsafe_byte,
+    has_no_cors_unsafe_bytes,
+    is_safelisted_header,
+    is_safelisted_language_value,
+    is_safelisted_content_type,
+)
 from webresearch.engine.ip_filter import IpFilter, IpFilterError
 from webresearch.engine.rate_limiter import RateLimiter
 from webresearch.engine.robots import RobotsPolicy, RobotsStore
 from webresearch.engine.singleflight import SingleFlight
-from webresearch.engine.web_bot_auth import BotAuthConfig, sign_request
+from webresearch.engine.web_bot_auth import BotAuthConfig, sign_request, sign_web_bot_auth
 from webresearch.network import NetworkEngine
 
 
@@ -333,4 +341,110 @@ async def test_network_engine_robots_disallow():
     res = await engine.fetch("https://restricted.example.com/disallowed/doc.html", client=None)
     assert res.status == 403
     assert res.headers.get("x-webresearch-blocked") == "robots.txt"
+
+
+def test_ip_filter_nat64_and_cidr_list_syntax():
+    filter_ = IpFilter(block_private=True)
+
+    # NAT64 embedded loopback 64:ff9b::127.0.0.1
+    nat64_loopback = ipaddress.ip_address("64:ff9b::7f00:1")
+    with pytest.raises(IpFilterError):
+        filter_.is_ip_allowed(nat64_loopback)
+
+    # NAT64 embedded metadata 64:ff9b::169.254.169.254
+    nat64_metadata = ipaddress.ip_address("64:ff9b::a9fe:a9fe")
+    with pytest.raises(IpFilterError, match="cloud metadata"):
+        filter_.is_ip_allowed(nat64_metadata)
+
+    # Local-use NAT64 64:ff9b:1::/48
+    nat64_local = ipaddress.ip_address("64:ff9b:1::1")
+    with pytest.raises(IpFilterError, match="private IP"):
+        filter_.is_ip_allowed(nat64_local)
+
+    # Zone ID stripping
+    with pytest.raises(IpFilterError):
+        filter_.is_host_allowed("[fe80::1%eth0]")
+
+    # CIDR list parsing with '-' allowlist override syntax
+    filter2 = IpFilter(block_private=True)
+    filter2.parse_cidr_list("10.0.0.0/8,-10.0.0.42/32,192.168.0.0/16")
+    # 10.0.0.42 exempted
+    filter2.is_ip_allowed(ipaddress.ip_address("10.0.0.42"))
+    # 10.0.0.43 blocked
+    with pytest.raises(IpFilterError):
+        filter2.is_ip_allowed(ipaddress.ip_address("10.0.0.43"))
+
+
+def test_cors_whatwg_safelist_rules():
+    assert is_cors_unsafe_byte(0x00)
+    assert is_cors_unsafe_byte(0x08)
+    assert is_cors_unsafe_byte(ord('"'))
+    assert is_cors_unsafe_byte(ord('<'))
+    assert is_cors_unsafe_byte(127)
+    assert not is_cors_unsafe_byte(ord('a'))
+
+    assert not has_no_cors_unsafe_bytes('text/html; charset="utf-8"')
+    assert has_no_cors_unsafe_bytes('text/html; charset=utf-8')
+
+    # Max length <= 128
+    assert is_safelisted_header("accept", "a" * 128)
+    assert not is_safelisted_header("accept", "a" * 129)
+
+    # Language tags
+    assert is_safelisted_language_value("en-US,en;q=0.9,fr;q=0.8")
+    assert not is_safelisted_language_value("en-US\nEvil: 1")
+
+    # Content types
+    assert is_safelisted_content_type("text/plain")
+    assert is_safelisted_content_type("application/x-www-form-urlencoded; charset=utf-8")
+    assert is_safelisted_content_type("multipart/form-data; boundary=123")
+    assert not is_safelisted_content_type("application/json")
+
+
+def test_robots_content_signals_and_utf8_bom():
+    text_with_bom = "\ufeffUser-agent: *\nContent-Signal: ai-train=no, search=yes\nDisallow: /private/\n\nUser-agent: Dosh\nContent-Signal: ai-train=yes\nDisallow:\n"
+    policy = RobotsPolicy.parse(text_with_bom)
+
+    # Generic bot gets wildcard signals
+    gen_signals = policy.get_content_signals("curl/7.68.0")
+    assert len(gen_signals) == 2
+    assert gen_signals[0].name == "ai-train"
+    assert gen_signals[0].value == "no"
+
+    # Dosh gets specific signal
+    dosh_signals = policy.get_content_signals("Dosh/1.0")
+    assert len(dosh_signals) == 1
+    assert dosh_signals[0].name == "ai-train"
+    assert dosh_signals[0].value == "yes"
+
+    # Empty Disallow: clears prior disallows
+    assert policy.is_allowed("/private/secret", "Dosh/1.0")
+
+
+def test_rate_limiter_reserve_gcra():
+    rl = RateLimiter(interval_ms=100.0, burst=1)
+    # 1.0s = 1000ms
+    assert rl.reserve("a.test:443", 1.0) == 1.0
+    # Second reservation spaced by 100ms
+    assert round(rl.reserve("a.test:443", 1.0), 3) == 1.1
+    # Third reservation at 1.05s spaced to 1.2s
+    assert round(rl.reserve("a.test:443", 1.05), 3) == 1.2
+    # Independent host starts now
+    assert rl.reserve("b.test", 1.0) == 1.0
+
+
+def test_web_bot_auth_cloudflare_convention():
+    config = BotAuthConfig(
+        key_id="cf-bot-key-1",
+        agent_identifier="dosh-agent.io",
+        secret_key=b"fixed-secret-key-at-least-32-bytes-long!",
+        algorithm="hmac-sha256",
+    )
+    signed = sign_web_bot_auth(config, '"api.example.com"', timestamp=1712000000)
+    assert signed["signature-agent"] == '"https://dosh-agent.io"'
+    assert "created=1712000000" in signed["signature-input"]
+    assert "expires=1712000060" in signed["signature-input"]
+    assert 'tag="web-bot-auth"' in signed["signature-input"]
+    assert "nonce=" in signed["signature-input"]
+    assert signed["signature"].startswith("sig1=:")
 

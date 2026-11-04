@@ -74,12 +74,21 @@ fn pattern_match(pattern: &str, path: &str) -> bool {
     true
 }
 
+/// A declared content-usage preference from a `Content-Signal:` robots.txt directive
+/// (e.g. `ai-train=no, search=yes` per contentsignals.org).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentSignal {
+    pub name: String,
+    pub value: String,
+}
+
 /// A parsed user-agent group inside robots.txt.
 #[derive(Debug, Clone, Default)]
 pub struct UserAgentGroup {
     pub user_agents: Vec<String>,
     pub rules: Vec<PathRule>,
     pub crawl_delay: Option<Duration>,
+    pub content_signals: Vec<ContentSignal>,
 }
 
 /// Complete parsed policy for an origin.
@@ -87,21 +96,39 @@ pub struct UserAgentGroup {
 pub struct RobotsPolicy {
     pub groups: Vec<UserAgentGroup>,
     pub sitemaps: Vec<String>,
+    pub global_content_signals: Vec<ContentSignal>,
     pub cached_at: Option<Instant>,
     pub ttl: Duration,
+}
+
+/// Extract RFC 9309 product token from User-Agent string.
+/// E.g. "Dosh/1.0 (+https://example.com)" -> "dosh", "Googlebot/2.1" -> "googlebot"
+pub fn extract_product_token(user_agent: &str) -> &str {
+    let trimmed = user_agent.trim();
+    for (i, c) in trimmed.char_indices() {
+        if !c.is_alphanumeric() && c != '-' && c != '_' {
+            return &trimmed[..i];
+        }
+    }
+    trimmed
 }
 
 impl RobotsPolicy {
     /// Parse raw robots.txt content according to RFC 9309.
     pub fn parse(text: &str) -> Self {
+        // Strip UTF-8 BOM if present
+        let clean_text = text.strip_prefix("\u{FEFF}").unwrap_or(text);
+
         let mut groups: Vec<UserAgentGroup> = Vec::new();
         let mut sitemaps = Vec::new();
+        let mut global_content_signals = Vec::new();
 
         let mut current_uas: Vec<String> = Vec::new();
         let mut current_rules: Vec<PathRule> = Vec::new();
         let mut current_delay: Option<Duration> = None;
+        let mut current_signals: Vec<ContentSignal> = Vec::new();
 
-        for line in text.lines() {
+        for line in clean_text.lines() {
             // Strip comments
             let clean = line.split('#').next().unwrap_or("").trim();
             if clean.is_empty() {
@@ -114,23 +141,28 @@ impl RobotsPolicy {
 
             match key.as_str() {
                 "user-agent" => {
-                    // Starting a new group if we already collected rules
-                    if !current_rules.is_empty() || current_delay.is_some() {
+                    // Starting a new group if we already collected rules or signals
+                    if !current_rules.is_empty() || current_delay.is_some() || !current_signals.is_empty() {
                         if !current_uas.is_empty() {
                             groups.push(UserAgentGroup {
                                 user_agents: current_uas.clone(),
                                 rules: current_rules.clone(),
                                 crawl_delay: current_delay,
+                                content_signals: current_signals.clone(),
                             });
                         }
                         current_uas.clear();
                         current_rules.clear();
                         current_delay = None;
+                        current_signals.clear();
                     }
                     current_uas.push(val.to_lowercase());
                 }
                 "disallow" => {
-                    if !val.is_empty() {
+                    if val.is_empty() {
+                        // Empty disallow clears previous disallows per RFC 9309
+                        current_rules.retain(|r| r.rule_type != RuleType::Disallow);
+                    } else {
                         current_rules.push(PathRule {
                             pattern: val.to_string(),
                             rule_type: RuleType::Disallow,
@@ -143,6 +175,21 @@ impl RobotsPolicy {
                             pattern: val.to_string(),
                             rule_type: RuleType::Allow,
                         });
+                    }
+                }
+                "content-signal" => {
+                    // Comma-separated name=value pairs (e.g. "ai-train=no, search=yes")
+                    for pair in val.split(',') {
+                        let trimmed = pair.trim();
+                        if let Some((k, v)) = trimmed.split_once('=') {
+                            let name = k.trim().to_lowercase();
+                            let value = v.trim().to_lowercase();
+                            if !name.is_empty() {
+                                let sig = ContentSignal { name, value };
+                                current_signals.push(sig.clone());
+                                global_content_signals.push(sig);
+                            }
+                        }
                     }
                 }
                 "crawl-delay" => {
@@ -162,12 +209,14 @@ impl RobotsPolicy {
                 user_agents: current_uas,
                 rules: current_rules,
                 crawl_delay: current_delay,
+                content_signals: current_signals,
             });
         }
 
         Self {
             groups,
             sitemaps,
+            global_content_signals,
             cached_at: Some(Instant::now()),
             ttl: Duration::from_secs(86400), // 24-hour default TTL
         }
@@ -176,12 +225,13 @@ impl RobotsPolicy {
     /// Check if `path` is allowed for a given `user_agent`.
     pub fn is_allowed(&self, path: &str, user_agent: &str) -> bool {
         let ua_clean = user_agent.to_lowercase();
+        let token = extract_product_token(&ua_clean).to_lowercase();
 
-        // 1. Find the most specific user-agent group matching this client
+        // 1. Find the most specific user-agent group matching this client product token
         let group = self
             .groups
             .iter()
-            .find(|g| g.user_agents.iter().any(|u| u != "*" && ua_clean.contains(u)))
+            .find(|g| g.user_agents.iter().any(|u| u != "*" && (ua_clean.contains(u) || u.contains(&token))))
             .or_else(|| self.groups.iter().find(|g| g.user_agents.iter().any(|u| u == "*")));
 
         let group = match group {
@@ -207,6 +257,35 @@ impl RobotsPolicy {
         }
 
         decision
+    }
+
+    /// Retrieve content signals (e.g. AI preferences) applicable for this agent.
+    pub fn get_content_signals(&self, user_agent: &str) -> Vec<ContentSignal> {
+        let ua_clean = user_agent.to_lowercase();
+        let token = extract_product_token(&ua_clean).to_lowercase();
+
+        // Check if agent-specific group defined signals
+        if let Some(group) = self.groups.iter().find(|g| {
+            g.user_agents.iter().any(|u| u != "*" && (ua_clean.contains(u) || u.contains(&token)))
+        }) {
+            if !group.content_signals.is_empty() {
+                return group.content_signals.clone();
+            }
+        }
+
+        // Fallback to wildcard group signals
+        if let Some(wildcard_group) = self.groups.iter().find(|g| g.user_agents.iter().any(|u| u == "*")) {
+            if !wildcard_group.content_signals.is_empty() {
+                return wildcard_group.content_signals.clone();
+            }
+        }
+
+        // Fallback to global signals
+        if !self.global_content_signals.is_empty() {
+            return self.global_content_signals.clone();
+        }
+
+        Vec::new()
     }
 
     /// Crawl delay for this user agent if specified.
@@ -348,6 +427,27 @@ Sitemap: https://example.com/sitemap.xml
 
         let url2 = url::Url::parse("https://example.com/admin/public/faq").unwrap();
         assert!(store.check_url(&url2, "dosh-browser").await);
+    }
+
+    #[test]
+    fn test_content_signals_and_utf8_bom() {
+        let text_with_bom = "\u{FEFF}User-agent: *\nContent-Signal: ai-train=no, search=yes\nDisallow: /private/\n\nUser-agent: Dosh\nContent-Signal: ai-train=yes\nDisallow:\n";
+        let policy = RobotsPolicy::parse(text_with_bom);
+
+        // General agent gets ai-train=no
+        let gen_signals = policy.get_content_signals("curl/7.68.0");
+        assert_eq!(gen_signals.len(), 2);
+        assert_eq!(gen_signals[0].name, "ai-train");
+        assert_eq!(gen_signals[0].value, "no");
+
+        // Dosh agent gets specific ai-train=yes
+        let dosh_signals = policy.get_content_signals("Dosh/1.0");
+        assert_eq!(dosh_signals.len(), 1);
+        assert_eq!(dosh_signals[0].name, "ai-train");
+        assert_eq!(dosh_signals[0].value, "yes");
+
+        // Empty Disallow: clears prior disallows -> everything allowed
+        assert!(policy.is_allowed("/private/secret", "Dosh/1.0"));
     }
 }
 
