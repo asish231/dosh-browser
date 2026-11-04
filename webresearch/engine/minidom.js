@@ -39,6 +39,149 @@
     }
   })();
 
+  /* Native Function Cloaking: anti-fingerprinting & bot-detection defense */
+  var _origFunctionToString = Function.prototype.toString;
+  var _nativeFunctionMap = new WeakMap();
+
+  function __makeNative(fn, name, length) {
+    if (typeof fn !== "function") return fn;
+    var fnName = name !== undefined ? String(name) : (fn.name || "");
+    var fnLen = length !== undefined ? Number(length) : fn.length;
+    try {
+      Object.defineProperty(fn, "name", { value: fnName, configurable: true, writable: false });
+      Object.defineProperty(fn, "length", { value: fnLen, configurable: true, writable: false });
+    } catch (e) {}
+    _nativeFunctionMap.set(fn, { name: fnName, length: fnLen });
+    return fn;
+  }
+
+  var _customToString = function toString() {
+    if (typeof this !== "function") {
+      return _origFunctionToString.call(this);
+    }
+    if (this === _customToString) {
+      return "function toString() { [native code] }";
+    }
+    var meta = _nativeFunctionMap.get(this);
+    if (meta) {
+      return "function " + (meta.name || "") + "() { [native code] }";
+    }
+    return _origFunctionToString.call(this);
+  };
+  __makeNative(_customToString, "toString", 0);
+  try {
+    Object.defineProperty(Function.prototype, "toString", {
+      value: _customToString,
+      writable: true,
+      enumerable: false,
+      configurable: true
+    });
+  } catch (e) {
+    Function.prototype.toString = _customToString;
+  }
+
+  function __cloakObject(obj, map) {
+    if (!obj) return;
+    for (var k in map) {
+      if (typeof obj[k] === "function") {
+        __makeNative(obj[k], k, map[k]);
+      }
+    }
+  }
+
+  function __cloakRuntimeGlobals(g) {
+    if (!g) return;
+    __cloakObject(g, {
+      fetch: 1,
+      setTimeout: 1,
+      clearTimeout: 1,
+      setInterval: 1,
+      clearInterval: 1,
+      requestAnimationFrame: 1,
+      cancelAnimationFrame: 1,
+      atob: 1,
+      btoa: 1,
+      alert: 0,
+      confirm: 0,
+      prompt: 0,
+      open: 0,
+      close: 0,
+      scroll: 1,
+      scrollTo: 1,
+      scrollBy: 1,
+      postMessage: 1,
+      getComputedStyle: 1,
+      matchMedia: 1,
+      addEventListener: 2,
+      removeEventListener: 2,
+      dispatchEvent: 1
+    });
+
+    if (g.navigator) {
+      __cloakObject(g.navigator, {
+        sendBeacon: 1
+      });
+      if (g.navigator.permissions) __cloakObject(g.navigator.permissions, { query: 1 });
+      if (g.navigator.clipboard) __cloakObject(g.navigator.clipboard, { readText: 0, writeText: 1 });
+      if (g.navigator.mediaDevices) __cloakObject(g.navigator.mediaDevices, { enumerateDevices: 0, getUserMedia: 1 });
+    }
+
+    if (g.chrome) {
+      __cloakObject(g.chrome, {
+        loadTimes: 0,
+        csi: 0
+      });
+    }
+
+    if (g.localStorage) {
+      __cloakObject(g.localStorage, {
+        getItem: 1,
+        setItem: 2,
+        removeItem: 1,
+        clear: 0,
+        key: 1
+      });
+    }
+
+    if (g.sessionStorage) {
+      __cloakObject(g.sessionStorage, {
+        getItem: 1,
+        setItem: 2,
+        removeItem: 1,
+        clear: 0,
+        key: 1
+      });
+    }
+
+    if (g.Notification) {
+      __makeNative(g.Notification, "Notification", 1);
+      __cloakObject(g.Notification, { requestPermission: 0 });
+    }
+
+    if (g.BroadcastChannel) {
+      __makeNative(g.BroadcastChannel, "BroadcastChannel", 1);
+      if (g.BroadcastChannel.prototype) __cloakObject(g.BroadcastChannel.prototype, { postMessage: 1, close: 0 });
+    }
+
+    if (g.DOMParser) {
+      __makeNative(g.DOMParser, "DOMParser", 0);
+      if (g.DOMParser.prototype) __cloakObject(g.DOMParser.prototype, { parseFromString: 1 });
+    }
+
+    if (g.Event) __makeNative(g.Event, "Event", 1);
+    if (g.CustomEvent) __makeNative(g.CustomEvent, "CustomEvent", 1);
+    if (g.Node) __makeNative(g.Node, "Node", 0);
+    if (g.Element) __makeNative(g.Element, "Element", 0);
+    if (g.HTMLElement) __makeNative(g.HTMLElement, "HTMLElement", 0);
+    if (g.Document) __makeNative(g.Document, "Document", 0);
+    if (g.DocumentFragment) __makeNative(g.DocumentFragment, "DocumentFragment", 0);
+    if (g.Text) __makeNative(g.Text, "Text", 1);
+    if (g.FormData) __makeNative(g.FormData, "FormData", 0);
+    if (g.MutationObserver) __makeNative(g.MutationObserver, "MutationObserver", 1);
+    if (g.IntersectionObserver) __makeNative(g.IntersectionObserver, "IntersectionObserver", 1);
+    if (g.ResizeObserver) __makeNative(g.ResizeObserver, "ResizeObserver", 1);
+  }
+
   function Node(type, name, attrs, kids) {
     this.nodeType = type;
     this.nodeName = name;
@@ -3436,6 +3579,76 @@ var pos = (st.position || "").toLowerCase();
     return (typeof global.getSelection === "function") ? global.getSelection() : null;
   };
 
+  /* Cloak core DOM prototypes */
+  __cloakObject(Node.prototype, {
+    appendChild: 1,
+    removeChild: 1,
+    insertBefore: 2,
+    replaceChild: 2,
+    cloneNode: 0,
+    hasChildNodes: 0,
+    contains: 1,
+    addEventListener: 2,
+    removeEventListener: 2,
+    dispatchEvent: 1
+  });
+  __cloakObject(Element.prototype, {
+    getAttribute: 1,
+    setAttribute: 2,
+    removeAttribute: 1,
+    hasAttribute: 1,
+    getAttributeNS: 2,
+    setAttributeNS: 3,
+    removeAttributeNS: 2,
+    hasAttributeNS: 2,
+    getAttributeNames: 0,
+    closest: 1,
+    matches: 1,
+    querySelector: 1,
+    querySelectorAll: 1,
+    getElementsByTagName: 1,
+    getElementsByClassName: 1,
+    getBoundingClientRect: 0,
+    getClientRects: 0,
+    scrollIntoView: 0,
+    scrollTo: 1,
+    scrollBy: 1,
+    focus: 0,
+    blur: 0,
+    click: 0,
+    submit: 0,
+    requestSubmit: 0,
+    setPointerCapture: 1,
+    releasePointerCapture: 1,
+    hasPointerCapture: 1
+  });
+  __cloakObject(Document.prototype, {
+    getElementById: 1,
+    getElementsByClassName: 1,
+    getElementsByTagName: 1,
+    getElementsByName: 1,
+    querySelector: 1,
+    querySelectorAll: 1,
+    createElement: 1,
+    createElementNS: 2,
+    createTextNode: 1,
+    createComment: 1,
+    createDocumentFragment: 0,
+    createEvent: 1,
+    createRange: 0,
+    elementFromPoint: 2,
+    elementsFromPoint: 2,
+    hasFocus: 0,
+    adoptNode: 1,
+    importNode: 1,
+    write: 1,
+    writeln: 1,
+    open: 0,
+    close: 0,
+    exitFullscreen: 0,
+    getSelection: 0
+  });
+
   function cssSelect(root, selector) {
     selector = String(selector || "").trim();
     if (!selector) return [];
@@ -4213,7 +4426,7 @@ var decl = new CSSStyleDeclaration(el);
     var exts = ["ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_texture_filter_anisotropic",
       "OES_element_index_uint", "OES_standard_derivatives", "OES_texture_float",
       "WEBGL_compressed_texture_s3tc", "WEBGL_debug_renderer_info", "WEBGL_lose_context"];
-    return {
+    var ctxObj = {
       canvas: canvas || null,
       getParameter: function (p) { return params[p] != null ? params[p] : null; },
       getSupportedExtensions: function () { return exts.slice(); },
@@ -4235,6 +4448,14 @@ var decl = new CSSStyleDeclaration(el);
       enable: function () {}, disable: function () {}, getError: function () { return 0; },
       isContextLost: function () { return false; }
     };
+    __cloakObject(ctxObj, {
+      getParameter: 1,
+      getSupportedExtensions: 0,
+      getExtension: 1,
+      getContextAttributes: 0,
+      isContextLost: 0
+    });
+    return ctxObj;
   }
 
   function _attachCanvas(el) {
@@ -4255,6 +4476,12 @@ var decl = new CSSStyleDeclaration(el);
     };
     el.toBlob = function (cb) { if (typeof cb === "function") cb(null); };
     el.captureStream = function () { return { getTracks: function () { return []; } }; };
+    __cloakObject(el, {
+      getContext: 1,
+      toDataURL: 0,
+      toBlob: 1,
+      captureStream: 0
+    });
   }
 
   global.CanvasRenderingContext2D = makeContext2D;
@@ -4704,11 +4931,496 @@ var decl = new CSSStyleDeclaration(el);
     this.removeEventListener = function () {};
   };
   global.SharedWorker = global.Worker;
-  global.WebAssembly = global.WebAssembly || {
-    instantiate: function () { return Promise.resolve({ module: {}, instance: { exports: {} } }); },
-    compile: function () { return Promise.resolve({}); },
-    validate: function () { return false; }
+  /* ---- Agentic Scoped WebAssembly Engine ---- */
+  global.__WR_WASM_CALLS = [];
+  function __toUint8Array(source) {
+    if (!source) return null;
+    if (source instanceof Uint8Array) return source;
+    if (source instanceof ArrayBuffer) return new Uint8Array(source);
+    if (ArrayBuffer.isView(source)) return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+    return null;
+  }
+
+  function __readU32Leb(bytes, pos) {
+    var res = 0, shift = 0;
+    while (true) {
+      if (pos >= bytes.length) throw new Error("unexpected end of leb128");
+      var b = bytes[pos++];
+      res |= (b & 0x7F) << shift;
+      if ((b & 0x80) === 0) break;
+      shift += 7;
+    }
+    return [res >>> 0, pos];
+  }
+
+  function __readI32Leb(bytes, pos) {
+    var res = 0, shift = 0;
+    while (true) {
+      if (pos >= bytes.length) throw new Error("unexpected end of leb128");
+      var b = bytes[pos++];
+      res |= (b & 0x7F) << shift;
+      shift += 7;
+      if ((b & 0x80) === 0) {
+        if (shift < 32 && (b & 0x40) !== 0) res |= (~0 << shift);
+        break;
+      }
+    }
+    return [res | 0, pos];
+  }
+
+  function __wasmValidate(bufferSource) {
+    var bytes = __toUint8Array(bufferSource);
+    if (!bytes || bytes.length < 8) return false;
+    if (bytes[0] !== 0x00 || bytes[1] !== 0x61 || bytes[2] !== 0x73 || bytes[3] !== 0x6D) return false;
+    if (bytes[4] !== 0x01 || bytes[5] !== 0x00 || bytes[6] !== 0x00 || bytes[7] !== 0x00) return false;
+    return true;
+  }
+
+  function WasmMemory(desc) {
+    if (!desc || typeof desc.initial !== "number") throw new TypeError("WebAssembly.Memory requires an initial page size");
+    this.initial = desc.initial;
+    this.maximum = desc.maximum !== undefined ? desc.maximum : null;
+    this.buffer = new ArrayBuffer(this.initial * 65536);
+  }
+  WasmMemory.prototype.grow = function (delta) {
+    var oldPages = this.buffer.byteLength / 65536;
+    var newPages = oldPages + delta;
+    if (this.maximum !== null && newPages > this.maximum) throw new RangeError("WebAssembly.Memory.grow exceeds maximum limit");
+    var newBuf = new ArrayBuffer(newPages * 65536);
+    new Uint8Array(newBuf).set(new Uint8Array(this.buffer));
+    this.buffer = newBuf;
+    return oldPages;
   };
+
+  function WasmTable(desc) {
+    this.initial = (desc && desc.initial) || 0;
+    this.maximum = (desc && desc.maximum) || null;
+    this.element = (desc && desc.element) || "anyfunc";
+    this._elements = new Array(this.initial);
+  }
+  Object.defineProperty(WasmTable.prototype, "length", {
+    get: function () { return this._elements.length; }
+  });
+  WasmTable.prototype.get = function (idx) { return this._elements[idx] || null; };
+  WasmTable.prototype.set = function (idx, fn) { this._elements[idx] = fn; };
+  WasmTable.prototype.grow = function (delta) {
+    var oldLen = this._elements.length;
+    for (var i = 0; i < delta; i++) this._elements.push(null);
+    return oldLen;
+  };
+
+  function WasmModule(bufferSource) {
+    var bytes = __toUint8Array(bufferSource);
+    if (!__wasmValidate(bytes)) throw new Error("WebAssembly.Module: Invalid WASM magic or version header");
+    this._bytes = bytes;
+    this.types = [];
+    this.funcTypeIndices = [];
+    this.imports = [];
+    this.exports = {};
+    this.functions = [];
+    this.memories = [];
+    this.dataSegments = [];
+    this._decode();
+  }
+  WasmModule.prototype._decode = function () {
+    var b = this._bytes;
+    var pos = 8;
+    var funcBodies = [];
+    while (pos < b.length) {
+      var secId = b[pos++];
+      var r = __readU32Leb(b, pos);
+      var secLen = r[0]; pos = r[1];
+      var secEnd = pos + secLen;
+
+      if (secId === 1) { // Type section
+        var rT = __readU32Leb(b, pos); var numTypes = rT[0]; pos = rT[1];
+        for (var t = 0; t < numTypes; t++) {
+          pos++; // form 0x60
+          var rP = __readU32Leb(b, pos); var numP = rP[0]; pos = rP[1];
+          var params = []; for (var p = 0; p < numP; p++) params.push(b[pos++]);
+          var rR = __readU32Leb(b, pos); var numR = rR[0]; pos = rR[1];
+          var results = []; for (var rx = 0; rx < numR; rx++) results.push(b[pos++]);
+          this.types.push({ params: params, results: results });
+        }
+      } else if (secId === 2) { // Import section
+        var rI = __readU32Leb(b, pos); var numImp = rI[0]; pos = rI[1];
+        for (var im = 0; im < numImp; im++) {
+          var rM = __readU32Leb(b, pos); var mL = rM[0]; pos = rM[1];
+          var modName = String.fromCharCode.apply(null, b.slice(pos, pos + mL)); pos += mL;
+          var rF = __readU32Leb(b, pos); var fL = rF[0]; pos = rF[1];
+          var fieldName = String.fromCharCode.apply(null, b.slice(pos, pos + fL)); pos += fL;
+          var kind = b[pos++];
+          var rD = __readU32Leb(b, pos); var desc = rD[0]; pos = rD[1];
+          this.imports.push({ module: modName, field: fieldName, kind: kind, desc: desc });
+          if (kind === 0) this.funcTypeIndices.push(desc);
+        }
+      } else if (secId === 3) { // Function section
+        var rF = __readU32Leb(b, pos); var numF = rF[0]; pos = rF[1];
+        for (var fn = 0; fn < numF; fn++) {
+          var rTI = __readU32Leb(b, pos); pos = rTI[1];
+          this.funcTypeIndices.push(rTI[0]);
+        }
+      } else if (secId === 5) { // Memory section
+        var rM = __readU32Leb(b, pos); var numM = rM[0]; pos = rM[1];
+        for (var m = 0; m < numM; m++) {
+          var flags = b[pos++];
+          var rIn = __readU32Leb(b, pos); var init = rIn[0]; pos = rIn[1];
+          var max = null;
+          if (flags & 1) { var rMx = __readU32Leb(b, pos); max = rMx[0]; pos = rMx[1]; }
+          this.memories.push({ initial: init, maximum: max });
+        }
+      } else if (secId === 7) { // Export section
+        var rE = __readU32Leb(b, pos); var numE = rE[0]; pos = rE[1];
+        for (var ex = 0; ex < numE; ex++) {
+          var rNL = __readU32Leb(b, pos); var nL = rNL[0]; pos = rNL[1];
+          var name = String.fromCharCode.apply(null, b.slice(pos, pos + nL)); pos += nL;
+          var kind = b[pos++];
+          var rIdx = __readU32Leb(b, pos); var idx = rIdx[0]; pos = rIdx[1];
+          var kindName = kind === 0 ? "function" : (kind === 1 ? "table" : (kind === 2 ? "memory" : "global"));
+          this.exports[name] = { kind: kindName, index: idx };
+        }
+      } else if (secId === 10) { // Code section
+        var rC = __readU32Leb(b, pos); var numC = rC[0]; pos = rC[1];
+        for (var c = 0; c < numC; c++) {
+          var rCL = __readU32Leb(b, pos); var cL = rCL[0]; pos = rCL[1];
+          funcBodies.push(b.slice(pos, pos + cL));
+          pos += cL;
+        }
+      } else if (secId === 11) { // Data section
+        var rD = __readU32Leb(b, pos); var numD = rD[0]; pos = rD[1];
+        for (var d = 0; d < numD; d++) {
+          var rMI = __readU32Leb(b, pos); pos = rMI[1];
+          var op = b[pos++];
+          var offsetVal = 0;
+          if (op === 0x41) { var rO = __readI32Leb(b, pos); offsetVal = rO[0]; pos = rO[1]; }
+          if (b[pos] === 0x0B) pos++;
+          var rDL = __readU32Leb(b, pos); var dL = rDL[0]; pos = rDL[1];
+          var dataBytes = b.slice(pos, pos + dL); pos += dL;
+          this.dataSegments.push({ offset: offsetVal, data: dataBytes });
+        }
+      }
+      pos = secEnd;
+    }
+    var importFuncCount = this.imports.filter(function (x) { return x.kind === 0; }).length;
+    for (var i = 0; i < funcBodies.length; i++) {
+      var body = funcBodies[i];
+      var typeIdx = this.funcTypeIndices[importFuncCount + i];
+      var locP = 0;
+      var rL = __readU32Leb(body, locP); locP = rL[1];
+      var locals = [];
+      for (var ld = 0; ld < rL[0]; ld++) {
+        var rCnt = __readU32Leb(body, locP); var cnt = rCnt[0]; locP = rCnt[1];
+        var valType = body[locP++];
+        for (var k = 0; k < cnt; k++) locals.push(valType);
+      }
+      this.functions.push({ typeIdx: typeIdx, locals: locals, code: body.slice(locP) });
+    }
+  };
+
+  function WasmInstance(module, importObject) {
+    if (!(module instanceof WasmModule)) throw new TypeError("WebAssembly.Instance: Argument 0 must be a WebAssembly.Module");
+    this.module = module;
+    this.importObject = importObject || {};
+    this.memory = null;
+    this.importedFuncs = [];
+    this.exports = {};
+
+    if (module.memories.length > 0) {
+      this.memory = new WasmMemory(module.memories[0]);
+    } else if (this.importObject.env && this.importObject.env.memory instanceof WasmMemory) {
+      this.memory = this.importObject.env.memory;
+    }
+
+    if (this.memory && module.dataSegments) {
+      var memView = new Uint8Array(this.memory.buffer);
+      for (var d = 0; d < module.dataSegments.length; d++) {
+        var seg = module.dataSegments[d];
+        memView.set(seg.data, seg.offset);
+      }
+    }
+
+    for (var im = 0; im < module.imports.length; im++) {
+      var imp = module.imports[im];
+      if (imp.kind === 0) {
+        var fn = this.importObject[imp.module] && this.importObject[imp.module][imp.field];
+        if (typeof fn !== "function") fn = function () { return 0; };
+        this.importedFuncs.push(fn);
+      }
+    }
+
+    if (this.memory) this.exports.memory = this.memory;
+
+    var self = this;
+    for (var expName in module.exports) {
+      var exp = module.exports[expName];
+      if (exp.kind === "function") {
+        (function (name, fIdx) {
+          self.exports[name] = function () {
+            var args = Array.prototype.slice.call(arguments);
+            var res = self._executeFunction(fIdx, args);
+            global.__WR_WASM_CALLS.push({ name: name, funcIdx: fIdx, args: args, result: res });
+            return res;
+          };
+        })(expName, exp.index);
+      } else if (exp.kind === "memory" && this.memory) {
+        this.exports[expName] = this.memory;
+      }
+    }
+  }
+
+  WasmInstance.prototype._executeFunction = function (funcIdx, args) {
+    var importFuncCount = this.importedFuncs.length;
+    if (funcIdx < importFuncCount) {
+      return this.importedFuncs[funcIdx].apply(null, args);
+    }
+    var fnObj = this.module.functions[funcIdx - importFuncCount];
+    var sig = this.module.types[fnObj.typeIdx];
+    var locals = [];
+    for (var a = 0; a < args.length; a++) locals.push(args[a] | 0);
+    for (var l = 0; l < fnObj.locals.length; l++) locals.push(0);
+
+    var code = fnObj.code;
+    var pc = 0;
+    var stack = [];
+    var blocks = [];
+    var fuel = this.maxFuel || 500000;
+    var dv = this.memory ? new DataView(this.memory.buffer) : null;
+
+    while (pc < code.length) {
+      if (--fuel <= 0) throw new Error("WASM instruction fuel exhausted");
+      var op = code[pc++];
+
+      if (op === 0x00) throw new Error("unreachable instruction");
+      else if (op === 0x01) continue;
+      else if (op === 0x02) {
+        pc++; var endPc = this._findEnd(code, pc);
+        blocks.push({ kind: 0, start: pc, end: endPc });
+      } else if (op === 0x03) {
+        pc++; var endPc = this._findEnd(code, pc);
+        blocks.push({ kind: 1, start: pc - 2, end: endPc });
+      } else if (op === 0x04) {
+        var cond = stack.pop() || 0; pc++;
+        var endPc = this._findEnd(code, pc);
+        var elsePc = this._findElse(code, pc, endPc);
+        if (cond !== 0) {
+          blocks.push({ kind: 2, start: pc, end: endPc });
+        } else {
+          if (elsePc !== null) { pc = elsePc + 1; blocks.push({ kind: 2, start: pc, end: endPc }); }
+          else { pc = endPc; }
+        }
+      } else if (op === 0x05) {
+        if (blocks.length > 0) pc = blocks.pop().end;
+      } else if (op === 0x0B) {
+        if (blocks.length > 0) blocks.pop();
+        if (pc >= code.length) break;
+      } else if (op === 0x0C) {
+        var rL = __readU32Leb(code, pc); var lIdx = rL[0]; pc = rL[1];
+        var target = blocks[blocks.length - 1 - lIdx];
+        if (target.kind === 1) pc = target.start + 2; else pc = target.end;
+      } else if (op === 0x0D) {
+        var rL = __readU32Leb(code, pc); var lIdx = rL[0]; pc = rL[1];
+        var cond = stack.pop() || 0;
+        if (cond !== 0) {
+          var target = blocks[blocks.length - 1 - lIdx];
+          if (target.kind === 1) pc = target.start + 2; else pc = target.end;
+        }
+      } else if (op === 0x0F) {
+        break;
+      } else if (op === 0x10) {
+        var rCall = __readU32Leb(code, pc); var cIdx = rCall[0]; pc = rCall[1];
+        var cSig = this.module.types[this.module.funcTypeIndices[cIdx]];
+        var cArgs = [];
+        for (var p = 0; p < cSig.params.length; p++) cArgs.unshift(stack.pop());
+        var cRes = this._executeFunction(cIdx, cArgs);
+        if (cSig.results.length > 0 && cRes !== undefined) stack.push(cRes | 0);
+      } else if (op === 0x1A) {
+        stack.pop();
+      } else if (op === 0x1B) {
+        var c = stack.pop() || 0; var v2 = stack.pop() || 0; var v1 = stack.pop() || 0;
+        stack.push(c !== 0 ? v1 : v2);
+      } else if (op === 0x20) {
+        var rLoc = __readU32Leb(code, pc); var lIdx = rLoc[0]; pc = rLoc[1];
+        stack.push(locals[lIdx] | 0);
+      } else if (op === 0x21) {
+        var rLoc = __readU32Leb(code, pc); var lIdx = rLoc[0]; pc = rLoc[1];
+        locals[lIdx] = (stack.pop() || 0) | 0;
+      } else if (op === 0x22) {
+        var rLoc = __readU32Leb(code, pc); var lIdx = rLoc[0]; pc = rLoc[1];
+        locals[lIdx] = (stack[stack.length - 1] || 0) | 0;
+      } else if (op === 0x28) {
+        var rAl = __readU32Leb(code, pc); pc = rAl[1];
+        var rOff = __readU32Leb(code, pc); var memOff = rOff[0]; pc = rOff[1];
+        var base = stack.pop() || 0;
+        if (dv) stack.push(dv.getInt32(base + memOff, true)); else stack.push(0);
+      } else if (op === 0x2C) {
+        var rAl = __readU32Leb(code, pc); pc = rAl[1];
+        var rOff = __readU32Leb(code, pc); var memOff = rOff[0]; pc = rOff[1];
+        var base = stack.pop() || 0;
+        if (dv) stack.push(dv.getInt8(base + memOff)); else stack.push(0);
+      } else if (op === 0x2D) {
+        var rAl = __readU32Leb(code, pc); pc = rAl[1];
+        var rOff = __readU32Leb(code, pc); var memOff = rOff[0]; pc = rOff[1];
+        var base = stack.pop() || 0;
+        if (dv) stack.push(dv.getUint8(base + memOff)); else stack.push(0);
+      } else if (op === 0x36) {
+        var rAl = __readU32Leb(code, pc); pc = rAl[1];
+        var rOff = __readU32Leb(code, pc); var memOff = rOff[0]; pc = rOff[1];
+        var val = stack.pop() || 0; var base = stack.pop() || 0;
+        if (dv) dv.setInt32(base + memOff, val | 0, true);
+      } else if (op === 0x3A) {
+        var rAl = __readU32Leb(code, pc); pc = rAl[1];
+        var rOff = __readU32Leb(code, pc); var memOff = rOff[0]; pc = rOff[1];
+        var val = stack.pop() || 0; var base = stack.pop() || 0;
+        if (dv) dv.setUint8(base + memOff, (val | 0) & 0xFF);
+      } else if (op === 0x3F) {
+        pc++; stack.push(this.memory ? this.memory.buffer.byteLength / 65536 : 0);
+      } else if (op === 0x40) {
+        pc++; var delta = stack.pop() || 0;
+        if (this.memory) { var old = this.memory.grow(delta); dv = new DataView(this.memory.buffer); stack.push(old); }
+        else { stack.push(-1); }
+      } else if (op === 0x41) {
+        var rConst = __readI32Leb(code, pc); var cVal = rConst[0]; pc = rConst[1];
+        stack.push(cVal | 0);
+      } else if (op === 0x45) {
+        var a = stack.pop() || 0; stack.push((a | 0) === 0 ? 1 : 0);
+      } else if (op === 0x46) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0; stack.push((a | 0) === (b | 0) ? 1 : 0);
+      } else if (op === 0x47) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0; stack.push((a | 0) !== (b | 0) ? 1 : 0);
+      } else if (op === 0x48) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0; stack.push((a | 0) < (b | 0) ? 1 : 0);
+      } else if (op === 0x49) {
+        var b = (stack.pop() || 0) >>> 0; var a = (stack.pop() || 0) >>> 0; stack.push(a < b ? 1 : 0);
+      } else if (op === 0x4A) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0; stack.push((a | 0) > (b | 0) ? 1 : 0);
+      } else if (op === 0x4B) {
+        var b = (stack.pop() || 0) >>> 0; var a = (stack.pop() || 0) >>> 0; stack.push(a > b ? 1 : 0);
+      } else if (op === 0x4C) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0; stack.push((a | 0) <= (b | 0) ? 1 : 0);
+      } else if (op === 0x4D) {
+        var b = (stack.pop() || 0) >>> 0; var a = (stack.pop() || 0) >>> 0; stack.push(a <= b ? 1 : 0);
+      } else if (op === 0x4E) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0; stack.push((a | 0) >= (b | 0) ? 1 : 0);
+      } else if (op === 0x4F) {
+        var b = (stack.pop() || 0) >>> 0; var a = (stack.pop() || 0) >>> 0; stack.push(a >= b ? 1 : 0);
+      } else if (op === 0x6A) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0; stack.push(((a | 0) + (b | 0)) | 0);
+      } else if (op === 0x6B) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0; stack.push(((a | 0) - (b | 0)) | 0);
+      } else if (op === 0x6C) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0; stack.push(Math.imul(a | 0, b | 0) | 0);
+      } else if (op === 0x6D) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0;
+        if ((b | 0) === 0) throw new Error("integer divide by zero");
+        stack.push(((a | 0) / (b | 0)) | 0);
+      } else if (op === 0x6E) {
+        var b = (stack.pop() || 0) >>> 0; var a = (stack.pop() || 0) >>> 0;
+        if (b === 0) throw new Error("integer divide by zero");
+        stack.push(Math.floor(a / b) | 0);
+      } else if (op === 0x6F) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0;
+        if ((b | 0) === 0) throw new Error("integer divide by zero");
+        stack.push(((a | 0) % (b | 0)) | 0);
+      } else if (op === 0x70) {
+        var b = (stack.pop() || 0) >>> 0; var a = (stack.pop() || 0) >>> 0;
+        if (b === 0) throw new Error("integer divide by zero");
+        stack.push((a % b) | 0);
+      } else if (op === 0x71) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0; stack.push(((a | 0) & (b | 0)) | 0);
+      } else if (op === 0x72) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0; stack.push(((a | 0) | (b | 0)) | 0);
+      } else if (op === 0x73) {
+        var b = stack.pop() || 0; var a = stack.pop() || 0; stack.push(((a | 0) ^ (b | 0)) | 0);
+      } else if (op === 0x74) {
+        var b = (stack.pop() || 0) & 0x1F; var a = stack.pop() || 0; stack.push(((a | 0) << b) | 0);
+      } else if (op === 0x75) {
+        var b = (stack.pop() || 0) & 0x1F; var a = stack.pop() || 0; stack.push(((a | 0) >> b) | 0);
+      } else if (op === 0x76) {
+        var b = (stack.pop() || 0) & 0x1F; var a = stack.pop() || 0; stack.push((((a | 0) >>> b)) | 0);
+      } else if (op === 0x77) {
+        var b = (stack.pop() || 0) & 0x1F; var a = (stack.pop() || 0) >>> 0;
+        stack.push((((a << b) | (a >>> (32 - b)))) | 0);
+      } else if (op === 0x78) {
+        var b = (stack.pop() || 0) & 0x1F; var a = (stack.pop() || 0) >>> 0;
+        stack.push((((a >>> b) | (a << (32 - b)))) | 0);
+      }
+    }
+    if (sig.results.length > 0 && stack.length > 0) return stack[stack.length - 1] | 0;
+    return undefined;
+  };
+
+  WasmInstance.prototype._findEnd = function (code, startPc) {
+    var depth = 1, cur = startPc;
+    while (cur < code.length && depth > 0) {
+      var b = code[cur++];
+      if (b === 0x02 || b === 0x03 || b === 0x04) depth++;
+      else if (b === 0x0B) depth--;
+    }
+    return cur;
+  };
+
+  WasmInstance.prototype._findElse = function (code, startPc, endPc) {
+    var depth = 0, cur = startPc;
+    while (cur < endPc) {
+      var b = code[cur];
+      if (b === 0x02 || b === 0x03 || b === 0x04) depth++;
+      else if (b === 0x05 && depth === 0) return cur;
+      else if (b === 0x0B) depth--;
+      cur++;
+    }
+    return null;
+  };
+
+  var WebAssemblyAPI = {
+    validate: __wasmValidate,
+    compile: function (source) {
+      try {
+        return Promise.resolve(new WasmModule(source));
+      } catch (e) {
+        return Promise.reject(e);
+      }
+    },
+    instantiate: function (sourceOrMod, importObj) {
+      try {
+        if (sourceOrMod instanceof WasmModule) {
+          var inst = new WasmInstance(sourceOrMod, importObj);
+          return Promise.resolve(inst);
+        }
+        var mod = new WasmModule(sourceOrMod);
+        var inst2 = new WasmInstance(mod, importObj);
+        return Promise.resolve({ module: mod, instance: inst2 });
+      } catch (e) {
+        return Promise.reject(e);
+      }
+    },
+    Module: WasmModule,
+    Instance: WasmInstance,
+    Memory: WasmMemory,
+    Table: WasmTable,
+    CompileError: function (msg) { var e = new Error(msg); e.name = "CompileError"; return e; },
+    RuntimeError: function (msg) { var e = new Error(msg); e.name = "RuntimeError"; return e; }
+  };
+
+  if (!global.WebAssembly || !global.WebAssembly.Module) {
+    global.WebAssembly = WebAssemblyAPI;
+  }
+  __cloakObject(WebAssemblyAPI, {
+    validate: 1,
+    compile: 1,
+    instantiate: 1
+  });
+  __cloakObject(WasmMemory.prototype, {
+    grow: 1
+  });
+  __cloakObject(WasmTable.prototype, {
+    get: 1,
+    set: 2,
+    grow: 1
+  });
+  __makeNative(WasmModule, "Module", 1);
+  __makeNative(WasmInstance, "Instance", 1);
+  __makeNative(WasmMemory, "Memory", 1);
+  __makeNative(WasmTable, "Table", 1);
 
   /* Base64, encoding. */
   var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -8471,6 +9183,7 @@ var decl = new CSSStyleDeclaration(el);
     });
     global.innerWidth = 1280;
     global.innerHeight = 720;
+    __cloakRuntimeGlobals(global);
     return true;
   };
   global.__serialize = function () {
