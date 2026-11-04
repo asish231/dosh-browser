@@ -1,10 +1,15 @@
 # DOSH: The Autonomous Browser for AI Agents
 
-**The browser built from scratch for AI agents, not humans.**
+[![CI](https://github.com/asish231/dosh-browser/actions/workflows/ci.yml/badge.svg)](https://github.com/asish231/dosh-browser/actions/workflows/ci.yml)
+[![Release](https://github.com/asish231/dosh-browser/actions/workflows/release.yml/badge.svg)](https://github.com/asish231/dosh-browser/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Engine](https://img.shields.io/badge/engine-doshgentv8%20(V8%2015.9)-orange.svg)](doshgentv8/)
+[![Pure Rust](https://img.shields.io/badge/core-pure--rust%20(zero--python)-black.svg)](dosh-browser-core/)
 
-No Chromium. No Playwright. No Puppeteer. No Selenium. No CDP.
+> **The browser built from scratch for autonomous AI agents, not human eyes.**  
+> **No Chromium. No Playwright. No Puppeteer. No Selenium. No CDP.**
 
-DOSH is a standalone browser built on an owned HTTP transport, our own DOM event model (`minidom.js`), an agent-tuned V8 engine (`doshgentv8`) with scoped WAASM execution, and an LLM-native action compiler.
+DOSH is a standalone agent browser engineered from the ground up: an owned HTTP/2 transport, our own DOM event model (`minidom.js`), an agent-tuned V8 engine (`doshgentv8`), an LLM-native action compiler, and an in-memory control plane (DOSH Control Protocol).
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -24,195 +29,237 @@ DOSH is a standalone browser built on an owned HTTP transport, our own DOM event
 
 ---
 
-## Architecture: Primary Rust Binary + Optional Python SDK
+## ⚡ Quick Install
 
-DOSH is structured around a **high-performance pure-Rust primary engine** with an **optional Python SDK**:
+### 1. One-Line Installer (Recommended)
+
+Install the precompiled, standalone pure-Rust `dosh` binary:
+
+```bash
+# Default: Official Standalone Pure-Rust Browser (Zero Python dependencies)
+curl -fsSL https://raw.githubusercontent.com/asish231/dosh-browser/main/install.sh | bash
+```
+
+```bash
+# Optional: Install Standalone Browser AND Python Companion SDK (-p / --python)
+curl -fsSL https://raw.githubusercontent.com/asish231/dosh-browser/main/install.sh | bash -s -- -p
+```
+
+The installer detects your platform (macOS Apple Silicon/Intel, Linux x86_64/aarch64), installs `dosh` into `~/.dosh/bin`, and adds it to your `$PATH`.
+
+### 2. Install from Cargo
+
+```bash
+cargo install --git https://github.com/asish231/dosh-browser.git dosh-browser-core --bin dosh
+```
+
+### 3. Install Python Companion Package (For Python Agent Frameworks)
+
+```bash
+pip install dosh-browser
+# or
+uv add dosh-browser
+```
+
+---
+
+## Architecture: Dual-Lane Model
+
+Every surface respects our two-lane architecture:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │                        DOSH ARCHITECTURE                               │
 ├────────────────────────────────────────────────────────────────────────┤
-│ 1. PRIMARY: Standalone Rust Core & Binary (dosh)                       │
+│ 1. OFFICIAL PRIMARY: Standalone Rust Core & Binary (dosh)              │
 │    - Pure Rust pipeline: fetch → parse → project → session → shell      │
-│    - Custom agentic V8 engine (doshgentv8) with Liftoff WAASM fuel traps│
-│    - Fast CLI, MCP stdio server, REST HTTP server, and interactive shell│
+│    - Custom agentic V8 engine (doshgentv8) with Liftoff fuel traps      │
+│    - In-Memory C-ABI Control Protocol (DCP) with zero-copy dispatch     │
+│    - Unified NetworkEngine: SSRF IpFilter, RFC 9111 Cache, SingleFlight │
+│    - 41 shell commands, stdio MCP server, and REST HTTP API             │
 │    - Zero Python runtime dependency.                                    │
 ├────────────────────────────────────────────────────────────────────────┤
-│ 2. OPTIONAL: Python Companion SDK (webresearch)                        │
-│    - Python agent framework bindings (LangChain, LlamaIndex, AutoGen)  │
+│ 2. OPTIONAL COMPANION: Python Companion SDK (webresearch)              │
+│    - Agent framework integration (LangChain, LlamaIndex, AutoGen)       │
 │    - Native PyO3 V8 bridge (doshgentv8_rust) + QuickJS fallback         │
 │    - ReCAPTCHA v2 protocol solver, OTP checkpoints, and video lane      │
-│    - Available via `pip install dosh-browser`                           │
+│    - Triggered via `dosh -p <cmd>` or `python -m webresearch`           │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
----
+### Switching Lanes via CLI Flags
 
-## 1. Quickstart: Primary Standalone Rust Browser (`dosh`)
-
-### Build & Install
+- **`dosh <cmd>`** *(Default)*: Runs the official pure-Rust browser core with embedded V8.
+- **`dosh -p <cmd>`** *(or `--python`)*: Invokes the Python companion SDK (`webresearch`).
+- **`dosh -d <cmd>`** *(or `--rust`)*: Explicitly forces pure-Rust execution.
 
 ```bash
-# Clone the repository
-git clone https://github.com/asish231/dosh-browser.git
-cd dosh-browser
+# Read a page using the high-performance pure-Rust pipeline
+dosh read https://news.ycombinator.com
 
-# Build the release binary
-cargo build --release --bin dosh
-
-# Install to Cargo path
-cargo install --path dosh-browser-core
+# Or read via the Python companion SDK
+dosh -p read https://news.ycombinator.com
 ```
 
-### CLI Commands
+---
+
+## CLI Usage
 
 ```bash
-# 1. Read & project an LLM-ready structured page model (ACD 2.0)
-dosh read https://example.com
-dosh read https://example.com --json
+dosh — Agent-native browser (pure Rust core, doshgentv8 V8 engine)
+Usage: dosh [-p|--python] [-d|--rust] <command> [args...]
 
-# 2. Autonomous agentic search with DDG fallback
-dosh search "best vector databases 2026"
+Commands:
+  read <url> [--json]       Read and project an LLM-ready page model
+  search <query> [--json]   Web search with DuckDuckGo fallback
+  download <url>            Download file or PDF streaming to disk with SHA-256
+  ask <prompt>              Let an agent research and answer using browser tools
+  shell [-c <command>]      Agent browser terminal (41 commands)
+  server / serve [--port N] Run REST HTTP API & tool invoke endpoints
+  mcp                       Run Model Context Protocol server over stdio
+  product / status          Show official lane and engine status
+```
 
-# 3. Autonomous multi-step research loop
+### Examples
+
+```bash
+# 1. Project an LLM-ready reading document (ACD 2.0 with semantic block tags)
+dosh read https://en.wikipedia.org/wiki/Rust_(programming_language)
+
+# 2. Autonomous search with waterfall fallback
+dosh search "latest AI agent frameworks 2026"
+
+# 3. Stream a PDF or dataset directly to disk with SHA-256 verification
+dosh download https://arxiv.org/pdf/2301.00001.pdf
+
+# 4. Multi-step autonomous research loop
 dosh ask "Look up the pricing of Cloudflare Workers and summarize tier limits"
 
-# 4. Run the Model Context Protocol (MCP) server over stdio (Claude, Cursor, Antigravity)
-dosh mcp
-
-# 5. Start the REST HTTP API server
+# 5. Start the REST API server
 dosh serve --port 4747
 
-# 6. Interactive agent browser terminal (36 commands)
-dosh shell
+# 6. Check engine status
+dosh status
 ```
 
 ---
 
-## 2. Optional: Python Package & Agent SDK
+## Model Context Protocol (MCP) Setup
 
-For Python-based AI agents, install the Python package:
+DOSH natively supports the **Model Context Protocol (MCP)** over stdio, allowing any AI assistant (Claude Desktop, Cursor, Antigravity) to browse the web autonomously with sub-millisecond control.
+
+### Configuration (`claude_desktop_config.json` or `cursor_config.json`)
+
+```json
+{
+  "mcpServers": {
+    "dosh": {
+      "command": "dosh",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### Available MCP Tools
+
+| MCP Tool | Description |
+| :--- | :--- |
+| `browser_navigate` | Navigate to a URL, execute client-side JS in V8, and return structured Page view. |
+| `browser_actions` | Retrieve the complete operable control surface with content-addressed `ref` markers. |
+| `browser_click` | Click an element by reference (`ref: "e1"`). |
+| `browser_type` | Type text into an input or contenteditable element with humanized cadence. |
+| `browser_search` | Search the web with automatic fallback; returns clean markdown hits. |
+| `browser_acd` | Extract the full Agent Content Document (ACD 2.0) with micro-ML semantic tags. |
+| `browser_query` | Query page content blocks by semantic category or keyword. |
+| `browser_slice` | Slice a specific range of blocks (e.g. `b1` to `b20`) for focused token budgets. |
+| `browser_wasm` | Inspect and throttle Liftoff WASM fuel traps (`wasm.fuel`), anti-tarpit defense. |
+| `browser_clock` | Freeze or advance the deterministic virtual host clock (`clock.set`, `clock.advance`). |
+| `browser_gate` | Dynamically toggle runtime capability gates (`eval`, `wasm`, `net`). |
+| `browser_heap` | Inspect V8 128MB pruned heap metrics and GC pauses. |
+| `browser_shell` | Execute any of the 41 terminal commands directly. |
+
+---
+
+## DoshShell: 41 Terminal Commands
+
+Run `dosh shell` for an interactive agent terminal or batch commands with `dosh shell -c "<cmd>"`:
 
 ```bash
-# Install via pip
-pip install dosh-browser
-
-# Or install locally for development
-pip install -e ".[test,impersonate,video]"
+# Set WASM anti-tarpit fuel limit and open page
+dosh shell -c "wasm fuel=50000" -c "open https://example.com" -c "actions"
 ```
 
-### Python Agent Usage
+| Category | Commands |
+| :--- | :--- |
+| **Navigation & DOM** | `open`, `read`, `actions`, `act`, `ref`, `wait`, `tabs`, `frames`, `layers`, `screenshot` |
+| **V8 Engine Controls** | `wasm` (fuel traps), `clock` (virtual time), `rng` (seeded PRNG), `heap` (128MB limit), `gate` (capabilities) |
+| **Network & Security** | `net.rule` (mock/block), `net.ledger` (causal trace), `net.apis` (API discovery), `cookies`, `video` |
+| **State & Checkpoints** | `checkpoint` (durable SQLite save), `restore` (rehydrate session), `storage`, `db`, `history` |
+| **Evidence & Diff** | `snapshot`, `diff`, `trace` (causal action footprint), `watch` (mutation observer) |
+| **Scripting & Automation**| `eval`, `frame.eval`, `skill.save`, `skill.run`, `skill.list`, `skill.delete`, `skill.update`, `caps`, `product` |
+
+---
+
+## Python Companion SDK
+
+For Python agents using LangChain, LlamaIndex, or AutoGen:
 
 ```python
-import httpx
-from webresearch.session import Session
+import asyncio
+from webresearch import Session
 
 async def main():
-    async with httpx.AsyncClient() as client:
-        session = Session(client, session_id="agent_1")
-        
-        # Open page, execute scripts, and compile action surface
+    async with Session() as session:
+        # Navigate and execute scripts
         page = await session.goto("https://news.ycombinator.com")
-        print(f"Loaded: {page.title}")
-        
-        # Read structured Agent Context Document (ACD 2.0)
-        print(page.view)
-        
-        # Execute action by semantic ref
-        await session.act("a1", text="")
+        print(f"Title: {page.title}")
+        print(f"Content:\n{page.view}")
+
+        # List reachable actions
+        actions = session.actions()
+        print(f"Reachable controls: {len(actions)}")
+
+        # Click first link
+        await session.click("e1")
+
+asyncio.run(main())
 ```
 
 ---
 
-## Built-In Agentic Primitives
+## Benchmarks: DOSH vs. Browser-Use (Playwright) vs. Scrapers
 
-| Primitive | What It Does |
-| :--- | :--- |
-| **Site-as-SDK API Discovery** (`net.apis`) | Automatically catalogs background XHR/fetch endpoints, parameter schemas, and HTTP methods for direct agent API replay. |
-| **Diff-First Reading** (`read --since-hashes`) | Uses SHA-256 block-level content hashing to return only mutated blocks on revisits, slashing LLM tokens by 80–95%. |
-| **Durable Checkpoints** (`checkpoint` / `restore`) | Serializes active DOM tree, localStorage, cookies, and history to SQLite so an agent can resume browsing across restarts. |
-| **WAASM (Agentic WebAssembly)** | Native Liftoff baseline JIT fuel counting and capability gates (`read_dom`, `act`, `emit`, `net_query`, `log`, `snapshot`). |
-| **Native Function Cloaking** | Cloaks DOM and host APIs to spec-compliant `[native code]` to defend against CreepJS and Cloudflare Turnstile anti-bot checks. |
-| **ReCAPTCHA v2 Protocol Solver** | Autonomous protocol-level challenge negotiation and image ensemble classifier without rasterizing pixels. |
-| **OTP Login Checkpoints** | Detects 2FA/OTP login walls, saves memory checkpoints, and accepts one-time passwords honestly without guessing. |
-
----
-
-## Overall Benchmark: DOSH Browser vs. Browser-Use vs. Traditional Scrapers
-
-Below is an end-to-end benchmark comparing **DOSH Browser** against **Browser-Use (Playwright / Chromium)** and **Traditional Scrapers (BeautifulSoup / Scrapy / Requests)** across latency, token efficiency, memory footprint, cost, and web capabilities.
-
-### 1. Executive Summary Benchmark Matrix
-
-| Benchmark Dimension | **DOSH Browser** *(Pure Rust + doshgentv8)* | **Browser-Use** *(Chromium + CDP + Vision)* | **Traditional Scrapers** *(Requests + BS4)* |
+| Dimension | **DOSH Browser** *(Pure Rust + doshgentv8)* | **Browser-Use** *(Chromium + CDP + Vision)* | **Traditional Scrapers** *(Requests + BS4)* |
 | :--- | :--- | :--- | :--- |
-| **Engine Architecture** | Pure Rust core + agent-tuned V8 | Full Headless Chromium (Playwright) | HTTP client + regex / lxml |
+| **Architecture** | Pure Rust core + agent-tuned V8 | Headless Chromium via CDP | HTTP client + regex / lxml |
 | **Average Task Duration** | **2.5 – 4.5 seconds** | **25 – 60 seconds** | **0.5 – 1.5 seconds** |
-| **Tokens per Task (Avg 3 steps)**| **~1,200 – 2,500 tokens** | **~25,000 – 60,000 tokens** | *N/A (Rule-based scripts)* |
+| **Tokens per Task (3 steps)** | **~1,200 – 2,500 tokens** | **~25,000 – 60,000 tokens** | *N/A (Rule-based scripts)* |
 | **RAM Footprint per Tab** | **~35 – 55 MB** | **450 – 900 MB** | **~15 – 25 MB** |
 | **Cold-Start Time** | **< 10 ms** | **2,500 – 4,500 ms** | **< 50 ms** |
-| **Client-Side JS Execution** |  **Yes** (doshgentv8 + QuickJS) |  **Yes** (V8 full engine) |  **No** (Static HTML only) |
-| **Modern SPAs (React 19, Vue)**|  **Supported** (`createRoot`, `render`) |  **Supported** |  **Fails completely** |
-| **Action Resolution** | **Semantic Action Surface** (`ref`) | Bounding boxes / Coordinates / JS eval | CSS selectors / XPath |
-| **Token Tracking** |  **Native** (Per-task & session total) |  **Blind** (No built-in tracking) | *N/A* |
+| **Client-Side JS Execution** | **Yes** (doshgentv8 + QuickJS) | **Yes** (Full V8 engine) | **No** (Static HTML only) |
+| **Modern SPAs (React 19, Vue)**| **Supported** | **Supported** | **Fails completely** |
+| **Action Resolution** | **Content-Addressed `ref`** | Bounding boxes / Coordinates / JS eval | CSS selectors / XPath |
+| **Anti-Tarpit WASM Metering** | **Native Liftoff CPU Traps** | None (Hangs on infinite WASM loops) | None |
 
 ---
 
-### 2. Task Execution Benchmark (Shorten URL on `shorturl.at`)
+## DevOps & Release Workflow
 
-Real side-by-side run measured on the exact same task:
+### Automated CI/CD
+- **Continuous Integration (`.github/workflows/ci.yml`)**: Runs Rust workspace tests (`cargo test --workspace`) and the full Python test suite (`uv run pytest`) on every push to `main`.
+- **Automated Releases (`.github/workflows/release.yml`)**: Triggers on tag pushes (`v*.*.*`), cross-compiles release binaries for macOS (ARM64, x86_64) and Linux (x86_64), generates SHA-256 checksums, and publishes assets directly to GitHub Releases.
 
+### Creating a Production Release
+To ship a new version:
+```bash
+git tag v1.0.0
+git push origin v1.0.0
 ```
-Task: "Open shorturl.at, enter 'https://safarnow.in/', submit form, and return shortened URL"
-```
-
-| Metric | DOSH Browser | Browser-Use | Delta |
-| :--- | :--- | :--- | :--- |
-| **Step 1: Navigation** | 1.5s · 747 tokens | 6.5s (includes 5s LLM thinking) · ~8,500 tokens | **DOSH 4.3× faster, 11× cheaper** |
-| **Step 2: Form Interaction**| 1.8s · 457 tokens | 12.0s (includes 8s thinking + DOM eval) · ~12,000 tokens | **DOSH 6.6× faster, 26× cheaper** |
-| **Step 3: Verification** | *Zero extra steps* (returned in step 2) | 10.5s (JS injection + regex search + env check) · ~9,500 tokens | **DOSH avoided entire step** |
-| **Total Turnaround** | **3.3s** | **29.0s** | **8.7× Faster** |
-
----
-
-### 3. Financial Cost at Scale (1,000 vs. 100,000 Tasks)
-
-Using standard modern reasoning model rates (e.g. Claude 3.5 Sonnet / GPT-4o @ ~$3.00 / 1M input tokens & $15.00 / 1M output tokens):
-
-| Tasks Run | **DOSH Browser** (~1,500 tokens/task) | **Browser-Use** (~35,000 tokens/task) | **Your Savings** |
-| :--- | :--- | :--- | :--- |
-| **100 tasks** | **$0.45** | **$10.50** | Save **$10.05** (95.7%) |
-| **1,000 tasks** | **$4.50** | **$105.00** | Save **$100.50** (95.7%) |
-| **10,000 tasks** | **$45.00** | **$1,050.00** | Save **$1,005.00** (95.7%) |
-| **100,000 tasks** | **$450.00** | **$10,500.00** | Save **$10,050.00** (95.7%) |
-
----
-
-### 4. Infrastructure & Server Requirements
-
-| Resource | DOSH Browser | Browser-Use |
-| :--- | :--- | :--- |
-| **Binary Dependencies** | None (Zero browser binaries) | Chromium + WebKit + Playwright (~150 MB binary download) |
-| **Container / Docker Size** | **~45 MB** (Alpine/Distroless binary) | **~1.2 GB** (Ubuntu + Chromium dependencies + font packs) |
-| **Serverless Deployment** | Runs on AWS Lambda / Cloudflare Workers | Exceeds Lambda package limits; requires EC2 / ECS |
-| **Concurrent Workers on 8GB RAM**| **~120 concurrent sessions** | **~8–10 concurrent sessions** before OOM crashes |
-
----
-
-### 5. Honest Capabilities & Boundaries
-
-| Scenario / Website Type | DOSH Browser | Browser-Use |
-| :--- | :--- | :--- |
-| **Standard Websites & Blogs** |  **Best** (Instant, clean markdown) |  Overkill |
-| **SPAs (React 18/19, Vue, Nuxt, Next.js)** |  **Supported** via custom DOM & V8/QuickJS |  Supported |
-| **Infinite Scroll & Lazy Loading** |  **Supported** via `browser_scroll` |  Supported |
-| **Form Submissions & Logins** |  **Supported** via native action compiler |  Supported via CDP typing |
-| **Stateful Sessions & Cookies** |  **Supported** via SQLite `profile.sqlite` |  Supported via browser context |
-| **Canvas / WebGL games & 3D apps** |  **Unsupported** (No pixel rasterizer) |  **Supported** |
-| **Visual Puzzle Captchas** |  *Disclosed gap* (Solves reCAPTCHA v2; no visual jigsaw solver) |  Can screenshot puzzle to vision model |
+GitHub Actions will automatically build, package, and publish the release binaries.
 
 ---
 
 ## License
 
-Apache-2.0
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)).

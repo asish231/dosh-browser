@@ -36,7 +36,7 @@ LANES = {
         "summary": (
             "The primary product. Pure-Rust standalone browser binary (dosh) and core "
             "crate with doshgentv8 V8 engine, ACD 2.0, champion INT8 neural model, "
-            "unified network pipeline, 36 shell commands, REST server, and MCP server. "
+            "unified network pipeline, 41 shell commands, REST server, and MCP server. "
             "Zero Python runtime dependency."
         ),
     },
@@ -47,7 +47,7 @@ LANES = {
             "The companion Python package and SDK. Full agent browser support: "
             "PyO3 native bindings via doshgentv8_rust, QuickJS fallback, "
             "reCAPTCHA v2 protocol solver, login/OTP, frame messaging, "
-            "video lane, MCP/HTTP/CLI surfaces, ACD 2.0, and 36 shell commands."
+            "video lane, MCP/HTTP/CLI surfaces, ACD 2.0, and 41 shell commands."
         ),
     },
 }
