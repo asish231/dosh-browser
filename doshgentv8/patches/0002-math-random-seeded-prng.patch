@@ -33,3 +33,4 @@ diff --git a/src/numbers/math-random.cc b/src/numbers/math-random.cc
        isolate->random_number_generator()->NextBytes(&seed, sizeof(seed));
 -- 
 2.48.1
+

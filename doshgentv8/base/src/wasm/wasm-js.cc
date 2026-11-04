@@ -3361,6 +3361,11 @@ void WasmJs::InstallModule(Isolate* isolate,
 
 // static
 void WasmJs::Install(Isolate* isolate) {
+  // doshgentv8 capability gate: if WebAssembly is disallowed on this isolate, suppress installation.
+  if (isolate != nullptr && !isolate->is_wasm_allowed()) {
+    return;
+  }
+
   DirectHandle<JSGlobalObject> global = isolate->global_object();
   DirectHandle<NativeContext> native_context(global->native_context(), isolate);
 

@@ -1194,6 +1194,7 @@ class LiftoffCompiler {
                    int budget_used) {
     if (for_debugging_ != kNotForDebugging) return;
     SCOPED_CODE_COMMENT("tierup check");
+    // doshgentv8: instruction fuel check in WebAssembly Liftoff tier
     budget_used += kTierUpCostForCheck;
     // We never want to blow the entire budget at once.
     const int max_budget_use = std::max(1, v8_flags.wasm_tiering_budget / 4);

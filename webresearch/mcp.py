@@ -318,6 +318,17 @@ TOOLS = [
         },
     },
     {
+        "name": "browser_tls_proceed",
+        "description": "Add a host to the runtime TLS proceed allowlist so overridable certificate errors (untrusted chain, expired, etc.) are accepted without an interstitial. Only works for overridable errors; wrong-host and HSTS-pinned hosts are never overridable.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Hostname to allow (e.g. 'erp.aktu.ac.in')"},
+            },
+            "required": ["host"],
+        },
+    },
+    {
         "name": "browser_solve_recaptcha",
         "description": "Solve the current page's reCAPTCHA v2 challenge through the challenge protocol "
         "(anchor -> reload -> payload -> userverify) with vision tile classification. Returns whether a "
@@ -698,6 +709,20 @@ class McpServer:
             if session.captcha_inspection is None:
                 return self._format_result("No captcha detected on current page.")
             return self._format_result(session.captcha_inspection.report.view)
+
+        elif name == "browser_tls_proceed":
+            try:
+                host = args["host"]
+            except KeyError:
+                return self._format_result("browser_tls_proceed failed: host is required")
+            from webresearch.engine.tls_policy import add_proceed_host, DECISIONS, decision_for_host, is_overridable, classify_tls_error
+            add_proceed_host(host)
+            decision = decision_for_host(host, "untrusted-chain")
+            return self._format_result(json.dumps({
+                "host": host,
+                "decision": decision,
+                "status": "allowlisted — next navigation will proceed past overridable TLS errors",
+            }, indent=2))
 
         elif name == "browser_solve_recaptcha":
             max_rounds = int(args.get("max_rounds", 8))

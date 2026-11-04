@@ -73,3 +73,4 @@ class Butterfly {
 }  // namespace v8
 
 #endif  // V8_OBJECTS_BUTTERFLY_H_
+

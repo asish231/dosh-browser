@@ -1,0 +1,23 @@
+From: dosh-browser authors <dev@doshbrowser.org>
+Subject: [PATCH 6/7] Prune runaway desktop heap reservations in Heap::ConfigureHeap
+
+Cuts default max old generation size from 1.4GB down to 128MB for lean
+agent isolate execution, preventing multi-tab memory exhaustion.
+---
+ src/heap/heap.cc | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/heap/heap.cc b/src/heap/heap.cc
+--- a/src/heap/heap.cc
++++ b/src/heap/heap.cc
+@@ -4960,7 +4960,8 @@ void Heap::ConfigureHeap(const v8::ResourceConstraints& constraints,
+   // Initialize max_old_generation_size_ and max_global_memory_.
+   {
+-    size_t max_old_generation_size = 700ul * (kSystemPointerSize / 4) * MB;
++    // doshgentv8: pruned runaway desktop 1.4GB default old space down to 128MB lean limit for agents
++    size_t max_old_generation_size = 128ul * MB;
+     if (constraints.max_old_generation_size_in_bytes() > 0) {
+       max_old_generation_size = constraints.max_old_generation_size_in_bytes();
+     }
+-- 
+2.48.1

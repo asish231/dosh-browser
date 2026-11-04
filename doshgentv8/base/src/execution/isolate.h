@@ -2267,6 +2267,12 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     return true;
   }
 
+  bool is_eval_allowed() const { return eval_allowed_; }
+  void set_eval_allowed(bool allowed) { eval_allowed_ = allowed; }
+
+  bool is_wasm_allowed() const { return wasm_allowed_; }
+  void set_wasm_allowed(bool allowed) { wasm_allowed_ = allowed; }
+
 #if V8_ENABLE_WEBASSEMBLY
   void AddSharedWasmMemory(DirectHandle<WasmMemoryObject> memory_object);
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -3090,6 +3096,8 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   uint64_t random_seed_ = 0;
   uint64_t execution_fuel_ = 0;
   bool fuel_enabled_ = false;
+  bool eval_allowed_ = true;
+  bool wasm_allowed_ = true;
 
   friend class HandleScopeImplementer;
   friend class GlobalSafepoint;

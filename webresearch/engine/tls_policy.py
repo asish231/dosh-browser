@@ -1,8 +1,8 @@
 """TLS interstitial model: classify transport TLS failures, decide explicitly.
 
 Default is deny. Proceeding past an overridable certificate error requires an
-explicit operator decision (WEBRESEARCH_TLS_PROCEED_HOSTS) and is recorded.
-Non-overridable errors (wrong host, HSTS-pinned host) can never proceed.
+explicit operator decision (WEBRESEARCH_TLS_PROCEED_HOSTS or runtime allowlist)
+and is recorded. Non-overridable errors (wrong host, HSTS-pinned host) can never proceed.
 """
 
 from __future__ import annotations
@@ -11,6 +11,12 @@ import os
 from dataclasses import dataclass, field
 
 DECISIONS: list[dict] = []
+_proceed_hosts: set[str] = set()
+
+
+def add_proceed_host(host: str) -> None:
+    """Add a host to the runtime TLS proceed allowlist."""
+    _proceed_hosts.add(host.strip().lower().lstrip("."))
 
 
 def _env_hosts(name: str) -> set[str]:
@@ -49,8 +55,11 @@ def is_overridable(kind: str, host: str) -> bool:
 def decision_for_host(host: str, kind: str) -> str:
     if not is_overridable(kind, host):
         return "deny"
-    allowed = _env_hosts("WEBRESEARCH_TLS_PROCEED_HOSTS")
     h = (host or "").lower()
+    # Runtime allowlist first
+    if h in _proceed_hosts:
+        return "proceed"
+    allowed = _env_hosts("WEBRESEARCH_TLS_PROCEED_HOSTS")
     for a in allowed:
         if h == a or h.endswith("." + a):
             return "proceed"

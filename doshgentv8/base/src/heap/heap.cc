@@ -4959,7 +4959,8 @@ void Heap::ConfigureHeap(const v8::ResourceConstraints& constraints,
 
   // Initialize max_old_generation_size_ and max_global_memory_.
   {
-    size_t max_old_generation_size = 700ul * (kSystemPointerSize / 4) * MB;
+    // doshgentv8: pruned runaway desktop 1.4GB default old space down to 128MB lean limit for agents
+    size_t max_old_generation_size = 128ul * MB;
     if (constraints.max_old_generation_size_in_bytes() > 0) {
       max_old_generation_size = constraints.max_old_generation_size_in_bytes();
     }
