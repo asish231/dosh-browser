@@ -6,11 +6,9 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use url::Url;
 
 use crate::fetch;
-use crate::tree;
-use crate::download;
 
 /// The result of a page navigation, matching Python's Page model.
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
@@ -142,6 +140,25 @@ impl Tab {
         }
         pushed_page
     }
+
+    /// Traverse history forwards or backwards to an absolute index.
+    pub fn traverse(&mut self, target: isize) -> Result<Page, String> {
+        if target < 0 || target as usize >= self.history.len() {
+            return Err(format!("history target {} out of bounds [0, {})", target, self.history.len()));
+        }
+        self.index = target;
+        let idx = target as usize;
+        let page = self.history[idx].clone();
+        if idx < self.snapshots.len() {
+            if let Some(h) = self.snapshots[idx]["html"].as_str() {
+                self.html = h.to_string();
+            }
+            if let Some(u) = self.snapshots[idx]["url"].as_str() {
+                self.url = u.to_string();
+            }
+        }
+        Ok(page)
+    }
 }
 
 /// The main session — tabs, client, storage, and navigation.
@@ -156,6 +173,10 @@ pub struct Session {
     pub last_dialogs: Vec<serde_json::Value>,
     /// Popup tabs
     pub last_popups: Vec<serde_json::Value>,
+    /// Network ledger for telemetry
+    pub network_ledger: crate::telemetry::NetworkLedger,
+    /// Console event log
+    pub console_logs: Vec<serde_json::Value>,
 }
 
 impl Session {
@@ -176,6 +197,17 @@ impl Session {
             local_storage: HashMap::new(),
             last_dialogs: Vec::new(),
             last_popups: Vec::new(),
+            network_ledger: crate::telemetry::NetworkLedger::new(1000, false),
+            console_logs: Vec::new(),
+        }
+    }
+
+    pub fn switch_tab(&mut self, tab_id: &str) -> Result<(), String> {
+        if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
+            self.current_tab_idx = idx;
+            Ok(())
+        } else {
+            Err(format!("tab not found: {}", tab_id))
         }
     }
 
@@ -187,7 +219,7 @@ impl Session {
         &mut self.tabs[self.current_tab_idx]
     }
 
-    /// Navigate to a URL: fetch → parse → run JS (via engine) → return Page.
+    /// Navigate to a URL: fetch → parse → run JS (via V8 engine) → build ACD/targets → return Page.
     pub async fn goto(
         &mut self,
         url: &str,
@@ -203,57 +235,293 @@ impl Session {
             8_000_000,
         ).await?;
 
-        // 2. Parse to tree → generate JS to hydrate minidom.js
-        let tree_json = if result.kind == "html" && !result.body.is_empty() {
-            serde_json::to_string(&tree::html_to_tree(&result.body)).unwrap_or_default()
-        } else {
-            "[]".to_string()
-        };
+        let mut html = result.body.clone();
+        let mut js_errors = Vec::new();
+        let mut runtime_title = String::new();
 
-        // 3. Build the view (simplified ACD — full port needs content.rs too)
-        let mut view = String::new();
-        let mut chars = 0;
-        if result.kind == "html" {
-            // Extract text content (simplified; full port uses content.rs)
-            let tree = tree::html_to_tree(&result.body);
-            view = extract_text_recursive(&tree, max_chars);
-            chars = view.chars().count();
+        // 2. Execute page scripts through Runtime (V8 + minidom.js)
+        if result.kind == "html" && !html.is_empty() {
+            let (clean_html, dismissed) = crate::consent::dismiss_consent_dom(&html);
+            if dismissed {
+                html = clean_html;
+            }
+            if let Ok(mut rt) = crate::runtime::Runtime::new(self.client.clone(), &result.final_url) {
+                if let Ok((mutated, info)) = rt.run_scripts(&html, &result.final_url) {
+                    html = mutated;
+                    js_errors = info.error_messages;
+                    if let Ok(t) = rt.eval("document.title") {
+                        if !t.is_empty() && t != "undefined" {
+                            runtime_title = t;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Build action targets, links, and frame inventory
+        let targets = crate::actions::extract_actions(&html, &result.final_url, 100);
+        let links = crate::links::links(&html, &result.final_url, 50);
+        let iframes = crate::tree::collect_iframes(&html);
+        let frame_infos: Vec<crate::types::FrameInfo> = iframes
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| crate::types::FrameInfo {
+                ref_id: format!("frame-{}", i + 1),
+                url: f.src,
+                title: f.title,
+                name: f.name,
+                ..Default::default()
+            })
+            .collect();
+
+        // 4. Build ACD projection and reading view
+        let title = if !runtime_title.is_empty() {
+            runtime_title
         } else {
-            view = result.body.clone();
-            chars = view.len();
+            extract_title(&html)
+        };
+        let acd_obj = crate::acd::build_acd(
+            &result.final_url,
+            &title,
+            &html,
+            &targets,
+            &links,
+            &frame_infos,
+            &serde_json::json!({}),
+            max_chars / 80 + 10,
+        );
+
+        let view = crate::acd::acd_view(&acd_obj, max_chars);
+        let chars = view.chars().count();
+        let acd_json: Vec<serde_json::Value> = acd_obj
+            .blocks
+            .into_iter()
+            .map(|b| serde_json::to_value(b).unwrap_or_default())
+            .collect();
+
+        let mut errors = js_errors;
+        if errors.is_empty() {
+            errors = html
+                .lines()
+                .filter(|l| l.contains("error") || l.contains("Error"))
+                .take(10)
+                .map(String::from)
+                .collect();
         }
 
         let page = Page {
             url: result.final_url.clone(),
-            title: extract_title(&result.body),
+            title,
             view,
             chars,
             status: result.status,
             content_type: result.content_type.clone(),
             headers: result.headers.clone(),
             kind: result.kind.clone(),
-            acd: vec![],
-            errors: result.body.lines()
-                .filter(|l| l.contains("error") || l.contains("Error"))
-                .take(10)
-                .map(String::from)
-                .collect(),
+            acd: acd_json,
+            errors,
             truncated: result.truncated,
         };
 
-        // 4. Push to history
+        // 5. Push to history stack
         let tab = self.current_tab_mut();
-        let pushed = tab.push(page.clone(), Some(result.body), Some(result.headers), false, None);
+        let pushed = tab.push(page.clone(), Some(html), Some(result.headers), false, None);
         Ok(pushed)
+    }
+
+    /// Load HTML content directly into session: executes page scripts via V8 runtime,
+    /// builds full ACD and action surfaces, and pushes Page to history.
+    pub fn goto_html(
+        &mut self,
+        url: &str,
+        html: &str,
+        max_chars: usize,
+    ) -> Result<Page, Box<dyn std::error::Error + Send + Sync>> {
+        let mut final_html = html.to_string();
+        let mut js_errors = Vec::new();
+        let mut runtime_title = String::new();
+
+        if let Ok(mut rt) = crate::runtime::Runtime::new(self.client.clone(), url) {
+            if let Ok((mutated, info)) = rt.run_scripts(&final_html, url) {
+                final_html = mutated;
+                js_errors = info.error_messages;
+                if let Ok(t) = rt.eval("document.title") {
+                    if !t.is_empty() && t != "undefined" {
+                        runtime_title = t;
+                    }
+                }
+            }
+        }
+
+        let targets = crate::actions::extract_actions(&final_html, url, 100);
+        let links = crate::links::links(&final_html, url, 50);
+        let iframes = crate::tree::collect_iframes(&final_html);
+        let frame_infos: Vec<crate::types::FrameInfo> = iframes
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| crate::types::FrameInfo {
+                ref_id: format!("frame-{}", i + 1),
+                url: f.src,
+                title: f.title,
+                name: f.name,
+                ..Default::default()
+            })
+            .collect();
+
+        let title = if !runtime_title.is_empty() {
+            runtime_title
+        } else {
+            extract_title(&final_html)
+        };
+        let acd_obj = crate::acd::build_acd(
+            url,
+            &title,
+            &final_html,
+            &targets,
+            &links,
+            &frame_infos,
+            &serde_json::json!({}),
+            max_chars / 80 + 10,
+        );
+
+        let view = crate::acd::acd_view(&acd_obj, max_chars);
+        let chars = view.chars().count();
+        let acd_json: Vec<serde_json::Value> = acd_obj
+            .blocks
+            .into_iter()
+            .map(|b| serde_json::to_value(b).unwrap_or_default())
+            .collect();
+
+        let page = Page {
+            url: url.to_string(),
+            title,
+            view,
+            chars,
+            status: 200,
+            content_type: "text/html".into(),
+            headers: HashMap::new(),
+            kind: "html".into(),
+            acd: acd_json,
+            errors: js_errors,
+            truncated: false,
+        };
+
+        let tab = self.current_tab_mut();
+        let pushed = tab.push(page.clone(), Some(final_html), None, false, None);
+        Ok(pushed)
+    }
+
+    /// Return all actionable targets on the current page.
+    pub fn actions(&self) -> Vec<crate::types::Target> {
+        let tab = self.current_tab();
+        if tab.html.is_empty() {
+            return Vec::new();
+        }
+        crate::actions::extract_actions(&tab.html, &tab.url, 100)
+    }
+
+    /// Perform a click on a target ref in the live session.
+    pub async fn click(&mut self, ref_id: &str) -> Result<Page, String> {
+        let tab = self.current_tab();
+        let html = tab.html.clone();
+        let url = tab.url.clone();
+        if html.is_empty() {
+            return Err("No document loaded in session".to_string());
+        }
+
+        let targets = crate::actions::extract_actions(&html, &url, 100);
+        if let Some(target) = targets.into_iter().find(|t| t.ref_id == ref_id) {
+            if target.tag == "a"
+                && !target.href.is_empty()
+                && !target.href.starts_with('#')
+                && !target.href.to_lowercase().starts_with("javascript:")
+            {
+                let full_url = if let Ok(base) = Url::parse(&url) {
+                    base.join(&target.href).map(|u| u.to_string()).unwrap_or(target.href)
+                } else {
+                    target.href
+                };
+                return self.goto(&full_url, 8000).await.map_err(|e| e.to_string());
+            }
+        }
+
+        // Apply action click via Runtime (V8)
+        let action_payload = serde_json::json!({
+            "type": "click",
+            "ref": ref_id,
+        });
+
+        let mut rt = crate::runtime::Runtime::new(self.client.clone(), &url)
+            .map_err(|e| format!("Failed to create runtime: {}", e))?;
+        rt.load_document(&html, &url)?;
+        rt.apply_action(&action_payload)?;
+        let mutated = rt.serialize()?;
+
+        self.goto_html(&url, &mutated, 8000)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Perform text typing into a target ref in the live session.
+    pub async fn type_text(&mut self, ref_id: &str, text: &str) -> Result<Page, String> {
+        let tab = self.current_tab();
+        let html = tab.html.clone();
+        let url = tab.url.clone();
+        if html.is_empty() {
+            return Err("No document loaded in session".to_string());
+        }
+
+        let action_payload = serde_json::json!({
+            "type": "type",
+            "ref": ref_id,
+            "text": text,
+        });
+
+        let mut rt = crate::runtime::Runtime::new(self.client.clone(), &url)
+            .map_err(|e| format!("Failed to create runtime: {}", e))?;
+        rt.load_document(&html, &url)?;
+        rt.apply_action(&action_payload)?;
+        let mutated = rt.serialize()?;
+
+        self.goto_html(&url, &mutated, 8000)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Discover iframe seeds in current page.
+    pub fn discover_frame_seeds(&self) -> Vec<crate::frames::FrameSeed> {
+        let tab = self.current_tab();
+        crate::frames::discover_seeds(&tab.html, &tab.url, "top", 0)
+    }
+
+    /// Check if current page is behind a login wall.
+    pub fn detect_login_wall(&self) -> Option<crate::login::LoginWall> {
+        let tab = self.current_tab();
+        let targets = self.actions();
+        crate::login::detect_login_wall(&tab.html, &tab.url, &targets, 200)
+    }
+
+    /// Execute a terminal shell command.
+    pub async fn execute_shell_command(
+        &mut self,
+        cmd: &str,
+        args: &[String],
+    ) -> Result<serde_json::Value, String> {
+        let store = crate::shell::ShellStore::new(None)
+            .map_err(|e| e.to_string())?;
+        let args_val = serde_json::to_value(args).unwrap_or_default();
+        crate::shell::execute_command(cmd, &args_val, self, &store)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
+#[allow(dead_code)]
 fn extract_text_recursive(tree: &serde_json::Value, max_chars: usize) -> String {
     let mut out = String::new();
     extract_recursive_inner(tree, &mut out, max_chars);
     out
 }
 
+#[allow(dead_code)]
 fn extract_recursive_inner(node: &serde_json::Value, out: &mut String, max: usize) {
     if out.chars().count() >= max {
         return;
@@ -285,7 +553,7 @@ fn extract_recursive_inner(node: &serde_json::Value, out: &mut String, max: usiz
     }
 }
 
-fn extract_title(html: &str) -> String {
+pub fn extract_title(html: &str) -> String {
     // Simple title extraction — full port uses tree.rs
     if let Some(start) = html.find("<title>") {
         if let Some(end) = html.find("</title>") {
@@ -371,5 +639,31 @@ mod tests {
         let result = rt.block_on(session.goto("https://example.com", 8000));
         // This will fail to connect without network, but shouldn't panic
         assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_goto_html_runs_scripts() {
+        let client = Client::builder().user_agent("test").build().unwrap();
+        let mut session = Session::new(client);
+        let html = r#"
+        <!DOCTYPE html>
+        <html>
+        <head><title>Original Title</title></head>
+        <body>
+            <div id="root">Initial Content</div>
+            <script>
+                document.title = "Client-Rendered Title";
+                var root = document.getElementById("root");
+                root.innerHTML = "<p>Hydrated SPA Paragraph</p><button id='action-btn'>Click Here</button>";
+            </script>
+        </body>
+        </html>
+        "#;
+        let page = session.goto_html("https://spa.example.com", html, 8000).unwrap();
+        assert_eq!(page.title, "Client-Rendered Title");
+        assert!(page.view.contains("Hydrated SPA Paragraph") || page.chars > 0);
+        let tab = session.current_tab();
+        assert!(tab.html.contains("Hydrated SPA Paragraph"));
+        assert!(tab.html.contains("action-btn"));
     }
 }

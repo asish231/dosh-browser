@@ -9,7 +9,7 @@ description = "Pure-Rust dosh-browser product — consumes doshgentv8-core"
 doshgentv8-core = { path = "../doshgentv8/core" }
 
 # HTTP & transport (replaces curl_cffi / httpx)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "stream", "json"] }
 http = "1.2"
 url = "2.5"
 encoding_rs = "0.8"
@@ -29,13 +29,14 @@ base64 = "0.22"
 
 # Async runtime for fetch & server
 tokio = { version = "1", features = ["rt", "macros", "fs", "time", "process", "rt-multi-thread"] }
+regex = "1.10"
 
 # Temp files (downloads, video)
 tempfile = "3"
 
 # Shell & Server
 rusqlite = { version = "0.32", features = ["bundled"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
 tower-http = "0.6"
 http-body-util = "0.1"

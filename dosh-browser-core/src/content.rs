@@ -5,8 +5,7 @@
 //! Byte-for-byte parity with Python's selectolax-based implementation.
 
 use kuchiki::NodeRef;
-use kuchiki::traits::TendrilSink;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 pub const SITE_ROOT_SELECTORS: &[&str] = &[
     "#mw-content-text .mw-parser-output",
