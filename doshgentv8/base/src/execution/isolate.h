@@ -2273,6 +2273,12 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   bool is_wasm_allowed() const { return wasm_allowed_; }
   void set_wasm_allowed(bool allowed) { wasm_allowed_ = allowed; }
 
+  // doshgentv8: WAASM capabilities mask
+  // 1: read_dom, 2: act, 4: emit, 8: net_query, 16: log, 32: snapshot
+  uint32_t waasm_capabilities_mask() const { return waasm_capabilities_mask_; }
+  void set_waasm_capabilities_mask(uint32_t mask) { waasm_capabilities_mask_ = mask; }
+  bool is_waasm_capability_allowed(uint32_t cap) const { return (waasm_capabilities_mask_ & cap) != 0; }
+
 #if V8_ENABLE_WEBASSEMBLY
   void AddSharedWasmMemory(DirectHandle<WasmMemoryObject> memory_object);
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -3098,6 +3104,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   bool fuel_enabled_ = false;
   bool eval_allowed_ = true;
   bool wasm_allowed_ = true;
+  uint32_t waasm_capabilities_mask_ = 0x3F;
 
   friend class HandleScopeImplementer;
   friend class GlobalSafepoint;

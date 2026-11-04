@@ -351,9 +351,17 @@ const EXTENSIONS_SCRIPT: &str = r#"
         return Number(sum >> 11n) / 9007199254740992;
     };
 
-    // 5. Capability Gates: eval & wasm & network
+    // 5. Capability Gates: eval & wasm & network & waasm
     let _evalAllowed = true;
     let _wasmAllowed = true;
+    let _waasmCaps = {
+        read_dom: true,
+        act: true,
+        emit: true,
+        net_query: true,
+        log: true,
+        snapshot: true,
+    };
     let _origWebAssembly = typeof WebAssembly !== 'undefined' ? WebAssembly : undefined;
 
     globalThis.__setCapabilityGate = function(cap, allowed) {
@@ -366,12 +374,135 @@ const EXTENSIONS_SCRIPT: &str = r#"
                 globalThis.WebAssembly = _origWebAssembly;
             }
         }
+        if (typeof cap === 'string' && cap.indexOf('waasm.') === 0) {
+            const sub = cap.slice(6);
+            if (sub in _waasmCaps) _waasmCaps[sub] = !!allowed;
+        }
     };
     globalThis.__getCapabilityGate = function(cap) {
         if (cap === 'eval') return _evalAllowed;
         if (cap === 'wasm') return _wasmAllowed;
+        if (typeof cap === 'string' && cap.indexOf('waasm.') === 0) {
+            const sub = cap.slice(6);
+            return sub in _waasmCaps ? _waasmCaps[sub] : false;
+        }
         return true;
     };
+
+    // WAASM Host Namespace for Agent-Native WebAssembly
+    globalThis.waasm = {
+        read_dom: function(spec_ptr, spec_len) {
+            if (!_waasmCaps.read_dom) throw new WebAssembly.LinkError("WAASM capability disallowed: read_dom");
+            if (typeof globalThis.host_waasm_read_dom === 'function') {
+                return globalThis.host_waasm_read_dom(spec_ptr, spec_len);
+            }
+            return 0;
+        },
+        act: function(actions_ptr, actions_len) {
+            if (!_waasmCaps.act) throw new WebAssembly.LinkError("WAASM capability disallowed: act");
+            if (typeof globalThis.host_waasm_act === 'function') {
+                return globalThis.host_waasm_act(actions_ptr, actions_len);
+            }
+            return 0;
+        },
+        emit: function(k_ptr, k_len, v_ptr, v_len) {
+            if (!_waasmCaps.emit) throw new WebAssembly.LinkError("WAASM capability disallowed: emit");
+            if (typeof globalThis.host_waasm_emit === 'function') {
+                return globalThis.host_waasm_emit(k_ptr, k_len, v_ptr, v_len);
+            }
+            return 0;
+        },
+        net_query: function(query_ptr, query_len) {
+            if (!_waasmCaps.net_query) throw new WebAssembly.LinkError("WAASM capability disallowed: net_query");
+            if (typeof globalThis.host_waasm_net_query === 'function') {
+                return globalThis.host_waasm_net_query(query_ptr, query_len);
+            }
+            return 0;
+        },
+        log: function(level, msg_ptr, msg_len) {
+            if (!_waasmCaps.log) throw new WebAssembly.LinkError("WAASM capability disallowed: log");
+            if (typeof globalThis.host_waasm_log === 'function') {
+                return globalThis.host_waasm_log(level, msg_ptr, msg_len);
+            }
+            return 0;
+        },
+        snapshot: function(kind) {
+            if (!_waasmCaps.snapshot) throw new WebAssembly.LinkError("WAASM capability disallowed: snapshot");
+            if (typeof globalThis.host_waasm_snapshot === 'function') {
+                return globalThis.host_waasm_snapshot(kind);
+            }
+            return 0;
+        }
+    };
+
+    if (_origWebAssembly && _origWebAssembly.instantiate) {
+        const _v8Instantiate = _origWebAssembly.instantiate;
+        _origWebAssembly.instantiate = function(source, imports) {
+            imports = imports || {};
+            if (source instanceof _origWebAssembly.Module) {
+                const capSections = _origWebAssembly.Module.customSections(source, "waasm.capabilities");
+                if (capSections && capSections.length > 0) {
+                    try {
+                        const dec = new TextDecoder();
+                        const capJson = JSON.parse(dec.decode(capSections[0]));
+                        if (Array.isArray(capJson)) {
+                            for (const c of capJson) {
+                                if (!globalThis.__getCapabilityGate('waasm.' + c)) {
+                                    return Promise.reject(new WebAssembly.LinkError("WAASM capability disallowed: " + c));
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        if (e instanceof WebAssembly.LinkError) return Promise.reject(e);
+                    }
+                }
+            }
+            if (!imports.waasm) {
+                imports.waasm = globalThis.waasm;
+            } else {
+                for (const k in imports.waasm) {
+                    if (!globalThis.__getCapabilityGate('waasm.' + k)) {
+                        return Promise.reject(new WebAssembly.LinkError("WAASM capability disallowed: " + k));
+                    }
+                }
+            }
+            return _v8Instantiate.call(this, source, imports);
+        };
+    }
+
+    if (_origWebAssembly && _origWebAssembly.Instance) {
+        const _v8Instance = _origWebAssembly.Instance;
+        _origWebAssembly.Instance = function(module, imports) {
+            imports = imports || {};
+            const capSections = _origWebAssembly.Module.customSections(module, "waasm.capabilities");
+            if (capSections && capSections.length > 0) {
+                try {
+                    const dec = new TextDecoder();
+                    const capJson = JSON.parse(dec.decode(capSections[0]));
+                    if (Array.isArray(capJson)) {
+                        for (const c of capJson) {
+                            if (!globalThis.__getCapabilityGate('waasm.' + c)) {
+                                throw new WebAssembly.LinkError("WAASM capability disallowed: " + c);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    if (e instanceof WebAssembly.LinkError) throw e;
+                }
+            }
+            if (!imports.waasm) {
+                imports.waasm = globalThis.waasm;
+            } else {
+                for (const k in imports.waasm) {
+                    if (!globalThis.__getCapabilityGate('waasm.' + k)) {
+                        throw new WebAssembly.LinkError("WAASM capability disallowed: " + k);
+                    }
+                }
+            }
+            return new _v8Instance(module, imports);
+        };
+        _origWebAssembly.Instance.prototype = _v8Instance.prototype;
+    }
 
     const _origEval = globalThis.eval;
     globalThis.eval = function(code) {
@@ -785,6 +916,18 @@ impl DoshEngine {
     pub fn is_network_allowed(&self) -> bool {
         self.network_allowed.load(Ordering::SeqCst)
     }
+
+    /// Capability Gate: allow or disallow a specific WAASM capability (e.g. "read_dom", "act", "emit", "net_query", "log", "snapshot").
+    pub fn set_waasm_capability(&mut self, cap: &str, allowed: bool) -> Result<(), String> {
+        self.eval(&format!("globalThis.__setCapabilityGate('waasm.{cap}', {allowed});"))?;
+        Ok(())
+    }
+
+    pub fn is_waasm_capability_allowed(&mut self, cap: &str) -> bool {
+        self.eval(&format!("globalThis.__getCapabilityGate('waasm.{cap}');"))
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    }
 }
 
 impl Drop for DoshEngine {
@@ -945,5 +1088,30 @@ mod tests {
             sum(100000);
         "#).unwrap();
         assert_eq!(res, "5000050000");
+    }
+
+    #[test]
+    fn test_waasm_agentic_wasm_capabilities() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        assert_eq!(engine.eval("typeof globalThis.waasm").unwrap(), "object");
+        assert_eq!(engine.eval("typeof globalThis.waasm.read_dom").unwrap(), "function");
+        assert_eq!(engine.eval("typeof globalThis.waasm.act").unwrap(), "function");
+
+        // Allowed by default
+        assert!(engine.is_waasm_capability_allowed("read_dom"));
+        assert!(engine.is_waasm_capability_allowed("act"));
+        assert_eq!(engine.eval("globalThis.waasm.read_dom(0, 0)").unwrap(), "0");
+
+        // Disallow act
+        engine.set_waasm_capability("act", false).unwrap();
+        assert!(!engine.is_waasm_capability_allowed("act"));
+        let err = engine.eval("globalThis.waasm.act(0, 0)");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("capability disallowed"));
+
+        // Re-allow act
+        engine.set_waasm_capability("act", true).unwrap();
+        assert!(engine.is_waasm_capability_allowed("act"));
+        assert_eq!(engine.eval("globalThis.waasm.act(0, 0)").unwrap(), "0");
     }
 }

@@ -1,0 +1,79 @@
+From: dosh-browser authors <dev@doshbrowser.org>
+Subject: [PATCH 12/12] Wire WAASM agentic host capability gate and fuel trap into WebAssembly
+
+Enforces declared capability grants on 'waasm.*' host imports and traps
+infinite WebAssembly execution on fuel exhaustion in Liftoff baseline tier.
+---
+ src/execution/isolate.h               |  7 +++++++
+ src/wasm/baseline/liftoff-compiler.cc |  4 ++++
+ src/wasm/module-instantiate.cc        | 18 ++++++++++++++++++
+ 3 files changed, 29 insertions(+)
+
+diff --git a/src/execution/isolate.h b/src/execution/isolate.h
+--- a/src/execution/isolate.h
++++ b/src/execution/isolate.h
+@@ -2273,6 +2273,12 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
+   bool is_wasm_allowed() const { return wasm_allowed_; }
+   void set_wasm_allowed(bool allowed) { wasm_allowed_ = allowed; }
+ 
++  // doshgentv8: WAASM capabilities mask
++  // 1: read_dom, 2: act, 4: emit, 8: net_query, 16: log, 32: snapshot
++  uint32_t waasm_capabilities_mask() const { return waasm_capabilities_mask_; }
++  void set_waasm_capabilities_mask(uint32_t mask) { waasm_capabilities_mask_ = mask; }
++  bool is_waasm_capability_allowed(uint32_t cap) const { return (waasm_capabilities_mask_ & cap) != 0; }
++
+ #if V8_ENABLE_WEBASSEMBLY
+   void AddSharedWasmMemory(DirectHandle<WasmMemoryObject> memory_object);
+ #endif  // V8_ENABLE_WEBASSEMBLY
+@@ -3098,6 +3104,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
+   bool fuel_enabled_ = false;
+   bool eval_allowed_ = true;
+   bool wasm_allowed_ = true;
++  uint32_t waasm_capabilities_mask_ = 0x3F;
+ 
+   friend class HandleScopeImplementer;
+   friend class GlobalSafepoint;
+diff --git a/src/wasm/baseline/liftoff-compiler.cc b/src/wasm/baseline/liftoff-compiler.cc
+--- a/src/wasm/baseline/liftoff-compiler.cc
++++ b/src/wasm/baseline/liftoff-compiler.cc
+@@ -1195,6 +1195,10 @@ class LiftoffCompiler {
+     if (for_debugging_ != kNotForDebugging) return;
+     SCOPED_CODE_COMMENT("tierup check");
+     // doshgentv8: instruction fuel check in WebAssembly Liftoff tier
++    if (isolate_ != nullptr && !isolate_->consume_fuel(static_cast<uint64_t>(budget_used + kTierUpCostForCheck))) {
++      __ Trap(TrapReason::kTrapUnreachable, position);
++      return;
++    }
+     budget_used += kTierUpCostForCheck;
+     // We never want to blow the entire budget at once.
+     const int max_budget_use = std::max(1, v8_flags.wasm_tiering_budget / 4);
+diff --git a/src/wasm/module-instantiate.cc b/src/wasm/module-instantiate.cc
+--- a/src/wasm/module-instantiate.cc
++++ b/src/wasm/module-instantiate.cc
+@@ -2111,6 +2111,24 @@ bool InstanceBuilder::ProcessImports() {
+   for (int index = 0; index < num_imports; ++index) {
+     const WasmImport& import = module_->import_table[index];
+ 
++    // doshgentv8: WAASM import capability gate check
++    const char* wire_bytes_start = reinterpret_cast<const char*>(wire_bytes_.data());
++    std::string mod_name(wire_bytes_start + import.module_name.offset(), import.module_name.length());
++    if (mod_name == "waasm") {
++      std::string field_name(wire_bytes_start + import.field_name.offset(), import.field_name.length());
++      uint32_t cap = 0;
++      if (field_name == "read_dom") cap = 1;
++      else if (field_name == "act") cap = 2;
++      else if (field_name == "emit") cap = 4;
++      else if (field_name == "net_query") cap = 8;
++      else if (field_name == "log") cap = 16;
++      else if (field_name == "snapshot") cap = 32;
++      if (cap != 0 && isolate_ != nullptr && !isolate_->is_waasm_capability_allowed(cap)) {
++        thrower_->LinkError("WAASM capability disallowed: module requested 'waasm.%s' without host capability grant", field_name.c_str());
++        return false;
++      }
++    }
++
+     DirectHandle<Object> value = sanitized_imports_[index];
+ 
+     switch (import.kind) {
+-- 
+2.48.1

@@ -133,3 +133,26 @@ def test_v8_proper_tail_call_trampoline():
     """)
     assert res == 25000
 
+
+@pytest.mark.skipif(not HAS_V8, reason="doshgentv8_rust not available")
+def test_v8_waasm_agentic_capabilities():
+    ctx = doshgentv8_rust.DoshContext()
+    assert ctx.eval("typeof globalThis.waasm") == "object"
+    assert ctx.eval("typeof globalThis.waasm.read_dom") == "function"
+    assert ctx.eval("typeof globalThis.waasm.act") == "function"
+    assert ctx.eval("typeof globalThis.waasm.emit") == "function"
+    assert ctx.eval("typeof globalThis.waasm.net_query") == "function"
+
+    # read_dom allowed by default
+    assert ctx.eval("globalThis.waasm.read_dom(0, 0)") == 0
+
+    # Disallow act capability
+    ctx.eval("globalThis.__setCapabilityGate('waasm.act', false)")
+    with pytest.raises(Exception, match="capability disallowed"):
+        ctx.eval("globalThis.waasm.act(0, 0)")
+
+    # Re-allow act capability
+    ctx.eval("globalThis.__setCapabilityGate('waasm.act', true)")
+    assert ctx.eval("globalThis.waasm.act(0, 0)") == 0
+
+

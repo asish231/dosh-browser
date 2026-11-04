@@ -2111,6 +2111,24 @@ bool InstanceBuilder::ProcessImports() {
   for (int index = 0; index < num_imports; ++index) {
     const WasmImport& import = module_->import_table[index];
 
+    // doshgentv8: WAASM import capability gate check
+    const char* wire_bytes_start = reinterpret_cast<const char*>(wire_bytes_.data());
+    std::string mod_name(wire_bytes_start + import.module_name.offset(), import.module_name.length());
+    if (mod_name == "waasm") {
+      std::string field_name(wire_bytes_start + import.field_name.offset(), import.field_name.length());
+      uint32_t cap = 0;
+      if (field_name == "read_dom") cap = 1;
+      else if (field_name == "act") cap = 2;
+      else if (field_name == "emit") cap = 4;
+      else if (field_name == "net_query") cap = 8;
+      else if (field_name == "log") cap = 16;
+      else if (field_name == "snapshot") cap = 32;
+      if (cap != 0 && isolate_ != nullptr && !isolate_->is_waasm_capability_allowed(cap)) {
+        thrower_->LinkError("WAASM capability disallowed: module requested 'waasm.%s' without host capability grant", field_name.c_str());
+        return false;
+      }
+    }
+
     DirectHandle<Object> value = sanitized_imports_[index];
 
     switch (import.kind) {
