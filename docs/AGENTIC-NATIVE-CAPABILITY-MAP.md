@@ -368,6 +368,30 @@ The V8 fork (`doshgentv8/`) enables several of these capabilities:
 | **Structured data extraction** | Native JSON-LD parsing (V8 has real JSON parser) |
 | **Rate limit awareness** | Real network timing, accurate clock |
 
-The fork is **necessary but not sufficient** — the agent-native capabilities listed above must still be
-implemented in the Python layer (dosh-browser core). The fork provides the engine; the core provides
-the intelligence.
+The fork is **necessary but not sufficient** — the agent-native capabilities listed above are
+implemented across both browser lanes: the official Python product (`webresearch/`) and the pure-Rust
+core (`dosh-browser-core/`). The fork provides the engine; the browser cores provide the agentic intelligence.
+
+---
+
+## 10. The Two Browser Implementations (Python Official & Pure-Rust Core)
+
+Per `webresearch/config.py` and `AGENTS.md`, dosh-browser maintains two distinct implementations:
+
+| Attribute | Python Lane (`webresearch/`) | Pure-Rust Core (`dosh-browser-core/`) |
+|---|---|---|
+| **Role & Status** | **OFFICIAL PRODUCT** (production-ready) | **PURE-RUST CORE** (native high-performance) |
+| **JS Engine** | **QuickJS** (official default; `doshgentv8` selectable) | **doshgentv8-core** (V8 152.2 / 15.9.0 native `HostSeam`) |
+| **DOM Substrate** | In-house `minidom.js` + Python host callables | In-house `minidom.js` + Rust native `HostSeam` |
+| **Neural Interactivity** | Pure-Python INT8 model (0 dependencies, ~1.2 µs) | Pure-Rust SIMD INT8 model (0 heap allocs, 100.99 ns) |
+| **HTTP Transport** | `curl_cffi` (JA3/JA4 Chrome 124 TLS matching) | `reqwest` HTTP/1.1 & HTTP/2 pipeline |
+| **HTML Parser** | `selectolax.lexbor` (C Lexbor engine) | `kuchiki` (pure Rust HTML5 tree) |
+| **Content Representation**| ACD 2.0 + action surface (stable refs) | ACD 2.0 + action surface (`Target` structs) |
+| **Server & Protocols** | FastAPI REST + MCP stdio server | Axum REST + stdio MCP server |
+| **Shell & Storage** | 35 commands, SQLite skills & snapshots | 35 commands, SQLite skills & snapshots |
+| **Test Suite** | **859 passed; 8 skipped; 0 failed** (`pytest`) | **140 passed; 0 failed** (`cargo test`) |
+
+Both implementations share identical contracts:
+- **No Chromium / No CDP**: Pure HTTP fetch, in-house mini-DOM, and native event models.
+- **ACD 2.0 Architecture**: Node-level provenance (CSS/XPath), semantic classification, and structured JSON-LD projection without polluting reading text.
+- **Champion Neural Model**: 684-byte INT8 Quantized MLP ($32 \to 16 \to 5$) detecting unsemantic interactive elements with hierarchical tree domination.
