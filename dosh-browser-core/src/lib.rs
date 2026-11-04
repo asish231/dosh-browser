@@ -54,6 +54,7 @@ pub mod cors;
 pub mod web_bot_auth;
 pub mod cache_sqlite;
 pub mod network;
+pub mod tls_policy;
 
 #[cfg(test)]
 mod tests {

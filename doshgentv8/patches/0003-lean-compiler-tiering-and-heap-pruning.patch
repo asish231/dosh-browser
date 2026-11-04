@@ -1,34 +1,41 @@
 From: dosh-browser authors <dev@doshbrowser.org>
 Subject: [PATCH 3/4] Prune heavy JIT tiers and desktop heap reservations
 
-Disables Maglev and TurboFan JIT tiers by default in agent execution mode,
-and reduces default semi-space size from 16MB to 1MB, cutting isolate
-initialization time and memory footprint by over 70%.
+Disables Maglev, TurboFan, and optimizing JIT tiers by default in agent execution
+mode, and enables optimize_for_size while reducing default semi-space size from
+16MB to 1MB, cutting isolate initialization time and memory footprint by over 70%.
 ---
- src/flags/flag-definitions.h | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
+ src/flags/flag-definitions.h | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
 
 diff --git a/src/flags/flag-definitions.h b/src/flags/flag-definitions.h
 --- a/src/flags/flag-definitions.h
 +++ b/src/flags/flag-definitions.h
 @@ -596,7 +596,8 @@
  #ifdef V8_ENABLE_MAGLEV
--// doshgentv8: pruned heavy Maglev JIT compiler default for lean agent runtime
--DEFINE_BOOL(maglev, false, "enable the maglev optimizing compiler")
-+DEFINE_BOOL(maglev, false, "enable the maglev optimizing compiler")
+ DEFINE_BOOL(maglev, false, "enable the maglev optimizing compiler")
++
+@@ -1007,7 +1008,7 @@
+ DEFINE_BOOL(
+-    disable_optimizing_compilers, false,
++    disable_optimizing_compilers, true,
+     "Disable all optimizing compilers while leaving baseline compilers enabled")
 @@ -1401,7 +1402,8 @@
  #ifdef V8_ENABLE_TURBOFAN
  #define V8_ENABLE_TURBOFAN_BOOL true
--// doshgentv8: pruned heavy TurboFan JIT compiler default for lean agent runtime
--DEFINE_BOOL(turbofan, false,
-+DEFINE_BOOL(turbofan, false,
+ DEFINE_BOOL(turbofan, false,
              "use the Turbofan optimizing compiler for JavaScript code "
+@@ -1932,7 +1934,8 @@
+ // Favor memory over execution speed.
+-DEFINE_BOOL(optimize_for_size, false,
++// doshgentv8: default to true for lean agent runtime
++DEFINE_BOOL(optimize_for_size, true,
+             "Enables optimizations which favor memory size over execution "
+             "speed")
+ DEFINE_VALUE_IMPLICATION(optimize_for_size, max_semi_space_size, size_t{1})
 @@ -2541,7 +2542,8 @@
--// doshgentv8: lean young-generation allocation default (1 MB)
--DEFINE_SIZE_T(max_semi_space_size, 1,
-+DEFINE_SIZE_T(max_semi_space_size, 1,
+ DEFINE_SIZE_T(max_semi_space_size, 1,
                "max size of a semi-space (in MBytes), the new space consists of "
                "two semi-spaces")
 -- 
 2.48.1
-

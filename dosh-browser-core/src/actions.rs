@@ -368,6 +368,7 @@ fn get_role(node: &NodeRef, tag: &str, _kind: &str) -> String {
                 "submit" => "button",
                 "button" => "button",
                 "file" => "file",
+                "password" => "password",
                 _ => "textbox",
             }
         }.to_string(),
@@ -488,5 +489,47 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].role, "link");
         assert_eq!(targets[0].href, "/dashboard");
+    }
+
+    #[test]
+    fn test_aktu_login_page() {
+        let html = r#"
+        <!DOCTYPE html>
+        <html xmlns="http://www.w3.org/1999/xhtml">
+        <head><title>AKTU Login</title></head>
+        <body>
+            <form method="post" action="./login.aspx" id="form1">
+                <input name="txtUserId" type="text" id="txtUserId" class="input100" PlaceHolder="User ID" />
+                <input type="hidden" name="hdnUserId" id="hdnUserId" />
+                <input name="txtPassword" type="password" id="txtPassword" class="input100" PlaceHolder="Password" />
+                <input type="hidden" name="hdnPassword" id="hdnPassword" />
+                <input type="submit" name="btnLogin" value="Login" id="btnLogin" title="Click here to login" class="login100-form-btn" />
+            </form>
+            <a href="forgot.aspx" title="Forgot password">Forgot</a>
+        </body>
+        </html>
+        "#;
+        let targets = extract_actions(html, "https://erp.aktu.ac.in/login.aspx", 100);
+        // Debug: print all targets found
+        for t in &targets {
+            eprintln!("TARGET: ref={} tag={} role={} kind=? name={} text={}", 
+                t.ref_id, t.tag, t.role, t.name, t.text.chars().take(40).collect::<String>());
+        }
+        assert_eq!(targets.len(), 4, "expected exactly 4 targets (textbox, password, button, link), got {} total", targets.len());
+        
+        let textboxes: Vec<_> = targets.iter().filter(|t| t.role == "textbox").collect();
+        assert_eq!(textboxes.len(), 1);
+        assert_eq!(textboxes[0].name, "txtUserId");
+        
+        let passwords: Vec<_> = targets.iter().filter(|t| t.role == "password").collect();
+        assert_eq!(passwords.len(), 1);
+        assert_eq!(passwords[0].name, "txtPassword");
+        
+        let buttons: Vec<_> = targets.iter().filter(|t| t.role == "button").collect();
+        assert_eq!(buttons.len(), 1);
+        assert_eq!(buttons[0].name, "btnLogin");
+        
+        let links: Vec<_> = targets.iter().filter(|t| t.role == "link").collect();
+        assert_eq!(links.len(), 1);
     }
 }
