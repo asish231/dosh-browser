@@ -10,9 +10,10 @@ ACD 2.0, champion INT8 neural model, 35 shell commands, MCP/HTTP/CLI surfaces �
 with the 859-test suite green. All agent surfaces serve this lane.
 
 **Rust (`dosh-browser-core/`) is EXPERIMENTAL.** The pipeline is ported and
-unit-tested (fetch → parse → project → session → shell → server, 140/140
-tests) on the doshgentv8 V8 core with ACD 2.0, SIMD INT8 neural model, and
-RFC 9111 HTTP cache, but page script execution is not yet wired into `goto()`
+unit-tested (fetch → parse → project → session → shell → server, 169/169
+tests) on the doshgentv8 V8 core with ACD 2.0, SIMD INT8 neural model, unified
+network pipeline (SSRF IpFilter, SingleFlight, RateLimiter, Robots, CORS, WebBotAuth,
+RFC 9111 SQLite cache), but page script execution is not yet wired into `goto()`
 and the adversarial/agent layers are not ported. Do not route production
 traffic to it, do not present it as the product, and do not flip this status
 until the migration gate passes: full-suite green on BOTH engines AND goto()

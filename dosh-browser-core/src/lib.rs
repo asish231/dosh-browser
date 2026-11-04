@@ -46,6 +46,14 @@ pub mod features;
 pub mod classifier;
 pub mod cluster;
 pub mod neural;
+pub mod ip_filter;
+pub mod singleflight;
+pub mod rate_limiter;
+pub mod robots;
+pub mod cors;
+pub mod web_bot_auth;
+pub mod cache_sqlite;
+pub mod network;
 
 #[cfg(test)]
 mod tests {
