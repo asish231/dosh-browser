@@ -179,6 +179,18 @@ pub struct Session {
     pub console_logs: Vec<serde_json::Value>,
     /// Content-addressed element identity tracker
     pub identity_tracker: crate::identity::IdentityTracker,
+    /// Injected virtual clock (epoch milliseconds)
+    pub virtual_clock_ms: Option<u64>,
+    /// Deterministic PRNG seed for Math.random
+    pub prng_seed: Option<u64>,
+    /// Liftoff WASM execution fuel budget
+    pub wasm_fuel: Option<u64>,
+    /// Dynamic eval capability gate
+    pub gate_eval: bool,
+    /// WebAssembly capability gate
+    pub gate_wasm: bool,
+    /// Network capability gate
+    pub gate_network: bool,
 }
 
 impl Session {
@@ -203,7 +215,29 @@ impl Session {
             network: crate::network::NetworkEngine::default(),
             console_logs: Vec::new(),
             identity_tracker: crate::identity::IdentityTracker::new(),
+            virtual_clock_ms: None,
+            prng_seed: None,
+            wasm_fuel: Some(10_000_000),
+            gate_eval: true,
+            gate_wasm: true,
+            gate_network: true,
         }
+    }
+
+    /// Apply session's V8 configuration (clock, PRNG, fuel, gates) to a runtime.
+    pub fn configure_runtime(&self, rt: &mut crate::runtime::Runtime) {
+        if let Some(ms) = self.virtual_clock_ms {
+            let _ = rt.engine.set_virtual_time(ms as f64);
+        }
+        if let Some(seed) = self.prng_seed {
+            let _ = rt.engine.set_random_seed(seed);
+        }
+        if let Some(fuel) = self.wasm_fuel {
+            rt.engine.set_fuel(fuel);
+        }
+        let _ = rt.engine.set_eval_allowed(self.gate_eval);
+        let _ = rt.engine.set_wasm_allowed(self.gate_wasm);
+        rt.engine.set_network_allowed(self.gate_network);
     }
 
     pub fn switch_tab(&mut self, tab_id: &str) -> Result<(), String> {
@@ -247,7 +281,12 @@ impl Session {
             if dismissed {
                 html = clean_html;
             }
-            if let Ok(mut rt) = crate::runtime::Runtime::new(self.client.clone(), &result.final_url) {
+            if let Ok(mut rt) = crate::runtime::Runtime::new_with_network(
+                self.client.clone(),
+                &result.final_url,
+                Some(std::sync::Arc::new(self.network.clone())),
+            ) {
+                self.configure_runtime(&mut rt);
                 if let Ok((mutated, info)) = rt.run_scripts(&html, &result.final_url) {
                     html = mutated;
                     js_errors = info.error_messages;
@@ -344,7 +383,12 @@ impl Session {
         let mut js_errors = Vec::new();
         let mut runtime_title = String::new();
 
-        if let Ok(mut rt) = crate::runtime::Runtime::new(self.client.clone(), url) {
+        if let Ok(mut rt) = crate::runtime::Runtime::new_with_network(
+            self.client.clone(),
+            url,
+            Some(std::sync::Arc::new(self.network.clone())),
+        ) {
+            self.configure_runtime(&mut rt);
             if let Ok((mutated, info)) = rt.run_scripts(&final_html, url) {
                 final_html = mutated;
                 js_errors = info.error_messages;
@@ -461,8 +505,12 @@ impl Session {
             "ref": effective_ref,
         });
 
-        let mut rt = crate::runtime::Runtime::new(self.client.clone(), &url)
-            .map_err(|e| format!("Failed to create runtime: {}", e))?;
+        let mut rt = crate::runtime::Runtime::new_with_network(
+            self.client.clone(),
+            &url,
+            Some(std::sync::Arc::new(self.network.clone())),
+        )
+        .map_err(|e| format!("Failed to create runtime: {}", e))?;
         rt.load_document(&html, &url)?;
         rt.apply_action(&action_payload)?;
         let mutated = rt.serialize()?;
@@ -493,8 +541,12 @@ impl Session {
             "text": text,
         });
 
-        let mut rt = crate::runtime::Runtime::new(self.client.clone(), &url)
-            .map_err(|e| format!("Failed to create runtime: {}", e))?;
+        let mut rt = crate::runtime::Runtime::new_with_network(
+            self.client.clone(),
+            &url,
+            Some(std::sync::Arc::new(self.network.clone())),
+        )
+        .map_err(|e| format!("Failed to create runtime: {}", e))?;
         rt.load_document(&html, &url)?;
         rt.apply_action(&action_payload)?;
         let mutated = rt.serialize()?;

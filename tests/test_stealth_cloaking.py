@@ -174,3 +174,20 @@ def test_function_to_string_incompatible_receiver_throws(js_ctx):
     assert data["objError"] is True
     assert data["strError"] is True
 
+
+def test_navigator_agentic_pruned_stubs_and_cloaking(js_ctx):
+    res = js_ctx.eval("""
+        JSON.stringify({
+            gamepads_str: navigator.getGamepads.toString(),
+            gamepads_val: navigator.getGamepads(),
+            battery_str: navigator.getBattery.toString(),
+            xr_val: typeof navigator.xr
+        });
+    """)
+    data = json.loads(res)
+    assert data["gamepads_str"] == "function getGamepads() { [native code] }"
+    assert data["gamepads_val"] == []
+    assert data["battery_str"] == "function getBattery() { [native code] }"
+    assert data["xr_val"] == "undefined"
+
+

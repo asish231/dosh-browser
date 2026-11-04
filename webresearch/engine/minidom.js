@@ -119,7 +119,9 @@
 
     if (g.navigator) {
       __cloakObject(g.navigator, {
-        sendBeacon: 1
+        sendBeacon: 1,
+        getGamepads: 0,
+        getBattery: 0
       });
       if (g.navigator.permissions) __cloakObject(g.navigator.permissions, { query: 1 });
       if (g.navigator.clipboard) __cloakObject(g.navigator.clipboard, { readText: 0, writeText: 1 });
@@ -8057,6 +8059,18 @@ var decl = new CSSStyleDeclaration(el);
       maxTouchPoints: 0,
       cookieEnabled: true,
       onLine: true,
+      xr: undefined,
+      getGamepads: function () { return []; },
+      getBattery: function () {
+        return Promise.resolve({
+          charging: true,
+          chargingTime: 0,
+          dischargingTime: Infinity,
+          level: 1.0,
+          addEventListener: function () {},
+          removeEventListener: function () {}
+        });
+      },
       plugins: pluginList,
       mimeTypes: mimeList,
       userActivation: {

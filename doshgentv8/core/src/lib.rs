@@ -15,6 +15,8 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
+pub mod protocol;
+
 /// Synchronous host seam. `args` are the JS arguments stringified (the same
 /// marshalling the QuickJS `add_callable` lane uses). `Ok(Some(s))` becomes a
 /// JS string, `Ok(None)` becomes `undefined`, and `Err(msg)` becomes a
@@ -576,6 +578,7 @@ pub struct DoshEngine {
     eval_allowed: Arc<AtomicBool>,
     wasm_allowed: Arc<AtomicBool>,
     network_allowed: Arc<AtomicBool>,
+    layout_buffer: Vec<protocol::DoshButterflyRect>,
 }
 
 impl DoshEngine {
@@ -677,6 +680,7 @@ impl DoshEngine {
             eval_allowed,
             wasm_allowed,
             network_allowed,
+            layout_buffer: Vec::new(),
         })
     }
 
@@ -944,6 +948,79 @@ impl DoshEngine {
             .map(|v| v == "true")
             .unwrap_or(false)
     }
+
+    /// Update or query the contiguous Butterfly layout rectangle cache.
+    pub fn set_layout_rects(&mut self, rects: Vec<protocol::DoshButterflyRect>) {
+        self.layout_buffer = rects;
+    }
+
+    pub fn get_layout_rects(&self) -> &[protocol::DoshButterflyRect] {
+        &self.layout_buffer
+    }
+
+    /// Dispatch an in-memory DCP command directly to the V8 C++ engine.
+    pub fn dispatch_command(&mut self, cmd: &protocol::DoshCommand) -> protocol::DoshResponse {
+        match cmd.opcode {
+            0x00 => protocol::DoshResponse::ok(),
+            0x01 => {
+                if let Some(code) = cmd.as_payload_str() {
+                    match self.eval(code) {
+                        Ok(_) => protocol::DoshResponse::ok(),
+                        Err(e) => protocol::DoshResponse::error(&e),
+                    }
+                } else {
+                    protocol::DoshResponse::error("missing payload for EVAL")
+                }
+            }
+            0x02 => {
+                self.set_fuel(cmd.param);
+                protocol::DoshResponse::ok()
+            }
+            0x03 => {
+                let rem = self.fuel_remaining();
+                protocol::DoshResponse::with_numeric(rem)
+            }
+            0x04 => {
+                let _ = self.set_virtual_time(cmd.param as f64);
+                protocol::DoshResponse::ok()
+            }
+            0x05 => {
+                let _ = self.set_random_seed(cmd.param);
+                protocol::DoshResponse::ok()
+            }
+            0x06 => {
+                let _ = self.set_eval_allowed((cmd.param & 1) != 0);
+                let _ = self.set_wasm_allowed((cmd.param & 2) != 0);
+                self.set_network_allowed((cmd.param & 4) != 0);
+                protocol::DoshResponse::ok()
+            }
+            0x07 => {
+                let drained = self.pump_jobs();
+                protocol::DoshResponse::with_numeric(if drained { 1 } else { 0 })
+            }
+            0x08 => {
+                let len = self.layout_buffer.len();
+                let bytes = len * std::mem::size_of::<protocol::DoshButterflyRect>();
+                protocol::DoshResponse {
+                    status: protocol::DoshStatusCode::Ok as u8,
+                    data_type: 4, // Buffer
+                    reserved: 0,
+                    result_len: bytes as u32,
+                    numeric_val: len as u64,
+                    result_data: if self.layout_buffer.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        self.layout_buffer.as_ptr() as *const u8
+                    },
+                }
+            }
+            0x09 => {
+                let used = self.used_heap_size() as u64;
+                protocol::DoshResponse::with_numeric(used)
+            }
+            _ => protocol::DoshResponse::error("unknown opcode"),
+        }
+    }
 }
 
 impl Drop for DoshEngine {
@@ -1129,5 +1206,60 @@ mod tests {
         engine.set_waasm_capability("act", true).unwrap();
         assert!(engine.is_waasm_capability_allowed("act"));
         assert_eq!(engine.eval("globalThis.waasm.act(0, 0)").unwrap(), "0");
+    }
+
+    #[test]
+    fn test_dcp_protocol_dispatch() {
+        use protocol::{DoshCommand, DoshOpCode, DoshStatusCode};
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+
+        // 1. Eval via DCP
+        let eval_cmd = DoshCommand::new(DoshOpCode::Eval).with_payload("globalThis.__dcpTest = 42; true");
+        let resp = engine.dispatch_command(&eval_cmd);
+        assert_eq!(resp.status, DoshStatusCode::Ok as u8);
+
+        // 2. Set Fuel via DCP
+        let fuel_cmd = DoshCommand::new(DoshOpCode::SetFuel).with_param(5000);
+        let resp = engine.dispatch_command(&fuel_cmd);
+        assert_eq!(resp.status, DoshStatusCode::Ok as u8);
+        assert_eq!(engine.fuel_remaining(), 5000);
+
+        // 3. Get Fuel via DCP
+        let get_fuel_cmd = DoshCommand::new(DoshOpCode::GetFuel);
+        let resp = engine.dispatch_command(&get_fuel_cmd);
+        assert_eq!(resp.status, DoshStatusCode::Ok as u8);
+        assert_eq!(resp.numeric_val, 5000);
+
+        // 4. Set Clock via DCP
+        let clock_cmd = DoshCommand::new(DoshOpCode::SetClock).with_param(1700000000000);
+        let resp = engine.dispatch_command(&clock_cmd);
+        assert_eq!(resp.status, DoshStatusCode::Ok as u8);
+        assert_eq!(engine.virtual_time(), Some(1700000000000.0));
+
+        // 5. Heap Stats via DCP
+        let heap_cmd = DoshCommand::new(DoshOpCode::GetHeapStats);
+        let resp = engine.dispatch_command(&heap_cmd);
+        assert_eq!(resp.status, DoshStatusCode::Ok as u8);
+        assert!(resp.numeric_val > 0);
+
+        // 6. Butterfly Layout Rects via DCP
+        let rect = protocol::DoshButterflyRect {
+            element_id: 1,
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 50.0,
+            z_index: 0,
+            occluded_stratum: 0,
+            flags: 0,
+        };
+        engine.set_layout_rects(vec![rect]);
+        let layout_cmd = DoshCommand::new(DoshOpCode::GetLayout);
+        let resp = engine.dispatch_command(&layout_cmd);
+        assert_eq!(resp.status, DoshStatusCode::Ok as u8);
+        assert_eq!(resp.data_type, 4);
+        assert_eq!(resp.numeric_val, 1);
+        assert_eq!(resp.result_len as usize, std::mem::size_of::<protocol::DoshButterflyRect>());
+        assert!(!resp.result_data.is_null());
     }
 }
