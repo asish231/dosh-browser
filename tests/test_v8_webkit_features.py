@@ -81,6 +81,32 @@ def test_v8_capability_gate_eval():
 
 
 @pytest.mark.skipif(not HAS_V8, reason="doshgentv8_rust not available")
+def test_v8_capability_gate_wasm():
+    ctx = doshgentv8_rust.DoshContext()
+    assert ctx.eval("typeof WebAssembly") == "object"
+
+    ctx.set_wasm_allowed(False)
+    assert ctx.eval("typeof WebAssembly") == "undefined"
+
+    ctx.set_wasm_allowed(True)
+    assert ctx.eval("typeof WebAssembly") == "object"
+
+
+@pytest.mark.skipif(not HAS_V8, reason="doshgentv8_rust not available")
+def test_v8_capability_gate_network():
+    ctx = doshgentv8_rust.DoshContext()
+    ctx.add_callable("host_fetch", lambda url: "mock_response")
+    assert ctx.eval("globalThis.host_fetch('https://example.com')") == "mock_response"
+
+    ctx.set_network_allowed(False)
+    with pytest.raises(RuntimeError, match="network capability disallowed"):
+        ctx.eval("globalThis.host_fetch('https://example.com')")
+
+    ctx.set_network_allowed(True)
+    assert ctx.eval("globalThis.host_fetch('https://example.com')") == "mock_response"
+
+
+@pytest.mark.skipif(not HAS_V8, reason="doshgentv8_rust not available")
 def test_v8_fuel_metering():
     ctx = doshgentv8_rust.DoshContext()
     ctx.set_fuel(20)

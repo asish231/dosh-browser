@@ -354,10 +354,18 @@ const EXTENSIONS_SCRIPT: &str = r#"
     // 5. Capability Gates: eval & wasm & network
     let _evalAllowed = true;
     let _wasmAllowed = true;
+    let _origWebAssembly = typeof WebAssembly !== 'undefined' ? WebAssembly : undefined;
 
     globalThis.__setCapabilityGate = function(cap, allowed) {
         if (cap === 'eval') _evalAllowed = !!allowed;
-        if (cap === 'wasm') _wasmAllowed = !!allowed;
+        if (cap === 'wasm') {
+            _wasmAllowed = !!allowed;
+            if (!_wasmAllowed) {
+                try { delete globalThis.WebAssembly; } catch (e) {}
+            } else if (_origWebAssembly) {
+                globalThis.WebAssembly = _origWebAssembly;
+            }
+        }
     };
     globalThis.__getCapabilityGate = function(cap) {
         if (cap === 'eval') return _evalAllowed;
@@ -883,6 +891,18 @@ mod tests {
         let err = engine.eval("eval('2 + 3')");
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("disallowed"));
+    }
+
+    #[test]
+    fn test_capability_gate_wasm() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        assert_eq!(engine.eval("typeof WebAssembly").unwrap(), "object");
+
+        engine.set_wasm_allowed(false).unwrap();
+        assert_eq!(engine.eval("typeof WebAssembly").unwrap(), "undefined");
+
+        engine.set_wasm_allowed(true).unwrap();
+        assert_eq!(engine.eval("typeof WebAssembly").unwrap(), "object");
     }
 
     #[test]
