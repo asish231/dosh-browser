@@ -12,7 +12,7 @@ does not spell out. Last verified against the tree: 2026-11-03.
   rules `E, F, I, UP, B, SIM, RUF` with the listed ignores. Run
   `.venv/bin/python -m ruff check` before committing.
 - Imports: ruff `I` handles ordering; stdlib → third-party → `webresearch`.
-- Never import from `doshgentv8/`, `v8_lane/`, or `research_repos/` inside `webresearch/`
+- Never import from `doshgentv8/` or `research_repos/` inside `webresearch/`
   or `tests/`. The product stays engine-neutral; V8 reaches it only through the
   `WR_JS_ENGINE` switch.
 - Tests: pytest, `testpaths = ["tests"]`. A new capability ships with a hermetic test
@@ -95,7 +95,7 @@ Rules:
   bridge via `RUSTY_V8_ARCHIVE`. One recipe per first-class arch, recorded in
   `doshgentv8/README.md` when it exists.
 - Parity gate before any engine switch becomes default: the full pytest suite on BOTH
-  engines plus `v8_lane` probes green.
+  engines plus `test_rust_bridge.py` probes green.
 
 
 ## 6. Tool & shell naming (agent-facing surface)
@@ -113,8 +113,8 @@ Rules:
 ## 7. Docs
 
 - `AGENTS.md` = the governing contract (rules, capability table, disclosure). Root-level
-  product docs: `README.md`, `WASM_SCOPE.md`, `DOSH_AGENTIC.md`, `DOSH_TERMINAL.md`,
-  `OPEN_ISSUES.md` (known gaps live here, honestly).
+  product docs: `README.md` and `LICENSE`. Technical architecture, RFCs, and planning live
+  under `docs/` (`docs/ANBC-RESEARCH-RFC.md`, `docs/WAASM-AGENTIC-WASM-PLAN.md`, etc.).
 - `docs/` = planning & analysis (ALL-CAPS-ish names: `DOSHGENTV8-MASTER-PLAN.md`,
   `AGENTIC-VERIFY-CLASSIFY.md`, `AGENTIC-NATIVE-CAPABILITY-MAP.md`,
   `WAASM-AGENTIC-WASM-PLAN.md`, this file).
@@ -131,7 +131,5 @@ Rules:
 - Never assert on a substring of a whole page; read the specific element (AGENTS.md
   hard-won rules apply to fork patches too — e.g. don't "prove" fuel by grepping output).
 - Distinguish "the action executed" from "the challenge passed" in every report.
-- Baseline before edits: full suite is 823 passed / 8 skipped / 1 known flake
-  (`test_port_transfer` fails only in the full run, passes solo — pre-existing, tracked
-  in OPEN_ISSUES.md when confirmed as pollution). Re-run the suite before claiming an
+- Baseline before edits: full suite is 920 passed / 8 skipped. Re-run the suite before claiming an
   edit is safe.

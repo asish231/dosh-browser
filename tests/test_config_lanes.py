@@ -1,11 +1,11 @@
-"""Config contract tests: the official/experimental lane status is one source
+"""Config contract tests: the official/primary lane status is one source
 of truth (webresearch/config.py) and surfaces honestly everywhere.
 
 Pins the policy the project runs on:
-- PYTHON (webresearch/) is the official product.
-- RUST (dosh-browser-core/) is experimental until its migration gate passes.
-- QuickJS is the official JS engine; the V8 lane is experimental until
-  Phase 2 parity, selectable only via WR_JS_ENGINE.
+- RUST (dosh-browser-core/) is the primary product.
+- PYTHON (webresearch/) is the optional companion SDK.
+- QuickJS is the default JS engine for Python companion flows; the V8 lane is
+  proven against the QuickJS oracle, selectable via WR_JS_ENGINE.
 """
 
 import pytest
@@ -22,25 +22,23 @@ from webresearch.config import (
 )
 
 
-def test_python_is_the_official_lane():
-    assert OFFICIAL_LANE == "python"
-    assert LANES["python"]["status"] == "official"
-    assert LANES["python"]["path"] == "webresearch/"
-
-
-def test_rust_is_experimental_until_the_gate_passes():
-    assert LANES["rust"]["status"] == "experimental"
+def test_rust_is_the_primary_lane():
+    assert OFFICIAL_LANE == "rust"
+    assert LANES["rust"]["status"] == "primary"
     assert LANES["rust"]["path"] == "dosh-browser-core/"
-    # the gate is stated, not implied
-    gate = LANES["rust"].get("migration_gate", "")
-    assert "Phase 2" in gate
-    assert "both engines" in gate
 
 
-def test_rust_summary_names_what_is_missing():
+def test_python_is_the_optional_sdk_lane():
+    assert LANES["python"]["status"] == "optional-sdk"
+    assert LANES["python"]["path"] == "webresearch/"
+    summary = LANES["python"]["summary"]
+    assert "companion Python package" in summary or "SDK" in summary
+
+
+def test_rust_summary_names_primary_capabilities():
     summary = LANES["rust"]["summary"]
-    assert "not yet wired" in summary or "not ported" in summary
-    assert "experimental" in summary.lower() or "in progress" in summary.lower()
+    assert "primary product" in summary.lower()
+    assert "standalone browser binary" in summary
 
 
 def test_unknown_lane_is_honest():
@@ -85,11 +83,11 @@ def test_unknown_engine_falls_back_to_official(monkeypatch):
 
 def test_project_status_answers_the_official_question():
     ps = project_status()
-    assert ps["official_lane"] == "python"
-    assert ps["lanes"]["python"]["status"] == "official"
-    assert ps["lanes"]["rust"]["status"] == "experimental"
-    assert "official" in ps["policy"]
-    assert "until" in ps["policy"]  # the policy states when that flips
+    assert ps["official_lane"] == "rust"
+    assert ps["lanes"]["rust"]["status"] == "primary"
+    assert ps["lanes"]["python"]["status"] == "optional-sdk"
+    assert "Rust" in ps["policy"]
+    assert "primary" in ps["policy"]
 
 
 @pytest.mark.asyncio
@@ -119,12 +117,13 @@ async def test_shell_product_command_reports_official_lane():
                 r = await shell.execute("product", {})
                 assert r["ok"], r
                 result = r["result"]
-                assert result["official_lane"] == "python"
-                assert result["lanes"]["rust"]["status"] == "experimental"
+                assert result["official_lane"] == "rust"
+                assert result["lanes"]["rust"]["status"] == "primary"
+                assert result["lanes"]["python"]["status"] == "optional-sdk"
                 # status carries it too
                 await shell.execute("open", {"url": "https://cfg.test/"})
                 r2 = await shell.execute("status", {})
-                assert r2["result"]["product"]["official_lane"] == "python"
+                assert r2["result"]["product"]["official_lane"] == "rust"
                 assert r2["result"]["product"]["active_js_engine"] == "quickjs"
             finally:
                 shell.close()

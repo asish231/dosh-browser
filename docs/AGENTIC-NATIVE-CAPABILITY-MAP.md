@@ -90,7 +90,7 @@ These features exist for human browsing patterns and should be **disabled or rem
 | **Layer inspection for visual debugging** (`browser_layers`) | A visual debugging tool for humans to understand occlusion. Agents don't debug visual layouts. | `shell.py:45` — `layers` inspects layout strata |
 | **Human-timing delays** | Artificial delays mimicking human behavior should be OFF for agents. Agents benefit from instant execution. | `runtime.py` — mimics human timing in login flows; should be toggleable |
 | **Smooth scroll animation** | Agents need instant scroll to content, not stepped animation. | `minidom.js` — smooth scroll is stepped-synchronous (already disclosed as approximation) |
-| **CSS animation rendering** | Agents don't care about visual transitions. CSS animations are cosmetic. | `OPEN_ISSUES.md` — CSS transitions/keyframes unimplemented (correct for agents) |
+| **CSS animation rendering** | Agents don't care about visual transitions. CSS animations are cosmetic. | Disclosed: CSS transitions/keyframes unimplemented (correct for agents) |
 | **Font rendering/shaping** | Agents need text content, not visual typography. Font shaping is wasted work. | `minidom.js` — no bidi/shaping (correct; agents don't need it) |
 | **Media playback** | Agents don't watch videos or listen to audio. Video download (metadata) is useful; playback is not. | `tools.py` — `browser_get_video` downloads, not plays |
 | **Print/PDF rendering** | Agents don't print. PDF text extraction is useful; visual print layout is not. | Not implemented (correct for agents) |

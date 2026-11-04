@@ -1,6 +1,6 @@
 """Agent-Native Binary Format (ANBF v1.0 / .anb) Compiler.
 
-Implements the RFC-01 specification from agent_native_browser_compiler_research.md:
+Implements the RFC-01 specification from docs/ANBC-RESEARCH-RFC.md:
 - 32-byte fixed header (Magic 'ANB1', version, flags, status, epoch ms, table offsets, CRC32).
 - Semantic Block Table (dense row-delimited tuples for tables, headings, code, text).
 - Action Graph Table (content-addressed action refs, kinds, and execution routings).

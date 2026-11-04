@@ -136,7 +136,7 @@ snapshots, server route responses (`/v1/tools`, `/v1/invoke` for help/status).
 ### Phase 6 — Parity & disclosure survey (the finish line, already defined)
 The 6-pass survey (DOM byte-diff per fixture, capability/disclosure table, full regression
 both engines, behavioral probes, fingerprint honesty, perf table) → results into
-`OPEN_ISSUES.md` + README. Nothing ships silently.
+`AGENTS.md` + README. Nothing ships silently.
 
 ## 3. Cross-arch builds (the "all CPU types" answer)
 

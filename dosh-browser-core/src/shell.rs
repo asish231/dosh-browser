@@ -891,7 +891,7 @@ pub async fn execute_command(
             if url.is_empty() || username.is_empty() || password.is_empty() {
                 return Err("login requires url, username, and password".into());
             }
-            let template = include_str!("../../tmp_scripts/login_runner.py.template");
+            let template = include_str!("../templates/login_runner.py.template");
             let script = template
                 .replace("{url}", url)
                 .replace("{username}", username)

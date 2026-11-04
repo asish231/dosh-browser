@@ -250,7 +250,7 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | Caret + selection model (editors, selection DnD) | Plain text only | `INVENT` |
 | Real rAF frame clock (today: `setTimeout(fn,16)` shim) | `minidom.js` | `INVENT` |
 | CSS transitions/keyframes timing engine | None | `INVENT` |
-| **Occlusion-gated clicks** — inspector exists, clicks bypass collision (`OPEN_ISSUES.md:245`) | `__inspectLayers` built, clicks unapproved | `WIRE + INVENT gate` |
+| **Occlusion-gated clicks** — inspector exists, clicks bypass collision | `__inspectLayers` built, clicks unapproved | `WIRE + INVENT gate` |
 | Canvas/media structural decomposition (never pixel raster) | None | `PARTIAL → INVENT` |
 
 ### Layer 3 — Session & State
@@ -269,7 +269,7 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 |---|---|---|
 | Tracker graph + surrogates + hash-pinned remote lists | `engine/trackers.py` | ✅ HAVE |
 | Challenge solvers (captcha family, DataDome, CT, OTP) | `engine/captcha.py`, `session.solve_*` | ✅ HAVE, keep upgrading |
-| Bot-guard handshake (postMessage port lane) | Uncommitted work | `IN PROGRESS` — `tmp_scripts/` |
+| Bot-guard handshake (postMessage port lane) | Verified in tests | ✅ HAVE |
 | Honeypot/decoy detection | `__inspectLayers` | `BUILT, WIRE` |
 | Human timing model, generalized beyond login | `runtime.py` mimics delays | `HAVE → EXTEND` |
 
@@ -283,7 +283,7 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | Frame/postMessage debugger projection (lanes, addressing, bodies) | `frames.py`, `runtime.py` | `DATA FLOWS, WIRE` |
 | **Causal trace**: action → DOM delta → network → console | Partial data | `INVENT` — flagship |
 | **Mutation subscription stream** (deltas instead of re-reads) | Not implemented | `INVENT` |
-| Capability manifest per page ("unavailable — and why", formalized) | `OPEN_ISSUES.md` | `PARTIAL → INVENT` |
+| Capability manifest per page ("unavailable — and why", formalized) | Agent action surface | `PARTIAL → INVENT` |
 | **Skills registry** (persistent site procedures across sessions) | Partial: `shell.skill_*` | `INVENT` |
 | DoshShell terminal as thin projection over all of the above | `shell.py` | `INVENT` (last, thinnest) |
 

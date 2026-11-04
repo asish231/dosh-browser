@@ -7,17 +7,14 @@ build/
 *.egg-info/
 .env
 .DS_Store
-ISSUES_AUDIT.local.md
 attestation-lab/
 .ruff_cache/
 .pytest_cache/
 tmp/
 tmp_scripts/
 tmp_out/
-agent_native_browser_compiler_research.md
 DOSH_Browser_Mini_Project_Presentation_ORIGINAL_BACKUP.pptx
 win/
-BUSINESS_STRATEGY.md
 research_repos/chromium
 # Build artifacts (never push compiled binaries)
 target/
@@ -28,5 +25,5 @@ doshgentv8/target/
 downloads/
 
 # Reference clones (read-only, not our code)
-research_repos/v8/
-research_repos/lightpanda/
+research_repos/*/
+!research_repos/PROJECT_REVIEW.md
