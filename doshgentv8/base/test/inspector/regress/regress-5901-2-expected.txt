@@ -1,8 +1,0 @@
-Tests stepping out of inlined function.
-function f() {
-  #debugger;
-  return 1;
-
-function g() {
-  return f();#  // Break
-}

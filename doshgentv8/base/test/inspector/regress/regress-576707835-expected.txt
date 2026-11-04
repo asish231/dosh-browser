@@ -1,2 +1,0 @@
-Tests that evaluating an async generator on a call frame with a colliding unique ID in script does not crash.
-Success

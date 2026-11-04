@@ -1,3 +1,0 @@
-Regression test for crbug.com/517316174.
-
-Running test: test

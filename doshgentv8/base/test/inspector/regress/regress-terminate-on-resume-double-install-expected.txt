@@ -1,2 +1,0 @@
-Runtime.terminateExecution followed by resume(terminateOnResume)
-Resumed without crashing

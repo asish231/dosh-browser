@@ -1,5 +1,0 @@
-specific_include_rules = {
-  "wasm-strings-unittest.cc": [
-    "+third_party/utf8-decoder",
-  ],
-}

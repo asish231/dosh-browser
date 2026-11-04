@@ -1,8 +1,0 @@
-Regression test for crbug.com/572276045.
-{
-    error : {
-        code : -32000
-        message : Object is not available
-    }
-    id : <messageId>
-}

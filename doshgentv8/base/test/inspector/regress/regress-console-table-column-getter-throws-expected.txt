@@ -1,3 +1,0 @@
-Checks that a throwing console.table() column getter does not leak the exception into the running script.
-Runtime disabled: no throw
-Runtime enabled: no throw

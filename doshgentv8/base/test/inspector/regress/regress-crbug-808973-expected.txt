@@ -1,5 +1,0 @@
-Regression test for crbug.com/808973.
-  await sleep();
-  #throw "a"; // Exception a
-}
-

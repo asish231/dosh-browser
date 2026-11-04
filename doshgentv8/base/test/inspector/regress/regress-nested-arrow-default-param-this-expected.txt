@@ -1,3 +1,0 @@
-Tests regress-nested-arrow-default-param-this.
-this === obj: true
-returned obj: true

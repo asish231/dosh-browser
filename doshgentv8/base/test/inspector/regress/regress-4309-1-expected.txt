@@ -1,2 +1,0 @@
-Tests regress-4309-1.
-Scope types: local, global

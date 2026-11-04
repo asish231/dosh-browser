@@ -1,3 +1,0 @@
-Tests stepping into constructors.
-call_graph for a(): accdca
-call_graph for b(): bbccdcb

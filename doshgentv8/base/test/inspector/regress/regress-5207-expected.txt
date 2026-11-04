@@ -1,3 +1,0 @@
-Tests regress-5207.
-scope[0] (eval): a=1
-scope[1] (global): a=undefined

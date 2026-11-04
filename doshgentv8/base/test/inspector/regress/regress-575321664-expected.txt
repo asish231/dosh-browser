@@ -1,6 +1,0 @@
-Checks that custom preview generation stops after execution termination.
-log: [object Object]
-{
-    code : -32000
-    message : Execution was terminated
-}

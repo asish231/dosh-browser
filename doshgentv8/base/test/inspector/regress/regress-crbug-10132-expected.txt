@@ -1,4 +1,0 @@
-Tests --print-break-location on debugger statement.
-[debug] break in function ''.
-[debug] debugger;
-[debug] ^

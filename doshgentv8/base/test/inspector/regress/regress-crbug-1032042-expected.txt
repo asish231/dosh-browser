@@ -1,3 +1,0 @@
-Regression test for crbug.com/1032042.
-Recorded Wasm scriptId: true
-Wasm script reported on re-enable: true
