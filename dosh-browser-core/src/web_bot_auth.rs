@@ -7,6 +7,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use ring::rand::SecureRandom;
 use ring::signature::{self, Ed25519KeyPair};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -128,6 +129,54 @@ pub fn sign_request(
     })
 }
 
+/// Sign an HTTP request using Cloudflare WebBotAuth convention:
+/// `("@authority" "signature-agent");created=...;expires=...;keyid="...";alg="ed25519";nonce="...";tag="web-bot-auth"`
+pub fn sign_web_bot_auth(
+    config: &BotAuthConfig,
+    authority: &str,
+    timestamp: Option<u64>,
+) -> Result<SignedHeaders, String> {
+    let now = timestamp.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    });
+    let expires = now + 60;
+
+    // 64-byte cryptographically secure random nonce
+    let mut nonce_bytes = [0u8; 64];
+    ring::rand::SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| "Failed to generate random nonce".to_string())?;
+    let nonce = BASE64.encode(nonce_bytes);
+
+    let agent_hdr = format!("\"https://{}\"", config.agent_identifier.trim_matches('"'));
+    let label = "sig1";
+
+    let sig_input_value = format!(
+        "(\"@authority\" \"signature-agent\");created={};expires={};keyid=\"{}\";alg=\"ed25519\";nonce=\"{}\";tag=\"web-bot-auth\"",
+        now, expires, config.key_id, nonce
+    );
+    let signature_input = format!("{}={}", label, sig_input_value);
+
+    let signature_base = format!(
+        "\"@authority\": {}\n\"signature-agent\": {}\n\"@signature-params\": {}",
+        authority, agent_hdr, sig_input_value
+    );
+
+    let key_pair = Ed25519KeyPair::from_seed_unchecked(&config.secret_key)
+        .map_err(|e| format!("Failed to create Ed25519 key pair: {}", e))?;
+    let raw_sig = key_pair.sign(signature_base.as_bytes()).as_ref().to_vec();
+    let signature_val = format!("{}=:{}:", label, BASE64.encode(raw_sig));
+
+    Ok(SignedHeaders {
+        signature_agent: agent_hdr,
+        signature_input,
+        signature: signature_val,
+    })
+}
+
 /// Verify an Ed25519 RFC 9421 signature given public key bytes.
 pub fn verify_ed25519_signature(
     public_key_bytes: &[u8],
@@ -215,6 +264,22 @@ mod tests {
         .unwrap();
 
         assert!(signed.signature_input.contains("alg=\"hmac-sha256\""));
+        assert!(signed.signature.starts_with("sig1=:"));
+    }
+
+    #[test]
+    fn test_cloudflare_web_bot_auth() {
+        let seed = [99u8; 32];
+        let config = BotAuthConfig::new_ed25519("cf-bot-key-1", "dosh-agent.io", seed);
+        let authority = "\"api.example.com\"";
+        let timestamp = 1712000000;
+
+        let signed = sign_web_bot_auth(&config, authority, Some(timestamp)).unwrap();
+        assert_eq!(signed.signature_agent, "\"https://dosh-agent.io\"");
+        assert!(signed.signature_input.contains("created=1712000000"));
+        assert!(signed.signature_input.contains("expires=1712000060"));
+        assert!(signed.signature_input.contains("tag=\"web-bot-auth\""));
+        assert!(signed.signature_input.contains("nonce="));
         assert!(signed.signature.starts_with("sig1=:"));
     }
 }

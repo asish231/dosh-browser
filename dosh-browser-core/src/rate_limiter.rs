@@ -19,10 +19,15 @@ pub struct RateLimiter {
 struct RateLimiterInner {
     interval: Duration,
     tau: Duration,
+    interval_ms: u64,
+    tau_ms: u64,
     // host -> Theoretical Arrival Time (TAT)
     hosts: HashMap<String, Instant>,
+    // host -> TAT in epoch ms
+    hosts_ms: HashMap<String, u64>,
     last_sweep: Instant,
     sweep_interval: Duration,
+    sweep_at: usize,
 }
 
 impl RateLimiter {
@@ -33,21 +38,49 @@ impl RateLimiter {
         let interval = Duration::from_millis(interval_ms);
         let burst_count = burst.max(1);
         let tau = interval * (burst_count - 1);
+        let tau_ms = interval_ms * ((burst_count - 1) as u64);
 
         Self {
             inner: Arc::new(Mutex::new(RateLimiterInner {
                 interval,
                 tau,
+                interval_ms,
+                tau_ms,
                 hosts: HashMap::new(),
+                hosts_ms: HashMap::new(),
                 last_sweep: Instant::now(),
                 sweep_interval: Duration::from_secs(60),
+                sweep_at: 256,
             })),
+        }
+    }
+
+    /// GCRA slot reservation algorithm: returns theoretical earliest timestamp (in ms)
+    /// that the request is permitted to run.
+    pub async fn reserve(&self, host: &str, now_ms: u64) -> u64 {
+        let clean_host = host.split(':').next().unwrap_or(host).to_lowercase();
+        let mut inner = self.inner.lock().await;
+
+        if let Some(&tat) = inner.hosts_ms.get(&clean_host) {
+            let start = now_ms.max(tat.saturating_sub(inner.tau_ms));
+            let next_tat = tat.max(start) + inner.interval_ms;
+            inner.hosts_ms.insert(clean_host, next_tat);
+            start
+        } else {
+            let next_tat = now_ms + inner.interval_ms;
+            inner.hosts_ms.insert(clean_host, next_tat);
+
+            if inner.hosts_ms.len() >= inner.sweep_at {
+                inner.sweep_ms(now_ms);
+            }
+            now_ms
         }
     }
 
     /// Check if a request to `host` can proceed now, or how long it must wait.
     /// If it must wait and `auto_wait` is desired, use `acquire`.
     pub async fn check(&self, host: &str) -> Result<(), Duration> {
+        let clean_host = host.split(':').next().unwrap_or(host).to_lowercase();
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
 
@@ -56,7 +89,7 @@ impl RateLimiter {
             inner.sweep(now);
         }
 
-        let tat = inner.hosts.get(host).copied().unwrap_or(now);
+        let tat = inner.hosts.get(&clean_host).copied().unwrap_or(now);
 
         // If TAT - now > tau, request violates rate limit
         if tat > now + inner.tau {
@@ -65,7 +98,7 @@ impl RateLimiter {
         }
 
         let new_tat = tat.max(now) + inner.interval;
-        inner.hosts.insert(host.to_string(), new_tat);
+        inner.hosts.insert(clean_host, new_tat);
         Ok(())
     }
 
@@ -101,6 +134,13 @@ impl RateLimiterInner {
             }
         });
         self.last_sweep = now;
+    }
+
+    fn sweep_ms(&mut self, now_ms: u64) {
+        self.hosts_ms.retain(|_, &mut tat| tat > now_ms);
+        if self.hosts_ms.len() >= self.sweep_at {
+            self.sweep_at *= 2;
+        }
     }
 }
 
@@ -154,6 +194,22 @@ mod tests {
         let w2 = rl.acquire(host).await;
         assert!(w2.as_millis() >= 25);
         assert!(start.elapsed().as_millis() >= 25);
+    }
+
+    #[tokio::test]
+    async fn test_reserve_gcra() {
+        let rl = RateLimiter::new(100, 1);
+        let host = "a.test:443";
+
+        // Idle host starts immediately
+        assert_eq!(rl.reserve(host, 1000).await, 1000);
+        // Second request at same timestamp is spaced by 100ms
+        assert_eq!(rl.reserve(host, 1000).await, 1100);
+        // Third request at 1050ms is spaced to 1200ms
+        assert_eq!(rl.reserve(host, 1050).await, 1200);
+
+        // Different host operates independently
+        assert_eq!(rl.reserve("b.test", 1000).await, 1000);
     }
 }
 

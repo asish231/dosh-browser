@@ -20,6 +20,7 @@ class RateLimiter:
         self._lock = asyncio.Lock()
         self._last_sweep = time.monotonic()
         self._sweep_interval = 60.0
+        self._sweep_at = 256
 
     def _sweep(self, now: float) -> None:
         max_age = self.tau + 30.0
@@ -27,6 +28,22 @@ class RateLimiter:
         for h in dead:
             self._hosts.pop(h, None)
         self._last_sweep = now
+        if len(self._hosts) >= self._sweep_at:
+            self._sweep_at *= 2
+
+    def reserve(self, host: str, now: float) -> float:
+        """Reserve next execution slot for host using GCRA, returning start time."""
+        clean_host = host.split(":")[0].lower()
+        if clean_host in self._hosts:
+            tat = self._hosts[clean_host]
+            start = max(now, tat - self.tau)
+            self._hosts[clean_host] = max(tat, start) + self.interval
+            return start
+        else:
+            self._hosts[clean_host] = now + self.interval
+            if len(self._hosts) >= self._sweep_at:
+                self._sweep(now)
+            return now
 
     async def check(self, host: str) -> float | None:
         """Check if request to host is allowed.

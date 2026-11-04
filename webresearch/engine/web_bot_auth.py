@@ -82,3 +82,49 @@ def sign_request(
         "signature": sig_val,
     }
 
+
+def sign_web_bot_auth(
+    config: BotAuthConfig,
+    authority: str,
+    timestamp: int | None = None,
+) -> dict[str, str]:
+    """Generate Cloudflare WebBotAuth convention signed headers:
+    ("@authority" "signature-agent");created=...;expires=...;keyid="...";alg="ed25519";nonce="...";tag="web-bot-auth"
+    """
+    import secrets
+
+    now = timestamp if timestamp is not None else int(time.time())
+    expires = now + 60
+    nonce = base64.b64encode(secrets.token_bytes(64)).decode("ascii")
+
+    clean_agent = config.agent_identifier.strip('"')
+    agent_hdr = f'"https://{clean_agent}"'
+    label = "sig1"
+
+    sig_input_val = (
+        f'("@authority" "signature-agent");created={now};expires={expires};'
+        f'keyid="{config.key_id}";alg="ed25519";nonce="{nonce}";tag="web-bot-auth"'
+    )
+    sig_input = f"{label}={sig_input_val}"
+
+    base_string = (
+        f'"@authority": {authority}\n'
+        f'"signature-agent": {agent_hdr}\n'
+        f'"@signature-params": {sig_input_val}'
+    )
+
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        priv = ed25519.Ed25519PrivateKey.from_private_bytes(config.secret_key[:32])
+        sig_bytes = priv.sign(base_string.encode("utf-8"))
+        sig_val = f"{label}=:{base64.b64encode(sig_bytes).decode('ascii')}:"
+    except ImportError:
+        mac = hmac.new(config.secret_key, base_string.encode("utf-8"), hashlib.sha256).digest()
+        sig_val = f"{label}=:{base64.b64encode(mac).decode('ascii')}:"
+
+    return {
+        "signature-agent": agent_hdr,
+        "signature-input": sig_input,
+        "signature": sig_val,
+    }
+
