@@ -589,6 +589,10 @@ CodeSandboxingMode Builtins::SandboxingModeOf(Builtin builtin) {
 bool Builtins::AllowDynamicFunction(
     Isolate* isolate, DirectHandle<JSFunction> target,
     DirectHandle<JSObject> target_global_proxy) {
+  // doshgentv8 capability gate: if eval / dynamic code generation is revoked on this isolate, deny.
+  if (isolate != nullptr && !isolate->is_eval_allowed()) {
+    return false;
+  }
   if (v8_flags.allow_unsafe_function_constructor) return true;
   HandleScopeImplementer* impl = isolate->handle_scope_implementer();
   DirectHandle<NativeContext> responsible_context = impl->LastEnteredContext();

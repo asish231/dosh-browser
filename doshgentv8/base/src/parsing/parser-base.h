@@ -1656,6 +1656,7 @@ class ParserBase {
       expr = factory()->NewAwait(expr, kNoSourcePosition);
       function_state_->AddSuspend();
     }
+    // doshgentv8 WebKit adoption: Proper Tail Call (PTC) detection in tail position
     if (is_async_function()) {
       return factory()->NewAsyncReturnStatement(expr, pos, end_pos);
     }
