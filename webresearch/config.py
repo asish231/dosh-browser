@@ -7,12 +7,13 @@ question the same way instead of by inference.
 Current status (2026-11-04):
 - PYTHON (webresearch/) is the OFFICIAL product: full agent browser —
   script execution, captcha solver, login/OTP, frame messaging, video
-  lane, 34 shell commands; 840-test suite green.
+  lane, 35 shell commands; 859-test suite green.
 - RUST (dosh-browser-core/) is EXPERIMENTAL: the pipeline is ported and
   unit-tested (fetch → parse → project → session → shell → server,
-  62/62 tests), but page script execution is not yet wired into goto(),
-  and the adversarial/agent layers (captcha, login, frames, ws, ESM,
-  MCP, telemetry) are not ported. It is not behind any agent surface.
+  140/140 tests) with the doshgentv8 V8 core, ACD 2.0, champion INT8 neural
+  interactivity model, and RFC 9111 HTTP cache, but page script execution is
+  not yet wired into goto(), and the adversarial/agent layers (captcha, login,
+  frames, ws, ESM, MCP, telemetry) are not ported. It is not behind any agent surface.
 - The V8 engine core (doshgentv8/) is proven against the QuickJS oracle
   (bridge GREEN: 27.5ms boot, 38µs host calls, native WASM) and will
   become selectable via WR_JS_ENGINE once Phase 2 seam parity passes.
@@ -34,7 +35,7 @@ LANES = {
             "The product. Full agent browser: QuickJS engine with live DOM, "
             "reCAPTCHA v2 protocol solver, login/OTP, frame messaging, "
             "WebSocket, ESM translator, video lane, MCP/HTTP/CLI surfaces, "
-            "34 shell commands. 840-test suite green."
+            "ACD 2.0, champion INT8 neural model, 35 shell commands. 859-test suite green."
         ),
     },
     "rust": {
@@ -42,8 +43,9 @@ LANES = {
         "status": "experimental",
         "summary": (
             "The pure-Rust rewrite, in progress. Pipeline ported and unit-tested "
-            "(fetch/parse/project/session/shell/server, 62/62 tests) with the "
-            "doshgentv8 V8 core, but page script execution is not yet wired into "
+            "(fetch/parse/project/session/shell/server, 140/140 tests) with the "
+            "doshgentv8 V8 core, ACD 2.0, champion INT8 neural model, and HTTP cache, "
+            "but page script execution is not yet wired into "
             "goto() and the adversarial/agent layers are not ported. Not behind "
             "any agent surface; do not route production traffic to it."
         ),
