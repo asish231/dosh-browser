@@ -74,20 +74,24 @@ fn parse_shell_line(line: &str) -> (&str, serde_json::Value) {
 
 fn find_python_executable() -> String {
     if let Ok(venv) = env::var("VIRTUAL_ENV") {
-        let p = std::path::Path::new(&venv).join("bin/python3");
+        for candidate in &["bin/python3", "bin/python", "Scripts/python.exe", "Scripts/python"] {
+            let p = std::path::Path::new(&venv).join(candidate);
+            if p.exists() {
+                return p.to_string_lossy().to_string();
+            }
+        }
+    }
+    for candidate in &[".venv/bin/python3", ".venv/bin/python", ".venv/Scripts/python.exe", ".venv/Scripts/python"] {
+        let p = std::path::Path::new(candidate);
         if p.exists() {
             return p.to_string_lossy().to_string();
         }
-        let p_alt = std::path::Path::new(&venv).join("bin/python");
-        if p_alt.exists() {
-            return p_alt.to_string_lossy().to_string();
-        }
     }
-    let local_venv = std::path::Path::new(".venv").join("bin/python3");
-    if local_venv.exists() {
-        return local_venv.to_string_lossy().to_string();
+    if cfg!(windows) {
+        "python".to_string()
+    } else {
+        "python3".to_string()
     }
-    "python3".to_string()
 }
 
 #[tokio::main]
