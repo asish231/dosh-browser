@@ -197,7 +197,7 @@ pub async fn download(
     match want {
         Some((algo, digest)) => {
             let actual = if algo == "sha256" {
-                Some(rec.sha256.as_bytes().to_vec())
+                hex::decode(&rec.sha256).ok()
             } else {
                 read_file_digest(&tmp_path, &algo).await
             };

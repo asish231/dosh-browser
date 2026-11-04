@@ -4,7 +4,6 @@
 //! internal anchors.
 
 use kuchiki::traits::TendrilSink;
-use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::content::{content_root, inside_chrome};
@@ -105,7 +104,6 @@ pub fn links(html: &str, base_url: &str, max_links: usize) -> Vec<Link> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kuchiki::traits::TendrilSink;
 
     #[test]
     fn test_links_extraction() {

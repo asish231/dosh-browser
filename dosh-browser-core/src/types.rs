@@ -272,6 +272,30 @@ pub struct CaptchaCodeDump {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TagProvenance {
+    #[serde(default)]
+    pub tag: String,
+    #[serde(default)]
+    pub css_path: String,
+    #[serde(default)]
+    pub xpath: String,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub attributes: std::collections::HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AcdCollection {
+    pub id: String,
+    pub category: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub block_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct AcdBlock {
     pub id: String,
     #[serde(rename = "type")]
@@ -290,6 +314,14 @@ pub struct AcdBlock {
     pub rows: Vec<Vec<String>>,
     #[serde(default)]
     pub locator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<TagProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -346,6 +378,8 @@ pub struct Acd {
     pub errors: Vec<String>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub counts: std::collections::HashMap<String, i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collections: Vec<AcdCollection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable: Vec<String>,
 }

@@ -40,12 +40,24 @@ pub fn classify(content_type: &str) -> &'static str {
     }
 }
 
-pub fn navigate_headers(url: &str) -> HeaderMap {
+pub fn navigate_headers(_url: &str) -> HeaderMap {
     let mut h = HeaderMap::new();
+    h.insert(
+        "user-agent",
+        HeaderValue::from_static(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        ),
+    );
     h.insert("sec-fetch-dest", HeaderValue::from_static("document"));
     h.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
     h.insert("sec-fetch-site", HeaderValue::from_static("none"));
     h.insert("sec-fetch-user", HeaderValue::from_static("?1"));
+    h.insert(
+        "sec-ch-ua",
+        HeaderValue::from_static("\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\""),
+    );
+    h.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
+    h.insert("sec-ch-ua-platform", HeaderValue::from_static("\"macOS\""));
     h.insert(
         "Accept",
         HeaderValue::from_static(

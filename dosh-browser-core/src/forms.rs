@@ -3,16 +3,12 @@
 //! Extracts forms and their fields from the DOM, mapping them to the
 //! `types::Form` and `types::FieldSpec` structures.
 
-use kuchiki::NodeRef;
 use kuchiki::traits::TendrilSink;
-use std::collections::HashSet;
 
 use crate::content::{attr, tag_name, text_content};
 use crate::types::{FieldSpec, Form};
 
-const SKIP_FORM_TAGS: &[&str] = &["input"]; // Only specific types are fields
 const INPUT_TYPES_TO_SKIP: &[&str] = &["hidden", "submit", "button", "reset", "image"];
-const BUTTON_TYPES: &[&str] = &["submit", "button"];
 
 /// Extract all forms from the DOM.
 pub fn extract_forms(html: &str) -> Vec<Form> {

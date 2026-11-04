@@ -8,7 +8,6 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -127,7 +126,7 @@ pub async fn get_video(
     url: &str,
     dest_dir: Option<&PathBuf>,
     format: Option<&str>,
-    use_session: bool,
+    _use_session: bool,
     max_bytes: Option<u64>,
     timeout: Option<u64>,
 ) -> VideoDownload {
@@ -181,7 +180,7 @@ pub async fn get_video(
     };
     let out_tpl = tmp_dir.path().join("%(title).190B.%(ext)s").to_string_lossy().to_string();
     let max_bytes_str = max_bytes.to_string();
-    let mut argv = vec![
+    let argv = vec![
         "yt-dlp", "--no-playlist", "--no-simulate", "--no-progress", "--no-warnings",
         "--retries", "3", "--socket-timeout", "30",
         "--max-filesize", max_bytes_str.as_str(),
@@ -302,6 +301,7 @@ fn meta_from_lines(lines: &[String]) -> HashMap<String, String> {
     meta
 }
 
+#[allow(dead_code)]
 fn parse_json_field(line: &str) -> Option<String> {
     // yt-dlp with %j flag outputs JSON-encoded strings
     if let Ok(val) = serde_json::from_str::<String>(line) {
