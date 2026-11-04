@@ -158,3 +158,4 @@ class CorsGate:
             raise CorsError(
                 f"CORS error: Origin mismatch (expected {client_origin}, got {allow_origin})"
             )
+

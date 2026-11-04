@@ -81,3 +81,4 @@ def sign_request(
         "signature-input": sig_input,
         "signature": sig_val,
     }
+

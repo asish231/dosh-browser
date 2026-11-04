@@ -112,3 +112,4 @@ class SqliteHttpCache:
                 (now,),
             )
             return cur.rowcount
+
