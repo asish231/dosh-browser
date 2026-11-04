@@ -65,6 +65,21 @@ impl PreflightEntry {
     pub fn is_fresh(&self) -> bool {
         Instant::now() < self.expires_at
     }
+
+    pub fn allows_method(&self, method: &str) -> bool {
+        let m = method.to_uppercase();
+        self.allowed_methods.contains("*") || self.allowed_methods.contains(&m)
+    }
+
+    pub fn allows_header(&self, header: &str) -> bool {
+        let h = header.to_lowercase();
+        if h == "authorization" {
+            // WHATWG Fetch §3.2.3: wildcard '*' does NOT cover Authorization
+            self.allowed_headers.contains("authorization")
+        } else {
+            self.allowed_headers.contains("*") || self.allowed_headers.contains(&h)
+        }
+    }
 }
 
 /// In-memory preflight authorization cache.
@@ -113,15 +128,26 @@ impl CorsStore {
             .map(|v| v.trim().eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let key = (client_origin.to_string(), target_origin.to_string());
+        let mut map = self.entries.lock().await;
+        if let Some(existing) = map.get_mut(&key) {
+            if existing.is_fresh() {
+                // WHATWG Fetch specification: union allowed methods & headers, clamp TTL
+                existing.allowed_methods.extend(allowed_methods);
+                existing.allowed_headers.extend(allowed_headers);
+                existing.allow_credentials = existing.allow_credentials || allow_credentials;
+                existing.expires_at = existing.expires_at.min(Instant::now() + Duration::from_secs(max_age_secs));
+                return;
+            }
+        }
+
         let entry = PreflightEntry {
             allowed_methods,
             allowed_headers,
             allow_credentials,
             expires_at: Instant::now() + Duration::from_secs(max_age_secs),
         };
-
-        let mut map = self.entries.lock().await;
-        map.insert((client_origin.to_string(), target_origin.to_string()), entry);
+        map.insert(key, entry);
     }
 
     /// Retrieve valid preflight entry.
@@ -175,8 +201,27 @@ impl CorsGate {
 
         // Check if preflight is already cached
         if let Some(preflight) = self.store.get(client_origin, &target_origin).await {
-            if preflight.allowed_methods.contains(&upper_method) || preflight.allowed_methods.contains("*") {
-                return CorsDecision::PreflightCached { origin_header };
+            if preflight.allows_method(method) {
+                let mut all_headers_allowed = true;
+                for (name, val) in headers {
+                    let lowered = name.to_lowercase();
+                    if lowered == "user-agent"
+                        || lowered == "host"
+                        || lowered == "origin"
+                        || lowered == "referer"
+                        || lowered.starts_with("sec-fetch-")
+                        || lowered.starts_with("sec-ch-ua")
+                    {
+                        continue;
+                    }
+                    if !is_safelisted_header(&lowered, val) && !preflight.allows_header(&lowered) {
+                        all_headers_allowed = false;
+                        break;
+                    }
+                }
+                if all_headers_allowed {
+                    return CorsDecision::PreflightCached { origin_header };
+                }
             }
         }
 
@@ -464,6 +509,73 @@ mod tests {
         // JSON or XML are NOT CORS-safelisted and MUST trigger preflight
         assert!(!is_safelisted_content_type("application/json"));
         assert!(!is_safelisted_content_type("application/xml"));
+    }
+
+    #[tokio::test]
+    async fn test_whatwg_preflight_grant_merging() {
+        let gate = CorsGate::new();
+        let target = Url::parse("https://api.partner.com/items").unwrap();
+        let client = "https://my-app.com";
+        let target_origin = "https://api.partner.com";
+
+        // Grant 1: GET and PUT, custom header x-custom-a, max-age 300
+        let mut h1 = HashMap::new();
+        h1.insert("access-control-allow-methods".into(), "GET, PUT".into());
+        h1.insert("access-control-allow-headers".into(), "x-custom-a".into());
+        h1.insert("access-control-max-age".into(), "300".into());
+        gate.store.record_preflight(client, target_origin, &h1).await;
+
+        // Grant 2: DELETE, custom header x-custom-b, max-age 60
+        let mut h2 = HashMap::new();
+        h2.insert("access-control-allow-methods".into(), "DELETE".into());
+        h2.insert("access-control-allow-headers".into(), "x-custom-b".into());
+        h2.insert("access-control-max-age".into(), "60".into());
+        gate.store.record_preflight(client, target_origin, &h2).await;
+
+        // Both PUT and DELETE must now be cached
+        let mut req_put = HashMap::new();
+        req_put.insert("x-custom-a".into(), "val".into());
+        assert!(matches!(
+            gate.evaluate_request(client, &target, "PUT", &req_put).await,
+            CorsDecision::PreflightCached { .. }
+        ));
+
+        let mut req_del = HashMap::new();
+        req_del.insert("x-custom-b".into(), "val".into());
+        assert!(matches!(
+            gate.evaluate_request(client, &target, "DELETE", &req_del).await,
+            CorsDecision::PreflightCached { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_whatwg_authorization_wildcard_exemption() {
+        let gate = CorsGate::new();
+        let target = Url::parse("https://api.partner.com/items").unwrap();
+        let client = "https://my-app.com";
+        let target_origin = "https://api.partner.com";
+
+        // Preflight grants wildcard '*' for headers
+        let mut h = HashMap::new();
+        h.insert("access-control-allow-methods".into(), "GET, POST".into());
+        h.insert("access-control-allow-headers".into(), "*".into());
+        gate.store.record_preflight(client, target_origin, &h).await;
+
+        // Arbitrary custom header is covered by '*'
+        let mut req_custom = HashMap::new();
+        req_custom.insert("x-random-header".into(), "val".into());
+        assert!(matches!(
+            gate.evaluate_request(client, &target, "POST", &req_custom).await,
+            CorsDecision::PreflightCached { .. }
+        ));
+
+        // BUT Authorization is NOT covered by '*' per WHATWG Fetch §3.2.3
+        let mut req_auth = HashMap::new();
+        req_auth.insert("authorization".into(), "Bearer secret".into());
+        assert!(matches!(
+            gate.evaluate_request(client, &target, "POST", &req_auth).await,
+            CorsDecision::PreflightRequired { .. }
+        ));
     }
 }
 

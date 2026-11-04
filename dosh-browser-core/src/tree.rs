@@ -178,6 +178,137 @@ pub fn collect_iframes(html: &str) -> Vec<IframeInfo> {
     iframes
 }
 
+/// A contiguous, flat DOM representation inspired by JavaScriptCore's Butterfly layout.
+/// Nodes, attributes, and children are packed into flat contiguous arrays, minimizing pointer indirection and GC fragmentation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DomButterfly {
+    pub nodes: Vec<ButterflyNode>,
+    pub attrs: Vec<(String, String)>,
+    pub children: Vec<usize>,
+    pub text_pool: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ButterflyNode {
+    pub tag: String,
+    pub attr_start: usize,
+    pub attr_count: usize,
+    pub child_start: usize,
+    pub child_count: usize,
+    pub text_start: usize,
+    pub text_len: usize,
+}
+
+impl DomButterfly {
+    /// Build a contiguous DomButterfly from a recursive Value tree.
+    pub fn from_value(tree: &Value) -> Self {
+        let mut bf = Self::default();
+        if tree.is_null() {
+            return bf;
+        }
+        bf.ingest_node(tree);
+        bf
+    }
+
+    fn ingest_node(&mut self, val: &Value) -> usize {
+        let node_idx = self.nodes.len();
+        let tag = val.get("t").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        let mut text_start = 0;
+        let mut text_len = 0;
+        if let Some(x) = val.get("x").and_then(|v| v.as_str()) {
+            text_start = self.text_pool.len();
+            text_len = x.len();
+            self.text_pool.push_str(x);
+        }
+
+        let attr_start = self.attrs.len();
+        let mut attr_count = 0;
+        if let Some(map) = val.get("a").and_then(|v| v.as_object()) {
+            for (k, v) in map {
+                let v_str = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                self.attrs.push((k.clone(), v_str));
+                attr_count += 1;
+            }
+        }
+
+        // Push placeholder
+        self.nodes.push(ButterflyNode {
+            tag,
+            attr_start,
+            attr_count,
+            child_start: 0,
+            child_count: 0,
+            text_start,
+            text_len,
+        });
+
+        // Ingest children
+        let mut child_indices = Vec::new();
+        if let Some(c_arr) = val.get("c").and_then(|v| v.as_array()) {
+            for c_val in c_arr {
+                let c_idx = self.ingest_node(c_val);
+                child_indices.push(c_idx);
+            }
+        }
+
+        let child_start = self.children.len();
+        let child_count = child_indices.len();
+        self.children.extend(child_indices);
+
+        self.nodes[node_idx].child_start = child_start;
+        self.nodes[node_idx].child_count = child_count;
+
+        node_idx
+    }
+
+    /// Recursion-free trampoline traversal to find nodes matching tag.
+    pub fn find_by_tag(&self, tag: &str) -> Vec<usize> {
+        let mut matches = Vec::new();
+        if self.nodes.is_empty() {
+            return matches;
+        }
+
+        let mut stack = vec![0]; // DFS trampoline stack
+        while let Some(idx) = stack.pop() {
+            let node = &self.nodes[idx];
+            if node.tag.eq_ignore_ascii_case(tag) {
+                matches.push(idx);
+            }
+            // Push children in reverse order so first child is popped next
+            for i in (0..node.child_count).rev() {
+                stack.push(self.children[node.child_start + i]);
+            }
+        }
+        matches
+    }
+
+    /// Read attribute of a node in contiguous memory.
+    pub fn get_attr(&self, node_idx: usize, name: &str) -> Option<&str> {
+        let node = self.nodes.get(node_idx)?;
+        for i in 0..node.attr_count {
+            let (ref k, ref v) = self.attrs[node.attr_start + i];
+            if k.eq_ignore_ascii_case(name) {
+                return Some(v.as_str());
+            }
+        }
+        None
+    }
+
+    /// Read text content of a node.
+    pub fn get_text(&self, node_idx: usize) -> Option<&str> {
+        let node = self.nodes.get(node_idx)?;
+        if node.text_len > 0 {
+            Some(&self.text_pool[node.text_start..node.text_start + node.text_len])
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +363,28 @@ mod tests {
         assert_eq!(frames[0].src, "https://example.com/frame");
         assert_eq!(frames[0].title, "test-frame");
         assert_eq!(frames[0].width, "300");
+    }
+
+    #[test]
+    fn test_dom_butterfly_layout() {
+        let html = r#"<div id="container" class="box"><p class="text">Hello</p><span>World</span></div>"#;
+        let tree = html_to_tree(html);
+        let bf = DomButterfly::from_value(&tree);
+
+        // Find elements with trampoline
+        let ps = bf.find_by_tag("p");
+        assert_eq!(ps.len(), 1);
+        assert_eq!(bf.get_attr(ps[0], "class"), Some("text"));
+
+        let divs = bf.find_by_tag("div");
+        assert_eq!(divs.len(), 1);
+        assert_eq!(bf.get_attr(divs[0], "id"), Some("container"));
+        assert_eq!(bf.get_attr(divs[0], "class"), Some("box"));
+
+        // Text nodes
+        let texts = bf.find_by_tag("#text");
+        assert_eq!(texts.len(), 2);
+        assert_eq!(bf.get_text(texts[0]), Some("Hello"));
+        assert_eq!(bf.get_text(texts[1]), Some("World"));
     }
 }

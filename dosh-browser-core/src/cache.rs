@@ -31,7 +31,7 @@ pub fn parse_cache_control(value: &str) -> HashMap<String, String> {
     out
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CacheEntry {
     pub url: String,
     pub status: u16,

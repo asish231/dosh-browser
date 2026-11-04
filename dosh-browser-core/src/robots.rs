@@ -222,6 +222,71 @@ impl RobotsPolicy {
         }
     }
 
+    /// Complete access permitted per RFC 9309 (e.g. 404 Not Found).
+    pub fn allow_all(ttl: Duration) -> Self {
+        Self {
+            groups: vec![UserAgentGroup {
+                user_agents: vec!["*".to_string()],
+                rules: vec![PathRule {
+                    pattern: "/".to_string(),
+                    rule_type: RuleType::Allow,
+                }],
+                crawl_delay: None,
+                content_signals: Vec::new(),
+            }],
+            sitemaps: Vec::new(),
+            global_content_signals: Vec::new(),
+            cached_at: Some(Instant::now()),
+            ttl,
+        }
+    }
+
+    /// Complete access restricted per RFC 9309 (e.g. 401/403 or 5xx error).
+    pub fn disallow_all(ttl: Duration) -> Self {
+        Self {
+            groups: vec![UserAgentGroup {
+                user_agents: vec!["*".to_string()],
+                rules: vec![PathRule {
+                    pattern: "/".to_string(),
+                    rule_type: RuleType::Disallow,
+                }],
+                crawl_delay: None,
+                content_signals: Vec::new(),
+            }],
+            sitemaps: Vec::new(),
+            global_content_signals: Vec::new(),
+            cached_at: Some(Instant::now()),
+            ttl,
+        }
+    }
+
+    /// RFC 9309 Section 2.3.1 status code dispatch table.
+    pub fn from_http_status(status: u16, text: &str, ttl: Duration) -> Self {
+        match status {
+            200..=299 => {
+                let mut policy = Self::parse(text);
+                policy.ttl = ttl;
+                policy
+            }
+            401 | 403 => {
+                // RFC 9309 §2.3.1.4: Complete access restricted
+                Self::disallow_all(ttl)
+            }
+            400..=499 => {
+                // RFC 9309 §2.3.1.4: 404 or other 4xx means completely permitted
+                Self::allow_all(ttl)
+            }
+            500..=599 => {
+                // RFC 9309 §2.3.1.5: Server error means access restricted
+                Self::disallow_all(ttl)
+            }
+            _ => {
+                // Network fail / unexpected status: fail-open with short TTL
+                Self::allow_all(Duration::from_secs(300))
+            }
+        }
+    }
+
     /// Check if `path` is allowed for a given `user_agent`.
     pub fn is_allowed(&self, path: &str, user_agent: &str) -> bool {
         let ua_clean = user_agent.to_lowercase();
@@ -448,6 +513,31 @@ Sitemap: https://example.com/sitemap.xml
 
         // Empty Disallow: clears prior disallows -> everything allowed
         assert!(policy.is_allowed("/private/secret", "Dosh/1.0"));
+    }
+
+    #[test]
+    fn test_rfc9309_status_code_dispatch() {
+        let ttl = Duration::from_secs(86400);
+
+        // 200 OK: parses content
+        let p200 = RobotsPolicy::from_http_status(200, "User-agent: *\nDisallow: /blocked\n", ttl);
+        assert!(!p200.is_allowed("/blocked", "bot"));
+        assert!(p200.is_allowed("/open", "bot"));
+
+        // 401/403: access restricted (disallow all)
+        let p401 = RobotsPolicy::from_http_status(401, "", ttl);
+        assert!(!p401.is_allowed("/anything", "bot"));
+
+        let p403 = RobotsPolicy::from_http_status(403, "", ttl);
+        assert!(!p403.is_allowed("/anything", "bot"));
+
+        // 404: completely permitted (allow all)
+        let p404 = RobotsPolicy::from_http_status(404, "", ttl);
+        assert!(p404.is_allowed("/anything", "bot"));
+
+        // 500: access restricted (disallow all)
+        let p500 = RobotsPolicy::from_http_status(500, "", ttl);
+        assert!(!p500.is_allowed("/anything", "bot"));
     }
 }
 

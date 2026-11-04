@@ -27,7 +27,7 @@ from webresearch.engine.cors import CorsGate
 from webresearch.engine.ip_filter import IpFilter, IpFilterError
 from webresearch.engine.onion import onion_refusal
 from webresearch.engine.rate_limiter import RateLimiter
-from webresearch.engine.robots import RobotsStore
+from webresearch.engine.robots import RobotsPolicy, RobotsStore
 from webresearch.engine.safebrowsing import blocked_result, is_blocked_host
 from webresearch.engine.singleflight import SingleFlight
 from webresearch.engine.trackers import TrackerGraph
@@ -142,10 +142,24 @@ class NetworkEngine:
                     headers={"x-webresearch-blocked": "tracker"},
                 )
 
-        # 5. Robots.txt Compliance Check
+        # 5. Robots.txt Compliance Check (RFC 9309 with SingleFlight coalescing)
         if self.enable_robots:
             ua_str = user_agent or "dosh-browser"
-            if not self.robots.check_url(url, ua_str):
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            policy = self.robots.get(origin)
+            if policy is None:
+                async def _fetch_robots() -> RobotsPolicy:
+                    robots_url = f"{origin}/robots.txt"
+                    try:
+                        r = await client.get(robots_url, headers={"user-agent": ua_str}, timeout=5.0)
+                        return RobotsPolicy.from_http_status(r.status_code, r.text)
+                    except Exception:
+                        return RobotsPolicy.allow_all(300.0)
+
+                policy = await self.singleflight.do(f"robots:{origin}", _fetch_robots)
+                self.robots.set(origin, policy)
+
+            if not policy.is_allowed(parsed.path or "/", ua_str):
                 return FetchResult(
                     url=url,
                     final_url=url,

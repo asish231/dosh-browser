@@ -95,6 +95,17 @@ class PreflightEntry:
     def is_fresh(self) -> bool:
         return time.time() < self.expires_at
 
+    def allows_method(self, method: str) -> bool:
+        upper = method.upper()
+        return "*" in self.allowed_methods or upper in self.allowed_methods
+
+    def allows_header(self, header_name: str) -> bool:
+        hn = header_name.lower()
+        if hn == "authorization":
+            # WHATWG Fetch §3.2.3: Wildcard '*' does NOT cover Authorization header
+            return "authorization" in self.allowed_headers
+        return "*" in self.allowed_headers or hn in self.allowed_headers
+
 
 class CorsStore:
     def __init__(self) -> None:
@@ -120,8 +131,17 @@ class CorsStore:
 
         allow_cred = headers.get("access-control-allow-credentials", "").lower() == "true"
 
-        entry = PreflightEntry(allowed_methods, allowed_headers, allow_cred, max_age)
-        self._entries[(client_origin.rstrip("/"), target_origin.rstrip("/"))] = entry
+        key = (client_origin.rstrip("/"), target_origin.rstrip("/"))
+        existing = self._entries.get(key)
+        if existing and existing.is_fresh():
+            # WHATWG Fetch specification: union allowed methods & headers, clamp TTL
+            existing.allowed_methods.update(allowed_methods)
+            existing.allowed_headers.update(allowed_headers)
+            existing.allow_credentials = existing.allow_credentials or allow_cred
+            existing.expires_at = min(existing.expires_at, time.time() + min(max_age, 7200.0))
+        else:
+            entry = PreflightEntry(allowed_methods, allowed_headers, allow_cred, max_age)
+            self._entries[key] = entry
 
     def get(self, client_origin: str, target_origin: str) -> PreflightEntry | None:
         key = (client_origin.rstrip("/"), target_origin.rstrip("/"))
@@ -156,8 +176,17 @@ class CorsGate:
         upper = method.upper()
 
         preflight = self.store.get(client_origin, target_origin)
-        if preflight and ("*" in preflight.allowed_methods or upper in preflight.allowed_methods):
-            return "preflight_cached"
+        if preflight and preflight.allows_method(upper):
+            all_headers_allowed = True
+            for k, v in headers.items():
+                lk = k.lower()
+                if lk in {"user-agent", "host", "origin", "referer"} or lk.startswith("sec-fetch-") or lk.startswith("sec-ch-ua"):
+                    continue
+                if not is_safelisted_header(lk, v) and not preflight.allows_header(lk):
+                    all_headers_allowed = False
+                    break
+            if all_headers_allowed:
+                return "preflight_cached"
 
         if is_simple_request(upper, headers):
             return "simple"
