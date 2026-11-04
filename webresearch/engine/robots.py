@@ -70,6 +70,47 @@ class RobotsPolicy:
         self.ttl = ttl_seconds
 
     @classmethod
+    def allow_all(cls, ttl_seconds: float = 86400.0) -> RobotsPolicy:
+        """Permit access to all paths per RFC 9309 (e.g. 404 Not Found)."""
+        grp = UserAgentGroup()
+        grp.user_agents = ["*"]
+        grp.rules = [PathRule("/", "allow")]
+        return cls(groups=[grp], sitemaps=[], ttl_seconds=ttl_seconds)
+
+    @classmethod
+    def disallow_all(cls, ttl_seconds: float = 86400.0) -> RobotsPolicy:
+        """Deny access to all paths per RFC 9309 (e.g. 401/403 or 5xx error)."""
+        grp = UserAgentGroup()
+        grp.user_agents = ["*"]
+        grp.rules = [PathRule("/", "disallow")]
+        return cls(groups=[grp], sitemaps=[], ttl_seconds=ttl_seconds)
+
+    @classmethod
+    def from_http_status(
+        cls,
+        status: int,
+        text: str = "",
+        ttl_seconds: float = 86400.0,
+    ) -> RobotsPolicy:
+        """RFC 9309 Section 2.3.1 status code dispatch table."""
+        if 200 <= status <= 299:
+            policy = cls.parse(text)
+            policy.ttl = ttl_seconds
+            return policy
+        elif status in (401, 403):
+            # RFC 9309 §2.3.1.4: Complete access restricted
+            return cls.disallow_all(ttl_seconds)
+        elif 400 <= status <= 499:
+            # RFC 9309 §2.3.1.4: 404 or other 4xx means completely permitted
+            return cls.allow_all(ttl_seconds)
+        elif 500 <= status <= 599:
+            # RFC 9309 §2.3.1.5: Server error means access restricted
+            return cls.disallow_all(ttl_seconds)
+        else:
+            # Network fail / unexpected status: fail-open with short TTL
+            return cls.allow_all(300.0)
+
+    @classmethod
     def parse(cls, text: str) -> RobotsPolicy:
         clean_text = text.lstrip("\ufeff")
         groups: list[UserAgentGroup] = []

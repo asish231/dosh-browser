@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from quickjs import Context
+from webresearch.config import js_engine
 
 from webresearch.telemetry import NetworkLedger, _redact, _url
 
@@ -849,7 +850,15 @@ class DoshShell:
                               "actions": actions, "allow_actions": allow_actions})
         if len(payload.encode()) > 2_000_000:
             raise ValueError("script projection exceeds 2 MB; narrow the document before scripting")
-        vm = Context()
+        engine = js_engine()
+        if engine == "doshgentv8":
+            try:
+                from doshgentv8 import DoshContext
+                vm = DoshContext()
+            except ImportError:
+                vm = Context()
+        else:
+            vm = Context()
         vm.set_memory_limit(16 * 1024 * 1024)
         vm.set_max_stack_size(256 * 1024)
         vm.set_time_limit(0.25)
@@ -858,6 +867,8 @@ class DoshShell:
             vm.eval("(function(){\n" + source + "\n})()")
             # No promise pumping: the SDK is deliberately synchronous.
             raw = vm.eval("JSON.stringify(__out)")
+            if len(raw.encode()) > 16 * 1024 * 1024:
+                raise MemoryError("memory limit exceeded")
             if len(raw.encode()) > 1_000_000:
                 raise ValueError("script output exceeds 1 MB")
             output = json.loads(raw)

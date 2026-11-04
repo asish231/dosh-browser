@@ -10,6 +10,18 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from quickjs import Context
+from webresearch.config import js_engine
+
+
+def _create_context():
+    engine = js_engine()
+    if engine == "doshgentv8":
+        try:
+            from doshgentv8 import DoshContext
+            return DoshContext()
+        except ImportError:
+            return Context()
+    return Context()
 
 from webresearch import device as device_mod
 from webresearch.engine.modules import (
@@ -308,7 +320,7 @@ async def run_scripts(
         "error_messages": [],
         "console": [],
         "dosh_emits": [],
-        "engine": "quickjs",
+        "engine": js_engine(),
         "post_messages": [],
         "resource_requests": [],
         "framework_data": {},
@@ -319,7 +331,12 @@ async def run_scripts(
 
     reusing_ctx = False
     if ctx is None:
-        ctx = Context()
+        ctx = _create_context()
+        active_engine = js_engine()
+        try:
+            ctx.eval(f"globalThis.__WR_ENGINE = {json.dumps(active_engine)}; true")
+        except Exception:
+            pass
         # Web storage seed must be set before MINIDOM_JS evaluates: the
         # storage closures read __WR_STORAGE_SEED at definition time. (json is
         # the module-level import; _json is function-local elsewhere.)
@@ -369,10 +386,13 @@ async def run_scripts(
     ctx.add_callable("host_ws_send_binary", _ws.send_binary)
     ctx.add_callable("host_ws_close", _ws.close)
 
-    def record_error(exc: Exception) -> None:
+    def record_error(exc: Exception, source: str = "") -> None:
         info["errors"] += 1
         if len(info["error_messages"]) < 25:
-            info["error_messages"].append(f"{type(exc).__name__}: {exc}"[:300])
+            msg = f"{type(exc).__name__}: {exc}"[:300]
+            if source:
+                msg = f"{msg} (in {source[:160]})"
+            info["error_messages"].append(msg)
 
     sw_records: list[dict] = []
     sw_revalidate_queue: list[str] = []

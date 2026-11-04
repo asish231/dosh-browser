@@ -4,6 +4,7 @@
   var _nativePromiseResolve = _NativePromise ? _NativePromise.resolve.bind(_NativePromise) : null;
   /* ECMAScript Integer-Indexed Exotic Objects [[Set]]: out-of-bounds writes are no-ops returning true */
   (function () {
+    if (global.__WR_ENGINE === "doshgentv8") return;
     var typedArrayClasses = [
       Uint8Array, Int8Array, Uint8ClampedArray,
       Int16Array, Uint16Array, Int32Array, Uint32Array,

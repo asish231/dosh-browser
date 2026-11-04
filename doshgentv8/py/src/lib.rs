@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use doshgentv8_core::{DoshEngine, HostSeam};
+use doshgentv8_core::{DoshEngine, HostSeam, JsValue};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -69,17 +69,26 @@ struct DoshContext {
 #[pymethods]
 impl DoshContext {
     #[new]
-    fn new() -> PyResult<Self> {
+    #[pyo3(signature = (memory_limit = None))]
+    fn new(memory_limit: Option<usize>) -> PyResult<Self> {
         let host = Arc::new(SharedPyHost(Mutex::new(PyHost {
             callables: HashMap::new(),
         })));
-        let engine = DoshEngine::new(host.clone()).map_err(PyRuntimeError::new_err)?;
+        let engine = DoshEngine::new_with_limit(host.clone(), memory_limit.unwrap_or(0))
+            .map_err(PyRuntimeError::new_err)?;
         Ok(Self { engine, host })
     }
 
-    /// Evaluate JS; returns the result as a string (quickjs parity).
-    fn eval(&mut self, code: &str) -> PyResult<String> {
-        self.engine.eval(code).map_err(PyRuntimeError::new_err)
+    /// Evaluate JS; returns typed Python value (quickjs parity).
+    fn eval(&mut self, py: Python<'_>, code: &str) -> PyResult<Py<PyAny>> {
+        let val = self.engine.eval_raw(code).map_err(PyRuntimeError::new_err)?;
+        match val {
+            JsValue::Null | JsValue::Undefined => Ok(py.None()),
+            JsValue::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any().unbind()),
+            JsValue::Int(i) => Ok(i.into_pyobject(py)?.to_owned().into_any().unbind()),
+            JsValue::Float(f) => Ok(f.into_pyobject(py)?.to_owned().into_any().unbind()),
+            JsValue::String(s) => Ok(s.into_pyobject(py)?.to_owned().into_any().unbind()),
+        }
     }
 
     /// Register a synchronous Python callable under `name` in the JS realm.
@@ -102,6 +111,17 @@ impl DoshContext {
 
     /// Heap budget in bytes (applied at isolate construction; see core docs).
     fn set_memory_limit(&mut self, bytes: u64) {
+        if self.engine.eval_count() == 0 {
+            if let Ok(mut new_engine) = DoshEngine::new_with_limit(self.host.clone(), bytes as usize) {
+                if let Ok(guard) = self.host.0.lock() {
+                    for name in guard.callables.keys() {
+                        let _ = new_engine.add_host(name);
+                    }
+                }
+                self.engine = new_engine;
+                return;
+            }
+        }
         self.engine.set_memory_limit(bytes as usize);
     }
 
@@ -113,6 +133,17 @@ impl DoshContext {
     /// Accepted for quickjs.Context parity. V8 manages its own stack guards,
     /// so there is no separate host-set stack limit to configure.
     fn set_max_stack_size(&mut self, _bytes: u64) {}
+
+    /// Explicit close / dispose hook for parity.
+    fn close(&mut self) {}
+
+    fn heap_used(&mut self) -> usize {
+        self.engine.used_heap_size()
+    }
+
+    fn heap_total(&mut self) -> usize {
+        self.engine.total_heap_size()
+    }
 }
 
 #[pymodule]

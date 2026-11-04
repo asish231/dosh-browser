@@ -197,6 +197,27 @@ def test_robots_policy_evaluation():
     assert policy.is_allowed("/secret/open", "GenericBot")
 
 
+def test_rfc9309_status_code_dispatch():
+    # 200 OK: parses content
+    p200 = RobotsPolicy.from_http_status(200, "User-agent: *\nDisallow: /blocked/\n")
+    assert not p200.is_allowed("/blocked/path", "bot")
+    assert p200.is_allowed("/other/path", "bot")
+
+    # 401/403: complete access restricted per RFC 9309 §2.3.1.4
+    p401 = RobotsPolicy.from_http_status(401)
+    assert not p401.is_allowed("/anything", "bot")
+    p403 = RobotsPolicy.from_http_status(403)
+    assert not p403.is_allowed("/anything", "bot")
+
+    # 404: complete access permitted per RFC 9309 §2.3.1.4
+    p404 = RobotsPolicy.from_http_status(404)
+    assert p404.is_allowed("/anything", "bot")
+
+    # 500: server error access restricted per RFC 9309 §2.3.1.5
+    p500 = RobotsPolicy.from_http_status(500)
+    assert not p500.is_allowed("/anything", "bot")
+
+
 # ============================================================================
 # 5. CorsGate (W3C CORS Preflight & Evaluation)
 # ============================================================================
@@ -250,6 +271,50 @@ def test_cors_response_validation():
     gate.validate_response(client, True, {"access-control-allow-origin": "https://app.com"})
 
 
+def test_whatwg_cors_grant_merging():
+    gate = CorsGate()
+    client = "https://app.com"
+    target = "https://api.com/items"
+    target_origin = "https://api.com"
+
+    # First preflight grant: GET and PUT
+    gate.store.record_preflight(client, target_origin, {
+        "access-control-allow-methods": "GET, PUT",
+        "access-control-allow-headers": "x-custom-1",
+        "access-control-max-age": "300",
+    })
+
+    # Second preflight grant: DELETE
+    gate.store.record_preflight(client, target_origin, {
+        "access-control-allow-methods": "DELETE",
+        "access-control-allow-headers": "x-custom-2",
+        "access-control-max-age": "60",
+    })
+
+    # Union: both PUT and DELETE must be cached
+    assert gate.evaluate_request(client, target, "PUT", {"x-custom-1": "a"}) == "preflight_cached"
+    assert gate.evaluate_request(client, target, "DELETE", {"x-custom-2": "b"}) == "preflight_cached"
+
+
+def test_whatwg_cors_authorization_wildcard_exemption():
+    gate = CorsGate()
+    client = "https://app.com"
+    target = "https://api.com/data"
+    target_origin = "https://api.com"
+
+    # Preflight with wildcard '*' allow-headers
+    gate.store.record_preflight(client, target_origin, {
+        "access-control-allow-methods": "GET, POST",
+        "access-control-allow-headers": "*",
+    })
+
+    # Regular custom header allowed
+    assert gate.evaluate_request(client, target, "POST", {"x-other": "123"}) == "preflight_cached"
+
+    # BUT Authorization header requires explicit allowance per WHATWG Fetch §3.2.3
+    assert gate.evaluate_request(client, target, "POST", {"authorization": "Bearer token"}) == "preflight_required"
+
+
 # ============================================================================
 # 6. WebBotAuth (RFC 9421 Signatures)
 # ============================================================================
@@ -299,6 +364,49 @@ def test_sqlite_cache_lifecycle():
 
     cache.invalidate(url)
     assert cache.get(url) is None
+
+
+def test_sqlite_cache_advanced_features():
+    cache = SqliteHttpCache()
+    url = "https://example.com/api/data"
+
+    # 1. Vary matching
+    req_headers = {"Accept": "application/json", "User-Agent": "agent1"}
+    resp_headers = {
+        "cache-control": "max-age=600",
+        "etag": '"etag-v1"',
+        "vary": "Accept",
+    }
+    cache.store(url, 200, resp_headers, b"json data", req_headers=req_headers)
+
+    # Same Vary header matches
+    assert cache.get(url, req_headers={"Accept": "application/json"}) is not None
+    # Mismatched Vary header misses
+    assert cache.get(url, req_headers={"Accept": "text/html"}) is None
+
+    # 2. get_result state machine
+    status, entry = cache.get_result(url, req_headers={"Accept": "application/json"})
+    assert status == "hit"
+    assert entry is not None
+
+    # Stale with validator -> revalidate
+    status_reval, _ = cache.get_result(url, req_headers={"Accept": "application/json"}, now=time.time() + 1000)
+    assert status_reval == "revalidate"
+
+    # 3. 304 renewal without body rewrite
+    renewed = cache.renew(url, 304, {"cache-control": "max-age=1200", "etag": '"etag-v2"'})
+    assert renewed is True
+    updated = cache.get(url, req_headers={"Accept": "application/json"})
+    assert updated is not None
+    assert updated["body"] == b"json data"
+    assert updated["etag"] == '"etag-v2"'
+    assert updated["max_age"] == 1200.0
+
+    # 4. Script cache
+    cache.put_script_cache("https://example.com/app.js", b"bytecode-blob", "hash-abc")
+    bc = cache.get_script_cache("https://example.com/app.js", "hash-abc")
+    assert bc == b"bytecode-blob"
+    assert cache.get_script_cache("https://example.com/app.js", "wrong-hash") is None
 
 
 # ============================================================================
