@@ -7,7 +7,8 @@ question the same way instead of by inference.
 Current status (2026-11-04):
 - PYTHON (webresearch/) is the OFFICIAL product: full agent browser —
   script execution, captcha solver, login/OTP, frame messaging, video
-  lane, 35 shell commands; 859-test suite green.
+  lane, unified network pipeline (SSRF IpFilter, SingleFlight, RateLimiter,
+  Robots, CORS, WebBotAuth, SQLite Cache), 35 shell commands; 874-test suite green.
 - RUST (dosh-browser-core/) is EXPERIMENTAL: the pipeline is ported and
   unit-tested (fetch → parse → project → session → shell → server,
   169/169 tests) with the doshgentv8 V8 core, ACD 2.0, champion INT8 neural
@@ -36,7 +37,8 @@ LANES = {
             "The product. Full agent browser: QuickJS engine with live DOM, "
             "reCAPTCHA v2 protocol solver, login/OTP, frame messaging, "
             "WebSocket, ESM translator, video lane, MCP/HTTP/CLI surfaces, "
-            "ACD 2.0, champion INT8 neural model, 35 shell commands. 859-test suite green."
+            "ACD 2.0, champion INT8 neural model, unified network pipeline, "
+            "35 shell commands. 874-test suite green."
         ),
     },
     "rust": {

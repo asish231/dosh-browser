@@ -384,12 +384,12 @@ Per `webresearch/config.py` and `AGENTS.md`, dosh-browser maintains two distinct
 | **JS Engine** | **QuickJS** (official default; `doshgentv8` selectable) | **doshgentv8-core** (V8 152.2 / 15.9.0 native `HostSeam`) |
 | **DOM Substrate** | In-house `minidom.js` + Python host callables | In-house `minidom.js` + Rust native `HostSeam` |
 | **Neural Interactivity** | Pure-Python INT8 model (0 dependencies, ~1.2 µs) | Pure-Rust SIMD INT8 model (0 heap allocs, 100.99 ns) |
-| **HTTP Transport** | `curl_cffi` (JA3/JA4 Chrome 124 TLS matching) | Unified `NetworkEngine` (SSRF `IpFilter`, `SingleFlight`, `RateLimiter`, `Robots`, `CorsGate`, `WebBotAuth`, `SqliteCache`, `reqwest`) |
+| **HTTP Transport** | `curl_cffi` + Unified `NetworkEngine` (SSRF `IpFilter`, `SingleFlight`, `RateLimiter`, `Robots`, `CorsGate`, `WebBotAuth`, `SqliteHttpCache`) | Unified `NetworkEngine` (SSRF `IpFilter`, `SingleFlight`, `RateLimiter`, `Robots`, `CorsGate`, `WebBotAuth`, `SqliteCache`, `reqwest`) |
 | **HTML Parser** | `selectolax.lexbor` (C Lexbor engine) | `kuchiki` (pure Rust HTML5 tree) |
 | **Content Representation**| ACD 2.0 + action surface (stable refs) | ACD 2.0 + action surface (`Target` structs) |
 | **Server & Protocols** | FastAPI REST + MCP stdio server | Axum REST + stdio MCP server |
 | **Shell & Storage** | 35 commands, SQLite skills & snapshots | 35 commands, SQLite skills & snapshots |
-| **Test Suite** | **859 passed; 8 skipped; 0 failed** (`pytest`) | **169 passed; 0 failed** (`cargo test`) |
+| **Test Suite** | **874 passed; 8 skipped; 0 failed** (`pytest`) | **169 passed; 0 failed** (`cargo test`) |
 
 Both implementations share identical contracts:
 - **No Chromium / No CDP**: Pure HTTP fetch, in-house mini-DOM, and native event models.

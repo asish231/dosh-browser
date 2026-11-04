@@ -6,8 +6,10 @@ Guidance for AI agents and humans working in this repository.
 
 **Python (`webresearch/`) is the OFFICIAL product.** The full agent browser —
 script execution, captcha solver, login/OTP, frame messaging, video lane,
-ACD 2.0, champion INT8 neural model, 35 shell commands, MCP/HTTP/CLI surfaces —
-with the 859-test suite green. All agent surfaces serve this lane.
+ACD 2.0, champion INT8 neural model, unified network pipeline (SSRF IpFilter,
+SingleFlight, RateLimiter, Robots, CORS, WebBotAuth, SQLite cache), 35 shell
+commands, MCP/HTTP/CLI surfaces — with the 874-test suite green. All agent
+surfaces serve this lane.
 
 **Rust (`dosh-browser-core/`) is EXPERIMENTAL.** The pipeline is ported and
 unit-tested (fetch → parse → project → session → shell → server, 169/169
