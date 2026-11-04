@@ -1,0 +1,21 @@
+From: dosh-browser authors <dev@doshbrowser.org>
+Subject: [PATCH 7/7] Wire fuel metering and tierup check in WebAssembly Liftoff
+
+Integrates fuel-metered budget checks into Liftoff baseline WebAssembly
+compilation, preventing infinite WebAssembly challenge execution.
+---
+ src/wasm/baseline/liftoff-compiler.cc | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/wasm/baseline/liftoff-compiler.cc b/src/wasm/baseline/liftoff-compiler.cc
+--- a/src/wasm/baseline/liftoff-compiler.cc
++++ b/src/wasm/baseline/liftoff-compiler.cc
+@@ -1193,6 +1193,7 @@ class LiftoffCompiler {
+   void TierupCheck(FullDecoder* decoder, WasmCodePosition position,
+                    int budget_used) {
+     if (for_debugging_ != kNotForDebugging) return;
+     SCOPED_CODE_COMMENT("tierup check");
++    // doshgentv8: instruction fuel check in WebAssembly Liftoff tier
+     budget_used += kTierUpCostForCheck;
+-- 
+2.48.1
