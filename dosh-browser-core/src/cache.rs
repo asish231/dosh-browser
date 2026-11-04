@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const MAX_ENTRIES: usize = 200;
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-fn now_secs() -> f64 {
+pub fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())

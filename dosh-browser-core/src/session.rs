@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use url::Url;
 
-use crate::fetch;
-
 /// The result of a page navigation, matching Python's Page model.
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Page {
@@ -175,6 +173,8 @@ pub struct Session {
     pub last_popups: Vec<serde_json::Value>,
     /// Network ledger for telemetry
     pub network_ledger: crate::telemetry::NetworkLedger,
+    /// Central Network Engine
+    pub network: crate::network::NetworkEngine,
     /// Console event log
     pub console_logs: Vec<serde_json::Value>,
 }
@@ -198,6 +198,7 @@ impl Session {
             last_dialogs: Vec::new(),
             last_popups: Vec::new(),
             network_ledger: crate::telemetry::NetworkLedger::new(1000, false),
+            network: crate::network::NetworkEngine::default(),
             console_logs: Vec::new(),
         }
     }
@@ -225,15 +226,13 @@ impl Session {
         url: &str,
         max_chars: usize,
     ) -> Result<Page, Box<dyn std::error::Error + Send + Sync>> {
-        // 1. Fetch the URL
-        let result = fetch::fetch(
-            &self.client,
-            url,
-            "GET",
-            None,
-            "{}",
-            8_000_000,
-        ).await?;
+        // 1. Fetch the URL through the central NetworkEngine (SSRF, rate limiting, cache, singleflight)
+        let req = crate::network::NetworkRequest::new(url);
+        let result = self
+            .network
+            .fetch(req)
+            .await
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let mut html = result.body.clone();
         let mut js_errors = Vec::new();

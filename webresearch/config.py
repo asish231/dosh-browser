@@ -10,9 +10,10 @@ Current status (2026-11-04):
   lane, 35 shell commands; 859-test suite green.
 - RUST (dosh-browser-core/) is EXPERIMENTAL: the pipeline is ported and
   unit-tested (fetch → parse → project → session → shell → server,
-  140/140 tests) with the doshgentv8 V8 core, ACD 2.0, champion INT8 neural
-  interactivity model, and RFC 9111 HTTP cache, but page script execution is
-  not yet wired into goto(), and the adversarial/agent layers (captcha, login,
+  169/169 tests) with the doshgentv8 V8 core, ACD 2.0, champion INT8 neural
+  interactivity model, unified network pipeline (SSRF IpFilter, SingleFlight,
+  RateLimiter, Robots, CORS, WebBotAuth, RFC 9111 SQLite Cache), but page script
+  execution is not yet wired into goto(), and the adversarial/agent layers (captcha, login,
   frames, ws, ESM, MCP, telemetry) are not ported. It is not behind any agent surface.
 - The V8 engine core (doshgentv8/) is proven against the QuickJS oracle
   (bridge GREEN: 27.5ms boot, 38µs host calls, native WASM) and will
@@ -43,9 +44,9 @@ LANES = {
         "status": "experimental",
         "summary": (
             "The pure-Rust rewrite, in progress. Pipeline ported and unit-tested "
-            "(fetch/parse/project/session/shell/server, 140/140 tests) with the "
-            "doshgentv8 V8 core, ACD 2.0, champion INT8 neural model, and HTTP cache, "
-            "but page script execution is not yet wired into "
+            "(fetch/parse/project/session/shell/server, 169/169 tests) with the "
+            "doshgentv8 V8 core, ACD 2.0, champion INT8 neural model, unified network pipeline, "
+            "and HTTP cache, but page script execution is not yet wired into "
             "goto() and the adversarial/agent layers are not ported. Not behind "
             "any agent surface; do not route production traffic to it."
         ),

@@ -449,6 +449,7 @@ dependencies = [
  "kuchiki",
  "regex",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
