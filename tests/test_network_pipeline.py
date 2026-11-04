@@ -333,3 +333,4 @@ async def test_network_engine_robots_disallow():
     res = await engine.fetch("https://restricted.example.com/disallowed/doc.html", client=None)
     assert res.status == 403
     assert res.headers.get("x-webresearch-blocked") == "robots.txt"
+
