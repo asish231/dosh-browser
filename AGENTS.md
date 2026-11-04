@@ -201,7 +201,8 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | Snapshot & diff | `shell.py:snapshot/diff` | In shell tests | ✅ Evidence snapshot of controls, not VM checkpoint |
 | `open`, `actions`, `act`, `net.*`, `console`, `eval`, `skill.*`, `db`, `storage`, `snapshot`/`diff`, `layers`, `frames`, `tabs`, `video`, `read`, `history`, `cookies`, `wait`, `caps`, `screenshot`, `frame.eval`, `ref`, `trace`, `watch` | `shell.py` | All commands tested | ✅ 33 commands fully connected |
 | Binary WebSockets (count & skip) | `engine/ws.py` | Disclosed | ❌ Implementation exists, flagged as unimplemented |
-| WASM interpreter | `engine/wasm.py` | ❌ Not yet built | ❌ Unimplemented |
+| Scoped WASM Interpreter & In-DOM Engine | `webresearch/engine/wasm.py`, `minidom.js` | `tests/test_wasm_engine.py`, `tests/test_wasm_minidom.py` (13 tests) | ✅ Implemented, fuel-metered anti-tarpit, linear memory, stack/table ops, causal export telemetry |
+| Native Function Cloaking | `minidom.js` (`__makeNative`, `Function.prototype.toString`) | `tests/test_stealth_cloaking.py` (6 tests) | ✅ Implemented, `[native code]` cloaking, spec-compliant name/length, CreepJS/Turnstile defense |
 | Unified SQL DB (history+cookies+storage+ledger) | ❌ | | ❌ Unimplemented |
 | Element identity tracker | `engine/identity.py` | ❌ | ❌ Unimplemented |
 | Causal trace stream (action→Δ→net→console) | `telemetry.py` + `shell.py` | ❌ | ❌ Wired but needs full pass integration |
@@ -239,7 +240,7 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | HTML→DOM with script ordering, mutated-document truth | `minidom.js` | ✅ HAVE |
 | ESM module graph translator (66-module LinkedIn graph verified) | `engine/modules.py` | ✅ HAVE |
 | Runtime-injected script execution | `runtime.py` | ✅ HAVE |
-| **Scoped WASM interpreter** (opcode subset real challenge modules use + hermetic tests) | Not built | `INVENT` — biggest engine hole |
+| **Scoped WASM interpreter** (opcode subset real challenge modules use + hermetic tests) | `webresearch/engine/wasm.py` + `minidom.js` | ✅ HAVE |
 | WebSocket binary frames | Counted & skipped | `INVENT` (currently counted & skipped) |
 | Worker substrate decision: real threads vs honest single-thread emulation with real message queues | Inert constructors | `DECIDE + INVENT` |
 | Service worker real execution (SW JS runs, navigation intercepted) | Python simulation | `INVENT` or keep simulation with disclosure |
