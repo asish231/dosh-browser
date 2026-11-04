@@ -33,19 +33,21 @@ DOSH is a standalone agent browser engineered from the ground up: an owned HTTP/
 
 ### 1. One-Line Installer (Recommended)
 
-Install the precompiled, standalone pure-Rust `dosh` binary:
-
+**macOS & Linux:**
 ```bash
 # Default: Official Standalone Pure-Rust Browser (Zero Python dependencies)
 curl -fsSL https://raw.githubusercontent.com/asish231/dosh-browser/main/install.sh | bash
-```
 
-```bash
 # Optional: Install Standalone Browser AND Python Companion SDK (-p / --python)
 curl -fsSL https://raw.githubusercontent.com/asish231/dosh-browser/main/install.sh | bash -s -- -p
 ```
 
-The installer detects your platform (macOS Apple Silicon/Intel, Linux x86_64/aarch64), installs `dosh` into `~/.dosh/bin`, and adds it to your `$PATH`.
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/asish231/dosh-browser/main/install.ps1 | iex
+```
+
+The installer detects your platform (macOS Apple Silicon/Intel, Linux x86_64/aarch64, Windows x64), installs `dosh` into your local bin directory (`~/.dosh/bin` or `%USERPROFILE%\.dosh\bin`), and automatically configures your `PATH`.
 
 ### 2. Install from Cargo
 

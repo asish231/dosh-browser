@@ -166,13 +166,18 @@ class FakeClient:
 
 def _real_jpeg(size: int = 90) -> bytes:
     """A real (tiny) JPEG grid image: PIL must be able to crop it."""
-    import io
+    try:
+        import io
+        from PIL import Image
 
-    from PIL import Image
-
-    buf = io.BytesIO()
-    Image.new("RGB", (size, size), (128, 128, 128)).save(buf, format="JPEG", quality=70)
-    return buf.getvalue()
+        buf = io.BytesIO()
+        Image.new("RGB", (size, size), (128, 128, 128)).save(buf, format="JPEG", quality=70)
+        return buf.getvalue()
+    except ImportError:
+        import base64
+        return base64.b64decode(
+            "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA="
+        )
 
 
 REAL_JPEG = _real_jpeg()
