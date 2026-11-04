@@ -72,12 +72,72 @@ fn parse_shell_line(line: &str) -> (&str, serde_json::Value) {
     }
 }
 
+fn find_python_executable() -> String {
+    if let Ok(venv) = env::var("VIRTUAL_ENV") {
+        let p = std::path::Path::new(&venv).join("bin/python3");
+        if p.exists() {
+            return p.to_string_lossy().to_string();
+        }
+        let p_alt = std::path::Path::new(&venv).join("bin/python");
+        if p_alt.exists() {
+            return p_alt.to_string_lossy().to_string();
+        }
+    }
+    let local_venv = std::path::Path::new(".venv").join("bin/python3");
+    if local_venv.exists() {
+        return local_venv.to_string_lossy().to_string();
+    }
+    "python3".to_string()
+}
+
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = env::args().collect();
+    let raw_args: Vec<String> = env::args().collect();
+    let mut is_python_mode = false;
+    let mut args: Vec<String> = Vec::new();
+
+    for (idx, a) in raw_args.into_iter().enumerate() {
+        if idx == 0 {
+            args.push(a);
+            continue;
+        }
+        if a == "-p" || a == "--python" || a == "--py" {
+            is_python_mode = true;
+        } else if a == "-d" || a == "--default" || a == "--rust" {
+            is_python_mode = false;
+        } else {
+            args.push(a);
+        }
+    }
+
+    if is_python_mode {
+        let py_bin = find_python_executable();
+        let mut py_cmd = std::process::Command::new(py_bin);
+        py_cmd.arg("-m").arg("webresearch");
+        for a in args.iter().skip(1) {
+            py_cmd.arg(a);
+        }
+        match py_cmd.status() {
+            Ok(status) => {
+                process::exit(status.code().unwrap_or(0));
+            }
+            Err(e) => {
+                eprintln!("Error executing Python companion SDK: {}", e);
+                eprintln!("\nTo install or activate the Python companion SDK:");
+                eprintln!("    pip install dosh-browser");
+                eprintln!("Or reinstall via:");
+                eprintln!("    curl -fsSL https://raw.githubusercontent.com/asish231/dosh-browser/main/install.sh | bash -s -- -p");
+                process::exit(1);
+            }
+        }
+    }
+
     if args.len() < 2 {
         eprintln!("dosh — Agent-native browser (pure Rust core, doshgentv8 V8 engine)");
-        eprintln!("Usage: dosh <command> [args...]");
+        eprintln!("Usage: dosh [-p|--python] [-d|--rust] <command> [args...]");
+        eprintln!("\nLanes:");
+        eprintln!("  -d, --rust, --default     Official standalone pure-Rust browser (default)");
+        eprintln!("  -p, --py, --python        Optional Python companion SDK (webresearch)");
         eprintln!("\nCommands:");
         eprintln!("  read <url> [--json]       Read and project an LLM-ready page model");
         eprintln!("  search <query> [--json]   Web search with DuckDuckGo fallback");
@@ -94,7 +154,10 @@ async fn main() {
     match cmd.as_str() {
         "--help" | "-h" | "help" => {
             eprintln!("dosh — Agent-native browser (pure Rust core, doshgentv8 V8 engine)");
-            eprintln!("Usage: dosh <command> [args...]");
+            eprintln!("Usage: dosh [-p|--python] [-d|--rust] <command> [args...]");
+            eprintln!("\nLanes:");
+            eprintln!("  -d, --rust, --default     Official standalone pure-Rust browser (default)");
+            eprintln!("  -p, --py, --python        Optional Python companion SDK (webresearch)");
             eprintln!("\nCommands:");
             eprintln!("  read <url> [--json]       Read and project an LLM-ready page model");
             eprintln!("  search <query> [--json]   Web search with DuckDuckGo fallback");
