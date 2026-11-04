@@ -24,12 +24,12 @@ pub fn project_status() -> serde_json::Value {
             "rust": {
                 "path": "dosh-browser-core/",
                 "status": "official",
-                "summary": "Full pure-Rust browser core with doshgentv8 V8 engine, RFC 9111 caching, ANBF binary packaging, 35 shell commands, and HTTP/REST server."
+                "summary": "Full pure-Rust browser core with doshgentv8 V8 engine, RFC 9111 caching, ANBF binary packaging, 36 shell commands, and HTTP/REST server."
             },
             "python": {
                 "path": "webresearch/",
-                "status": "reference",
-                "summary": "Original reference prototype with QuickJS."
+                "status": "optional-sdk",
+                "summary": "Companion Python SDK and agent framework integration."
             }
         }
     })

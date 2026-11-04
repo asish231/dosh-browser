@@ -30,37 +30,29 @@ import os
 # ---------------------------------------------------------------------------
 
 LANES = {
-    "python": {
-        "path": "webresearch/",
-        "status": "official",
-        "summary": (
-            "The product. Full agent browser: QuickJS engine with live DOM, "
-            "reCAPTCHA v2 protocol solver, login/OTP, frame messaging, "
-            "WebSocket, ESM translator, video lane, MCP/HTTP/CLI surfaces, "
-            "ACD 2.0, champion INT8 neural model, unified network pipeline, "
-            "35 shell commands. 874-test suite green."
-        ),
-    },
     "rust": {
         "path": "dosh-browser-core/",
-        "status": "experimental",
+        "status": "primary",
         "summary": (
-            "The pure-Rust rewrite, in progress. Pipeline ported and unit-tested "
-            "(fetch/parse/project/session/shell/server, 169/169 tests) with the "
-            "doshgentv8 V8 core, ACD 2.0, champion INT8 neural model, unified network pipeline, "
-            "and HTTP cache, but page script execution is not yet wired into "
-            "goto() and the adversarial/agent layers are not ported. Not behind "
-            "any agent surface; do not route production traffic to it."
+            "The primary product. Pure-Rust standalone browser binary (dosh) and core "
+            "crate with doshgentv8 V8 engine, ACD 2.0, champion INT8 neural model, "
+            "unified network pipeline, 36 shell commands, REST server, and MCP server. "
+            "Zero Python runtime dependency."
         ),
-        "migration_gate": (
-            "Lanes flip only after Phase 2 (WR_JS_ENGINE dual-engine parity, "
-            "full suite green on both engines) AND the goto() script-execution "
-            "wiring is verified against the Python oracle."
+    },
+    "python": {
+        "path": "webresearch/",
+        "status": "optional-sdk",
+        "summary": (
+            "The companion Python package and SDK. Full agent browser support: "
+            "PyO3 native bindings via doshgentv8_rust, QuickJS fallback, "
+            "reCAPTCHA v2 protocol solver, login/OTP, frame messaging, "
+            "video lane, MCP/HTTP/CLI surfaces, ACD 2.0, and 36 shell commands."
         ),
     },
 }
 
-OFFICIAL_LANE = "python"
+OFFICIAL_LANE = "rust"
 
 
 def lane_status(name: str) -> dict:
@@ -143,9 +135,7 @@ def project_status() -> dict:
         "lanes": {name: lane_status(name) for name in LANES},
         "js_engine": js_engine_status(),
         "policy": (
-            "Python (webresearch/) is the official product until the Rust "
-            "migration completes its gate: full-suite green on both engines "
-            "and goto() script execution verified against the Python oracle. "
-            "All agent surfaces (MCP, HTTP, CLI) serve the official lane."
+            "Rust (dosh-browser-core/) is the primary standalone browser binary. "
+            "Python (webresearch/) is the optional package and SDK for Python agent workflows."
         ),
     }

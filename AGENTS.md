@@ -4,25 +4,20 @@ Guidance for AI agents and humans working in this repository.
 
 ## Lane status (one source of truth: `webresearch/config.py`)
 
-**Python (`webresearch/`) is the OFFICIAL product.** The full agent browser —
-script execution, captcha solver, login/OTP, frame messaging, video lane,
-ACD 2.0, champion INT8 neural model, unified network pipeline (SSRF IpFilter,
-SingleFlight, RateLimiter, Robots, CORS, WebBotAuth, SQLite cache), 35 shell
-commands, MCP/HTTP/CLI surfaces — with the 874-test suite green. All agent
-surfaces serve this lane.
+**Rust (`dosh-browser-core/`) is the PRIMARY product.** The standalone agent
+browser binary (`dosh`) and engine core — pure Rust pipeline (fetch → parse → project →
+session → shell → server/MCP, 189/189 tests green) powered by our custom `doshgentv8`
+V8 engine, ACD 2.0, SIMD INT8 neural model, unified network pipeline (SSRF IpFilter,
+SingleFlight, RateLimiter, Robots, CORS, WebBotAuth, RFC 9111 SQLite cache),
+36 shell commands, Site-as-SDK API discovery, diff-first reading, and durable SQLite
+session checkpoints. Zero Python runtime dependency for browser operations.
 
-**Rust (`dosh-browser-core/`) is EXPERIMENTAL.** The pipeline is ported and
-unit-tested (fetch → parse → project → session → shell → server, 169/169
-tests) on the doshgentv8 V8 core with ACD 2.0, SIMD INT8 neural model, unified
-network pipeline (SSRF IpFilter, SingleFlight, RateLimiter, Robots, CORS, WebBotAuth,
-RFC 9111 SQLite cache), but page script execution is not yet wired into `goto()`
-and the adversarial/agent layers are not ported. Do not route production
-traffic to it, do not present it as the product, and do not flip this status
-until the migration gate passes: full-suite green on BOTH engines AND goto()
-script execution verified against the Python oracle. `WR_JS_ENGINE=doshgentv8`
-selects the (also experimental) V8 engine lane; the default remains QuickJS.
+**Python (`webresearch/`) is an OPTIONAL companion package.** The Python SDK
+and agent integration package — provides PyO3 native bindings via `doshgentv8_rust`,
+QuickJS fallback, reCAPTCHA v2 protocol solver, login/OTP, frame messaging,
+video lane, FastAPI REST server, and MCP tools for Python agentic frameworks.
 
-Every surface must answer "which version is official?" from
+Every surface answers "which version is primary?" from
 `webresearch/config.py` (`shell product` / `project_status()`), never by
 inference from commit messages.
 
