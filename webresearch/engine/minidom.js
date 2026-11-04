@@ -2066,6 +2066,7 @@
       bottom: null,
       right: null,
       flexDirection: null,
+      flexWrap: null,
       gap: null,
       width: null,
       height: null,
@@ -2235,6 +2236,7 @@ var pos = (st.position || "").toLowerCase();
         bottom: st.bottom,
         right: st.right,
         flexDirection: flexDir,
+        flexWrap: (st.flexWrap || "nowrap").toLowerCase(),
         gap: st.gap,
         width: st.width,
         height: st.height,
@@ -2441,18 +2443,23 @@ var pos = (st.position || "").toLowerCase();
                 w = Math.max(30, Math.min(contentW, tw + padding[1] + padding[3] + 20));
               }
             }
-            var itemContentW = Math.max(0, w - padding[1] - padding[3]);
-            var r = layoutChildren(c, ccs, curX + margin[3] + padding[3], y + margin[0] + padding[0], itemContentW);
-            var itemH = (h == null) ? Math.max(0, r.bottom - (y + margin[0] + padding[0])) : h;
-            var boxH = padding[0] + itemH + padding[2];
-            c.__box = { x: curX + margin[3], y: y + margin[0], width: w, height: boxH };
-            layout.boxes++;
             var fullItemW = margin[3] + w + margin[1];
+            if (cs.flexWrap === "wrap" && curX + fullItemW > x + contentW && curX > x) {
+              curX = x;
+              curY += maxRowH + gap;
+              maxRowH = 0;
+            }
+            var itemContentW = Math.max(0, w - padding[1] - padding[3]);
+            var r = layoutChildren(c, ccs, curX + margin[3] + padding[3], curY + margin[0] + padding[0], itemContentW);
+            var itemH = (h == null) ? Math.max(0, r.bottom - (curY + margin[0] + padding[0])) : h;
+            var boxH = padding[0] + itemH + padding[2];
+            c.__box = { x: curX + margin[3], y: curY + margin[0], width: w, height: boxH };
+            layout.boxes++;
             curX += fullItemW + (idx < children.length - 1 ? gap : 0);
             if (boxH + margin[0] + margin[2] > maxRowH) maxRowH = boxH + margin[0] + margin[2];
           }
         });
-        return { bottom: isCol ? curY : (y + maxRowH), maxW: isCol ? totalColW : (curX - x) };
+        return { bottom: isCol ? curY : (curY + maxRowH), maxW: isCol ? totalColW : (curX - x) };
       }
       var cursor = y;
       var line = null;
@@ -2465,8 +2472,16 @@ var pos = (st.position || "").toLowerCase();
         line.runs.forEach(function (r) {
           var rec = { x: r.x, y: cursor, h: h, text: r.text || "" };
           (r.el.__lines = r.el.__lines || []).push(rec);
-          r.el.__box = { x: r.x, y: cursor, width: r.w, height: h };
-          layout.boxes++;
+          if (!r.el.__box) {
+            r.el.__box = { x: r.x, y: cursor, width: r.w, height: h };
+            layout.boxes++;
+          } else if (r.el !== el && r.el.nodeName !== "body" && r.el.nodeName !== "html") {
+            var bx1 = Math.min(r.el.__box.x, r.x);
+            var by1 = Math.min(r.el.__box.y, cursor);
+            var bx2 = Math.max(r.el.__box.x + r.el.__box.width, r.x + r.w);
+            var by2 = Math.max(r.el.__box.y + r.el.__box.height, cursor + h);
+            r.el.__box = { x: bx1, y: by1, width: bx2 - bx1, height: by2 - by1 };
+          }
         });
         cursor += h;
         if (line.w > maxW) maxW = line.w;
@@ -2610,6 +2625,18 @@ var pos = (st.position || "").toLowerCase();
         else if (relRight != null) el.__box.x -= relRight;
         if (relTop != null) el.__box.y += relTop;
         else if (relBottom != null) el.__box.y -= relBottom;
+      } else if (cs.position === "sticky") {
+        var stickyTop = __parsePx(cs.top, null, cs.fontSize);
+        var stickyBottom = __parsePx(cs.bottom, null, cs.fontSize);
+        var curScrollY = global.scrollY || 0;
+        if (stickyTop != null) {
+          var targetY = curScrollY + stickyTop;
+          if (el.__box.y < targetY) el.__box.y = targetY;
+        } else if (stickyBottom != null) {
+          var vh = Number(global.innerHeight) || 720;
+          var targetY2 = curScrollY + vh - stickyBottom - totalH;
+          if (el.__box.y > targetY2) el.__box.y = targetY2;
+        }
       }
       layout.boxes++;
       return { bottom: by + totalH + margin[2], w: margin[3] + w + margin[1] };
@@ -3641,8 +3668,34 @@ var pos = (st.position || "").toLowerCase();
     return id;
   };
   global.clearInterval = function (id) { __timerDrop(id); };
-  global.requestAnimationFrame = function (fn) { return global.setTimeout(fn, 16); };
-  global.cancelAnimationFrame = function (id) { __timerDrop(id); };
+  var __rafSeq = 1;
+  var __rafQueue = [];
+  global.requestAnimationFrame = function (fn) {
+    if (typeof fn !== "function") throw new TypeError("Argument 1 to Window.requestAnimationFrame must be a function");
+    var id = __rafSeq++;
+    var originTime = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : __timerNow;
+    __rafQueue.push({ id: id, fn: fn, scheduledAt: originTime });
+    return id;
+  };
+  global.cancelAnimationFrame = function (id) {
+    __rafQueue = __rafQueue.filter(function (item) { return item.id !== id; });
+  };
+  global.__drainRaf = function (frameTime) {
+    if (__rafQueue.length === 0) return 0;
+    var now = (frameTime !== undefined) ? frameTime : ((global.performance && typeof global.performance.now === "function") ? global.performance.now() : __timerNow);
+    var batch = __rafQueue.slice();
+    __rafQueue = [];
+    var executed = 0;
+    for (var i = 0; i < batch.length; i++) {
+      try {
+        batch[i].fn(now);
+        executed++;
+      } catch (e) {
+        if (typeof global.__recordError === "function") global.__recordError(e);
+      }
+    }
+    return executed;
+  };
   global.queueMicrotask = function (fn) {
     if (_nativePromiseResolve) {
       _nativePromiseResolve().then(fn);
@@ -3651,6 +3704,7 @@ var pos = (st.position || "").toLowerCase();
     }
   };
   global.__drainTimers = function () {
+    global.__drainRaf(__timerNow);
     var q = timers.slice(); timers = [];
     q.sort(function (a, b) { return a.due - b.due || a.id - b.id; });
     q.forEach(function (t) {
@@ -5479,6 +5533,10 @@ var decl = new CSSStyleDeclaration(el);
     var clamped = _clampScroll(unclampedX, unclampedY);
     scrollState.x = clamped[0];
     scrollState.y = clamped[1];
+    if (global.document) {
+      global.document.__layoutCache = null;
+      global.document.__layoutVersion = (global.document.__layoutVersion || 0) + 1;
+    }
     _notifyIntersections();
     if (typeof global.dispatchEvent === "function" && typeof global.Event === "function") {
       try {
@@ -8586,13 +8644,24 @@ var decl = new CSSStyleDeclaration(el);
     return lines.join("");
   };
 
-  global.__clickPath = function (path, stealth) {
+  global.__clickPath = function (path, stealth, gateOcclusion) {
     var el = global.__byPath(path);
-    if (!el) return false;
+    if (!el) {
+      global.__lastActionError = "element_not_found";
+      return false;
+    }
+    if (gateOcclusion && typeof global.__isElementOccluded === "function") {
+      var occ = global.__isElementOccluded(el);
+      if (occ) {
+        global.__lastActionError = "occluded_by:" + occ.occluded_by;
+        return false;
+      }
+    }
     if (stealth !== undefined) global.__stealthMode = !!stealth;
     if (typeof el.__nativeClick === "function") el.__nativeClick();
     else if (typeof el.click === "function") el.click();
     else el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true, __trusted: true }));
+    global.__lastActionError = null;
     return true;
   };
 
@@ -9580,6 +9649,21 @@ global.__submitPath = function (path) {
       occlusions: occlusions,
       honeypots: honeypots
     });
+  };
+
+  global.__isElementOccluded = function (el) {
+    if (!el || el.nodeType !== 1) return null;
+    try {
+      if (typeof global.__inspectLayers !== "function") return null;
+      var layers = JSON.parse(global.__inspectLayers());
+      if (!layers || !layers.occlusions) return null;
+      var sel = typeof __nodeSelector === "function" ? __nodeSelector(el) : "";
+      for (var i = 0; i < layers.occlusions.length; i++) {
+        var occ = layers.occlusions[i];
+        if (occ.control === sel) return occ;
+      }
+    } catch (e) {}
+    return null;
   };
 
   /* ---- DOSH In-Realm Agent Scripting SDK (globalThis.dosh) ---- */

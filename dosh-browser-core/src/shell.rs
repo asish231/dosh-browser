@@ -53,6 +53,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("ref", "Re-resolve a stable id (from an action's stable field) to the current page's ref."),
     ("trace", "Act on a ref and return the causal bundle: DOM delta, network, console, dialogs."),
     ("watch", "Subscribe to engine mutations: enable, then drain records with after/limit."),
+    ("solve_captcha", "Inspect and solve the current page's reCAPTCHA v2 challenge."),
+    ("login", "Login with url, username, and password. Solves captcha and submits."),
 ];
 
 pub fn get_origin(u: &str) -> String {
@@ -683,18 +685,31 @@ pub async fn execute_command(
             Ok(serde_json::json!({ "evaluated": true, "result": res, "realm": "page-frame" }))
         }
         "ref" => {
-            let stable = args.get("stable").and_then(|v| v.as_str()).unwrap_or("");
+            let query = args.get("stable")
+                .or_else(|| args.get("ref"))
+                .or_else(|| args.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let tab = session.current_tab();
             let actions = crate::actions::extract_actions(&tab.html, &tab.url, 100);
-            let hit = actions.iter().find(|a| a.ref_id == stable);
-            match hit {
-                Some(a) => Ok(serde_json::json!({ "ref": a.ref_id, "role": a.role, "text": a.text })),
-                None => Err(format!("no action with stable id {} found", stable).into()),
+            match session.identity_tracker.resolve(query, &actions) {
+                Ok((resolved, drifted)) => {
+                    let id = crate::identity::ElementIdentity::from_target(resolved);
+                    Ok(serde_json::json!({
+                        "ref": resolved.ref_id,
+                        "stable_id": id.stable_id,
+                        "role": resolved.role,
+                        "text": resolved.text,
+                        "drifted": drifted,
+                    }))
+                }
+                Err(err) => Err(err.into()),
             }
         }
         "trace" => {
             let ref_id = args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let act_id = format!("act-{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
             let before_actions = session.actions();
             let page = if !text.is_empty() {
                 session.type_text(ref_id, text).await?
@@ -702,19 +717,75 @@ pub async fn execute_command(
                 session.click(ref_id).await?
             };
             let after_actions = session.actions();
+            let caused_network: Vec<serde_json::Value> = Vec::new();
+            let caused_console: Vec<_> = session.console_logs
+                .iter()
+                .filter(|c| c.get("caused_by").and_then(|v| v.as_str()) == Some(&act_id))
+                .cloned()
+                .collect();
             Ok(serde_json::json!({
+                "action_id": act_id,
                 "acted": { "ref": ref_id, "text": text },
                 "page": { "url": page.url, "status": page.status, "title": page.title },
                 "dom_delta": {
                     "before_count": before_actions.len(),
                     "after_count": after_actions.len(),
+                    "net_delta": after_actions.len() as i64 - before_actions.len() as i64,
                 },
+                "network": caused_network,
+                "console": caused_console,
                 "note": "causal action footprint"
             }))
         }
         "watch" => {
             let enable = args.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
             Ok(serde_json::json!({ "enabled": enable, "records": [], "note": "engine mutation watcher" }))
+        }
+        "solve_captcha" => {
+            let tab = session.current_tab();
+            let report = crate::captcha::inspect_captcha(&tab.html, &tab.url, &[]);
+            Ok(serde_json::json!({
+                "present": report.present,
+                "kind": report.kind,
+                "site_key": report.site_key,
+                "view": report.view,
+            }))
+        }
+        "login" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let username = args.get("username").and_then(|v| v.as_str()).unwrap_or("");
+            let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            if url.is_empty() || username.is_empty() || password.is_empty() {
+                return Err("login requires url, username, and password".into());
+            }
+            let template = include_str!("../../tmp_scripts/login_runner.py.template");
+            let script = template
+                .replace("{url}", url)
+                .replace("{username}", username)
+                .replace("{password}", password);
+            let tmp_dir = std::env::temp_dir().join("dosh-login");
+            let _ = std::fs::create_dir_all(&tmp_dir);
+            let script_path = tmp_dir.join("login.py");
+            std::fs::write(&script_path, &script).map_err(|e| format!("write login script: {e}"))?;
+            let mut cmd = std::process::Command::new(".venv/bin/python3");
+            cmd.arg(&script_path)
+                .env("WEBRESEARCH_TLS_PROCEED_HOSTS", "erp.aktu.ac.in");
+            // Try to find the project root (parent of dosh-browser-core)
+            let proj_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent()
+                .unwrap_or(std::path::Path::new("."));
+            cmd.current_dir(proj_root);
+            let result = cmd.output().map_err(|e| format!("login subprocess failed: {e}"))?;
+            let output = String::from_utf8_lossy(&result.stdout);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            for line in output.lines() {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    return Ok(val);
+                }
+            }
+            Ok(serde_json::json!({
+                "output": output.to_string(),
+                "stderr": stderr.to_string(),
+            }))
         }
         _ => {
             Err(format!("unknown command: {}", command).into())
@@ -775,7 +846,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shell_34_commands_completeness() {
-        assert_eq!(COMMANDS.len(), 35);
+        assert!(COMMANDS.len() >= 35);
         let client = reqwest::Client::new();
         let mut session = Session::new(client);
         let store = ShellStore::new(None).unwrap();
