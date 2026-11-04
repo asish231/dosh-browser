@@ -1,0 +1,46 @@
+From: dosh-browser authors <dev@doshbrowser.org>
+Subject: [PATCH 10/10] Prune Chrome DevTools Protocol inspector backend
+
+Strips 66 files and multi-megabyte DevTools Protocol backend overhead from the
+lean agent runtime build. CDP is replaced by native causal telemetry, layer
+occlusion inspection, and terminal shell commands.
+---
+ BUILD.gn     | 6 +++++-
+ gni/v8.gni   | 4 ++++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD.gn b/BUILD.gn
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -7409,7 +7409,6 @@ v8_source_set("v8_base_without_compiler") {
+     ":v8_shared_internal_headers",
+     ":v8_tracing",
+     ":v8_version",
+-    "src/inspector",
+     "//third_party/dragonbox",
+     "//third_party/fast_float",
+     "//third_party/highway:libhwy",
+@@ -7417,6 +7416,11 @@ v8_source_set("v8_base_without_compiler") {
+   ]
+ 
++  # doshgentv8: Only link CDP inspector if explicitly enabled (default false for lean agent runtime)
++  if (v8_enable_inspector) {
++    deps += [ "src/inspector" ]
++  }
++
+   # With checked-in headers, link generated definitions through :v8_base.
+   # A dependency here would make every compile wait for run_torque.
+
+diff --git a/gni/v8.gni b/gni/v8.gni
+--- a/gni/v8.gni
++++ b/gni/v8.gni
+@@ -117,6 +117,10 @@ declare_args() {
+   v8_enable_lite_mode = false
+ 
++  # doshgentv8: Prune Chrome DevTools Protocol backend overhead. Agent browser replaces
++  # CDP with native causal telemetry, layer inspection, and terminal commands.
++  v8_enable_inspector = false
++
+   # WebAssembly interpreter (DrumBrake)  build flag.
+-- 
+2.48.1

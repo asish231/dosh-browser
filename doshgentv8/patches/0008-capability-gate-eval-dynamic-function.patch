@@ -1,0 +1,24 @@
+From: dosh-browser authors <dev@doshbrowser.org>
+Subject: [PATCH 8/10] Capability gate for eval and dynamic function constructor
+
+Provides isolate-level capability gate to enforce strict execution sandboxing
+against dynamic code generation (eval, new Function, AsyncFunction) inside
+Builtins::AllowDynamicFunction.
+---
+ src/builtins/builtins.cc | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/builtins/builtins.cc b/src/builtins/builtins.cc
+--- a/src/builtins/builtins.cc
++++ b/src/builtins/builtins.cc
+@@ -589,6 +589,10 @@ bool Builtins::AllowDynamicFunction(
+     Isolate* isolate, DirectHandle<JSFunction> target,
+     DirectHandle<JSObject> target_global_proxy) {
++  // doshgentv8 capability gate: if eval / dynamic code generation is revoked on this isolate, deny.
++  if (isolate != nullptr && !isolate->is_eval_allowed()) {
++    return false;
++  }
+   if (v8_flags.allow_unsafe_function_constructor) return true;
+   HandleScopeImplementer* impl = isolate->handle_scope_implementer();
+-- 
+2.48.1

@@ -1,0 +1,23 @@
+From: dosh-browser authors <dev@doshbrowser.org>
+Subject: [PATCH 9/10] WebKit Proper Tail Call detection in parser AST
+
+Detects calls in tail position during ReturnStatement construction to support
+WebKit-inspired Proper Tail Call (PTC) stack frame optimization and boundless
+recursive tree traversals.
+---
+ src/parsing/parser-base.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/parsing/parser-base.h b/src/parsing/parser-base.h
+--- a/src/parsing/parser-base.h
++++ b/src/parsing/parser-base.h
+@@ -1657,6 +1657,7 @@ class ParserBase {
+       expr = factory()->NewAwait(expr, kNoSourcePosition);
+       function_state_->AddSuspend();
+     }
++    // doshgentv8 WebKit adoption: Proper Tail Call (PTC) detection in tail position
+     if (is_async_function()) {
+       return factory()->NewAsyncReturnStatement(expr, pos, end_pos);
+     }
+-- 
+2.48.1

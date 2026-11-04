@@ -7406,11 +7406,15 @@ v8_cluster_source_set("v8_base_without_compiler") {
     ":v8_shared_internal_headers",
     ":v8_tracing",
     ":v8_version",
-    "src/inspector",
     "//third_party/dragonbox",
     "//third_party/fast_float",
     "//third_party/highway:libhwy",
   ]
+
+  # doshgentv8: Only link CDP inspector if explicitly enabled (default false for lean agent runtime)
+  if (v8_enable_inspector) {
+    deps += [ "src/inspector" ]
+  }
 
   # With checked-in headers, link generated definitions through :v8_base.
   # A dependency here would make every compile wait for run_torque.

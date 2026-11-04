@@ -115,6 +115,10 @@ declare_args() {
   # Sets -DV8_LITE_MODE.
   v8_enable_lite_mode = false
 
+  # doshgentv8: Prune Chrome DevTools Protocol backend overhead. Agent browser replaces
+  # CDP with native causal telemetry, layer inspection, and terminal commands.
+  v8_enable_inspector = false
+
   # WebAssembly interpreter (DrumBrake)  build flag.
   v8_enable_drumbrake = false
 
