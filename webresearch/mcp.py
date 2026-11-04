@@ -376,6 +376,16 @@ TOOLS = [
             "properties": {},
         },
     },
+    {
+        "name": "browser_acd",
+        "description": "Retrieve the full Agent Content Document (ACD 2.0) with micro-ML semantic classifications (ArticleBody, ProductCard, SearchResult), DOM tag provenance (CSS path & XPath), and clustered collections.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_blocks": {"type": "integer", "default": 200},
+            },
+        },
+    },
 ]
 
 from copy import deepcopy
@@ -508,6 +518,12 @@ class McpServer:
             limit = int(args.get("limit", 120))
             blocks = session.slice(start, end, limit=limit)
             return self._format_result(json.dumps(blocks, indent=2))
+
+        elif name == "browser_acd":
+            max_blocks = int(args.get("max_blocks", 200))
+            if session.page is None or session.page.acd is None:
+                return self._format_result(json.dumps({"error": "no ACD for the current page"}))
+            return self._format_result(json.dumps(session.page.acd.model_dump(), indent=2))
 
         elif name == "browser_actions":
             max_actions = int(args.get("max_actions", 200))

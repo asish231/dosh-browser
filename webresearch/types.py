@@ -160,6 +160,21 @@ class CaptchaCodeDump(BaseModel):
     note: str = ""
 
 
+class TagProvenance(BaseModel):
+    tag: str = ""
+    css_path: str = ""
+    xpath: str = ""
+    attributes: dict[str, str] = Field(default_factory=dict)
+
+
+class AcdCollection(BaseModel):
+    id: str
+    category: str
+    name: str = ""
+    count: int = 0
+    block_ids: list[str] = Field(default_factory=list)
+
+
 class AcdBlock(BaseModel):
     id: str
     type: str
@@ -170,6 +185,10 @@ class AcdBlock(BaseModel):
     href: str = ""
     rows: list[list[str]] = Field(default_factory=list)
     locator: str = ""
+    provenance: TagProvenance | None = None
+    semantic_category: str | None = None
+    confidence: float | None = None
+    cluster_id: str | None = None
 
 
 class AcdAction(BaseModel):
@@ -203,6 +222,7 @@ class Acd(BaseModel):
     framework: dict[str, Any] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
+    collections: list[AcdCollection] = Field(default_factory=list)
     unavailable: list[str] = Field(default_factory=list)
 
 

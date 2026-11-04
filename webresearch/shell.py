@@ -553,7 +553,14 @@ class DoshShell:
                         continue
                     rendered = _reading_text(b)
                     if rendered:
-                        all_blocks.append({"type": b.type, "text": rendered})
+                        entry = {"type": b.type, "text": rendered}
+                        if b.provenance is not None:
+                            entry["provenance"] = b.provenance.model_dump()
+                        if b.semantic_category is not None:
+                            entry["category"] = b.semantic_category
+                        if b.confidence is not None:
+                            entry["confidence"] = b.confidence
+                        all_blocks.append(entry)
             if not all_blocks:
                 # Form-heavy pages can compile zero reading blocks (the ACD
                 # keeps controls in its action projection instead). Fall back
@@ -571,12 +578,15 @@ class DoshShell:
                 if len(row["text"]) > max_chars:
                     row["text"] = row["text"][:max_chars]
                     row["truncated"] = True
-            return {"title": page.title, "url": _url(s.url), "source": source, "blocks": rows,
-                    "total": len(all_blocks), "returned": len(rows),
-                    "omitted_before": min(offset, len(all_blocks)),
-                    "omitted_after": max(0, len(all_blocks) - offset - limit),
-                    "next_offset": offset + limit if offset + limit < len(all_blocks) else None,
-                    "note": "reading projection; navigation chrome is filtered, use actions for controls"}
+            res = {"title": page.title, "url": _url(s.url), "source": source, "blocks": rows,
+                   "total": len(all_blocks), "returned": len(rows),
+                   "omitted_before": min(offset, len(all_blocks)),
+                   "omitted_after": max(0, len(all_blocks) - offset - limit),
+                   "next_offset": offset + limit if offset + limit < len(all_blocks) else None,
+                   "note": "reading projection; navigation chrome is filtered, use actions for controls"}
+            if page.acd is not None and page.acd.collections:
+                res["collections"] = [c.model_dump() for c in page.acd.collections]
+            return res
         if name == "history":
             entries = s.history
             if "move" in a or "goto" in a:
