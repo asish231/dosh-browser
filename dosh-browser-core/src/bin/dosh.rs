@@ -41,6 +41,29 @@ fn parse_shell_line(line: &str) -> (&str, serde_json::Value) {
                 "frame.eval" => (cmd, serde_json::json!({ "expr": rest })),
                 "query" => (cmd, serde_json::json!({ "category": rest })),
                 "slice" => (cmd, serde_json::json!({ "path": rest })),
+                "wasm" => {
+                    if let Ok(n) = rest.parse::<u64>() {
+                        (cmd, serde_json::json!({ "fuel": n }))
+                    } else {
+                        (cmd, serde_json::json!({ "subcommand": rest }))
+                    }
+                }
+                "clock" => {
+                    if let Ok(n) = rest.parse::<u64>() {
+                        (cmd, serde_json::json!({ "set": n }))
+                    } else {
+                        (cmd, serde_json::json!({ "subcommand": rest }))
+                    }
+                }
+                "rng" => {
+                    if let Ok(n) = rest.parse::<u64>() {
+                        (cmd, serde_json::json!({ "seed": n }))
+                    } else {
+                        (cmd, serde_json::json!({ "seed": rest }))
+                    }
+                }
+                "checkpoint" => (cmd, serde_json::json!({ "id": rest })),
+                "restore" => (cmd, serde_json::json!({ "id": rest })),
                 _ => (cmd, serde_json::json!({ "value": rest })),
             }
         }
@@ -60,7 +83,7 @@ async fn main() {
         eprintln!("  search <query> [--json]   Web search with DuckDuckGo fallback");
         eprintln!("  download <url>            Download file or PDF streaming to disk with SHA-256");
         eprintln!("  ask <prompt>              Let an agent research and answer using browser tools");
-        eprintln!("  shell [-c <command>]      Agent browser terminal (36 commands)");
+        eprintln!("  shell [-c <command>]      Agent browser terminal (41 commands)");
         eprintln!("  server / serve [--port N] Run REST HTTP API & tool invoke endpoints");
         eprintln!("  mcp                       Run Model Context Protocol server over stdio");
         eprintln!("  product / status          Show official lane and engine status");
@@ -77,7 +100,7 @@ async fn main() {
             eprintln!("  search <query> [--json]   Web search with DuckDuckGo fallback");
             eprintln!("  download <url>            Download file or PDF streaming to disk with SHA-256");
             eprintln!("  ask <prompt>              Let an agent research and answer using browser tools");
-            eprintln!("  shell [-c <command>]      Agent browser terminal (36 commands)");
+            eprintln!("  shell [-c <command>]      Agent browser terminal (41 commands)");
             eprintln!("  server / serve [--port N] Run REST HTTP API & tool invoke endpoints");
             eprintln!("  mcp                       Run Model Context Protocol server over stdio");
             eprintln!("  product / status          Show official lane and engine status");

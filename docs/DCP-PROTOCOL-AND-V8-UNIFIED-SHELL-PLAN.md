@@ -246,33 +246,34 @@ typedef struct {
 
 ## 3. Implementation To-Do List
 
-- [ ] **Phase 1: DCP C-ABI Header & Rust FFI Bindings**
-  - [ ] Add `doshgentv8/base/include/dosh_protocol.h` with `DoshCommand`, `DoshResponse`, `DoshTelemetryRing`.
-  - [ ] Generate Rust bindings in `doshgentv8-core/src/protocol.rs`.
-  - [ ] Implement zero-copy `dispatch_command(&DoshCommand) -> DoshResponse` in `doshgentv8-core/src/lib.rs`.
+- [x] **Phase 1: DCP C-ABI Header & Rust FFI Bindings**
+  - [x] Add `doshgentv8/base/include/dosh_protocol.h` with `DoshCommand`, `DoshResponse`, `DoshTelemetryRing`.
+  - [x] Generate Rust bindings in `doshgentv8-core/src/protocol.rs`.
+  - [x] Implement zero-copy `dispatch_command(&DoshCommand) -> DoshResponse` in `doshgentv8-core/src/lib.rs`.
 
-- [ ] **Phase 2: Wire NetworkEngine to V8 `host_fetch`**
-  - [ ] Update `dosh-browser-core/src/runtime.rs`: Replace raw `fetch::fetch` with `NetworkEngine::execute()`.
-  - [ ] Attach `caused_by: "v8_script"` and script origin to every outgoing fetch.
-  - [ ] Verify that `net.rule` block/mock rules intercept V8 page requests before network dispatch.
+- [x] **Phase 2: Wire NetworkEngine to V8 `host_fetch`**
+  - [x] Update `dosh-browser-core/src/runtime.rs`: Replace raw `fetch::fetch` with `NetworkEngine::fetch()`.
+  - [x] Attach `caused_by: "v8_script"` and script origin to every outgoing fetch.
+  - [x] Verify that `net.rule` block/mock rules intercept V8 page requests before network dispatch.
 
-- [ ] **Phase 3: Expose Native V8 Commands in DoshShell**
-  - [ ] Implement `wasm` command (`dosh-browser-core/src/shell.rs`):
+- [x] **Phase 3: Expose Native V8 Commands in DoshShell**
+  - [x] Implement `wasm` command (`dosh-browser-core/src/shell.rs`):
     - Subcommands: `wasm.fuel [limit]`, `wasm.exports`, `wasm.inspect`.
-  - [ ] Implement `clock` command:
+  - [x] Implement `clock` command:
     - Subcommands: `clock.now`, `clock.set <ms>`, `clock.advance <ms>`.
-  - [ ] Implement `rng` command:
+  - [x] Implement `rng` command:
     - Subcommands: `rng.seed <u64>`, `rng.reset`.
-  - [ ] Implement `heap` command:
+  - [x] Implement `heap` command:
     - Dump total heap, used bytes, limit (128MB), and GC count.
-  - [ ] Implement `gate` command:
+  - [x] Implement `gate` command:
     - Subcommands: `gate.eval [allow|block|strict]`, `gate.net [allow|block]`, `gate.wasm [allow|block]`.
 
-- [ ] **Phase 4: Butterfly Layout Zero-Copy Integration**
-  - [ ] Export `ButterflyRect` layout array pointer from V8 C++ on layout recalculations.
-  - [ ] Update `dosh-browser-core/src/shell.rs` command `layers` to read from the memory slice directly.
+- [x] **Phase 4: Butterfly Layout Zero-Copy Integration**
+  - [x] Export `ButterflyRect` layout array pointer from V8 C++ on layout recalculations.
+  - [x] Update `dosh-browser-core/src/shell.rs` command `layers` to read from the memory slice directly via `sync_butterfly_layout` and `get_butterfly_layout`.
 
-- [ ] **Phase 5: Agent Tooling (MCP & CLI) Alignment**
-  - [ ] Expose `browser_wasm`, `browser_clock`, `browser_gate` in stdio MCP server (`src/mcp.rs`).
-  - [ ] Expose commands in standalone `dosh` binary CLI (`src/bin/dosh.rs`).
-  - [ ] Add hermetic integration tests in `tests/` verifying sub-microsecond execution and anti-tarpit fuel traps.
+- [x] **Phase 5: Agent Tooling (MCP & CLI) Alignment**
+  - [x] Expose `browser_wasm`, `browser_clock`, `browser_gate`, `browser_heap` in stdio MCP server (`src/mcp.rs`).
+  - [x] Expose commands in standalone `dosh` binary CLI (`src/bin/dosh.rs`).
+  - [x] Add hermetic integration tests in `dosh-browser-core` and Python tests verifying sub-microsecond execution and anti-tarpit fuel traps.
+

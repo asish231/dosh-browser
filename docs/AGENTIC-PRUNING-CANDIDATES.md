@@ -29,13 +29,13 @@ The following features have been identified as unnecessary or overly fancy for a
 
 | Category | Feature / Subsystem | Why Traditional Browsers Have It | Why Agents Don't Need It | Recommendation | Status |
 |---|---|---|---|---|---|
-| **Rendering** | **Sub-pixel font hinting & HarfBuzz shaping** | Renders crisp text glyphs on LCD monitors for human eyes. | Agents read UTF-8 strings and text nodes directly from AST. They never look at rendered font pixels. | **PRUNE**: Keep text metrics table; stub font rasterization. | 🟡 Candidate |
-| **Animation** | **60 FPS CSS Keyframes & Transitions** | Creates smooth visual transitions (fades, slides) for humans. | Agents inspect DOM state at discrete microtask boundaries. Waiting for animation frames burns CPU and token latency. | **STUB**: Report computed styles immediately at final values; do not run animation loop. | 🟡 Candidate |
-| **Layout** | **CSS Float Wrapping & Dynamic Flex Reflows** | Computes how text wraps around floated images on resize. | Block-flow + flex row/col + grid covers 99.8% of agent spatial hierarchy. Float wrapping adds complex multi-pass reflow bugs. | **SIMPLIFY**: Retain block-flow vertical stacking; ignore float wrapping. | 🟡 Candidate |
-| **Graphics** | **WebGL, WebGL2 & WebGPU 3D Shaders** | 3D browser games, CAD viewers, and complex canvas shaders. | Massive attack surface and multi-megabyte driver dependency. Agents never render 3D scenes. *(Canvas 2D getImageData is kept!)* | **PRUNE**: Provide inert stub `HTMLCanvasElement.getContext('webgl') -> null`. | 🟡 Candidate |
-| **Multimedia** | **WebAudio API (Oscillators, Biquads, AudioContext)** | Synthesizes sounds and spatial 3D audio effects. | Zero information value for web research or automation. Often used by malicious fingerprinting scripts. | **STUB**: Provide benign stub with static audio fingerprint to pass bot probes without sound synthesis. | 🟡 Candidate |
-| **Sensors** | **WebXR / WebVR (Virtual Reality Headsets)** | Connects VR headsets and controllers. | Completely irrelevant for an autonomous agent. | **DROP**: Keep `navigator.xr = undefined`. | 🟢 Safe to Drop |
-| **Sensors** | **Gamepad API, Battery Status, Ambient Light Sensor** | Reads hardware controllers and battery levels. | No legitimate web research uses gamepad or battery levels; often abused for tracking. | **DROP / STUB**: Fixed static values. | 🟢 Safe to Drop |
+| **Rendering** | **Sub-pixel font hinting & HarfBuzz shaping** | Renders crisp text glyphs on LCD monitors for human eyes. | Agents read UTF-8 strings and text nodes directly from AST. They never look at rendered font pixels. | **PRUNE**: Keep text metrics table; stub font rasterization. | 🟢 Pruned / Text Metrics Active |
+| **Animation** | **60 FPS CSS Keyframes & Transitions** | Creates smooth visual transitions (fades, slides) for humans. | Agents inspect DOM state at discrete microtask boundaries. Waiting for animation frames burns CPU and token latency. | **STUB**: Report computed styles immediately at final values; do not run animation loop. | 🟢 Stubbed / Instant Final State |
+| **Layout** | **CSS Float Wrapping & Dynamic Flex Reflows** | Computes how text wraps around floated images on resize. | Block-flow + flex row/col + grid covers 99.8% of agent spatial hierarchy. Float wrapping adds complex multi-pass reflow bugs. | **SIMPLIFY**: Retain block-flow vertical stacking; ignore float wrapping. | 🟢 Simplified / Block-Flow Active |
+| **Graphics** | **WebGL, WebGL2 & WebGPU 3D Shaders** | 3D browser games, CAD viewers, and complex canvas shaders. | Massive attack surface and multi-megabyte driver dependency. Agents never render 3D scenes. *(Canvas 2D getImageData is kept!)* | **PRUNE**: Provide inert stub `makeWebGLContext()` without compiling GPU shaders. | 🟢 Pruned / Inert Stub Active |
+| **Multimedia** | **WebAudio API (Oscillators, Biquads, AudioContext)** | Synthesizes sounds and spatial 3D audio effects. | Zero information value for web research or automation. Often used by malicious fingerprinting scripts. | **STUB**: Provide benign stub with static audio fingerprint to pass bot probes without sound synthesis. | 🟢 Stubbed / AudioContext Active |
+| **Sensors** | **WebXR / WebVR (Virtual Reality Headsets)** | Connects VR headsets and controllers. | Completely irrelevant for an autonomous agent. | **DROP**: Keep `navigator.xr = undefined`. | 🟢 Dropped / `xr = undefined` |
+| **Sensors** | **Gamepad API, Battery Status, Ambient Light Sensor** | Reads hardware controllers and battery levels. | No legitimate web research uses gamepad or battery levels; often abused for tracking. | **DROP / STUB**: Fixed static values (`navigator.getGamepads`, `navigator.getBattery`). | 🟢 Stubbed & Cloaked |
 
 ---
 
@@ -83,3 +83,4 @@ Please review the candidates in Section 2:
 - [ ] Confirm pruning WebGL/WebGPU and WebAudio down to lightweight stubs.
 - [ ] Confirm ignoring 60 FPS CSS animation loops and setting computed styles immediately.
 - [ ] Confirm keeping Block-Flow / Flex / Grid without complex Float text wrapping.
+

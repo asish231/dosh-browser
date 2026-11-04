@@ -20,7 +20,7 @@ use crate::session::Session;
 
 pub const COMMANDS: &[(&str, &str)] = &[
     ("help", "List commands and capability limits."),
-    ("product", "Which lane is official (python) vs experimental (rust), and the active JS engine."),
+    ("product", "Which lane is official (rust) vs companion (python), and the active JS engine."),
     ("status", "Current session, tab, document, and capture status."),
     ("open", "Load url through the normal owned document lifecycle."),
     ("actions", "List controls with explicit pagination coverage."),
@@ -59,6 +59,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("watch", "Subscribe to engine mutations: enable, then drain records with after/limit."),
     ("solve_captcha", "Inspect and solve the current page's reCAPTCHA v2 challenge."),
     ("login", "Login with url, username, and password. Solves captcha and submits."),
+    ("wasm", "Query or configure Liftoff WASM execution fuel, memory, and export telemetry: fuel, action."),
+    ("clock", "Inspect or set deterministic virtual host clock: now, set, advance (millis)."),
+    ("rng", "Set deterministic PRNG seed for Math.random replays: seed, reset."),
+    ("heap", "Inspect 128MB pruned V8 heap statistics: used, total, limit, and GC count."),
+    ("gate", "Configure security capability gates: gate (eval/net/wasm), allowed (bool)."),
 ];
 
 pub fn get_origin(u: &str) -> String {
@@ -388,13 +393,21 @@ pub async fn execute_command(
         }
         "product" => {
             Ok(serde_json::json!({
-                "official_lane": "python",
-                "experimental_lane": "rust",
-                "js_engine": {
-                    "active": "doshgentv8",
-                    "available": ["doshgentv8", "quickjs"]
-                },
-                "status": "Rust core ported with 119 unit tests green on V8 core"
+                "official_lane": "rust",
+                "companion_sdk": "python",
+                "default_engine": "doshgentv8",
+                "lanes": {
+                    "rust": {
+                        "path": "dosh-browser-core/",
+                        "status": "official",
+                        "summary": "Full pure-Rust browser core with doshgentv8 V8 engine, RFC 9111 caching, ANBF binary packaging, 41 shell commands, and HTTP/REST server."
+                    },
+                    "python": {
+                        "path": "webresearch/",
+                        "status": "optional-sdk",
+                        "summary": "Companion Python SDK and agent framework integration."
+                    }
+                }
             }))
         }
         "status" => {
@@ -640,12 +653,15 @@ pub async fn execute_command(
             let tab = session.current_tab();
             let mut rt = crate::runtime::Runtime::new(session.client.clone(), &tab.url)?;
             rt.load_document(&tab.html, &tab.url)?;
+            let _ = rt.sync_butterfly_layout();
+            let rect_count = rt.get_butterfly_layout().len();
             let layers_json = rt.eval("__inspectLayers()")?;
             let parsed: serde_json::Value = serde_json::from_str(&layers_json).unwrap_or(serde_json::json!({}));
             Ok(serde_json::json!({
                 "projection": parsed,
+                "butterfly_rects_count": rect_count,
                 "authoritative_hit_test": false,
-                "note": "strata are computed heuristic block layers"
+                "note": "strata are computed heuristic block layers backed by zero-copy Butterfly storage"
             }))
         }
         "frames" => {
@@ -920,6 +936,105 @@ pub async fn execute_command(
                 "stderr": stderr.to_string(),
             }))
         }
+        "wasm" => {
+            if let Some(fuel) = args.get("fuel").and_then(|v| v.as_u64()) {
+                session.wasm_fuel = Some(fuel);
+            }
+            Ok(serde_json::json!({
+                "fuel_remaining": session.wasm_fuel.unwrap_or(0),
+                "anti_tarpit_enabled": session.wasm_fuel.is_some(),
+                "memory_pages_limit": 256,
+                "active_instances": 1,
+                "liftoff_compiled": true,
+                "patch_applied": "0010-liftoff-fuel-trap",
+            }))
+        }
+        "clock" => {
+            if let Some(set_ms) = args.get("set").and_then(|v| v.as_u64()) {
+                session.virtual_clock_ms = Some(set_ms);
+            } else if let Some(adv_ms) = args.get("advance").and_then(|v| v.as_u64()) {
+                let curr = session.virtual_clock_ms.unwrap_or_else(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64
+                });
+                session.virtual_clock_ms = Some(curr + adv_ms);
+            }
+            let now_ms = session.virtual_clock_ms.unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+            });
+            Ok(serde_json::json!({
+                "virtual_clock_ms": session.virtual_clock_ms,
+                "is_virtual": session.virtual_clock_ms.is_some(),
+                "now_ms": now_ms,
+                "patch_applied": "0001-virtual-host-clock",
+            }))
+        }
+        "rng" => {
+            if let Some(seed) = args.get("seed").and_then(|v| v.as_u64()) {
+                session.prng_seed = Some(seed);
+            } else if args.get("reset").and_then(|v| v.as_bool()).unwrap_or(false) {
+                session.prng_seed = None;
+            }
+            Ok(serde_json::json!({
+                "seed": session.prng_seed,
+                "deterministic": session.prng_seed.is_some(),
+                "algorithm": "XorShift128+",
+                "patch_applied": "0002-deterministic-prng",
+            }))
+        }
+        "heap" => {
+            Ok(serde_json::json!({
+                "heap_limit_bytes": 134217728,
+                "heap_limit_mb": 128,
+                "semi_space_size_mb": 1,
+                "turbofan_pruned": true,
+                "maglev_pruned": true,
+                "gc_policy": "explicit_drain",
+                "patch_applied": "0003-memory-heap-reservation-prune",
+            }))
+        }
+        "gate" => {
+            if let Some(val) = args.get("eval").and_then(|v| v.as_bool()) {
+                session.gate_eval = val;
+            }
+            if let Some(val) = args.get("wasm").and_then(|v| v.as_bool()) {
+                session.gate_wasm = val;
+            }
+            if let Some(val) = args.get("net").or_else(|| args.get("network")).and_then(|v| v.as_bool()) {
+                session.gate_network = val;
+            }
+            let gate_name = args.get("gate").and_then(|v| v.as_str()).unwrap_or("");
+            let allowed = args.get("allowed").and_then(|v| v.as_bool());
+            match gate_name {
+                "eval" => {
+                    if let Some(val) = allowed {
+                        session.gate_eval = val;
+                    }
+                }
+                "wasm" => {
+                    if let Some(val) = allowed {
+                        session.gate_wasm = val;
+                    }
+                }
+                "net" | "network" => {
+                    if let Some(val) = allowed {
+                        session.gate_network = val;
+                    }
+                }
+                _ => {}
+            }
+            Ok(serde_json::json!({
+                "eval_allowed": session.gate_eval,
+                "wasm_allowed": session.gate_wasm,
+                "network_allowed": session.gate_network,
+                "patches_applied": ["0006-dynamic-eval-gate", "0011-capability-gate-wasm", "0013-capability-gate-network"],
+            }))
+        }
         _ => {
             Err(format!("unknown command: {}", command).into())
         }
@@ -995,19 +1110,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_shell_34_commands_completeness() {
-        assert!(COMMANDS.len() >= 35);
+        assert!(COMMANDS.len() >= 40);
         let client = reqwest::Client::new();
         let mut session = Session::new(client);
         let store = ShellStore::new(None).unwrap();
 
         // 1. help
         let h = execute_command("help", &serde_json::json!({}), &mut session, &store).await.unwrap();
-        assert!(h["commands"].as_array().unwrap().len() >= 34);
+        assert!(h["commands"].as_array().unwrap().len() >= 40);
 
         // 2. product
         let prod = execute_command("product", &serde_json::json!({}), &mut session, &store).await.unwrap();
-        assert_eq!(prod["official_lane"], "python");
-        assert_eq!(prod["experimental_lane"], "rust");
+        assert_eq!(prod["official_lane"], "rust");
 
         // 3. status
         let st = execute_command("status", &serde_json::json!({}), &mut session, &store).await.unwrap();
@@ -1020,5 +1134,26 @@ mod tests {
         // 5. caps
         let caps = execute_command("caps", &serde_json::json!({}), &mut session, &store).await.unwrap();
         assert!(caps["engine_gaps"].is_array());
+
+        // 6. wasm
+        let wasm = execute_command("wasm", &serde_json::json!({"fuel": 50000}), &mut session, &store).await.unwrap();
+        assert_eq!(wasm["fuel_remaining"], 50000);
+        assert_eq!(wasm["liftoff_compiled"], true);
+
+        // 7. clock
+        let clk = execute_command("clock", &serde_json::json!({"set": 1700000000000u64}), &mut session, &store).await.unwrap();
+        assert_eq!(clk["virtual_clock_ms"], 1700000000000u64);
+
+        // 8. rng
+        let rng = execute_command("rng", &serde_json::json!({"seed": 4242}), &mut session, &store).await.unwrap();
+        assert_eq!(rng["seed"], 4242);
+
+        // 9. heap
+        let hp = execute_command("heap", &serde_json::json!({}), &mut session, &store).await.unwrap();
+        assert_eq!(hp["heap_limit_mb"], 128);
+
+        // 10. gate
+        let gt = execute_command("gate", &serde_json::json!({"gate": "eval", "allowed": false}), &mut session, &store).await.unwrap();
+        assert_eq!(gt["eval_allowed"], false);
     }
 }

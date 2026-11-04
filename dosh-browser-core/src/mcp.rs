@@ -160,6 +160,47 @@ pub fn get_tools_list() -> Value {
                     "limit": { "type": "integer", "default": 120 }
                 }
             }
+        },
+        {
+            "name": "browser_wasm",
+            "description": "Inspect and control Liftoff WASM fuel traps, query remaining fuel, anti-tarpit state, and challenge exports.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "fuel": { "type": "integer", "description": "Set fuel units limit for Liftoff WASM execution" }
+                }
+            }
+        },
+        {
+            "name": "browser_clock",
+            "description": "Inspect and manipulate the deterministic virtual host clock.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "set": { "type": "integer", "description": "Set virtual clock timestamp in milliseconds" },
+                    "advance": { "type": "integer", "description": "Advance virtual clock by milliseconds" }
+                }
+            }
+        },
+        {
+            "name": "browser_gate",
+            "description": "Inspect and toggle runtime capability gates: dynamic code generation (eval), Liftoff WASM, and network access.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "eval": { "type": "boolean", "description": "Enable or disable eval and Function constructor" },
+                    "wasm": { "type": "boolean", "description": "Enable or disable WebAssembly execution" },
+                    "net": { "type": "boolean", "description": "Enable or disable network access" }
+                }
+            }
+        },
+        {
+            "name": "browser_heap",
+            "description": "Report V8 128MB pruned heap statistics, allocated bytes, and GC policy.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
         }
     ])
 }
@@ -310,6 +351,34 @@ pub async fn handle_mcp_message(
                         Err(e) => format!("Shell error: {}", e),
                     }
                 }
+                "browser_wasm" => {
+                    let mut sess = session.lock().await;
+                    match execute_command("wasm", arguments, &mut sess, store).await {
+                        Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_default(),
+                        Err(e) => format!("WASM error: {}", e),
+                    }
+                }
+                "browser_clock" => {
+                    let mut sess = session.lock().await;
+                    match execute_command("clock", arguments, &mut sess, store).await {
+                        Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_default(),
+                        Err(e) => format!("Clock error: {}", e),
+                    }
+                }
+                "browser_gate" => {
+                    let mut sess = session.lock().await;
+                    match execute_command("gate", arguments, &mut sess, store).await {
+                        Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_default(),
+                        Err(e) => format!("Gate error: {}", e),
+                    }
+                }
+                "browser_heap" => {
+                    let mut sess = session.lock().await;
+                    match execute_command("heap", arguments, &mut sess, store).await {
+                        Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_default(),
+                        Err(e) => format!("Heap error: {}", e),
+                    }
+                }
                 _ => {
                     if name.starts_with("browser_") {
                         let args_map: std::collections::HashMap<String, Value> = match arguments {
@@ -424,5 +493,45 @@ mod tests {
         assert!(res.error.is_none());
         let text = res.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
         assert!(text.contains("commands"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_tools_call_wasm_and_clock() {
+        let store = Arc::new(ShellStore::new(None).unwrap());
+        let session = Arc::new(Mutex::new(Session::new(Client::new())));
+
+        // Test browser_wasm via MCP
+        let req_wasm = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(4)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "browser_wasm",
+                "arguments": {
+                    "fuel": 75000
+                }
+            })),
+        };
+        let resp_wasm = handle_mcp_message(req_wasm, &session, &store).await.unwrap();
+        assert!(resp_wasm.error.is_none());
+        let text_wasm = resp_wasm.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+        assert!(text_wasm.contains("75000"));
+
+        // Test browser_clock via MCP
+        let req_clock = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(5)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "browser_clock",
+                "arguments": {
+                    "set": 1700000000000u64
+                }
+            })),
+        };
+        let resp_clock = handle_mcp_message(req_clock, &session, &store).await.unwrap();
+        assert!(resp_clock.error.is_none());
+        let text_clock = resp_clock.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+        assert!(text_clock.contains("1700000000000"));
     }
 }

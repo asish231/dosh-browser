@@ -69,6 +69,7 @@ pub struct RunScriptsInfo {
 /// Inner state backing the 13 host callables.
 pub struct InnerSeam {
     pub client: Client,
+    pub network: Option<Arc<crate::network::NetworkEngine>>,
     pub url: Mutex<String>,
     pub cookies: Mutex<HashMap<String, String>>,
     pub console: Mutex<Vec<ConsoleEntry>>,
@@ -187,9 +188,30 @@ impl HostSeam for SharedSeam {
                     req_url
                 };
 
+                let network_opt = self.0.network.clone();
                 let client = self.0.client.clone();
+                let page_origin = crate::shell::get_origin(&page_url);
+
                 let do_fetch = async move {
-                    fetch::fetch(&client, &abs_url, &method, body, &headers_json, 8_000_000).await
+                    if let Some(net) = network_opt {
+                        let mut req = crate::network::NetworkRequest::new(&abs_url);
+                        req.method = method;
+                        req.body = body;
+                        req.client_origin = Some(page_origin);
+                        req.caused_by = Some("v8_script".into());
+                        req.is_subresource = true;
+                        if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&headers_json) {
+                            req.headers = map;
+                        }
+                        match net.fetch(req).await {
+                            Ok(res) => Ok(res),
+                            Err(e) => Err(format!("Network error: {e}")),
+                        }
+                    } else {
+                        fetch::fetch(&client, &abs_url, &method, body, &headers_json, 8_000_000)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
                 };
 
                 // Handle both sync & async environments cleanly
@@ -228,6 +250,15 @@ pub struct Runtime {
 impl Runtime {
     /// Create a fresh runtime context, register host callables, and boot minidom.js.
     pub fn new(client: Client, url: &str) -> Result<Self, String> {
+        Self::new_with_network(client, url, None)
+    }
+
+    /// Create a fresh runtime context with full central NetworkEngine integration.
+    pub fn new_with_network(
+        client: Client,
+        url: &str,
+        network: Option<Arc<crate::network::NetworkEngine>>,
+    ) -> Result<Self, String> {
         let ctx_key = format!(
             "ctx-{:x}",
             std::time::SystemTime::now()
@@ -238,6 +269,7 @@ impl Runtime {
 
         let seam = Arc::new(SharedSeam(InnerSeam {
             client,
+            network,
             url: Mutex::new(url.to_string()),
             cookies: Mutex::new(HashMap::new()),
             console: Mutex::new(Vec::new()),
@@ -514,6 +546,52 @@ impl Runtime {
     /// Serialize current live DOM tree to HTML string.
     pub fn serialize(&mut self) -> Result<String, String> {
         self.engine.eval("__serialize()")
+    }
+
+    /// Sync computed DOM layout into contiguous ButterflyRect memory.
+    pub fn sync_butterfly_layout(&mut self) -> Result<usize, String> {
+        let layers_json = self.engine.eval("__inspectLayers()")?;
+        if let Ok(val) = serde_json::from_str::<Value>(&layers_json) {
+            let mut rects = Vec::new();
+            if let Some(strata) = val.get("strata").and_then(|v| v.as_object()) {
+                let stratum_names = ["L0_FLOW", "L1_CHROME", "L2_SCROLLER", "L3_POPOVER", "L4_OVERLAY"];
+                let mut seq = 0u32;
+                for (s_idx, s_name) in stratum_names.iter().enumerate() {
+                    if let Some(nodes) = strata.get(*s_name).and_then(|v| v.as_array()) {
+                        for node in nodes {
+                            seq += 1;
+                            let r = node.get("rect").unwrap_or(&Value::Null);
+                            let x = r.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                            let y = r.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                            let width = r.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                            let height = r.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                            let z = node.get("zIndex").and_then(|v| v.as_i64()).unwrap_or(0) as u16;
+                            let occluded = node.get("occluded").and_then(|v| v.as_bool()).unwrap_or(false);
+                            rects.push(doshgentv8_core::protocol::DoshButterflyRect {
+                                element_id: seq,
+                                x,
+                                y,
+                                width,
+                                height,
+                                z_index: z,
+                                occluded_stratum: s_idx as u8,
+                                flags: if occluded { 1 } else { 0 },
+                            });
+                        }
+                    }
+                }
+            }
+            let count = rects.len();
+            self.engine.set_layout_rects(rects);
+            Ok(count)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Access zero-copy contiguous Butterfly layout rectangle memory slice.
+    pub fn get_butterfly_layout(&self) -> &[doshgentv8_core::protocol::DoshButterflyRect] {
+        self.engine.get_layout_rects()
     }
 }
 
