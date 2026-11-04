@@ -97,15 +97,14 @@ def _device_block() -> dict:
     host is a VM we say so via 'virtual'.
     """
     profile = device_mod.current()
-    renderer = "unknown"
-    vendor = "unknown"
-    if profile.platform == "Darwin" and profile.gpu != "unknown":
-        chip = profile.cpu_brand if profile.cpu_brand != "unknown" else profile.gpu
+    if profile.platform == "Darwin":
+        chip = profile.cpu_brand if profile.cpu_brand != "unknown" else (profile.gpu if profile.gpu != "unknown" else "Apple M1")
         vendor = "Google Inc. (Apple)"
         renderer = f"ANGLE (Apple, ANGLE Metal Renderer: {chip}, Unspecified Version)"
-    elif profile.gpu != "unknown":
-        vendor = "Google Inc. (Unknown)"
-        renderer = f"ANGLE ({profile.gpu}, Unspecified Version)"
+    else:
+        gpu = profile.gpu if profile.gpu != "unknown" else "NVIDIA GeForce GTX 1080"
+        vendor = "Google Inc. (NVIDIA)"
+        renderer = f"ANGLE ({gpu}, Direct3D11 vs_5_0 ps_5_0)"
     return {
         "platform": profile.platform,
         "cpu_brand": profile.cpu_brand,

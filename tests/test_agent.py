@@ -238,7 +238,11 @@ class SettingsTests(unittest.TestCase):
 
     def test_dotenv_does_not_clobber_an_explicit_override(self):
         """setdefault semantics: an exported variable wins over the file."""
-        with mock.patch.dict(os.environ, {"OPENAI_COMPAT_MODEL": "glm-5.3"}, clear=False):
+        with mock.patch.dict(os.environ, {
+            "OPENAI_COMPAT_BASE_URL": "https://example.test/v1",
+            "OPENAI_COMPAT_API_KEY": "dummy",
+            "OPENAI_COMPAT_MODEL": "glm-5.3",
+        }, clear=False):
             self.assertEqual(llm_config("pool-auto")["model"], "glm-5.3")
 
     def test_registry_lists_both_vendors(self):

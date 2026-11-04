@@ -176,3 +176,4 @@ echo "  Lanes:"
 echo "    dosh <cmd>     -> Official standalone pure-Rust browser (default)"
 echo "    dosh -p <cmd>  -> Optional Python companion SDK (webresearch)"
 echo "════════════════════════════════════════════════════════════"
+

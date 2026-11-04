@@ -21,7 +21,7 @@ jobs:
             target: aarch64-apple-darwin
             binary: dosh
             archive: tar.gz
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             binary: dosh
             archive: tar.gz
@@ -59,9 +59,9 @@ jobs:
           if [ ! -f "$BIN_PATH" ]; then
             BIN_PATH="target/release/${{ matrix.binary }}"
           fi
-          cp "$BIN_PATH" "dist/${{ matrix.binary }}"
-          cd dist
           if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "$BIN_PATH" "dist/${{ matrix.binary }}"
+            cd dist
             7z a -tzip "../dosh-${{ matrix.target }}.zip" "${{ matrix.binary }}"
             cd ..
             if command -v shasum >/dev/null 2>&1; then
@@ -70,7 +70,8 @@ jobs:
               sha256sum "dosh-${{ matrix.target }}.zip" > "dosh-${{ matrix.target }}.zip.sha256"
             fi
           else
-            cp "${{ matrix.binary }}" dosh
+            cp "$BIN_PATH" "dist/dosh"
+            cd dist
             tar -czf "../dosh-${{ matrix.target }}.tar.gz" dosh
             cd ..
             if command -v shasum >/dev/null 2>&1; then
