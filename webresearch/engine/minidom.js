@@ -3525,6 +3525,67 @@ var pos = (st.position || "").toLowerCase();
     var ctor = (ctorMap && ctorMap[j.t]) || null;
     return ctor ? new ctor(j.t, j.a || {}, kids) : new Element(j.t, j.a || {}, kids);
   }
+  /* === Interactivity & Synthetic Framework Hook Introspection === */
+  var INTERACT_CLICK      = 1 << 0;  // 1
+  var INTERACT_MOUSEDOWN  = 1 << 1;  // 2
+  var INTERACT_KEYDOWN    = 1 << 2;  // 4
+  var INTERACT_CHANGE     = 1 << 3;  // 8
+  var INTERACT_SUBMIT     = 1 << 4;  // 16
+  var INTERACT_INLINE     = 1 << 5;  // 32
+  var INTERACT_REACT      = 1 << 6;  // 64
+  var INTERACT_VUE        = 1 << 7;  // 128
+  var INTERACT_ANGULAR    = 1 << 8;  // 256
+  var INTERACT_SVELTE     = 1 << 9;  // 512
+  var INTERACT_POINTER_CS = 1 << 10; // 1024 (cursor: pointer)
+
+  function __inspectNodeInteractivity(el) {
+    if (!el || el.nodeType !== 1) return 0;
+    var flags = 0;
+    if (el._listeners) {
+      if (el._listeners["click"] && el._listeners["click"].length) flags |= INTERACT_CLICK;
+      if (el._listeners["mousedown"] && el._listeners["mousedown"].length) flags |= INTERACT_MOUSEDOWN;
+      if (el._listeners["keydown"] && el._listeners["keydown"].length) flags |= INTERACT_KEYDOWN;
+      if (el._listeners["input"] || el._listeners["change"]) flags |= INTERACT_CHANGE;
+      if (el._listeners["submit"]) flags |= INTERACT_SUBMIT;
+    }
+    if (typeof el.onclick === "function") flags |= (INTERACT_CLICK | INTERACT_INLINE);
+    if (typeof el.onkeydown === "function") flags |= (INTERACT_KEYDOWN | INTERACT_INLINE);
+    if (el.attributes && el.attributes.onclick) flags |= (INTERACT_CLICK | INTERACT_INLINE);
+
+    for (var k in el) {
+      if (k.charCodeAt(0) === 95 && k.charCodeAt(1) === 95) {
+        if (k.indexOf("__reactProps$") === 0 || k.indexOf("__reactEventHandlers$") === 0) {
+          var rp = el[k];
+          if (rp) {
+            if (rp.onClick || rp.onClickCapture) flags |= (INTERACT_CLICK | INTERACT_REACT);
+            if (rp.onMouseDown || rp.onPointerDown) flags |= (INTERACT_MOUSEDOWN | INTERACT_REACT);
+            if (rp.onChange || rp.onInput) flags |= (INTERACT_CHANGE | INTERACT_REACT);
+            if (rp.onKeyDown) flags |= (INTERACT_KEYDOWN | INTERACT_REACT);
+          }
+        } else if (k.indexOf("__reactFiber$") === 0) {
+          var rf = el[k];
+          if (rf && rf.memoizedProps) {
+            var mp = rf.memoizedProps;
+            if (mp.onClick) flags |= (INTERACT_CLICK | INTERACT_REACT);
+            if (mp.onChange) flags |= (INTERACT_CHANGE | INTERACT_REACT);
+          }
+        }
+      }
+    }
+    if (el._vei && (el._vei.onClick || el._vei.click)) flags |= (INTERACT_CLICK | INTERACT_VUE);
+    if (el.__vueParentComponent && el.__vnode && el.__vnode.props) {
+      if (el.__vnode.props.onClick) flags |= (INTERACT_CLICK | INTERACT_VUE);
+    }
+    if (el.__zone_symbol__clickfalse || el.__zone_symbol__addEventListener) {
+      flags |= (INTERACT_CLICK | INTERACT_ANGULAR);
+    }
+    if (el.__click || el._svelte) flags |= (INTERACT_CLICK | INTERACT_SVELTE);
+    if (el.style && el.style.cursor === "pointer") {
+      flags |= INTERACT_POINTER_CS;
+    }
+    return flags;
+  }
+
   function serializeNode(n, parentTag) {
     if (!n) return "";
     if (n.nodeType === 3) {
@@ -3535,6 +3596,10 @@ var pos = (st.position || "").toLowerCase();
     Object.keys(n.attributes || {}).forEach(function (k) {
       attrs += " " + k + "=\"" + escapeHtml(String(n.attributes[k])) + "\"";
     });
+    var flags = __inspectNodeInteractivity(n);
+    if (flags > 0 && !(n.attributes && n.attributes["data-dosh-interact"])) {
+      attrs += " data-dosh-interact=\"" + flags + "\"";
+    }
     var voidTags = { area:1,base:1,br:1,col:1,embed:1,hr:1,img:1,input:1,link:1,meta:1,param:1,source:1,track:1,wbr:1 };
     var inner = n.childNodes.map(function (c) { return serializeNode(c, n.nodeName); }).join("");
     if (voidTags[n.nodeName]) return "<" + n.nodeName + attrs + ">";

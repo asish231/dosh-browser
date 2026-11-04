@@ -25,6 +25,7 @@ target/
 *.so
 *.a
 doshgentv8/target/
+downloads/
 
 # Reference clones (read-only, not our code)
 research_repos/v8/

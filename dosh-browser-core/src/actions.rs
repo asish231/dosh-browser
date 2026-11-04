@@ -6,15 +6,17 @@
 use kuchiki::NodeRef;
 use kuchiki::traits::TendrilSink;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use crate::content::{attr, class_tokens, inside_chrome, tag_name, text_content};
-use crate::types::{Challenge, Target};
+use crate::content::{attr, class_tokens, tag_name, text_content};
+use crate::types::Target;
 
 // --- Constants from actions.py ---
+#[allow(dead_code)]
 const ACTIVE_TAGS: &[&str] = &[
     "button", "input", "textarea", "select", "label", "summary",
 ];
+#[allow(dead_code)]
 const EMBED_TAGS: &[&str] = &[
     "iframe", "canvas", "video", "audio", "object", "embed",
 ];
@@ -85,7 +87,46 @@ fn is_machinery(text: &str) -> bool {
     MACHINERY_TOKENS.iter().any(|t| lower.contains(t))
 }
 
-pub fn extract_actions(html: &str, base_url: &str, max_actions: usize) -> Vec<Target> {
+/// The element is hidden by its own markup or CSS without an engine cascade:
+/// inline display:none / visibility:hidden, [hidden] attribute on element or ancestor,
+/// closed <dialog>, closed [popover], or closed <details>.
+pub fn is_inline_hidden(node: &NodeRef) -> bool {
+    // 1. Check aria-hidden on node
+    if attr(node, "aria-hidden").as_deref() == Some("true") {
+        return true;
+    }
+
+    // 2. Walk self and ancestors for style / hidden attributes
+    let mut cur = Some(node.clone());
+    while let Some(p) = cur {
+        if let Some(style_val) = attr(&p, "style") {
+            let s = style_val.replace(" ", "").to_lowercase();
+            if s.contains("display:none")
+                || s.contains("visibility:hidden")
+                || s.contains("visibility:collapse")
+                || s.contains("opacity:0")
+                || s.contains("left:-9999px")
+                || s.contains("position:absolute;left:-")
+            {
+                return true;
+            }
+        }
+        if attr(&p, "hidden").is_some() {
+            return true;
+        }
+        let tag = tag_name(&p);
+        if tag == "dialog" && attr(&p, "open").is_none() {
+            return true;
+        }
+        if attr(&p, "popover").is_some() && attr(&p, "open").is_none() {
+            return true;
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+pub fn extract_actions(html: &str, _base_url: &str, max_actions: usize) -> Vec<Target> {
     let dom = kuchiki::parse_html().one(html);
     let root = dom.clone();
     
@@ -101,12 +142,16 @@ pub fn extract_actions(html: &str, base_url: &str, max_actions: usize) -> Vec<Ta
     }
 
     let mut ref_counts: HashMap<String, i32> = HashMap::new();
+    let mut seen_ptrs: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     for node in &interactive_nodes {
+        seen_ptrs.insert(&**node as *const _ as usize);
         let tag = tag_name(node);
-        // Filter out hidden/disabled
-        if attr(node, "hidden").is_some() { continue; }
+        let input_type = attr(node, "type").unwrap_or("text".to_string()).to_lowercase();
+        // Filter out hidden/disabled, invisible CSS honeypots, and hidden inputs
+        if tag == "input" && input_type == "hidden" { continue; }
         if attr(node, "disabled").is_some() { continue; }
+        if is_inline_hidden(node) { continue; }
         
         let href = attr(node, "href").unwrap_or_default();
         let is_nav = NAV_TAGS.contains(&tag.as_str()) && !href.is_empty();
@@ -119,7 +164,15 @@ pub fn extract_actions(html: &str, base_url: &str, max_actions: usize) -> Vec<Ta
         
         // Check for sliders
         let tokens = class_tokens(node);
-        let is_dragger = tokens.iter().any(|t| HANDLE_TOKENS.contains(&t.as_str()));
+        let is_dragger = tokens.iter().any(|t| {
+            if t == "cursor" {
+                let raw_cls = attr(node, "class").unwrap_or_default().to_lowercase();
+                let raw_style = attr(node, "style").unwrap_or_default().to_lowercase();
+                !raw_cls.contains("cursor-") && !raw_style.contains("cursor:")
+            } else {
+                HANDLE_TOKENS.contains(&t.as_str())
+            }
+        });
         let is_target = tokens.iter().any(|t| TARGET_TOKENS.contains(&t.as_str()));
 
         let mut kind = "activate".to_string();
@@ -151,7 +204,7 @@ pub fn extract_actions(html: &str, base_url: &str, max_actions: usize) -> Vec<Ta
         targets.push(Target {
             ref_id,
             role,
-            text: if !label.is_empty() && label != text_content(node) { label } else { "".to_string() },
+            text: if !label.is_empty() { label } else { text_content(node).chars().take(80).collect() },
             tag: tag.clone(),
             name: attr(node, "name").unwrap_or_default(),
             href,
@@ -164,6 +217,114 @@ pub fn extract_actions(html: &str, base_url: &str, max_actions: usize) -> Vec<Ta
             challenge: false,
             path: Vec::new(),
         });
+    }
+
+    // --- Neural pass: recover unsemantic interactive elements ---
+    // (React 18/19 synthetic clicks, Vue _vei, Angular/Svelte, Tailwind buttons)
+    let neural_selector = "[data-dosh-interact], [data-action], [data-click], div, span, li, p, svg, i, tr";
+    let mut candidate_nodes: Vec<NodeRef> = Vec::new();
+    if let Ok(sel) = root.select(neural_selector) {
+        for node in sel {
+            candidate_nodes.push(node.as_node().clone());
+        }
+    }
+
+    for node in &candidate_nodes {
+        let ptr = &**node as *const _ as usize;
+        if seen_ptrs.contains(&ptr) {
+            continue;
+        }
+        if is_inline_hidden(node) {
+            continue;
+        }
+
+        let raw_flags = attr(node, "data-dosh-interact");
+        let flags: u32 = raw_flags.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0);
+
+        let has_role = attr(node, "role").is_some();
+        let has_act = attr(node, "data-action").is_some() || attr(node, "data-click").is_some();
+        let has_href = attr(node, "data-href").is_some() || attr(node, "href").is_some() || attr(node, "to").is_some();
+        let tokens = class_tokens(node);
+        let has_interactive_class = tokens.iter().any(|t| {
+            let lt = t.to_lowercase();
+            lt.contains("btn")
+                || lt.contains("button")
+                || lt.contains("cta")
+                || lt.contains("press")
+                || lt.contains("cursor-pointer")
+                || lt.contains("clickable")
+                || lt.contains("handle")
+                || lt.contains("thumb")
+                || lt.contains("link")
+                || lt.contains("search")
+                || lt.contains("select")
+                || lt.contains("switch")
+                || lt.contains("toggle")
+        });
+
+        if flags == 0 && !has_role && !has_act && !has_href && !has_interactive_class {
+            continue;
+        }
+
+        let feats = crate::neural::extract_interactivity_features(node, flags);
+        let pred = crate::neural::predict_interactivity(&feats);
+
+        if pred.class != crate::neural::ActionRoleClass::NonInteractive && pred.confidence >= 0.50 {
+            // Tree domination: do not create child targets if ancestor was already added
+            let mut dominated = false;
+            let mut p = node.parent();
+            while let Some(parent) = p {
+                let p_ptr = &*parent as *const _ as usize;
+                if seen_ptrs.contains(&p_ptr) {
+                    dominated = true;
+                    break;
+                }
+                p = parent.parent();
+            }
+            if dominated {
+                continue;
+            }
+
+            seen_ptrs.insert(ptr);
+
+            let tag = tag_name(node);
+            let href = attr(node, "href").or_else(|| attr(node, "data-href")).unwrap_or_default();
+            let role = match pred.class {
+                crate::neural::ActionRoleClass::Button => "button".to_string(),
+                crate::neural::ActionRoleClass::Input => "textbox".to_string(),
+                crate::neural::ActionRoleClass::Link => "link".to_string(),
+                crate::neural::ActionRoleClass::Slider => "slider".to_string(),
+                crate::neural::ActionRoleClass::NonInteractive => unreachable!(),
+            };
+
+            let label = _label_for(node);
+            let ref_base = _stable_hash(node);
+            let count = ref_counts.entry(ref_base.clone()).or_insert(0);
+            *count += 1;
+            let occurrence = *count;
+
+            let ref_id = if occurrence > 1 {
+                format!("{}~{}", ref_base, occurrence)
+            } else {
+                ref_base.clone()
+            };
+
+            if targets.len() >= max_actions {
+                continue;
+            }
+
+            targets.push(Target {
+                ref_id,
+                role,
+                text: if !label.is_empty() { label } else { text_content(node).chars().take(80).collect() },
+                tag,
+                name: attr(node, "name").unwrap_or_default(),
+                href,
+                checked: None,
+                challenge: false,
+                path: Vec::new(),
+            });
+        }
     }
 
     targets
@@ -193,7 +354,7 @@ fn get_parent_form_action(node: &NodeRef) -> Option<(String, String)> {
     None
 }
 
-fn get_role(node: &NodeRef, tag: &str, kind: &str) -> String {
+fn get_role(node: &NodeRef, tag: &str, _kind: &str) -> String {
     if let Some(r) = attr(node, "role") {
         return r;
     }
@@ -264,5 +425,68 @@ mod tests {
         // The handle should be a target with role=slider
         let handles: Vec<_> = targets.iter().filter(|t| t.role == "slider").collect();
         assert_eq!(handles.len(), 1);
+    }
+
+    #[test]
+    fn test_skip_css_hidden_and_honeypot() {
+        let html = r#"
+            <div>
+                <button style="display: none">Hidden Button</button>
+                <input type="text" style="visibility: hidden" name="bot_trap">
+                <input type="hidden" name="csrf" value="123">
+                <div style="opacity: 0"><a href="/trap">Invisible Trap</a></div>
+                <button aria-hidden="true">Screen Reader Only</button>
+                <button id="real">Visible Button</button>
+            </div>
+        "#;
+        let targets = extract_actions(html, "https://base.com", 10);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].ref_id.len(), 8);
+        assert_eq!(targets[0].role, "button");
+    }
+
+    #[test]
+    fn test_neural_react_synthetic_button() {
+        let html = r#"
+            <div>
+                <h1>Header</h1>
+                <div data-dosh-interact="64" class="px-4 py-2 bg-blue-600 rounded text-white font-medium">
+                    Proceed to Checkout
+                </div>
+            </div>
+        "#;
+        let targets = extract_actions(html, "https://store.example.com", 10);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].role, "button");
+        assert_eq!(targets[0].tag, "div");
+        assert!(targets[0].text.contains("Proceed to Checkout"));
+    }
+
+    #[test]
+    fn test_neural_vue_dominated_hierarchy() {
+        let html = r#"
+            <div data-dosh-interact="128" class="btn btn-primary">
+                <span class="btn-text">Save Changes</span>
+                <svg class="icon" viewBox="0 0 24 24"></svg>
+            </div>
+        "#;
+        let targets = extract_actions(html, "https://app.example.com", 10);
+        // Tree domination: only outer div emitted, inner span/svg dominated
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].role, "button");
+        assert!(targets[0].text.contains("Save Changes"));
+    }
+
+    #[test]
+    fn test_neural_unsemantic_link() {
+        let html = r#"
+            <div data-dosh-interact="1" data-href="/dashboard" class="nav-item cursor-pointer">
+                User Dashboard
+            </div>
+        "#;
+        let targets = extract_actions(html, "https://app.example.com", 10);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].role, "link");
+        assert_eq!(targets[0].href, "/dashboard");
     }
 }

@@ -585,28 +585,82 @@ def collect(html: str, url: str, *, max_actions: int = 200) -> ActionSurface:
     # no role, so the tag selector above can never see them. Sweep for the
     # class/structure signature separately and de-duplicate. Contenteditable
     # elements are the same story: any tag can carry the attribute.
-    seen_nodes = {id(node) for node, _ in candidates}
+    seen_nodes = {node.mem_id for node, _ in candidates}
     for node in root.css("div, span, i, section, li"):
-        if id(node) in seen_nodes:
+        if node.mem_id in seen_nodes:
             continue
         if not (_is_drag(node) or _is_drop_target(node)):
             continue
         candidates.append((node, ""))
-        seen_nodes.add(id(node))
+        seen_nodes.add(node.mem_id)
     for node in root.css("[contenteditable]"):
-        if id(node) in seen_nodes:
+        if node.mem_id in seen_nodes:
             continue
         if not _is_editable(node):
             continue
         candidates.append((node, ""))
-        seen_nodes.add(id(node))
+        seen_nodes.add(node.mem_id)
+
+    # Neural candidate sweep for unsemantic interactive elements:
+    # React synthetic clicks (__reactProps$), Vue _vei, Angular/Svelte,
+    # computed cursor: pointer, Tailwind icon buttons, custom checkout cards.
+    from webresearch.neural import (
+        ActionRoleClass,
+        extract_interactivity_features,
+        predict_interactivity,
+    )
+
+    for node in root.css("[data-dosh-interact], [data-action], [data-click], div, span, li, p, svg, i, tr"):
+        nid = node.mem_id
+        if nid in seen_nodes:
+            continue
+        if _inline_hidden(node):
+            continue
+
+        attrs = node.attributes or {}
+        raw_flags = attrs.get("data-dosh-interact")
+        flags = int(raw_flags) if (raw_flags and raw_flags.isdigit()) else 0
+
+        # Fast filter: skip plain layout containers without flags, interactive classes, or attributes
+        has_role = "role" in attrs
+        has_act = "data-action" in attrs or "data-click" in attrs
+        has_href = "data-href" in attrs or "href" in attrs or "to" in attrs
+        classes = (attrs.get("class") or "").lower()
+        has_interactive_class = any(
+            tok in classes
+            for tok in (
+                "btn", "button", "cta", "press", "cursor-pointer", "clickable",
+                "handle", "thumb", "link", "search", "select", "switch", "toggle",
+            )
+        )
+
+        if flags == 0 and not (has_role or has_act or has_href or has_interactive_class):
+            continue
+
+        feats = extract_interactivity_features(node, flags)
+        pred = predict_interactivity(feats)
+
+        if pred.role_class != ActionRoleClass.NON_INTERACTIVE and pred.confidence >= 0.50:
+            # Tree domination: do not create child targets if ancestor is already interactive
+            dominated = False
+            cur = node.parent
+            while cur is not None and cur is not root:
+                if cur.mem_id in seen_nodes:
+                    dominated = True
+                    break
+                cur = cur.parent
+            if dominated:
+                continue
+
+            candidates.append((node, pred.role_class.name.lower()))
+            seen_nodes.add(nid)
 
     candidates = _pick_one_handle_per_container(candidates)
 
     surface.total_found = len(candidates)
 
     ordered: list[Action] = []
-    for index, (node, _) in enumerate(candidates, start=1):
+    for index, (node, neural_role_hint) in enumerate(candidates, start=1):
         tag = node.tag or ""
         attrs = node.attributes
         href = attrs.get("href") or ""
@@ -656,6 +710,26 @@ def collect(html: str, url: str, *, max_actions: int = 200) -> ActionSurface:
         elif tag in ACTIVE_TAGS:
             kind = "activate"
             target = _css_path(node, root)
+        elif neural_role_hint:
+            if neural_role_hint == "button":
+                kind = "activate"
+                target = _css_path(node, root)
+            elif neural_role_hint == "input":
+                kind = "activate"
+                target = _css_path(node, root)
+            elif neural_role_hint == "link":
+                link_href = attrs.get("href") or attrs.get("data-href") or ""
+                if link_href and not link_href.startswith("#") and not link_href.lower().startswith("javascript:"):
+                    kind = "navigate"
+                    target = urljoin(url, link_href)
+                else:
+                    kind = "activate"
+                    target = _css_path(node, root)
+            elif neural_role_hint == "slider":
+                kind = "drag"
+                target = _css_path(node, root)
+            else:
+                continue
         else:
             continue
 
@@ -669,6 +743,8 @@ def collect(html: str, url: str, *, max_actions: int = 200) -> ActionSurface:
         notes = ""
         if kind in {"activate", "drag", "embed"}:
             notes = "needs real engine"
+        if neural_role_hint:
+            notes = f"neural {neural_role_hint} (unsemantic element recovered)"
         if _is_editable(node):
             notes = "contenteditable: pass text to type into the editor"
         if tag == "canvas":
@@ -679,6 +755,17 @@ def collect(html: str, url: str, *, max_actions: int = 200) -> ActionSurface:
             notes = "content is a separate document; read its source"
 
         role = _role_of(node, kind)
+        if neural_role_hint:
+            if neural_role_hint == "button":
+                role = "button"
+            elif neural_role_hint == "input":
+                role = "textbox"
+            elif neural_role_hint == "link":
+                role = "link"
+            elif neural_role_hint == "slider":
+                role = "slider"
+        if not label:
+            label = _text_of(node) or role
         ordered.append(
             Action(
                 ref=_stable_ref(url, node, index),
@@ -855,8 +942,15 @@ def _is_drag(node: Node) -> bool:
         return False
 
     # The handle names itself: a bare 'slider' / 'handle' / 'thumb' token.
-    if tokens & set(_HANDLE_TOKEN_NAMES):
-        return True
+    matched_handles = tokens & set(_HANDLE_TOKEN_NAMES)
+    if matched_handles:
+        # Guard: "cursor" from utility classes like "cursor-pointer" or "cursor-default" is CSS styling, not a slider handle
+        if matched_handles == {"cursor"}:
+            raw_cls = (attrs.get("class") or "").lower()
+            if not ("cursor-" in raw_cls or "cursor:" in (attrs.get("style") or "").lower()):
+                return True
+        else:
+            return True
 
     if tokens & set(DRAG_ATTR_HINTS):
         return True
