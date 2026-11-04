@@ -35,3 +35,4 @@ diff --git a/src/wasm/wasm-js.cc b/src/wasm/wasm-js.cc
    DirectHandle<JSGlobalObject> global = isolate->global_object();
 -- 
 2.48.1
+

@@ -129,6 +129,10 @@ impl std::error::Error for NetworkError {}
 pub struct NetworkEngine {
     pub config: NetworkConfig,
     client: Client,
+    /// Retry client with `danger_accept_invalid_certs(true)`, used only for
+    /// requests to hosts listed in `WEBRESEARCH_TLS_PROCEED_HOSTS` (an explicit
+    /// operator decision; recorded in the network ledger as proceeded-unverified).
+    insecure_client: Option<Client>,
     pub ip_filter: IpFilter,
     pub rate_limiter: RateLimiter,
     pub singleflight: SingleFlight<FetchResult, String>,
@@ -153,6 +157,19 @@ impl NetworkEngine {
             .build()
             .unwrap_or_else(|_| Client::new());
 
+        // Build an accept-invalid-certs fallback client only when the operator
+        // has explicitly listed proceed hosts. Per-request host matching is
+        // delegated to tls_policy::decision_for_host at dispatch time.
+        let insecure_client = if std::env::var("WEBRESEARCH_TLS_PROCEED_HOSTS").is_ok() {
+            Client::builder()
+                .cookie_store(true)
+                .danger_accept_invalid_certs(true)
+                .build()
+                .ok()
+        } else {
+            None
+        };
+
         let ip_filter = IpFilter::new(config.block_private_ips);
         let rate_limiter = RateLimiter::new(
             config.rate_limit_interval_ms,
@@ -168,6 +185,7 @@ impl NetworkEngine {
         Self {
             config,
             client,
+            insecure_client,
             ip_filter,
             rate_limiter,
             singleflight,
@@ -366,20 +384,68 @@ impl NetworkEngine {
 
         // Build reqwest request
         let method = req.method.parse().unwrap_or(reqwest::Method::GET);
-        let mut builder = self.client.request(method, &req.url).headers(req_headers.clone());
+        let mut builder = self.client.request(method.clone(), &req.url).headers(req_headers.clone());
         if let Some(ref b) = req.body {
             builder = builder.body(b.clone());
         }
 
-        let resp = builder.send().await.map_err(|e| e.to_string())?;
+        // TLS proceed intercept: if the primary client fails with a TLS error
+        // and the host is explicitly allowed, retry once with the insecure client.
+        let parsed = Url::parse(&req.url).map_err(|e| e.to_string())?;
+        let host = parsed.host_str().unwrap_or("");
+        let resp = match builder.send().await {
+            Ok(r) => r,
+            Err(err) => {
+                // reqwest's Display prints only the top-level message; rustls/TLS
+                // details live in the source chain. Walk it for honest classification.
+                let mut err_text = err.to_string();
+                let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&err);
+                while let Some(e) = src {
+                    err_text.push_str(&format!(": {}", e));
+                    src = e.source();
+                }
+                if let Some(interstitial) = crate::tls_policy::handle_tls_error(host, &err_text) {
+                    if interstitial.decision == "proceed" {
+                        let insecure = self.insecure_client
+                            .as_ref()
+                            .ok_or_else(|| format!("TLS proceed decision but no insecure client available for {}", host))?;
+                        let mut builder2 = insecure.request(method, &req.url).headers(req_headers.clone());
+                        if let Some(ref b) = req.body {
+                            builder2 = builder2.body(b.clone());
+                        }
+                        let resp2 = builder2.send().await.map_err(|e2| e2.to_string())?;
+                        // Attach x-webresearch-tls header to mark the response
+                        return self.build_fetch_result(req, resp2, Some(format!("proceeded-unverified:{}", interstitial.kind)), stale_cache).await;
+                    }
+                }
+                return Err(err_text);
+            }
+        };
+
+        self.build_fetch_result(req, resp, None, stale_cache).await
+    }
+
+    /// Common path for building a FetchResult from a successful reqwest Response.
+    /// Optionally injects an `x-webresearch-tls` header (e.g. "proceeded-unverified:untrusted-chain").
+    async fn build_fetch_result(
+        &self,
+        req: NetworkRequest,
+        resp: reqwest::Response,
+        tls_header: Option<String>,
+        stale_cache: Option<CacheEntry>,
+    ) -> Result<FetchResult, String> {
         let status = resp.status().as_u16();
         let final_url = resp.url().as_str().to_string();
 
-        let resp_headers: HashMap<String, String> = resp
+        let mut resp_headers: HashMap<String, String> = resp
             .headers()
             .iter()
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
+
+        if let Some(tls_val) = tls_header {
+            resp_headers.insert("x-webresearch-tls".to_string(), tls_val);
+        }
 
         let content_type = resp_headers
             .get("content-type")

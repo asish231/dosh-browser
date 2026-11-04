@@ -1005,7 +1005,7 @@ DEFINE_NEG_IMPLICATION(jitless, wasm_in_js_inlining_wrapper)
 DEFINE_NEG_IMPLICATION(jitless, interpreted_frames_native_stack)
 
 DEFINE_BOOL(
-    disable_optimizing_compilers, false,
+    disable_optimizing_compilers, true,
     "Disable all optimizing compilers while leaving baseline compilers enabled")
 // Disable all optimizing JavaScript compilers.
 // JavaScript code can execute either in Ignition or Sparkplug.
@@ -1929,7 +1929,8 @@ DEFINE_INT(invocation_count_for_maglev_with_delay, 600,
            "reaching this invocation count")
 
 // Favor memory over execution speed.
-DEFINE_BOOL(optimize_for_size, false,
+// doshgentv8: default to true for lean agent runtime
+DEFINE_BOOL(optimize_for_size, true,
             "Enables optimizations which favor memory size over execution "
             "speed")
 DEFINE_VALUE_IMPLICATION(optimize_for_size, max_semi_space_size, size_t{1})
