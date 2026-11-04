@@ -20,6 +20,7 @@ test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
 video = ["yt-dlp>=2026.10.26"]
 
 [project.scripts]
+dosh = "webresearch.cli:main"
 webresearch = "webresearch.cli:main"
 
 [build-system]

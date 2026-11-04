@@ -162,7 +162,7 @@ Why the nesting is correct:
 
 1. **V8's build system demands it.** GN/ninja must run from the tree root where
    `BUILD.gn`, `.gn`, and `DEPS` sit. You cannot merge V8's build into a Rust
-   crate layout; every forker (Lightpanda's zig-v8-fork, deno's rusty_v8)
+   crate layout; every forker (e.g. deno's rusty_v8)
    vendors V8 as a nested tree.
 2. **Upstream rebase discipline.** V8 ships every 4 weeks. Keeping the pristine
    upstream in `research_repos/v8/` (247 MB, with .git) as the diff oracle and
