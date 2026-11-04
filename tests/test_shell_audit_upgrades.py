@@ -9,7 +9,7 @@ Implemented after verifying the audit's claims against live code:
 - #4 caps export: manifest to disk as machine-readable JSON.
 - #5 effect labels: read/mutate/privileged privilege classes on actions.
 
-Deferred with reasons (see UPGRADES_AUDIT_AND_PLAN.md): #3 receipts
+Deferred with reasons: #3 receipts
 (a real subsystem — new table, HMAC key management, chain verification),
 #6 privileged gating (the bridge it gates on does not exist; the spec
 would block every login in single-user DOSH).

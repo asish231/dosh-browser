@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-03 · **Engine:** QuickJS (`webresearch/engine/minidom.js`, 9,494 lines) · **Method:** 16 real websites loaded through the full owned pipeline (fetch → parse → scripts → ACD → shell), each with an honest per-site verdict.
 
-This report is built **strictly from live evidence** — every verdict below was reproduced by loading the actual site, not inferred from documentation. The sweep script lives at `tmp_scripts/site_sweep.py`.
+This report is built **strictly from live evidence** — every verdict below was reproduced by loading the actual site, not inferred from documentation. The sweep script lives at `scripts/site_sweep.py`.
 
 ---
 
@@ -120,7 +120,7 @@ These will not change; AGENTS.md's rule applies: *"Say 'this needs a real browse
 ## Reproducing
 
 ```bash
-.venv/bin/python tmp_scripts/site_sweep.py
+.venv/bin/python scripts/site_sweep.py
 ```
 
 Per-site verdicts depend on live bot-wall behavior (IP reputation, time of day); the wall classifications are the stable signal. The engine-side results (SPA hydration, ACD coverage, JS error counts) are deterministic.

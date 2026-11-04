@@ -1,0 +1,106 @@
+"""Auto-generated login runner script."""
+import asyncio, sys, re, base64, json, os
+
+sys.path.insert(0, os.environ.get("PYTHONPATH", "."))
+
+from webresearch.session import Browser
+from webresearch.engine.login import verify_logged_in
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+from webresearch.engine.captcha import solve_recaptcha_v2, vision_grid_select, vision_tile_contains
+from webresearch.settings import llm_config
+from webresearch.fetch import fetch
+
+URL = "{url}"
+USERNAME = "{username}"
+PASSWORD = "{password}"
+AES_KEY = b"$^Snk!D@!npQs!11"
+AES_IV = b"$^S214tsIKS19!11"
+
+def aes_cbc(plain):
+    padder = padding.PKCS7(128).padder()
+    data = padder.update(plain.encode()) + padder.finalize()
+    enc = Cipher(algorithms.AES(AES_KEY), modes.CBC(AES_IV)).encryptor()
+    ct = enc.update(data) + enc.finalize()
+    return base64.b64encode(ct).decode()
+
+async def main():
+    b = Browser()
+    s = await b.create()
+    html = ""
+    for attempt in range(15):
+        try:
+            await s.goto(URL, max_chars=2000)
+            html = s.html
+            if len(html) > 2000:
+                break
+        except Exception as e:
+            print(f"  load error: {e}", file=sys.stderr)
+        await asyncio.sleep(5)
+    if len(html) < 2000:
+        print(json.dumps({"verdict": "failed", "message": "could not load page"}))
+        await b.close_all()
+        return
+    vs = re.search(r'name="__VIEWSTATE"[^>]*value="([^"]*)"', html)
+    vsg = re.search(r'name="__VIEWSTATEGENERATOR"[^>]*value="([^"]*)"', html)
+    ev = re.search(r'name="__EVENTVALIDATION"[^>]*value="([^"]*)"', html)
+    btn = re.search(r'name="btnLogin"[^>]*value="([^"]*)"', html)
+    viewstate = vs.group(1) if vs else ""
+    vsgen = vsg.group(1) if vsg else ""
+    eventval = ev.group(1) if ev else ""
+    btnval = btn.group(1) if btn else "Login"
+    site_key = ""
+    m = re.search(r"sitekey='([^']*)'", html) or re.search(r'data-sitekey="([^"]*)"', html)
+    if m:
+        site_key = m.group(1)
+    if not site_key:
+        print(json.dumps({"verdict": "failed", "message": "no sitekey found"}))
+        await b.close_all()
+        return
+    print(f"sitekey: {site_key}", file=sys.stderr)
+    cfg = llm_config("auto")
+    async def tile(t, g):
+        return await vision_tile_contains(
+            t, g, api_key=cfg["api_key"], base_url=cfg["base_url"],
+            model=cfg["model"], models=["gemini-3.6-flash"])
+    async def grid(gb, g, r, c):
+        return await vision_grid_select(
+            gb, g, r, c, api_key=cfg["api_key"], base_url=cfg["base_url"],
+            model=cfg["model"], models=["gemini-3.6-flash"])
+    try:
+        token = await solve_recaptcha_v2(
+            s.client, site_key=site_key, site_url=URL,
+            grid_select=grid, tile_contains=tile, max_rounds=12)
+        print(f"token solved: {len(token)} chars", file=sys.stderr)
+    except Exception as e:
+        print(json.dumps({"verdict": "failed", "message": f"captcha solve: {e}"}))
+        await b.close_all()
+        return
+    enc_user = aes_cbc(USERNAME)
+    enc_pass = aes_cbc(PASSWORD)
+    payload = {
+        "__EVENTTARGET": "", "__EVENTARGUMENT": "",
+        "__VIEWSTATE": viewstate, "__VIEWSTATEGENERATOR": vsgen,
+        "txtUserId": USERNAME, "hdnUserId": enc_user,
+        "txtPassword": enc_pass, "hdnPassword": enc_pass,
+        "g-recaptcha-response": token, "btnLogin": btnval,
+    }
+    if eventval:
+        payload["__EVENTVALIDATION"] = eventval
+    result = await fetch(
+        URL, client=s.client, method="POST",
+        data=list(payload.items()),
+        headers={"Referer": URL, "Origin": "https://erp.aktu.ac.in",
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    print(f"POST: {result.status} -> {result.final_url}", file=sys.stderr)
+    verdict = verify_logged_in(
+        result.body or "", result.final_url or URL,
+        URL, dict(s.client.cookies), result.status)
+    text = re.sub(r"<[^>]+>", " ", result.body or "")[:600]
+    print(json.dumps({
+        "verdict": verdict, "url": result.final_url,
+        "status": result.status, "text_preview": text,
+    }))
+    await b.close_all()
+
+asyncio.run(main())

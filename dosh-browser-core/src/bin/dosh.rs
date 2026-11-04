@@ -60,7 +60,7 @@ async fn main() {
         eprintln!("  search <query> [--json]   Web search with DuckDuckGo fallback");
         eprintln!("  download <url>            Download file or PDF streaming to disk with SHA-256");
         eprintln!("  ask <prompt>              Let an agent research and answer using browser tools");
-        eprintln!("  shell [-c <command>]      Agent browser terminal (35 commands)");
+        eprintln!("  shell [-c <command>]      Agent browser terminal (36 commands)");
         eprintln!("  server / serve [--port N] Run REST HTTP API & tool invoke endpoints");
         eprintln!("  mcp                       Run Model Context Protocol server over stdio");
         eprintln!("  product / status          Show official lane and engine status");
@@ -69,6 +69,20 @@ async fn main() {
 
     let cmd = &args[1];
     match cmd.as_str() {
+        "--help" | "-h" | "help" => {
+            eprintln!("dosh — Agent-native browser (pure Rust core, doshgentv8 V8 engine)");
+            eprintln!("Usage: dosh <command> [args...]");
+            eprintln!("\nCommands:");
+            eprintln!("  read <url> [--json]       Read and project an LLM-ready page model");
+            eprintln!("  search <query> [--json]   Web search with DuckDuckGo fallback");
+            eprintln!("  download <url>            Download file or PDF streaming to disk with SHA-256");
+            eprintln!("  ask <prompt>              Let an agent research and answer using browser tools");
+            eprintln!("  shell [-c <command>]      Agent browser terminal (36 commands)");
+            eprintln!("  server / serve [--port N] Run REST HTTP API & tool invoke endpoints");
+            eprintln!("  mcp                       Run Model Context Protocol server over stdio");
+            eprintln!("  product / status          Show official lane and engine status");
+            process::exit(0);
+        }
         "read" => {
             if args.len() < 3 {
                 eprintln!("Usage: dosh read <url> [--json]");
