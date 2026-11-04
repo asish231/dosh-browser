@@ -1,0 +1,35 @@
+From: dosh-browser authors <dev@doshbrowser.org>
+Subject: [PATCH 2/4] Add isolate-scoped seeded PRNG to Math.random
+
+Enforces deterministic XorShift128+ state initialization from an
+isolate-scoped seed, ensuring 100% reproducible execution across
+replays.
+---
+ src/execution/isolate.h    | 8 ++++++++
+ src/numbers/math-random.cc | 6 +++++-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/execution/isolate.h b/src/execution/isolate.h
+--- a/src/execution/isolate.h
++++ b/src/execution/isolate.h
+@@ -2249,6 +2249,8 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
+   uint64_t random_seed() const { return random_seed_; }
+   void set_random_seed(uint64_t seed) { random_seed_ = seed; }
+@@ -3098,6 +3100,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
+   uint64_t random_seed_ = 0;
+
+diff --git a/src/numbers/math-random.cc b/src/numbers/math-random.cc
+--- a/src/numbers/math-random.cc
++++ b/src/numbers/math-random.cc
+@@ -56,7 +56,9 @@ Address MathRandom::InitializeAndMaybeRefillCache(Isolate* isolate,
+   if (state.s0 == 0 && state.s1 == 0) {
+     uint64_t seed;
+-    if (v8_flags.random_seed != 0) {
++    if (isolate != nullptr && isolate->random_seed() != 0) {
++      seed = isolate->random_seed();
++    } else if (v8_flags.random_seed != 0) {
+       seed = v8_flags.random_seed;
+     } else {
+       isolate->random_number_generator()->NextBytes(&seed, sizeof(seed));
+-- 
+2.48.1

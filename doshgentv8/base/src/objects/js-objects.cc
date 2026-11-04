@@ -6016,6 +6016,11 @@ int64_t JSDate::CurrentTimeValue(Isolate* isolate) {
   if (v8_flags.log_timer_events) LOG(isolate, CurrentTimeEvent());
   if (v8_flags.correctness_fuzzer_suppressions) return 4;
 
+  // doshgentv8 host-clock injection: if a virtual host clock is active, return it.
+  if (isolate != nullptr && isolate->has_virtual_time()) {
+    return isolate->virtual_time();
+  }
+
   // According to ECMA-262, section 15.9.1, page 117, the precision of
   // the number in a Date object representing a particular instant in
   // time is milliseconds. Therefore, we floor the result of getting

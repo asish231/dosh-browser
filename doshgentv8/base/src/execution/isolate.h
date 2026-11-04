@@ -2238,6 +2238,35 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     elements_deletion_counter_ = value;
   }
 
+  // doshgentv8 agentic policy overlay (WebKit feature adoptions):
+  bool has_virtual_time() const { return has_virtual_time_; }
+  int64_t virtual_time() const { return virtual_time_; }
+  void set_virtual_time(int64_t time_ms) {
+    has_virtual_time_ = true;
+    virtual_time_ = time_ms;
+  }
+  void clear_virtual_time() { has_virtual_time_ = false; }
+
+  uint64_t random_seed() const { return random_seed_; }
+  void set_random_seed(uint64_t seed) { random_seed_ = seed; }
+
+  uint64_t execution_fuel() const { return execution_fuel_; }
+  bool fuel_enabled() const { return fuel_enabled_; }
+  void set_execution_fuel(uint64_t fuel) {
+    execution_fuel_ = fuel;
+    fuel_enabled_ = true;
+  }
+  void disable_fuel() { fuel_enabled_ = false; }
+  bool consume_fuel(uint64_t units) {
+    if (!fuel_enabled_) return true;
+    if (execution_fuel_ <= units) {
+      execution_fuel_ = 0;
+      return false;
+    }
+    execution_fuel_ -= units;
+    return true;
+  }
+
 #if V8_ENABLE_WEBASSEMBLY
   void AddSharedWasmMemory(DirectHandle<WasmMemoryObject> memory_object);
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -3054,6 +3083,13 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 #endif
 
   bool is_frozen_ = false;
+
+  // doshgentv8 agentic policy overlay state:
+  bool has_virtual_time_ = false;
+  int64_t virtual_time_ = 0;
+  uint64_t random_seed_ = 0;
+  uint64_t execution_fuel_ = 0;
+  bool fuel_enabled_ = false;
 
   friend class HandleScopeImplementer;
   friend class GlobalSafepoint;

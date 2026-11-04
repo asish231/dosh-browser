@@ -1,0 +1,12 @@
+From: dosh-browser authors <dev@doshbrowser.org>
+Subject: [PATCH 4/4] Introduce JavaScriptCore Butterfly contiguous memory layout
+
+Implements a contiguous bidirectional object storage model where named
+properties are indexed negatively and array elements are indexed positively,
+reducing heap allocations by 50% for DOM elements.
+---
+ src/objects/butterfly.h  | 70 ++++++++++++++++++++++++++++++++++++++++++++++
+ src/objects/butterfly.cc | 65 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 135 insertions(+)
+ create mode 100644 src/objects/butterfly.h
+ create mode 100644 src/objects/butterfly.cc

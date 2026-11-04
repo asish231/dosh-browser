@@ -55,7 +55,9 @@ Address MathRandom::InitializeAndMaybeRefillCache(Isolate* isolate,
   // sequence.
   if (state.s0 == 0 && state.s1 == 0) {
     uint64_t seed;
-    if (v8_flags.random_seed != 0) {
+    if (isolate != nullptr && isolate->random_seed() != 0) {
+      seed = isolate->random_seed();
+    } else if (v8_flags.random_seed != 0) {
       seed = v8_flags.random_seed;
     } else {
       isolate->random_number_generator()->NextBytes(&seed, sizeof(seed));
