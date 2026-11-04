@@ -398,8 +398,6 @@ if (v8_wasm_random_fuzzers == "") {
 # subdirectories.
 v8_path_prefix = get_path_info("../", "abspath")
 
-v8_inspector_js_protocol = v8_path_prefix + "/include/js_protocol.pdl"
-
 ###############################################################################
 # Templates
 #
