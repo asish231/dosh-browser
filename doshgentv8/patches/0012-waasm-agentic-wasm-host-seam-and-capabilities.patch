@@ -77,3 +77,4 @@ diff --git a/src/wasm/module-instantiate.cc b/src/wasm/module-instantiate.cc
      switch (import.kind) {
 -- 
 2.48.1
+

@@ -189,6 +189,7 @@ class AcdBlock(BaseModel):
     semantic_category: str | None = None
     confidence: float | None = None
     cluster_id: str | None = None
+    content_hash: str = ""
 
 
 class AcdAction(BaseModel):

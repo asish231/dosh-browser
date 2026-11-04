@@ -10,6 +10,7 @@
 
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +29,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("net.capture", "Enable/disable opt-in redacted JSON/form response bodies: enabled."),
     ("net.rule", "Add runtime fetch/XHR block/header/mock rule: action, pattern, options."),
     ("net.unrule", "Remove network rule by id."),
+    ("net.apis", "Catalog discovered background API endpoints for Site-as-SDK replay."),
     ("console", "Query captured page logs/errors: after, limit, level."),
     ("eval", "Run bounded control-realm JavaScript: source, args, allow_actions=false."),
     ("skill.save", "Save source, name, origins, allow_actions=false to the workspace registry."),
@@ -39,6 +41,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("storage", "Inspect page storage metadata (values=false by default)."),
     ("snapshot", "Save a redacted document/control evidence snapshot; not a VM checkpoint."),
     ("diff", "Compare evidence snapshots: before, after."),
+    ("checkpoint", "Save durable session checkpoint (DOM tree, storage, history, cookies) to SQLite: id."),
+    ("restore", "Restore session from durable checkpoint: id."),
     ("layers", "Inspect approximate layout strata; not authoritative hit testing."),
     ("frames", "Inspect loaded frame realms and message counts, without message payloads."),
     ("tabs", "List tabs or switch using id."),
@@ -95,6 +99,11 @@ impl ShellStore {
             CREATE TABLE IF NOT EXISTS snapshots (
                 id INTEGER PRIMARY KEY, created REAL NOT NULL, tab_id TEXT NOT NULL,
                 url TEXT NOT NULL, evidence TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                id TEXT PRIMARY KEY, created REAL NOT NULL, tab_id TEXT NOT NULL,
+                url TEXT NOT NULL, title TEXT NOT NULL, html TEXT NOT NULL,
+                cookies TEXT NOT NULL, storage TEXT NOT NULL, history TEXT NOT NULL
             );",
         )?;
 
@@ -257,6 +266,75 @@ impl ShellStore {
         )
     }
 
+    pub fn save_checkpoint(
+        &self,
+        id: &str,
+        tab_id: &str,
+        url: &str,
+        title: &str,
+        html: &str,
+        cookies: &str,
+        storage: &str,
+        history: &str,
+    ) -> Result<serde_json::Value, rusqlite::Error> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO checkpoints (id, created, tab_id, url, title, html, cookies, storage, history) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![id, now, tab_id, url, title, html, cookies, storage, history],
+        )?;
+        Ok(serde_json::json!({
+            "id": id,
+            "created": now,
+            "tab_id": tab_id,
+            "url": url,
+            "title": title,
+        }))
+    }
+
+    pub fn get_checkpoint(&self, id: &str) -> Result<serde_json::Value, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, created, tab_id, url, title, html, cookies, storage, history FROM checkpoints WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "created": row.get::<_, f64>(1)?,
+                    "tab_id": row.get::<_, String>(2)?,
+                    "url": row.get::<_, String>(3)?,
+                    "title": row.get::<_, String>(4)?,
+                    "html": row.get::<_, String>(5)?,
+                    "cookies": row.get::<_, String>(6)?,
+                    "storage": row.get::<_, String>(7)?,
+                    "history": row.get::<_, String>(8)?,
+                }))
+            },
+        )
+    }
+
+    pub fn list_checkpoints(&self) -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, created, tab_id, url, title FROM checkpoints ORDER BY created DESC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "created": row.get::<_, f64>(1)?,
+                "tab_id": row.get::<_, String>(2)?,
+                "url": row.get::<_, String>(3)?,
+                "title": row.get::<_, String>(4)?,
+            }))
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
     pub fn query_readonly(&self, sql: &str, limit: usize) -> Result<Vec<serde_json::Value>, String> {
         let sql_lower = sql.trim().to_lowercase();
         if !sql_lower.starts_with("select") && !sql_lower.starts_with("values") {
@@ -389,6 +467,10 @@ pub async fn execute_command(
             let removed = session.network_ledger.remove_rule(id);
             Ok(serde_json::json!({ "removed": removed }))
         }
+        "net.apis" => {
+            let apis = session.network_ledger.discover_apis();
+            Ok(serde_json::json!({ "endpoints": apis }))
+        }
         "console" => {
             let after = args.get("after").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
@@ -509,6 +591,51 @@ pub async fn execute_command(
                 "note": "evidence snapshot comparison"
             }))
         }
+        "checkpoint" => {
+            let tab = session.current_tab();
+            let default_id = format!("chk_{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or(&default_id);
+            let title = tab.page().map(|p| p.title).unwrap_or_default();
+            let cookies = serde_json::to_string(&tab.headers).unwrap_or_default();
+            let storage = serde_json::to_string(&session.local_storage).unwrap_or_default();
+            let history = serde_json::to_string(&tab.history).unwrap_or_default();
+            let res = store.save_checkpoint(id, &tab.id, &tab.url, &title, &tab.html, &cookies, &storage, &history)
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "checkpoint": res, "note": "durable session checkpoint saved to SQLite" }))
+        }
+        "restore" => {
+            let id = args.get("id").and_then(|v| v.as_str()).ok_or("id is required to restore checkpoint")?;
+            let chk = store.get_checkpoint(id).map_err(|e| e.to_string())?;
+            if let Some(s) = chk["storage"].as_str() {
+                if let Ok(st) = serde_json::from_str::<HashMap<String, HashMap<String, String>>>(s) {
+                    session.local_storage = st;
+                }
+            }
+            let tab = session.current_tab_mut();
+            if let Some(h) = chk["html"].as_str() {
+                tab.html = h.to_string();
+            }
+            if let Some(u) = chk["url"].as_str() {
+                tab.url = u.to_string();
+            }
+            if let Some(c) = chk["cookies"].as_str() {
+                if let Ok(hdr) = serde_json::from_str::<HashMap<String, String>>(c) {
+                    tab.headers = hdr;
+                }
+            }
+            if let Some(hist) = chk["history"].as_str() {
+                if let Ok(h) = serde_json::from_str::<Vec<crate::session::Page>>(hist) {
+                    tab.history = h;
+                    tab.index = (tab.history.len() as isize) - 1;
+                }
+            }
+            Ok(serde_json::json!({
+                "restored": id,
+                "url": chk["url"],
+                "title": chk["title"],
+                "note": "session rehydrated from checkpoint"
+            }))
+        }
         "layers" => {
             let tab = session.current_tab();
             let mut rt = crate::runtime::Runtime::new(session.client.clone(), &tab.url)?;
@@ -552,10 +679,15 @@ pub async fn execute_command(
             let max_chars = args.get("max_chars").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
             let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            let since_hashes: std::collections::HashSet<String> = args
+                .get("since_hashes")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
             let title = tab.page().map(|p| p.title).unwrap_or_default();
             let acd = crate::acd::build_acd(&tab.url, &title, &tab.html, &[], &[], &[], &serde_json::json!({}), 400);
             let reading_blocks: Vec<serde_json::Value> = acd.blocks.iter()
-                .filter(|b| b.block_type != "table")
+                .filter(|b| b.block_type != "table" && !since_hashes.contains(&b.content_hash))
                 .skip(offset)
                 .take(limit)
                 .map(|b| {
@@ -564,6 +696,7 @@ pub async fn execute_command(
                     serde_json::json!({
                         "type": b.block_type,
                         "text": text,
+                        "content_hash": b.content_hash,
                         "provenance": b.provenance,
                         "category": b.semantic_category,
                         "confidence": b.confidence,
@@ -842,6 +975,22 @@ mod tests {
         let s = store.get_snapshot(id).unwrap();
         assert_eq!(s["tab_id"], "tab1");
         assert_eq!(s["url"], "https://test.com");
+    }
+
+    #[test]
+    fn test_shell_store_checkpoint_lifecycle() {
+        let store = ShellStore::new(None).unwrap();
+        let res = store.save_checkpoint("chk_1", "tab1", "https://example.com", "Example", "<h1>Hello</h1>", "{}", "{}", "[]").unwrap();
+        assert_eq!(res["id"], "chk_1");
+
+        let chk = store.get_checkpoint("chk_1").unwrap();
+        assert_eq!(chk["url"], "https://example.com");
+        assert_eq!(chk["title"], "Example");
+        assert_eq!(chk["html"], "<h1>Hello</h1>");
+
+        let list = store.list_checkpoints().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["id"], "chk_1");
     }
 
     #[tokio::test]

@@ -34,6 +34,7 @@ COMMANDS = {
     "net.capture": "Enable/disable opt-in redacted JSON/form response bodies: enabled.",
     "net.rule": "Add runtime fetch/XHR block/header/mock rule: action, pattern, options.",
     "net.unrule": "Remove network rule by id.",
+    "net.apis": "Catalog discovered background API endpoints for Site-as-SDK replay.",
     "console": "Query captured page logs/errors: after, limit, level.",
     "eval": "Run bounded control-realm JavaScript: source, args, allow_actions=false.",
     "skill.save": "Save source, name, origins, allow_actions=false to the workspace registry.",
@@ -45,6 +46,8 @@ COMMANDS = {
     "storage": "Inspect page storage metadata (values=false by default).",
     "snapshot": "Save a redacted document/control evidence snapshot; not a VM checkpoint.",
     "diff": "Compare evidence snapshots: before, after.",
+    "checkpoint": "Save durable session checkpoint (DOM tree, storage, history, cookies) to SQLite: id.",
+    "restore": "Restore session from durable checkpoint: id.",
     "layers": "Inspect approximate layout strata; not authoritative hit testing.",
     "frames": "Inspect loaded frame realms and message counts, without message payloads.",
     "tabs": "List tabs or switch using id.",
@@ -103,6 +106,11 @@ class ShellStore:
             CREATE TABLE IF NOT EXISTS snapshots (
                 id INTEGER PRIMARY KEY, created REAL NOT NULL, tab_id TEXT NOT NULL,
                 url TEXT NOT NULL, evidence TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                id TEXT PRIMARY KEY, created REAL NOT NULL, tab_id TEXT NOT NULL,
+                url TEXT NOT NULL, title TEXT NOT NULL, html TEXT NOT NULL,
+                cookies TEXT NOT NULL, storage TEXT NOT NULL, history TEXT NOT NULL
             );
         """)
         # Warrant TTL migration (upgrade audit #2): persistent workspaces
@@ -200,6 +208,36 @@ class ShellStore:
         finally:
             self.conn.set_authorizer(None)
             self.conn.set_progress_handler(None, 0)
+
+    def save_checkpoint(
+        self, id: str, tab_id: str, url: str, title: str, html: str,
+        cookies: str, storage: str, history: str,
+    ) -> dict:
+        created = time.time()
+        with self.conn:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO checkpoints (id, created, tab_id, url, title, html, cookies, storage, history)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (id, created, tab_id, url, title, html, cookies, storage, history))
+        return {"id": id, "created": created, "tab_id": tab_id, "url": url, "title": title}
+
+    def get_checkpoint(self, id: str) -> dict:
+        row = self.conn.execute(
+            "SELECT id, created, tab_id, url, title, html, cookies, storage, history FROM checkpoints WHERE id=?",
+            (id,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"checkpoint '{id}' not found")
+        return {
+            "id": row[0], "created": row[1], "tab_id": row[2], "url": row[3],
+            "title": row[4], "html": row[5], "cookies": row[6], "storage": row[7], "history": row[8],
+        }
+
+    def list_checkpoints(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id, created, tab_id, url, title FROM checkpoints ORDER BY created DESC"
+        ).fetchall()
+        return [{"id": r[0], "created": r[1], "tab_id": r[2], "url": r[3], "title": r[4]} for r in rows]
 
     def close(self):
         self.conn.close()
@@ -420,6 +458,8 @@ class DoshShell:
             return self.network.add_rule(a["action"], a["pattern"], a.get("method", "*"), **a.get("options", {}))
         if name == "net.unrule":
             return {"removed": self.network.remove_rule(a["id"])}
+        if name == "net.apis":
+            return {"endpoints": self.network.discover_apis()}
         if name == "console":
             after = a.get("after", 0)
             if isinstance(after, bool) or not isinstance(after, int) or after < 0:
@@ -505,6 +545,31 @@ class DoshShell:
                     "changed": [v for k, v in new.items() if k in old and v != old[k]],
                     "url_changed": before["url"] != after["url"],
                     "note": "content-addressed refs can change when labels change; not a VM diff"}
+        if name == "checkpoint":
+            cid = a.get("id") or f"chk_{int(time.time())}"
+            cookies_data = json.dumps([{"name": k, "value": v} for k, v in getattr(s.client, "cookies", {}).items()])
+            storage_data = json.dumps(getattr(s, "_web_storage", {}))
+            tab = getattr(s, "current_tab", None)
+            history_data = json.dumps([{"url": p.url, "title": p.title} for p in (tab.history if tab else [])])
+            html = s.html or ""
+            title = s.page.title if s.page else ""
+            res = self.store.save_checkpoint(cid, s.active_tab_id, _url(s.url), title, html, cookies_data, storage_data, history_data)
+            return {"checkpoint": res, "note": "durable session checkpoint saved to SQLite"}
+        if name == "restore":
+            cid = a.get("id")
+            if not cid:
+                raise ValueError("id is required to restore checkpoint")
+            chk = self.store.get_checkpoint(cid)
+            tab = getattr(s, "current_tab", None)
+            if tab is not None:
+                tab.html = chk["html"]
+                tab.url = chk["url"]
+            if hasattr(s, "_web_storage") and chk["storage"]:
+                try:
+                    s._web_storage.update(json.loads(chk["storage"]))
+                except Exception:
+                    pass
+            return {"restored": cid, "url": chk["url"], "title": chk["title"], "note": "session rehydrated from checkpoint"}
         if name == "layers":
             data = json.loads(self._context(a.get("frame", "")).eval("__inspectLayers()"))
             return {"projection": data, "authoritative_hit_test": False,
@@ -561,7 +626,12 @@ class DoshShell:
                             entry["category"] = b.semantic_category
                         if b.confidence is not None:
                             entry["confidence"] = b.confidence
+                        if b.content_hash:
+                            entry["content_hash"] = b.content_hash
                         all_blocks.append(entry)
+            if a.get("since_hashes"):
+                since_set = set(a["since_hashes"])
+                all_blocks = [blk for blk in all_blocks if blk.get("content_hash") not in since_set]
             if not all_blocks:
                 # Form-heavy pages can compile zero reading blocks (the ACD
                 # keeps controls in its action projection instead). Fall back

@@ -348,6 +348,79 @@ impl NetworkLedger {
             "body_max_bytes": self.body_max_bytes,
         })
     }
+
+    /// Catalog discovered background API endpoints (XHR/fetch/JSON) for Site-as-SDK direct replay.
+    pub fn discover_apis(&self) -> Vec<Value> {
+        let mut endpoints: HashMap<(String, String), Value> = HashMap::new();
+
+        for r in &self.records {
+            let is_api = r.url.contains("/api/")
+                || r.content_type.to_lowercase().contains("json")
+                || r.initiator_type == "fetch"
+                || r.initiator_type == "xmlhttprequest"
+                || r.url.ends_with(".json")
+                || r.url.ends_with(".graphql");
+
+            if !is_api {
+                continue;
+            }
+
+            let Ok(parsed) = url::Url::parse(&r.url) else {
+                continue;
+            };
+
+            let path = parsed.path().to_string();
+            let host = parsed.host_str().unwrap_or("").to_string();
+            let scheme = parsed.scheme().to_string();
+            let base_endpoint = format!("{scheme}://{host}{path}");
+            let key = (r.method.to_uppercase(), base_endpoint.clone());
+
+            let query_keys: Vec<String> = parsed
+                .query_pairs()
+                .map(|(k, _)| k.to_string())
+                .collect();
+
+            if let Some(entry) = endpoints.get_mut(&key) {
+                if let Some(obs) = entry.get_mut("observations") {
+                    *obs = json!(obs.as_u64().unwrap_or(0) + 1);
+                }
+                if let Some(params) = entry.get_mut("query_params").and_then(|v| v.as_array_mut()) {
+                    for qk in query_keys {
+                        let qk_val = json!(qk);
+                        if !params.contains(&qk_val) {
+                            params.push(qk_val);
+                        }
+                    }
+                }
+            } else {
+                endpoints.insert(
+                    key,
+                    json!({
+                        "method": r.method.to_uppercase(),
+                        "endpoint": base_endpoint,
+                        "host": host,
+                        "path": path,
+                        "query_params": query_keys,
+                        "content_type": r.content_type,
+                        "sample_status": r.status,
+                        "observations": 1,
+                    }),
+                );
+            }
+        }
+
+        let mut res: Vec<Value> = endpoints.into_values().collect();
+        res.sort_by(|a, b| {
+            let obs_b = b["observations"].as_u64().unwrap_or(0);
+            let obs_a = a["observations"].as_u64().unwrap_or(0);
+            obs_b.cmp(&obs_a).then_with(|| {
+                let ep_a = a["endpoint"].as_str().unwrap_or("");
+                let ep_b = b["endpoint"].as_str().unwrap_or("");
+                ep_a.cmp(ep_b)
+            })
+        });
+        res
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +469,44 @@ mod tests {
         // Verify URL was redacted
         let record = &query["records"][0];
         assert!(record["url"].as_str().unwrap().contains("%5BREDACTED%5D"));
+    }
+
+    #[test]
+    fn test_discover_apis_catalog() {
+        let mut ledger = NetworkLedger::new(100, true);
+        ledger.append(NetworkRecord {
+            url: "https://example.com/api/v1/users?page=1&limit=20".to_string(),
+            method: "GET".to_string(),
+            status: Some(200),
+            content_type: "application/json".to_string(),
+            initiator_type: "fetch".to_string(),
+            ..Default::default()
+        });
+        ledger.append(NetworkRecord {
+            url: "https://example.com/api/v1/users?page=2".to_string(),
+            method: "GET".to_string(),
+            status: Some(200),
+            content_type: "application/json".to_string(),
+            initiator_type: "fetch".to_string(),
+            ..Default::default()
+        });
+        ledger.append(NetworkRecord {
+            url: "https://example.com/static/style.css".to_string(),
+            method: "GET".to_string(),
+            status: Some(200),
+            content_type: "text/css".to_string(),
+            initiator_type: "link".to_string(),
+            ..Default::default()
+        });
+
+        let apis = ledger.discover_apis();
+        assert_eq!(apis.len(), 1);
+        let ep = &apis[0];
+        assert_eq!(ep["method"], "GET");
+        assert_eq!(ep["path"], "/api/v1/users");
+        assert_eq!(ep["observations"], 2);
+        let params = ep["query_params"].as_array().unwrap();
+        assert!(params.contains(&json!("page")));
     }
 }
 

@@ -396,6 +396,9 @@ void MicrotaskQueue::RemoveMicrotasksCompletedCallback(
 }
 
 void MicrotaskQueue::OnCompleted(Isolate* isolate) {
+  if (isolate != nullptr) {
+    isolate->TriggerCheckpointCallback();
+  }
   DCHECK_IMPLIES(microtasks_completed_callbacks_.empty(),
                  !microtasks_completed_callbacks_cow_.has_value());
   if (microtasks_completed_callbacks_.empty()) [[likely]] {

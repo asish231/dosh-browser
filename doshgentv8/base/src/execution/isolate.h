@@ -2279,6 +2279,18 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   void set_waasm_capabilities_mask(uint32_t mask) { waasm_capabilities_mask_ = mask; }
   bool is_waasm_capability_allowed(uint32_t cap) const { return (waasm_capabilities_mask_ & cap) != 0; }
 
+  // doshgentv8: Checkpoint callback hook for microtask boundaries
+  using CheckpointCallback = void (*)(Isolate*, void*);
+  void SetCheckpointCallback(CheckpointCallback callback, void* data) {
+    checkpoint_callback_ = callback;
+    checkpoint_callback_data_ = data;
+  }
+  void TriggerCheckpointCallback() {
+    if (checkpoint_callback_ != nullptr) {
+      checkpoint_callback_(this, checkpoint_callback_data_);
+    }
+  }
+
 #if V8_ENABLE_WEBASSEMBLY
   void AddSharedWasmMemory(DirectHandle<WasmMemoryObject> memory_object);
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -3105,6 +3117,8 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   bool eval_allowed_ = true;
   bool wasm_allowed_ = true;
   uint32_t waasm_capabilities_mask_ = 0x3F;
+  CheckpointCallback checkpoint_callback_ = nullptr;
+  void* checkpoint_callback_data_ = nullptr;
 
   friend class HandleScopeImplementer;
   friend class GlobalSafepoint;
