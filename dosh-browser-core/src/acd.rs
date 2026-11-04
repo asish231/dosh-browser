@@ -98,6 +98,21 @@ fn emit_block_with_node(
         (None, None, None)
     };
 
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(block_type.as_bytes());
+    hasher.update(b":");
+    hasher.update(locator.as_bytes());
+    hasher.update(b":");
+    hasher.update(text.as_bytes());
+    for row in &rows {
+        for cell in row {
+            hasher.update(cell.as_bytes());
+            hasher.update(b":");
+        }
+    }
+    let content_hash = format!("{:x}", hasher.finalize())[..16].to_string();
+
     blocks.push(AcdBlock {
         id: format!("b{}", counter),
         block_type: block_type.to_string(),
@@ -112,6 +127,7 @@ fn emit_block_with_node(
         semantic_category,
         confidence,
         cluster_id: None,
+        content_hash,
     });
 }
 
@@ -651,6 +667,56 @@ pub fn slice_acd(acd: &Acd, start: &str, end: &str, limit: usize) -> Result<Vec<
     Ok(acd.blocks[i..j.min(i + limit)].to_vec())
 }
 
+/// Diff-first reading: return only newly added or mutated blocks between visits.
+pub fn diff_acd(old_acd: &Acd, new_acd: &Acd) -> Value {
+    let mut old_hashes: HashMap<String, String> = HashMap::new();
+    let mut old_locators: HashMap<String, String> = HashMap::new();
+
+    for b in &old_acd.blocks {
+        if !b.content_hash.is_empty() {
+            old_hashes.insert(b.id.clone(), b.content_hash.clone());
+            if !b.locator.is_empty() {
+                old_locators.insert(b.locator.clone(), b.content_hash.clone());
+            }
+        }
+    }
+
+    let mut mutated_blocks: Vec<AcdBlock> = Vec::new();
+    let mut unchanged_count = 0;
+
+    for b in &new_acd.blocks {
+        let prior = old_hashes.get(&b.id).or_else(|| {
+            if !b.locator.is_empty() {
+                old_locators.get(&b.locator)
+            } else {
+                None
+            }
+        });
+        if let Some(hash) = prior {
+            if *hash == b.content_hash {
+                unchanged_count += 1;
+                continue;
+            }
+        }
+        mutated_blocks.push(b.clone());
+    }
+
+    let new_ids: std::collections::HashSet<String> = new_acd.blocks.iter().map(|b| b.id.clone()).collect();
+    let removed_ids: Vec<String> = old_hashes
+        .keys()
+        .filter(|id| !new_ids.contains(*id))
+        .cloned()
+        .collect();
+
+    serde_json::json!({
+        "mutated_blocks": mutated_blocks,
+        "mutated_count": mutated_blocks.len(),
+        "removed_block_ids": removed_ids,
+        "unchanged_count": unchanged_count,
+        "total_blocks": new_acd.blocks.len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +734,20 @@ mod tests {
         assert_eq!(acd.blocks[0].level, Some(1));
         assert_eq!(acd.blocks[1].block_type, "text");
         assert_eq!(acd.blocks[1].text, "Para 1");
+        assert!(!acd.blocks[0].content_hash.is_empty());
+    }
+
+    #[test]
+    fn test_diff_acd_mutated_blocks() {
+        let html1 = "<main><h1>Title</h1><p>Para 1</p></main>";
+        let html2 = "<main><h1>Title</h1><p>Para 1 Updated</p><p>Para 2 New</p></main>";
+        let acd1 = build_acd("https://a.com", "T1", html1, &[], &[], &[], &serde_json::json!({}), 100);
+        let acd2 = build_acd("https://a.com", "T2", html2, &[], &[], &[], &serde_json::json!({}), 100);
+
+        let diff = diff_acd(&acd1, &acd2);
+        assert_eq!(diff["total_blocks"], 3);
+        assert_eq!(diff["unchanged_count"], 1); // "Title" is unchanged
+        assert_eq!(diff["mutated_count"], 2); // "Para 1 Updated" and "Para 2 New"
     }
 
     #[test]

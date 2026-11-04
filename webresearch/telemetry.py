@@ -309,6 +309,67 @@ class NetworkLedger:
             "metadata_limits": {"headers": 64, "header_name_chars": 128, "header_value_chars": 1024, "url_chars": 2048},
         }
 
+    def discover_apis(self) -> list[dict]:
+        """Catalog discovered background API endpoints (XHR/fetch/JSON) for Site-as-SDK direct replay."""
+        endpoints: dict[tuple[str, str], dict] = {}
+        for record in self._records.values():
+            url = record.get("url", "")
+            method = record.get("method", "GET").upper()
+            content_type = record.get("content_type", "")
+            status = record.get("status")
+
+            path_lower = urlsplit(url).path.lower()
+            if path_lower.endswith((".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot")):
+                continue
+
+            is_api = (
+                "/api/" in url
+                or "json" in content_type.lower()
+                or record.get("source") in ("runtime", "fetch", "xhr")
+                or record.get("initiatorType") in ("fetch", "xmlhttprequest")
+                or url.endswith((".json", ".graphql"))
+            )
+            if not is_api:
+                continue
+
+            try:
+                parts = urlsplit(url)
+                path = parts.path
+                host = parts.netloc
+                base_endpoint = f"{parts.scheme}://{host}{path}"
+                query_keys = [k for k, _ in parse_qsl(parts.query)]
+            except Exception:
+                continue
+
+            key = (method, base_endpoint)
+            if key not in endpoints:
+                endpoints[key] = {
+                    "method": method,
+                    "endpoint": base_endpoint,
+                    "host": host,
+                    "path": path,
+                    "query_params": set(query_keys),
+                    "content_type": content_type,
+                    "sample_status": status,
+                    "observations": 0,
+                }
+            else:
+                endpoints[key]["query_params"].update(query_keys)
+                if status:
+                    endpoints[key]["sample_status"] = status
+                if content_type:
+                    endpoints[key]["content_type"] = content_type
+
+            endpoints[key]["observations"] += 1
+
+        result = []
+        for ep in endpoints.values():
+            ep_copy = dict(ep)
+            ep_copy["query_params"] = sorted(list(ep["query_params"]))
+            result.append(ep_copy)
+        result.sort(key=lambda x: (-x["observations"], x["endpoint"]))
+        return result
+
     def add_rule(self, action: str, pattern: str, method: str = "*", **kwargs) -> dict:
         """Store a runtime rule and return redacted metadata, never its payload.
 

@@ -156,3 +156,20 @@ def test_v8_waasm_agentic_capabilities():
     assert ctx.eval("globalThis.waasm.act(0, 0)") == 0
 
 
+@pytest.mark.skipif(not HAS_V8, reason="doshgentv8_rust not available")
+def test_v8_waasm_zero_copy_buffer_view():
+    ctx = doshgentv8_rust.DoshContext()
+    # Test zero-copy memory buffer view accessor
+    script = """
+    const mem = new WebAssembly.Memory({ initial: 1 });
+    globalThis.waasm.setMemory(mem);
+    const view = globalThis.waasm.getBufferView(4, 8);
+    view[0] = 42;
+    view[1] = 99;
+    const directView = new Uint8Array(mem.buffer);
+    directView[4] === 42 && directView[5] === 99;
+    """
+    assert ctx.eval(script) is True
+
+
+

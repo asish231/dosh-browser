@@ -391,6 +391,12 @@ const EXTENSIONS_SCRIPT: &str = r#"
 
     // WAASM Host Namespace for Agent-Native WebAssembly
     globalThis.waasm = {
+        _lastMemory: null,
+        setMemory: function(mem) { this._lastMemory = mem; },
+        getBufferView: function(ptr, len) {
+            if (!this._lastMemory || !this._lastMemory.buffer) return null;
+            return new Uint8Array(this._lastMemory.buffer, ptr, len);
+        },
         read_dom: function(spec_ptr, spec_len) {
             if (!_waasmCaps.read_dom) throw new WebAssembly.LinkError("WAASM capability disallowed: read_dom");
             if (typeof globalThis.host_waasm_read_dom === 'function') {
@@ -466,7 +472,13 @@ const EXTENSIONS_SCRIPT: &str = r#"
                     }
                 }
             }
-            return _v8Instantiate.call(this, source, imports);
+            return _v8Instantiate.call(this, source, imports).then(function(res) {
+                const inst = (res && res.instance) ? res.instance : res;
+                if (inst && inst.exports && inst.exports.memory) {
+                    globalThis.waasm.setMemory(inst.exports.memory);
+                }
+                return res;
+            });
         };
     }
 
@@ -499,7 +511,11 @@ const EXTENSIONS_SCRIPT: &str = r#"
                     }
                 }
             }
-            return new _v8Instance(module, imports);
+            const inst = new _v8Instance(module, imports);
+            if (inst && inst.exports && inst.exports.memory) {
+                globalThis.waasm.setMemory(inst.exports.memory);
+            }
+            return inst;
         };
         _origWebAssembly.Instance.prototype = _v8Instance.prototype;
     }

@@ -109,6 +109,14 @@ def build_acd(
         blocks_total = len(candidates)
 
         def _emit(block: AcdBlock, node=None):
+            if not block.content_hash:
+                import hashlib
+                h = hashlib.sha256()
+                h.update(f"{block.type}:{block.locator}:{block.text}".encode("utf-8", errors="replace"))
+                if block.rows:
+                    for row in block.rows:
+                        h.update(":".join(row).encode("utf-8", errors="replace"))
+                block.content_hash = h.hexdigest()[:16]
             if node is not None:
                 try:
                     block.provenance = extract_provenance(node)
@@ -301,7 +309,12 @@ def build_acd(
             budget_hit = True
             break
         counter += 1
-        blocks.append(AcdBlock(id=f"b{counter}", **kwargs))
+        b = AcdBlock(id=f"b{counter}", **kwargs)
+        import hashlib
+        h = hashlib.sha256()
+        h.update(f"{b.type}:{b.locator}:{b.text}".encode("utf-8", errors="replace"))
+        b.content_hash = h.hexdigest()[:16]
+        blocks.append(b)
 
     actions: list[AcdAction] = []
     for target in targets:
@@ -422,6 +435,33 @@ def build_acd(
         collections=collections,
         unavailable=unavailable,
     )
+
+
+def diff_acd(old_acd: Acd, new_acd: Acd) -> dict:
+    """Diff-first reading: return only newly added or mutated blocks between visits."""
+    old_hashes = {b.id: b.content_hash for b in old_acd.blocks if b.content_hash}
+    old_locators = {b.locator: b.content_hash for b in old_acd.blocks if b.locator and b.content_hash}
+
+    mutated_blocks: list[AcdBlock] = []
+    unchanged_count = 0
+
+    for b in new_acd.blocks:
+        prior_hash = old_hashes.get(b.id) or (old_locators.get(b.locator) if b.locator else None)
+        if prior_hash and prior_hash == b.content_hash:
+            unchanged_count += 1
+        else:
+            mutated_blocks.append(b)
+
+    new_ids = {b.id for b in new_acd.blocks}
+    removed_ids = [bid for bid in old_hashes if bid not in new_ids]
+
+    return {
+        "mutated_blocks": mutated_blocks,
+        "mutated_count": len(mutated_blocks),
+        "removed_block_ids": removed_ids,
+        "unchanged_count": unchanged_count,
+        "total_blocks": len(new_acd.blocks),
+    }
 
 
 def error_summary(errors: list[str], *, limit: int = 3, width: int = 160) -> str:
