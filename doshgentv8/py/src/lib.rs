@@ -144,6 +144,68 @@ impl DoshContext {
     fn heap_total(&mut self) -> usize {
         self.engine.total_heap_size()
     }
+
+    /// Set deterministic instruction/step fuel limit.
+    fn set_fuel(&mut self, fuel: u64) {
+        self.engine.set_fuel(fuel);
+    }
+
+    fn fuel_remaining(&self) -> u64 {
+        self.engine.fuel_remaining()
+    }
+
+    fn disable_fuel(&mut self) {
+        self.engine.disable_fuel();
+    }
+
+    /// Set deterministic virtual host clock in milliseconds.
+    fn set_virtual_time(&mut self, millis: f64) -> PyResult<()> {
+        self.engine.set_virtual_time(millis).map_err(PyRuntimeError::new_err)
+    }
+
+    fn advance_virtual_time(&mut self, delta_millis: f64) -> PyResult<()> {
+        self.engine.advance_virtual_time(delta_millis).map_err(PyRuntimeError::new_err)
+    }
+
+    fn virtual_time(&self) -> Option<f64> {
+        self.engine.virtual_time()
+    }
+
+    /// Set deterministic PRNG seed for Math.random.
+    fn set_random_seed(&mut self, seed: u64) -> PyResult<()> {
+        self.engine.set_random_seed(seed).map_err(PyRuntimeError::new_err)
+    }
+
+    fn reset_random(&mut self) -> PyResult<()> {
+        self.engine.reset_random().map_err(PyRuntimeError::new_err)
+    }
+
+    /// Capability Gate: allow or disallow eval() and Function constructor.
+    fn set_eval_allowed(&mut self, allowed: bool) -> PyResult<()> {
+        self.engine.set_eval_allowed(allowed).map_err(PyRuntimeError::new_err)
+    }
+
+    fn is_eval_allowed(&self) -> bool {
+        self.engine.is_eval_allowed()
+    }
+
+    /// Capability Gate: allow or disallow WebAssembly.
+    fn set_wasm_allowed(&mut self, allowed: bool) -> PyResult<()> {
+        self.engine.set_wasm_allowed(allowed).map_err(PyRuntimeError::new_err)
+    }
+
+    fn is_wasm_allowed(&self) -> bool {
+        self.engine.is_wasm_allowed()
+    }
+
+    /// Capability Gate: allow or disallow host network calls.
+    fn set_network_allowed(&mut self, allowed: bool) {
+        self.engine.set_network_allowed(allowed);
+    }
+
+    fn is_network_allowed(&self) -> bool {
+        self.engine.is_network_allowed()
+    }
 }
 
 #[pymodule]

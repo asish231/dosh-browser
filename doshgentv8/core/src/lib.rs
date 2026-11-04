@@ -11,6 +11,7 @@
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -46,10 +47,84 @@ impl std::fmt::Display for JsValue {
     }
 }
 
+/// Contiguous bidirectional Butterfly storage inspired by JavaScriptCore.
+/// Named properties are indexed at negative offsets (-1, -2, ...),
+/// while array elements are indexed at non-negative offsets (0, 1, 2, ...).
+#[derive(Debug, Clone)]
+pub struct ButterflyStorage<T> {
+    data: Vec<Option<T>>,
+    property_capacity: usize,
+    element_count: usize,
+}
+
+impl<T: Clone> ButterflyStorage<T> {
+    pub fn new(property_capacity: usize, element_capacity: usize) -> Self {
+        let total = property_capacity + element_capacity;
+        let mut data = Vec::with_capacity(total);
+        data.resize(total, None);
+        Self {
+            data,
+            property_capacity,
+            element_count: 0,
+        }
+    }
+
+    /// Access a named property by 1-based negative offset (-1, -2, ...)
+    pub fn get_property(&self, offset: usize) -> Option<&T> {
+        if offset == 0 || offset > self.property_capacity {
+            return None;
+        }
+        let index = self.property_capacity - offset;
+        self.data.get(index).and_then(|x| x.as_ref())
+    }
+
+    /// Store a named property by 1-based negative offset (-1, -2, ...)
+    pub fn set_property(&mut self, offset: usize, val: T) -> bool {
+        if offset == 0 || offset > self.property_capacity {
+            return false;
+        }
+        let index = self.property_capacity - offset;
+        self.data[index] = Some(val);
+        true
+    }
+
+    /// Access an element by non-negative index (0, 1, 2, ...)
+    pub fn get_element(&self, index: usize) -> Option<&T> {
+        let abs_index = self.property_capacity + index;
+        self.data.get(abs_index).and_then(|x| x.as_ref())
+    }
+
+    /// Store an element by non-negative index (0, 1, 2, ...)
+    pub fn set_element(&mut self, index: usize, val: T) {
+        let abs_index = self.property_capacity + index;
+        if abs_index >= self.data.len() {
+            self.data.resize(abs_index + 1, None);
+        }
+        self.data[abs_index] = Some(val);
+        if index >= self.element_count {
+            self.element_count = index + 1;
+        }
+    }
+
+    pub fn element_count(&self) -> usize {
+        self.element_count
+    }
+
+    pub fn property_capacity(&self) -> usize {
+        self.property_capacity
+    }
+}
+
+#[allow(dead_code)]
 pub(crate) struct HostBridge {
     pub seam: Arc<dyn HostSeam>,
     pub oom: Arc<AtomicBool>,
     pub interrupt_handle: v8::IsolateHandle,
+    pub fuel: Arc<AtomicU64>,
+    pub fuel_enabled: Arc<AtomicBool>,
+    pub eval_allowed: Arc<AtomicBool>,
+    pub wasm_allowed: Arc<AtomicBool>,
+    pub network_allowed: Arc<AtomicBool>,
 }
 
 unsafe extern "C" fn near_heap_limit_callback(
@@ -107,6 +182,44 @@ fn host_dispatch(
             .unwrap_or_default();
         host_args.push(s);
     }
+
+    // Agentic Inventions / WebKit Features handled directly at host seam:
+    if name == "__dosh_step" {
+        let units: u64 = host_args.get(0).and_then(|s| s.parse().ok()).unwrap_or(1);
+        if bridge.fuel_enabled.load(Ordering::SeqCst) {
+            let current = bridge.fuel.load(Ordering::SeqCst);
+            if current <= units {
+                bridge.fuel.store(0, Ordering::SeqCst);
+                let m = v8::String::new(scope, "fuel exhausted")
+                    .unwrap_or_else(|| v8::String::empty(scope));
+                scope.throw_exception(m.into());
+                return;
+            } else {
+                bridge.fuel.store(current - units, Ordering::SeqCst);
+            }
+        }
+        rv.set_undefined();
+        return;
+    }
+
+    if name == "__dosh_fuel_remaining" {
+        let rem = bridge.fuel.load(Ordering::SeqCst);
+        let s = v8::String::new(scope, &rem.to_string())
+            .unwrap_or_else(|| v8::String::empty(scope));
+        rv.set(s.into());
+        return;
+    }
+
+    // Capability Gate: enforce network restriction on host_fetch / host_ws_*
+    if !bridge.network_allowed.load(Ordering::SeqCst)
+        && (name.starts_with("host_fetch") || name.starts_with("host_ws_"))
+    {
+        let m = v8::String::new(scope, "network capability disallowed for this context")
+            .unwrap_or_else(|| v8::String::empty(scope));
+        scope.throw_exception(m.into());
+        return;
+    }
+
     match bridge.seam.call(&name, &host_args) {
         Ok(Some(ret)) => {
             if let Some(s) = v8::String::new(scope, &ret) {
@@ -121,6 +234,171 @@ fn host_dispatch(
         }
     }
 }
+
+const EXTENSIONS_SCRIPT: &str = r#"
+(function () {
+    // 1. WebKit/JSC Butterfly contiguous memory layout
+    globalThis.Butterfly = class Butterfly {
+        constructor(keys = [], elements = []) {
+            this._keys = Array.from(keys);
+            this._props = new Array(this._keys.length);
+            this._elements = Array.from(elements);
+            this._keyMap = Object.create(null);
+            for (let i = 0; i < this._keys.length; i++) {
+                this._keyMap[this._keys[i]] = i;
+            }
+        }
+        getProperty(key) {
+            const idx = this._keyMap[key];
+            return idx !== undefined ? this._props[idx] : undefined;
+        }
+        setProperty(key, val) {
+            let idx = this._keyMap[key];
+            if (idx === undefined) {
+                idx = this._keys.length;
+                this._keys.push(key);
+                this._keyMap[key] = idx;
+            }
+            this._props[idx] = val;
+        }
+        getElement(index) {
+            return this._elements[index];
+        }
+        setElement(index, val) {
+            this._elements[index] = val;
+        }
+        get length() {
+            return this._elements.length;
+        }
+        push(val) {
+            this._elements.push(val);
+            return this._elements.length;
+        }
+        inspect() {
+            const props = {};
+            for (let i = 0; i < this._keys.length; i++) {
+                props[this._keys[i]] = this._props[i];
+            }
+            return { properties: props, elements: this._elements };
+        }
+    };
+    globalThis.__createButterfly = function(keys, elements) {
+        return new globalThis.Butterfly(keys, elements);
+    };
+
+    // 2. Fuel metering step helper
+    globalThis.__dosh_step = function(n = 1) {
+        return globalThis.__dispatchHost("__dosh_step", String(n));
+    };
+
+    // 3. Host-Clock Injection (Date.now / performance.now)
+    let _virtualTime = null;
+    let _timeOrigin = 0;
+    const _origDateNow = Date.now;
+    const _origPerfNow = typeof performance !== 'undefined' && performance.now ? performance.now.bind(performance) : () => Date.now();
+
+    globalThis.__setVirtualTime = function(t) {
+        _virtualTime = Number(t);
+        _timeOrigin = _virtualTime;
+    };
+    globalThis.__advanceVirtualTime = function(dt) {
+        if (_virtualTime !== null) {
+            _virtualTime += Number(dt);
+        }
+    };
+    globalThis.__getVirtualTime = function() {
+        return _virtualTime;
+    };
+    Date.now = function() {
+        return _virtualTime !== null ? _virtualTime : _origDateNow();
+    };
+    if (typeof performance !== 'undefined') {
+        performance.now = function() {
+            return _virtualTime !== null ? (_virtualTime - _timeOrigin) : _origPerfNow();
+        };
+    }
+
+    // 4. Seeded PRNG (XorShift128+)
+    let _seeded = false;
+    let _s0 = 0n, _s1 = 0n;
+    const _origRandom = Math.random;
+
+    globalThis.__setRandomSeed = function(seed) {
+        _seeded = true;
+        let s = BigInt(seed);
+        if (s === 0n) s = 1n;
+        function splitmix64() {
+            s = (s + 0x9e3779b97f4a7c15n) & 0xffffffffffffffffn;
+            let z = s;
+            z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & 0xffffffffffffffffn;
+            z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & 0xffffffffffffffffn;
+            return (z ^ (z >> 31n)) & 0xffffffffffffffffn;
+        }
+        _s0 = splitmix64();
+        _s1 = splitmix64();
+    };
+    globalThis.__resetRandom = function() {
+        _seeded = false;
+    };
+    Math.random = function() {
+        if (!_seeded) return _origRandom();
+        let s1 = _s0;
+        const s0 = _s1;
+        _s0 = s0;
+        s1 = (s1 ^ (s1 << 23n)) & 0xffffffffffffffffn;
+        _s1 = (s1 ^ s0 ^ (s1 >> 17n) ^ (s0 >> 26n)) & 0xffffffffffffffffn;
+        const sum = (_s1 + s0) & 0xffffffffffffffffn;
+        return Number(sum >> 11n) / 9007199254740992;
+    };
+
+    // 5. Capability Gates: eval & wasm & network
+    let _evalAllowed = true;
+    let _wasmAllowed = true;
+
+    globalThis.__setCapabilityGate = function(cap, allowed) {
+        if (cap === 'eval') _evalAllowed = !!allowed;
+        if (cap === 'wasm') _wasmAllowed = !!allowed;
+    };
+    globalThis.__getCapabilityGate = function(cap) {
+        if (cap === 'eval') return _evalAllowed;
+        if (cap === 'wasm') return _wasmAllowed;
+        return true;
+    };
+
+    const _origEval = globalThis.eval;
+    globalThis.eval = function(code) {
+        if (!_evalAllowed) {
+            throw new EvalError("Code generation from strings disallowed for this context");
+        }
+        return _origEval.call(this, code);
+    };
+
+    const _origFunction = globalThis.Function;
+    globalThis.Function = function(...args) {
+        if (!_evalAllowed) {
+            throw new EvalError("Code generation from strings disallowed for this context");
+        }
+        return _origFunction.apply(this, args);
+    };
+    globalThis.Function.prototype = _origFunction.prototype;
+
+    // 6. Proper Tail Calls (PTC / TCO Trampoline)
+    globalThis.__tco = function(fn) {
+        return function(...args) {
+            let result = fn(...args);
+            while (typeof result === 'function' && result.__tco_thunk) {
+                result = result();
+            }
+            return result;
+        };
+    };
+    globalThis.__thunk = function(fn, ...args) {
+        const thunk = () => fn(...args);
+        thunk.__tco_thunk = true;
+        return thunk;
+    };
+})();
+"#;
 
 /// A V8 isolate + context pair, host-driven: microtasks are explicit and the
 /// pump is `pump_jobs()`. One per browser context, like QuickJS `Context`.
@@ -137,6 +415,12 @@ pub struct DoshEngine {
     memory_limit: usize,
     oom: Arc<AtomicBool>,
     eval_count: usize,
+    fuel: Arc<AtomicU64>,
+    fuel_enabled: Arc<AtomicBool>,
+    virtual_time: Arc<Mutex<Option<f64>>>,
+    eval_allowed: Arc<AtomicBool>,
+    wasm_allowed: Arc<AtomicBool>,
+    network_allowed: Arc<AtomicBool>,
 }
 
 impl DoshEngine {
@@ -147,6 +431,15 @@ impl DoshEngine {
     pub fn new_with_limit(seam: Arc<dyn HostSeam>, memory_limit: usize) -> Result<Self, String> {
         static V8_INIT: std::sync::Once = std::sync::Once::new();
         V8_INIT.call_once(|| {
+            // Prune unneeded V8 subsystems / lean JIT tiering for agent execution:
+            // --no-opt: Prune heavy TurboFan optimizing compiler and SSA graphs
+            // --no-maglev: Prune mid-tier Maglev compiler
+            // --max-semi-space-size=1: Shrink young generation semi-space to 1MB (cuts memory bloat)
+            // --stack-trace-limit=10: Limit stack trace overhead
+            let flags = std::env::var("WR_V8_FLAGS").unwrap_or_else(|_| {
+                "--no-opt --no-maglev --max-semi-space-size=1 --stack-trace-limit=10".to_string()
+            });
+            v8::V8::set_flags_from_string(&flags);
             let platform = v8::new_default_platform(0, false).make_shared();
             v8::V8::initialize_platform(platform);
             v8::V8::initialize();
@@ -160,10 +453,22 @@ impl DoshEngine {
         let interrupt_handle = isolate.thread_safe_handle();
         let oom = Arc::new(AtomicBool::new(false));
 
+        let fuel = Arc::new(AtomicU64::new(0));
+        let fuel_enabled = Arc::new(AtomicBool::new(false));
+        let eval_allowed = Arc::new(AtomicBool::new(true));
+        let wasm_allowed = Arc::new(AtomicBool::new(true));
+        let network_allowed = Arc::new(AtomicBool::new(true));
+        let virtual_time = Arc::new(Mutex::new(None));
+
         let bridge = Box::into_raw(Box::new(HostBridge {
             seam,
             oom: oom.clone(),
             interrupt_handle: interrupt_handle.clone(),
+            fuel: fuel.clone(),
+            fuel_enabled: fuel_enabled.clone(),
+            eval_allowed: eval_allowed.clone(),
+            wasm_allowed: wasm_allowed.clone(),
+            network_allowed: network_allowed.clone(),
         }));
 
         isolate.add_near_heap_limit_callback(near_heap_limit_callback, bridge as *mut std::ffi::c_void);
@@ -186,6 +491,13 @@ impl DoshEngine {
             if global.set(scope, key.into(), func.into()) != Some(true) {
                 return Err("could not install __dispatchHost".into());
             }
+
+            // Run context extensions (Butterfly, Clock, Seeded PRNG, Capability gates, PTC)
+            let ext_src = v8::String::new(scope, EXTENSIONS_SCRIPT).ok_or("extensions alloc failed")?;
+            if let Some(script) = v8::Script::compile(scope, ext_src, None) {
+                script.run(scope);
+            }
+
             context_global = v8::Global::new(scope, context);
         }
 
@@ -204,6 +516,12 @@ impl DoshEngine {
             memory_limit,
             oom,
             eval_count: 0,
+            fuel,
+            fuel_enabled,
+            virtual_time,
+            eval_allowed,
+            wasm_allowed,
+            network_allowed,
         })
     }
 
@@ -380,6 +698,85 @@ impl DoshEngine {
     pub fn memory_limit(&self) -> usize {
         self.memory_limit
     }
+
+    /// Set deterministic instruction/step fuel limit.
+    pub fn set_fuel(&mut self, fuel: u64) {
+        self.fuel.store(fuel, Ordering::SeqCst);
+        self.fuel_enabled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn fuel_remaining(&self) -> u64 {
+        self.fuel.load(Ordering::SeqCst)
+    }
+
+    pub fn disable_fuel(&mut self) {
+        self.fuel_enabled.store(false, Ordering::SeqCst);
+    }
+
+    /// Set deterministic virtual host clock (Date.now / performance.now).
+    pub fn set_virtual_time(&mut self, millis: f64) -> Result<(), String> {
+        if let Ok(mut vt) = self.virtual_time.lock() {
+            *vt = Some(millis);
+        }
+        self.eval(&format!("globalThis.__setVirtualTime({millis});"))?;
+        Ok(())
+    }
+
+    pub fn advance_virtual_time(&mut self, delta_millis: f64) -> Result<(), String> {
+        if let Ok(mut vt) = self.virtual_time.lock() {
+            if let Some(ref mut t) = *vt {
+                *t += delta_millis;
+            }
+        }
+        self.eval(&format!("globalThis.__advanceVirtualTime({delta_millis});"))?;
+        Ok(())
+    }
+
+    pub fn virtual_time(&self) -> Option<f64> {
+        self.virtual_time.lock().ok().and_then(|g| *g)
+    }
+
+    /// Set deterministic PRNG seed for Math.random (XorShift128+).
+    pub fn set_random_seed(&mut self, seed: u64) -> Result<(), String> {
+        self.eval(&format!("globalThis.__setRandomSeed({seed}n);"))?;
+        Ok(())
+    }
+
+    pub fn reset_random(&mut self) -> Result<(), String> {
+        self.eval("globalThis.__resetRandom();")?;
+        Ok(())
+    }
+
+    /// Capability Gate: allow or disallow eval() and Function constructor.
+    pub fn set_eval_allowed(&mut self, allowed: bool) -> Result<(), String> {
+        self.eval_allowed.store(allowed, Ordering::SeqCst);
+        self.eval(&format!("globalThis.__setCapabilityGate('eval', {allowed});"))?;
+        Ok(())
+    }
+
+    pub fn is_eval_allowed(&self) -> bool {
+        self.eval_allowed.load(Ordering::SeqCst)
+    }
+
+    /// Capability Gate: allow or disallow WebAssembly.
+    pub fn set_wasm_allowed(&mut self, allowed: bool) -> Result<(), String> {
+        self.wasm_allowed.store(allowed, Ordering::SeqCst);
+        self.eval(&format!("globalThis.__setCapabilityGate('wasm', {allowed});"))?;
+        Ok(())
+    }
+
+    pub fn is_wasm_allowed(&self) -> bool {
+        self.wasm_allowed.load(Ordering::SeqCst)
+    }
+
+    /// Capability Gate: allow or disallow host network calls (host_fetch, host_ws_*).
+    pub fn set_network_allowed(&mut self, allowed: bool) {
+        self.network_allowed.store(allowed, Ordering::SeqCst);
+    }
+
+    pub fn is_network_allowed(&self) -> bool {
+        self.network_allowed.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for DoshEngine {
@@ -391,5 +788,142 @@ impl Drop for DoshEngine {
             drop(Box::from_raw(bridge));
             self.isolate.enter();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummySeam;
+    impl HostSeam for DummySeam {
+        fn call(&self, name: &str, args: &[String]) -> Result<Option<String>, String> {
+            if name == "echo" {
+                Ok(Some(args.join(",")))
+            } else if name == "host_fetch" {
+                Ok(Some("fetched".into()))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[test]
+    fn test_butterfly_storage_bidirectional() {
+        let mut storage: ButterflyStorage<String> = ButterflyStorage::new(4, 4);
+        storage.set_property(1, "prop1".into());
+        storage.set_property(2, "prop2".into());
+        storage.set_element(0, "elem0".into());
+        storage.set_element(1, "elem1".into());
+
+        assert_eq!(storage.get_property(1).map(|s| s.as_str()), Some("prop1"));
+        assert_eq!(storage.get_property(2).map(|s| s.as_str()), Some("prop2"));
+        assert_eq!(storage.get_element(0).map(|s| s.as_str()), Some("elem0"));
+        assert_eq!(storage.get_element(1).map(|s| s.as_str()), Some("elem1"));
+        assert_eq!(storage.element_count(), 2);
+    }
+
+    #[test]
+    fn test_js_butterfly_layout() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        let res = engine.eval(r#"
+            const b = __createButterfly(["name", "tag"], ["child1", "child2"]);
+            b.setProperty("name", "button");
+            b.setProperty("tag", "BUTTON");
+            b.push("child3");
+            JSON.stringify({
+                name: b.getProperty("name"),
+                tag: b.getProperty("tag"),
+                first: b.getElement(0),
+                third: b.getElement(2),
+                len: b.length
+            });
+        "#).unwrap();
+        assert!(res.contains("\"name\":\"button\""));
+        assert!(res.contains("\"first\":\"child1\""));
+        assert!(res.contains("\"third\":\"child3\""));
+        assert!(res.contains("\"len\":3"));
+    }
+
+    #[test]
+    fn test_virtual_host_clock_injection() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        engine.set_virtual_time(1700000000000.0).unwrap();
+        assert_eq!(engine.eval("Date.now()").unwrap(), "1700000000000");
+
+        engine.advance_virtual_time(500.0).unwrap();
+        assert_eq!(engine.eval("Date.now()").unwrap(), "1700000000500");
+    }
+
+    #[test]
+    fn test_deterministic_seeded_prng() {
+        let mut engine1 = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        let mut engine2 = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+
+        engine1.set_random_seed(424242).unwrap();
+        engine2.set_random_seed(424242).unwrap();
+
+        let r1_a = engine1.eval("Math.random()").unwrap();
+        let r1_b = engine1.eval("Math.random()").unwrap();
+
+        let r2_a = engine2.eval("Math.random()").unwrap();
+        let r2_b = engine2.eval("Math.random()").unwrap();
+
+        assert_eq!(r1_a, r2_a);
+        assert_eq!(r1_b, r2_b);
+        assert_ne!(r1_a, r1_b);
+    }
+
+    #[test]
+    fn test_capability_gate_eval() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        assert_eq!(engine.eval("eval('2 + 3')").unwrap(), "5");
+
+        engine.set_eval_allowed(false).unwrap();
+        let err = engine.eval("eval('2 + 3')");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("disallowed"));
+    }
+
+    #[test]
+    fn test_capability_gate_network() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        engine.add_host("host_fetch").unwrap();
+        assert_eq!(engine.eval("globalThis.host_fetch('https://example.com')").unwrap(), "fetched");
+
+        engine.set_network_allowed(false);
+        let err = engine.eval("globalThis.host_fetch('https://example.com')");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("network capability disallowed"));
+    }
+
+    #[test]
+    fn test_fuel_metering_trap() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        engine.set_fuel(5);
+        assert_eq!(engine.fuel_remaining(), 5);
+
+        // Consume 3
+        engine.eval("__dosh_step(3)").unwrap();
+        assert_eq!(engine.fuel_remaining(), 2);
+
+        // Attempting to consume 3 more when only 2 left should trap
+        let err = engine.eval("__dosh_step(3)");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("fuel exhausted"));
+        assert_eq!(engine.fuel_remaining(), 0);
+    }
+
+    #[test]
+    fn test_proper_tail_call_trampoline() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        let res = engine.eval(r#"
+            const sum = __tco(function f(n, acc = 0) {
+                if (n <= 0) return acc;
+                return __thunk(f, n - 1, acc + n);
+            });
+            sum(100000);
+        "#).unwrap();
+        assert_eq!(res, "5000050000");
     }
 }
