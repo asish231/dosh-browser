@@ -67,6 +67,16 @@ async def test_solve_reads_key_and_stages_token(monkeypatch):
     # The session method imports the solver lazily from engine.captcha, so
     # patching the module attribute is enough.
     monkeypatch.setattr(captcha_mod, "solve_recaptcha_v2", fake_solve)
+    monkeypatch.setattr(
+        "webresearch.settings.llm_config",
+        lambda *args, **kwargs: {"api_key": "k", "base_url": "https://test", "model": "m", "provider": "openai_compat"}
+    )
+    async def mock_tile(*args, **kwargs):
+        return True
+    async def mock_grid(*args, **kwargs):
+        return [1, 2]
+    monkeypatch.setattr(captcha_mod, "vision_tile_contains", mock_tile)
+    monkeypatch.setattr(captcha_mod, "vision_grid_select", mock_grid)
 
     token = await session.solve_recaptcha_v2()
     assert token.startswith("0cAFtoken")
