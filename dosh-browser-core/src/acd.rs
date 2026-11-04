@@ -6,11 +6,15 @@
 
 use kuchiki::NodeRef;
 use kuchiki::traits::TendrilSink;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 use crate::content::{content_root, inside_chrome, tag_name, text_content, attr};
 use crate::types::*;
+use crate::provenance::extract_provenance;
+use crate::features::extract_features;
+use crate::classifier::classify_node;
+use crate::cluster::cluster_siblings;
 
 const BLOCK_SEL: &[&str] = &[
     "h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "pre", "blockquote", "table",
@@ -59,6 +63,7 @@ fn locator(node: &NodeRef) -> String {
     parts.join(" > ")
 }
 
+#[allow(dead_code)]
 fn emit_block(
     blocks: &mut Vec<AcdBlock>,
     counter: &mut i64,
@@ -69,7 +74,30 @@ fn emit_block(
     rows: Vec<Vec<String>>,
     role: String,
 ) {
+    emit_block_with_node(blocks, counter, block_type, text, level, locator, rows, role, None);
+}
+
+fn emit_block_with_node(
+    blocks: &mut Vec<AcdBlock>,
+    counter: &mut i64,
+    block_type: &str,
+    text: String,
+    level: Option<i64>,
+    locator: String,
+    rows: Vec<Vec<String>>,
+    role: String,
+    node: Option<&NodeRef>,
+) {
     *counter += 1;
+    let (provenance, semantic_category, confidence) = if let Some(n) = node {
+        let prov = extract_provenance(n);
+        let feats = extract_features(n);
+        let classif = classify_node(&feats);
+        (Some(prov), Some(classif.category.as_str().to_string()), Some(classif.confidence))
+    } else {
+        (None, None, None)
+    };
+
     blocks.push(AcdBlock {
         id: format!("b{}", counter),
         block_type: block_type.to_string(),
@@ -80,6 +108,10 @@ fn emit_block(
         href: "".to_string(),
         rows,
         locator,
+        provenance,
+        semantic_category,
+        confidence,
+        cluster_id: None,
     });
 }
 
@@ -99,7 +131,6 @@ pub fn build_acd(
     
     let mut blocks: Vec<AcdBlock> = Vec::new();
     let mut counter = 0i64;
-    let mut blocks_total = 0i64;
     let mut chrome_skipped = 0i64;
     let mut budget_hit = false;
     let mut seen_region_texts = HashSet::new();
@@ -114,7 +145,7 @@ pub fn build_acd(
         }
     }
     
-    blocks_total = all_block_nodes.len() as i64;
+    let mut blocks_total = all_block_nodes.len() as i64;
 
     for node in &all_block_nodes {
         if inside_chrome(node, Some(&root)) {
@@ -146,7 +177,7 @@ pub fn build_acd(
             }
             if !rows.is_empty() {
                 let loc = locator(node);
-                emit_block(&mut blocks, &mut counter, "table", "".to_string(), None, loc, rows, "".to_string());
+                emit_block_with_node(&mut blocks, &mut counter, "table", "".to_string(), None, loc, rows, "".to_string(), Some(node));
                 if blocks.len() >= max_blocks { budget_hit = true; break; }
             }
             continue;
@@ -158,16 +189,16 @@ pub fn build_acd(
         let loc = locator(node);
         if tag.starts_with('h') {
             if let Ok(lvl) = tag[1..].parse::<i64>() {
-                emit_block(&mut blocks, &mut counter, "heading", text, Some(lvl), loc, vec![], "".to_string());
+                emit_block_with_node(&mut blocks, &mut counter, "heading", text, Some(lvl), loc, vec![], "".to_string(), Some(node));
             }
         } else if tag == "pre" {
-            emit_block(&mut blocks, &mut counter, "code", text, None, "".to_string(), vec![], "".to_string());
+            emit_block_with_node(&mut blocks, &mut counter, "code", text, None, "".to_string(), vec![], "".to_string(), Some(node));
         } else if tag == "li" {
-            emit_block(&mut blocks, &mut counter, "list", text, None, "".to_string(), vec![], "".to_string());
+            emit_block_with_node(&mut blocks, &mut counter, "list", text, None, "".to_string(), vec![], "".to_string(), Some(node));
         } else if tag == "blockquote" {
-            emit_block(&mut blocks, &mut counter, "quote", text, None, loc, vec![], "".to_string());
+            emit_block_with_node(&mut blocks, &mut counter, "quote", text, None, loc, vec![], "".to_string(), Some(node));
         } else {
-            emit_block(&mut blocks, &mut counter, "text", text, None, loc, vec![], "".to_string());
+            emit_block_with_node(&mut blocks, &mut counter, "text", text, None, loc, vec![], "".to_string(), Some(node));
         }
         
         if blocks.len() >= max_blocks { budget_hit = true; break; }
@@ -227,7 +258,7 @@ pub fn build_acd(
             if blocks.len() >= max_blocks { budget_hit = true; break; }
             let text = text_content(node);
             let loc = locator(node);
-            emit_block(&mut blocks, &mut counter, "text", text, None, loc, vec![], "region".to_string());
+            emit_block_with_node(&mut blocks, &mut counter, "text", text, None, loc, vec![], "region".to_string(), Some(node));
         }
     }
 
@@ -369,6 +400,7 @@ pub fn build_acd(
             href: "".to_string(),
             rows: rows.clone(),
             locator: "".to_string(),
+            ..Default::default()
         });
     }
 
@@ -485,10 +517,24 @@ pub fn build_acd(
         unavailable.push(format!("blocks: {} candidate content region(s) beyond the {}-block budget were not projected", blocks_total - blocks.len() as i64, max_blocks));
     }
 
+    // --- Subtree Clustering for Collections (ACD 2.0) ---
+    let mut collections = cluster_siblings(&root, 1);
+    if let Ok(containers) = tree.select("div, section, main, ul") {
+        for cont in containers {
+            let sub_cols = cluster_siblings(cont.as_node(), collections.len() + 1);
+            for c in sub_cols {
+                if !collections.iter().any(|existing| existing.name == c.name) {
+                    collections.push(c);
+                }
+            }
+            if collections.len() >= 10 { break; }
+        }
+    }
+
     Acd {
         url: url.to_string(),
         title: title.to_string(),
-        version: "1".to_string(),
+        version: "2".to_string(),
         blocks,
         actions,
         links: links.to_vec(),
@@ -497,6 +543,7 @@ pub fn build_acd(
         framework,
         errors,
         counts,
+        collections,
         unavailable,
     }
 }
@@ -726,5 +773,49 @@ mod tests {
         let dom = kuchiki::parse_html().one(html);
         let span = dom.select("span").unwrap().next().unwrap();
         assert_eq!(locator(span.as_node()), "#x > span");
+    }
+
+    #[test]
+    fn test_acd_2_provenance_and_collections() {
+        let html = r#"
+        <html>
+          <body>
+            <main id="main">
+              <article class="post">
+                <h1>Balfour Case Analysis</h1>
+                <p>A landmark English contract law decision on intention to create legal relations.</p>
+              </article>
+              <div id="results">
+                <div class="card"><h3>Item 1</h3><p>Desc 1</p><a href="/1">1</a></div>
+                <div class="card"><h3>Item 2</h3><p>Desc 2</p><a href="/2">2</a></div>
+                <div class="card"><h3>Item 3</h3><p>Desc 3</p><a href="/3">3</a></div>
+              </div>
+            </main>
+          </body>
+        </html>
+        "#;
+
+        let acd = build_acd("https://law.example.com", "Law Title", html, &[], &[], &[], &serde_json::json!({}), 50);
+        assert_eq!(acd.version, "2");
+        assert!(!acd.blocks.is_empty());
+
+        // Check first block provenance and classification
+        let b0 = &acd.blocks[0];
+        assert!(b0.provenance.is_some());
+        let prov = b0.provenance.as_ref().unwrap();
+        assert_eq!(prov.tag, "h1");
+        assert!(prov.css_path.contains("main#main"));
+        assert!(prov.xpath.contains("h1"));
+
+        // Check semantic classification
+        let p_block = acd.blocks.iter().find(|b| b.block_type == "text").unwrap();
+        assert_eq!(p_block.semantic_category.as_deref(), Some("ArticleBody"));
+        assert!(p_block.confidence.unwrap() > 0.5);
+
+        // Check collections discovery
+        assert!(!acd.collections.is_empty());
+        let col = &acd.collections[0];
+        assert_eq!(col.category, "SearchResults");
+        assert_eq!(col.count, 3);
     }
 }

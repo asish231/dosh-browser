@@ -13,6 +13,12 @@ import json
 from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 from webresearch.content import content_root, inside_chrome
+from webresearch.provenance import (
+    classify_node,
+    cluster_siblings,
+    extract_features,
+    extract_provenance,
+)
 from webresearch.types import (
     Acd,
     AcdAction,
@@ -102,7 +108,16 @@ def build_acd(
         candidates = root.css(BLOCK_SEL)
         blocks_total = len(candidates)
 
-        def _emit(block: AcdBlock):
+        def _emit(block: AcdBlock, node=None):
+            if node is not None:
+                try:
+                    block.provenance = extract_provenance(node)
+                    feats = extract_features(node)
+                    cat, conf = classify_node(feats)
+                    block.semantic_category = cat
+                    block.confidence = conf
+                except Exception:
+                    pass
             blocks.append(block)
 
         for node in candidates:
@@ -128,7 +143,8 @@ def build_acd(
                         type="table",
                         rows=rows,
                         locator=_locator(node),
-                    )
+                    ),
+                    node=node,
                 )
                 if len(blocks) >= max_blocks:
                     budget_hit = True
@@ -146,16 +162,17 @@ def build_acd(
                         level=int(tag[1]),
                         text=text,
                         locator=_locator(node),
-                    )
+                    ),
+                    node=node,
                 )
             elif tag == "pre":
-                _emit(AcdBlock(id=f"b{counter}", type="code", text=text))
+                _emit(AcdBlock(id=f"b{counter}", type="code", text=text), node=node)
             elif tag == "li":
-                _emit(AcdBlock(id=f"b{counter}", type="list", text=text))
+                _emit(AcdBlock(id=f"b{counter}", type="list", text=text), node=node)
             elif tag == "blockquote":
-                _emit(AcdBlock(id=f"b{counter}", type="quote", text=text))
+                _emit(AcdBlock(id=f"b{counter}", type="quote", text=text), node=node)
             else:
-                _emit(AcdBlock(id=f"b{counter}", type="text", text=text))
+                _emit(AcdBlock(id=f"b{counter}", type="text", text=text), node=node)
             if len(blocks) >= max_blocks:
                 budget_hit = True
                 break
@@ -189,8 +206,16 @@ def build_acd(
                     break
                 text = _text(node)
                 counter += 1
-                _emit(AcdBlock(id=f"b{counter}", type="text", text=text,
-                               locator=_locator(node), role="region"))
+                _emit(
+                    AcdBlock(
+                        id=f"b{counter}",
+                        type="text",
+                        text=text,
+                        locator=_locator(node),
+                        role="region",
+                    ),
+                    node=node,
+                )
 
     # Extract JSON-LD structured data (FAQPage, HowTo, Product, etc.)
     json_ld_data: list[dict] = []
@@ -368,7 +393,22 @@ def build_acd(
         unavailable.append(
             f"blocks: {blocks_total - len(blocks)} candidate content region(s) beyond the {max_blocks}-block budget were not projected"
         )
+
+    # Subtree clustering for Collections (ACD 2.0)
+    collections = []
+    search_root = tree.body if tree is not None and tree.body is not None else root
+    if search_root is not None:
+        collections = cluster_siblings(search_root, 1)
+        for cont in search_root.css("div, section, main, ul")[:50]:
+            sub_cols = cluster_siblings(cont, len(collections) + 1)
+            for c in sub_cols:
+                if not any(existing.name == c.name for existing in collections):
+                    collections.append(c)
+            if len(collections) >= 10:
+                break
+
     return Acd(
+        version="2",
         url=url,
         title=title,
         blocks=blocks,
@@ -379,6 +419,7 @@ def build_acd(
         framework=framework,
         errors=errors,
         counts=counts,
+        collections=collections,
         unavailable=unavailable,
     )
 

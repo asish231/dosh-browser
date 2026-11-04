@@ -62,6 +62,7 @@ def browser_client_hints(ua: str = DEFAULT_UA, platform: str = "macOS") -> dict[
 def navigate_headers(url: str) -> dict[str, str]:
     """Sec-Fetch-* headers for a top-level document load."""
     return {
+        "User-Agent": DEFAULT_UA,
         "sec-fetch-dest": "document",
         "sec-fetch-mode": "navigate",
         "sec-fetch-site": "none",
