@@ -173,3 +173,4 @@ def test_function_to_string_incompatible_receiver_throws(js_ctx):
     data = json.loads(res)
     assert data["objError"] is True
     assert data["strError"] is True
+

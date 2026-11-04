@@ -130,3 +130,4 @@ def test_wasm_fuel_exhaustion_trap():
 
     with pytest.raises(WasmFuelExhausted, match="fuel exhausted"):
         inst.exports["loop"]()
+
