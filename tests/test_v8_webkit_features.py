@@ -106,3 +106,4 @@ def test_v8_proper_tail_call_trampoline():
         recurse(25000);
     """)
     assert res == 25000
+

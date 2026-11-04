@@ -1,0 +1,54 @@
+From: dosh-browser authors <dev@doshbrowser.org>
+Subject: [PATCH 1/4] Add host-clock injection to V8 Isolate and JSDate
+
+Allows host embedding layers (doshgentv8) to inject a deterministic virtual
+clock into the isolate, preventing real OS clock leakage to web scripts and
+anti-bot challenges.
+---
+ src/execution/isolate.h   | 15 +++++++++++++++
+ src/objects/js-objects.cc |  5 +++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/src/execution/isolate.h b/src/execution/isolate.h
+--- a/src/execution/isolate.h
++++ b/src/execution/isolate.h
+@@ -2240,6 +2240,15 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
+   size_t elements_deletion_counter() { return elements_deletion_counter_; }
+   void set_elements_deletion_counter(size_t value) {
+     elements_deletion_counter_ = value;
+   }
++
++  // doshgentv8 agentic policy overlay (WebKit feature adoptions):
++  bool has_virtual_time() const { return has_virtual_time_; }
++  int64_t virtual_time() const { return virtual_time_; }
++  void set_virtual_time(int64_t time_ms) {
++    has_virtual_time_ = true;
++    virtual_time_ = time_ms;
++  }
++  void clear_virtual_time() { has_virtual_time_ = false; }
+@@ -3085,6 +3094,9 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
+   bool is_frozen_ = false;
++
++  // doshgentv8 agentic policy overlay state:
++  bool has_virtual_time_ = false;
++  int64_t virtual_time_ = 0;
+ 
+   friend class HandleScopeImplementer;
+
+diff --git a/src/objects/js-objects.cc b/src/objects/js-objects.cc
+--- a/src/objects/js-objects.cc
++++ b/src/objects/js-objects.cc
+@@ -6016,6 +6016,11 @@ int64_t JSDate::CurrentTimeValue(Isolate* isolate) {
+   if (v8_flags.log_timer_events) LOG(isolate, CurrentTimeEvent());
+   if (v8_flags.correctness_fuzzer_suppressions) return 4;
+ 
++  // doshgentv8 host-clock injection: if a virtual host clock is active, return it.
++  if (isolate != nullptr && isolate->has_virtual_time()) {
++    return isolate->virtual_time();
++  }
++
+   // According to ECMA-262, section 15.9.1, page 117, the precision of
+   // the number in a Date object representing a particular instant in
+   // time is milliseconds. Therefore, we floor the result of getting
+-- 
+2.48.1

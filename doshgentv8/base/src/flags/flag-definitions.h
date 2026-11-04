@@ -594,7 +594,8 @@ DEFINE_BOOL(force_emit_interrupt_budget_checks, false,
             "force emit tier-up logic from all non-turbofan code, even if it "
             "is the top enabled tier")
 #ifdef V8_ENABLE_MAGLEV
-DEFINE_BOOL(maglev, true, "enable the maglev optimizing compiler")
+// doshgentv8: pruned heavy Maglev JIT compiler default for lean agent runtime
+DEFINE_BOOL(maglev, false, "enable the maglev optimizing compiler")
 #if !ENABLE_MAGLEV
 // Enable Maglev on Future for platforms in which it's not enabled by default
 // (eg, Android).
@@ -1400,7 +1401,8 @@ DEFINE_BOOL(disable_loop_stack_checks, false,
 // Flags for TurboFan.
 #ifdef V8_ENABLE_TURBOFAN
 #define V8_ENABLE_TURBOFAN_BOOL true
-DEFINE_BOOL(turbofan, true,
+// doshgentv8: pruned heavy TurboFan JIT compiler default for lean agent runtime
+DEFINE_BOOL(turbofan, false,
             "use the Turbofan optimizing compiler for JavaScript code "
             "(Wasm uses separate flags)")
 // TODO(leszeks): Temporary alias until we make sure all our infra is passing
@@ -2536,7 +2538,8 @@ DEFINE_BOOL(lazy_new_space_shrinking, false,
 DEFINE_SIZE_T(min_semi_space_size, 0,
               "min size of a semi-space (in MBytes), the new space consists of "
               "two semi-spaces")
-DEFINE_SIZE_T(max_semi_space_size, 0,
+// doshgentv8: lean young-generation allocation default (1 MB)
+DEFINE_SIZE_T(max_semi_space_size, 1,
               "max size of a semi-space (in MBytes), the new space consists of "
               "two semi-spaces")
 DEFINE_INT(semi_space_growth_factor, 2, "factor by which to grow the new space")
