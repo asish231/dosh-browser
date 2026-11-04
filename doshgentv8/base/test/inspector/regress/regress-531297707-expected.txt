@@ -1,4 +1,0 @@
-Tests that deoptimizing the topmost optimized frame on debugger break prevents stale TypedArray length/backing-store accesses.
-Paused in hot
-Paused in hot
-Paused in hot

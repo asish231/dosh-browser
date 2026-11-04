@@ -1,2 +1,0 @@
-Tests regress-crbug-633999.
-exception pauses: 3

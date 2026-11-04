@@ -1,3 +1,0 @@
-Checks restartFrame during an embedder breakProgram pause
-caller() returned 42 after 2 pauses.
-Done (no crash).

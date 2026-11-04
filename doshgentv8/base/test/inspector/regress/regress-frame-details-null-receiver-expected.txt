@@ -1,3 +1,0 @@
-Tests regress-frame-details-null-receiver.
-functionName: , this: object
-functionName: , this: object

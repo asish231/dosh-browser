@@ -1,9 +1,0 @@
-Tests that CommandLineAPIScope ignores a getter on Array.prototype[0].
-{
-    id : <messageId>
-    result : {
-        result : {
-            type : undefined
-        }
-    }
-}

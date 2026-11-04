@@ -1,2 +1,0 @@
-Tests regress-3280.
-scopes: local, global

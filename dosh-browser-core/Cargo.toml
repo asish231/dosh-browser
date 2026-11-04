@@ -30,6 +30,7 @@ ring = "0.17"
 
 # Async runtime for fetch & server
 tokio = { version = "1", features = ["rt", "macros", "fs", "time", "process", "rt-multi-thread", "sync"] }
+futures = "0.3"
 regex = "1.10"
 
 # Temp files (downloads, video)
@@ -41,3 +42,4 @@ axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
 tower-http = "0.6"
 http-body-util = "0.1"
+image = { version = "0.25.10", features = ["jpeg", "png"] }

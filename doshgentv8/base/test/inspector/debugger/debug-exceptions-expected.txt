@@ -1,3 +1,0 @@
-Tests caught vs uncaught exception pause events with for-of and yield*.
-uncaughtList: [true,true,false,false,false,false]
-yieldStarThrowResult: {"done":true}

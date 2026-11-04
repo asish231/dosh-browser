@@ -1,7 +1,0 @@
-Tests regress-491536.
-ok
-{
-    result : {
-        type : undefined
-    }
-}

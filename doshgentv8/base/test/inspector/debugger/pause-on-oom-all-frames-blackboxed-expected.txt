@@ -1,3 +1,0 @@
-Tests that an OOM break pauses even if all frames are blackboxed
-reason: OOM
-Test finished normally.

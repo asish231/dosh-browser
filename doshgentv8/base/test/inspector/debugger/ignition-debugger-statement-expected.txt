@@ -1,4 +1,0 @@
-Tests ignition-debugger-statement.
-before enable: 0
-after enable: 1
-after disable: 1

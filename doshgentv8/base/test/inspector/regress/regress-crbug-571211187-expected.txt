@@ -1,7 +1,0 @@
-Tests that console.assert does not crash when the context has no contextGroupId
-
-Running test: testAssertInDestroyedContext
-
-Running test: testDestroyContextDuringAssertFormatting
-
-Running test: testDestroyContextDuringAssertWrapping

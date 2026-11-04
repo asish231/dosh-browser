@@ -1,3 +1,0 @@
-Tests pause events for caught exceptions and breakpoints.
-paused: reason=exception, func=f, uncaught=false
-paused: reason=other, func=a

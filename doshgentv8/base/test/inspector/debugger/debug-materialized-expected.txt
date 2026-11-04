@@ -1,4 +1,0 @@
-Tests inspecting materialized arguments and objects in optimized frames.
-'x' = undefined
-'x' = undefined
-t is unavailable or materialized object

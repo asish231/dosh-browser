@@ -1,3 +1,0 @@
-Tests regress-crbug-432493.
-breakCount: 1, throwCount: 0
-breakCount: 2, throwCount: 1

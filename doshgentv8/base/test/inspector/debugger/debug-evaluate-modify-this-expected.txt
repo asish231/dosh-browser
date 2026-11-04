@@ -1,5 +1,0 @@
-Tests that modifying this via evaluateOnCallFrame throws.
-throws: true SyntaxError
-throws: true SyntaxError
-throws: true SyntaxError
-throws: true SyntaxError

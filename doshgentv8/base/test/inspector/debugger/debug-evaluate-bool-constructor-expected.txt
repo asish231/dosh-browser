@@ -1,3 +1,0 @@
-Tests evaluating an object whose constructor property is a boolean.
-a.type: object
-a.className: Object

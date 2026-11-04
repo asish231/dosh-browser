@@ -1,4 +1,0 @@
-Tests evaluating function name variable inside named function expressions.
-Pause 1: startsWith("function f()") = true
-Pause 2: startsWith("function f()") = true
-Pause 3: threw ReferenceError

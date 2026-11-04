@@ -1,8 +1,0 @@
-Tests regress-392114.
-{
-    result : {
-        description : NaN
-        type : number
-        unserializableValue : NaN
-    }
-}

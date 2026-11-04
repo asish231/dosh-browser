@@ -1,6 +1,0 @@
-Tests debug-evaluate-no-side-effect-iife.
-EvalError
-a === 2
-100 === 100
-100 === 100
-EvalError
