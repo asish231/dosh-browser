@@ -194,18 +194,22 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | Bounded control-realm `eval` | `shell.py:run_script` | In shell tests | ✅ Run JS with action/reading projection, strict limits |
 | Skills registry | `shell.py:ShellStore` + SQLite | In shell tests | ✅ Save/run/delete skills with SHA-256 pinning |
 | Snapshot & diff | `shell.py:snapshot/diff` | In shell tests | ✅ Evidence snapshot of controls, not VM checkpoint |
-| `open`, `actions`, `act`, `net.*`, `console`, `eval`, `skill.*`, `db`, `storage`, `snapshot`/`diff`, `layers`, `frames`, `tabs`, `video`, `read`, `history`, `cookies`, `wait`, `caps`, `screenshot`, `frame.eval`, `ref`, `trace`, `watch` | `shell.py` | All commands tested | ✅ 33 commands fully connected |
+| `open`, `actions`, `act`, `net.*`, `console`, `eval`, `skill.*`, `db`, `storage`, `snapshot`/`diff`, `layers`, `frames`, `tabs`, `video`, `read`, `history`, `cookies`, `wait`, `caps`, `screenshot`, `frame.eval`, `ref`, `trace`, `watch` | `shell.py` | All commands tested | ✅ 55 shell commands fully connected (46 baseline + 6 net.* depth + 3 state.*; count asserted in `test_shell_45_commands_completeness`) |
 | Binary WebSockets (count & skip) | `engine/ws.py` | Disclosed | ❌ Implementation exists, flagged as unimplemented |
 | Scoped WASM Interpreter & In-DOM Engine | `webresearch/engine/wasm.py`, `minidom.js` | `tests/test_wasm_engine.py`, `tests/test_wasm_minidom.py` (13 tests) | ✅ Implemented, fuel-metered anti-tarpit, linear memory, stack/table ops, causal export telemetry |
 | Native Function Cloaking | `minidom.js` (`__makeNative`, `Function.prototype.toString`) | `tests/test_stealth_cloaking.py` (6 tests) | ✅ Implemented, `[native code]` cloaking, spec-compliant name/length, CreepJS/Turnstile defense |
-| Unified SQL DB (history+cookies+storage+ledger) | ❌ | | ❌ Unimplemented |
-| Element identity tracker | `engine/identity.py` | ❌ | ❌ Unimplemented |
-| Causal trace stream (action→Δ→net→console) | `telemetry.py` + `shell.py` | ❌ | ❌ Wired but needs full pass integration |
-| Mutation subscription stream | `engine/delta.py` | ❌ | ❌ Unimplemented |
-| Capability manifest per page | ❌ | | ❌ Unimplemented |
+| **Unified SQL state DB** (history+cookies+storage+ledger) | `state_snapshots` in `shell.py` (`state_snapshots` in Rust `shell.rs`) | `tests/test_shell.py::test_state_*` + Rust shell tests | ✅ Implemented, both lanes, with `state.snapshot`/`state.diff`/`state.rollback`; diff is value-free, rollback rehydrates live jar + DOM, ledger stays append-only (disclosed). |
+| **Element identity tracker** (stable refs across re-renders) | Rust `identity.rs`; Python content-identity inventory | Rust shell test, `tests/test_shell.py::test_ref_stable_survives_rerender_shift` | ✅ Implemented, both lanes. Refs are content-addressed; `ref {stable}` re-resolves across re-rendering. |
+| **Causal trace stream** (action→Δ→net→console) | Python `trace` (full bundle) | Python shell tests | 🟡 Python complete (identity-keyed DOM delta + network + console + dialogs); Rust `trace` is wired but the `caused_by` link is still absent. |
+| **Mutation subscription stream** (deltas, not re-reads) | host-side MutationObserver in `minidom.js` (`__wrWatch*`) + `watch` drain | Rust `test_watch_real_mutation_stream`; Python `test_watch_*` | ✅ Implemented, both lanes: after/limit/next_after, disabled retains. |
+| **Capability manifest per page** ("unavailable — and why") | `caps` (Rust + Python) | Rust caps test + Python caps tests | ✅ Implemented, both lanes: live-realm counts with labeled static fallback, tabs/frames/dialogs, unavailable+why, absolute-path export. |
 | rAF frame clock | `minidom.js` (shim) | | ⚠️ Exists as `setTimeout` shim |
 | CSS transitions & keyframes | ❌ | | ❌ Unimplemented |
 | Sticky/flex-wrap/floats | ⚠️ | | ⚠️ Pending |
+| **In-session DevTools agent (`assist`)** + **SSH-like attach bridge** | `dosh-browser-core/src/assist.rs`, `registry.rs`, `server.rs` (`/v1/attach` WS, `/v1/sessions`); Python `webresearch/shell.py:_assist` | Rust: `assist::*`, `registry::*`, `server::test_bridge_*`, `shell::test_assist_*`; Python: `tests/test_shell.py::test_assist_*` | ✅ Implemented & wired. `assist` runs a walkthrough over the live session (cookies/storage/`net.apis`) and synthesizes a unified cURL referencing secrets by name only. The bridge adds a session registry + a persistent WebSocket that attaches a client to one isolated live session so context persists across turns and connections do not clobber each other. Exposed via shell `assist`, MCP `browser_assist`, CLI `dosh assist`. |
+| **Resident-runtime eval + live cookie jar** | `shell.rs` `eval`/`skill.run` now use `session.get_or_create_runtime`; `session.rs:current_cookies` | `shell::test_eval_state_persists_across_turns`, `shell::test_cookies_reads_live_jar` | ✅ Fixed. `eval`/`skill.run` previously rebuilt a throwaway runtime per call (empty cookie jar, no persisted JS state); they now evaluate against the tab's resident runtime so console state and `document.cookie` writes survive across turns. The `cookies` command reads the live jar (was reading stale HTTP response headers). `storage` now also reports localStorage. |
+| **Phase 1 network depth (N1–N9)** | `telemetry.rs` (SSE/timing/sealed/protobuf/WS), `ws.rs` (RFC 6455), `cors.rs` (`cors_verdict`), `network.rs` (chunked stream), `shell.rs` (`net.stream/ws/cors/timing/replay/decode`, `cookies values=raw`, `gate secret_reveal`); Python mirror in `webresearch/{telemetry,shell}.py`, `engine/{runtime,ws}.py`, `minidom.js` (stack hint) | Rust: `telemetry::*`, `shell::test_watch*`-adjacent net tests; Python: `tests/test_telemetry.py`, `tests/test_shell.py` | ✅ Implemented, both lanes. Live streams (SSE with arrival stamps), WS frames (text+b64 binary, direction+opcode), CORS verdicts, measured ttfb/duration (DNS/connect disclosed unmeasured), audited replay + secret reveal (sealed in-memory evidence, 256 KiB cap, `RevealAudit` log), structural protobuf decode, parameterized body caps with honest truncation, sanitized initiator stacks. |
+| **Phase 2 state manipulation (S1–S3, S9)** | `shell.rs`/`webresearch/shell.py` (`state_snapshots` table + `state.snapshot/diff/rollback`), `identity.rs` + `Target.selector` + `actions.rs::_css_path`, `minidom.js` (`__wrWatch*`, `__lastActionError` honesty), `session.rs` (`click`/`type_text` selector resolution, `fork` document materialization) | `shell::test_state_snapshot_diff_rollback_roundtrip`, `shell::test_watch_real_mutation_stream`, `shell::test_stable_identity_survives_rerender_shift`, `shell::test_act_resolves_css_selector_not_content_hash`, `shell::test_caps_manifest_live_counts_and_honest_unavailable`; Python: `test_state_*`, `test_ref_stable_survives_rerender_shift` | ✅ Implemented, both lanes. Unified state DB (DOM + live cookie jar + storage + history + ledger view); value-free structural diff; rollback rehydrates the live runtime and jar (ledger append-only, disclosed). Stable content-addressed refs survive re-renders in both lanes. `watch` is a real host-side MutationObserver drain (after/limit/next_after). `caps` is a live per-page available/unavailable+why manifest. |
 
 ### Not yet invented / explicitly out of scope
 - **OS shell** — never build one; this is a browser terminal, not a POSIX shell.
@@ -239,7 +243,7 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | WebSocket binary frames | Counted & skipped | `INVENT` (currently counted & skipped) |
 | Worker substrate decision: real threads vs honest single-thread emulation with real message queues | Inert constructors | `DECIDE + INVENT` |
 | Service worker real execution (SW JS runs, navigation intercepted) | Python simulation | `INVENT` or keep simulation with disclosure |
-| **Element identity tracker** — stable refs surviving re-renders | Not implemented | `INVENT` |
+| **Element identity tracker** — stable refs surviving re-renders | `identity.rs` (Rust) / content-identity inventory (Python) | ✅ HAVE |
 
 ### Layer 2 — Layout, Geometry, Text
 | Invention | Current State | Status |
@@ -260,7 +264,7 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | Dialogs, uploads, downloads, named keys, WS text | `shell.py` commands | ✅ HAVE |
 | IndexedDB store + per-pass drain | `runtime.py` | `HAVE/PARTIAL` |
 | localStorage/sessionStorage + cross-tab storage events | `runtime.py` | ✅ HAVE |
-| **Unified SQL state DB** (history+cookies+storage+ledger) with snapshots/diffs/rollbacks | Not implemented | `INVENT` (sqlite3) |
+| **Unified SQL state DB** (history+cookies+storage+ledger) with snapshots/diffs/rollbacks | `state_snapshots` + `state.snapshot/diff/rollback` (both lanes) | ✅ HAVE |
 | **Deterministic replay engine** (ledger + snapshots + seeds) | Not implemented | `INVENT` |
 | bfcache parity | Documented rebuild, no live heap | `HAVE-as-disclosed` |
 
@@ -282,8 +286,8 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | **Multi-realm eval** (run JS in a chosen frame's context) | Not implemented | `INVENT` |
 | Frame/postMessage debugger projection (lanes, addressing, bodies) | `frames.py`, `runtime.py` | `DATA FLOWS, WIRE` |
 | **Causal trace**: action → DOM delta → network → console | Partial data | `INVENT` — flagship |
-| **Mutation subscription stream** (deltas instead of re-reads) | Not implemented | `INVENT` |
-| Capability manifest per page ("unavailable — and why", formalized) | Agent action surface | `PARTIAL → INVENT` |
+| **Mutation subscription stream** (deltas instead of re-reads) | `watch` over host-side `__wrWatch*` MutationObserver (both lanes) | ✅ HAVE |
+| Capability manifest per page ("unavailable — and why", formalized) | `caps` (both lanes) | ✅ HAVE |
 | **Skills registry** (persistent site procedures across sessions) | Partial: `shell.skill_*` | `INVENT` |
 | DoshShell terminal as thin projection over all of the above | `shell.py` | `INVENT` (last, thinnest) |
 
