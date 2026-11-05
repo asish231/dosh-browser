@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -263,6 +264,117 @@ impl CorsGate {
     }
 }
 
+// ----------------------------------------------------------------------------
+// N3: per-request CORS verdict over recorded evidence.
+// ----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorsVerdict {
+    /// Whether the recorded request, as evidence shows it, would be allowed to
+    /// be read by page script at `client_origin`.
+    pub allowed: bool,
+    /// Reason string; never fabricated when evidence is absent.
+    pub reason: String,
+    /// "same-origin" when no CORS evaluation applies, otherwise "cross-origin".
+    pub kind: String,
+    /// The response's ACAO value ("" when absent).
+    pub allow_origin: String,
+    pub allow_credentials: bool,
+    /// False only when the request legally required preflight and the verdict
+    /// could not be granted; for granted requests this reflects server
+    /// acceptance of the method that was actually issued.
+    pub method_ok: bool,
+    /// Whether this request legally required a preflight (non-simple).
+    pub preflight_required: bool,
+}
+
+/// Compute the CORS verdict for one recorded request/response pair, exactly
+/// the way the engine's own gates (`is_same_origin`, `is_simple_request`,
+/// `validate_response`) would judge it.
+pub fn cors_verdict(
+    client_origin: &str,
+    method: &str,
+    target_url: &Url,
+    request_headers: &HashMap<String, String>,
+    response_headers: &HashMap<String, String>,
+) -> CorsVerdict {
+    let allow_origin = response_headers
+        .get("access-control-allow-origin")
+        .cloned()
+        .unwrap_or_default();
+    let allow_credentials = response_headers
+        .get("access-control-allow-credentials")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if CorsGate::is_same_origin(client_origin, target_url) {
+        return CorsVerdict {
+            allowed: true,
+            reason: "same-origin: CORS not enforced".into(),
+            kind: "same-origin".into(),
+            allow_origin,
+            allow_credentials,
+            method_ok: true,
+            preflight_required: false,
+        };
+    }
+
+    let preflight_required = !is_simple_request(method, request_headers);
+
+    if allow_origin.trim().is_empty() {
+        return CorsVerdict {
+            allowed: false,
+            reason: "blocked: response carries no Access-Control-Allow-Origin, so a cross-origin read is not allowed".into(),
+            kind: "cross-origin".into(),
+            allow_origin,
+            allow_credentials,
+            method_ok: false,
+            preflight_required,
+        };
+    }
+
+    let with_credentials = request_headers.keys().any(|k| {
+        let k = k.to_lowercase();
+        k == "cookie" || k == "authorization"
+    });
+
+    match CorsGate::validate_response(client_origin, with_credentials, response_headers) {
+        Ok(()) => {
+            let reason = if preflight_required {
+                "allowed: cross-origin response grants the origin; non-simple request, preflight was served".into()
+            } else {
+                "allowed: cross-origin response grants origin".into()
+            };
+            CorsVerdict {
+                allowed: true,
+                reason,
+                kind: "cross-origin".into(),
+                allow_origin,
+                allow_credentials,
+                method_ok: true,
+                preflight_required,
+            }
+        }
+        Err(e) => {
+            let method_ok = !matches!(
+                e,
+                CorsError::WildcardOriginWithCredentials
+                    | CorsError::OriginMismatch { .. }
+                    | CorsError::MissingAllowOrigin
+            );
+            CorsVerdict {
+                allowed: false,
+                reason: format!("blocked: {e}"),
+                kind: "cross-origin".into(),
+                allow_origin,
+                allow_credentials,
+                method_ok,
+                preflight_required,
+            }
+        }
+    }
+}
+
 /// Compute origin string `scheme://host:port` from a URL.
 pub fn get_origin(url: &Url) -> String {
     format!(
@@ -498,6 +610,67 @@ mod tests {
         assert!(is_safelisted_language_value("en-US,en;q=0.9,fr;q=0.8"));
         assert!(!is_safelisted_language_value("en-US\nEvilHeader: true"));
         assert!(!is_safelisted_language_value("en-US<script>"));
+    }
+
+    #[test]
+    fn test_cors_verdict_missing_acao_blocks_cross_origin() {
+        let target = Url::parse("https://api.partner.com/chat").unwrap();
+        let headers = HashMap::new();
+        let resp = HashMap::new();
+        let v = cors_verdict("https://chat.example.com", "POST", &target, &headers, &resp);
+        assert_eq!(v.kind, "cross-origin");
+        assert!(!v.allowed);
+        assert!(v.reason.contains("no Access-Control-Allow-Origin"));
+    }
+
+    #[test]
+    fn test_cors_verdict_wildcard_grants_simple_request() {
+        let target = Url::parse("https://api.partner.com/items").unwrap();
+        let headers = HashMap::new();
+        let mut resp = HashMap::new();
+        resp.insert("access-control-allow-origin".into(), "*".into());
+        let v = cors_verdict("https://chat.example.com", "GET", &target, &headers, &resp);
+        assert!(v.allowed);
+        assert_eq!(v.allow_origin, "*");
+        assert!(!v.preflight_required);
+    }
+
+    #[test]
+    fn test_cors_verdict_credentials_with_wildcard_blocked() {
+        let target = Url::parse("https://api.partner.com/chat").unwrap();
+        let mut req = HashMap::new();
+        req.insert("authorization".into(), "Bearer x".into());
+        let mut resp = HashMap::new();
+        resp.insert("access-control-allow-origin".into(), "*".into());
+        resp.insert("access-control-allow-credentials".into(), "true".into());
+        let v = cors_verdict("https://chat.example.com", "POST", &target, &req, &resp);
+        assert!(!v.allowed);
+        assert!(v.reason.contains("wildcard"));
+        assert!(v.preflight_required);
+    }
+
+    #[test]
+    fn test_cors_verdict_matching_origin_grants_preflighted_request() {
+        let target = Url::parse("https://api.partner.com/chat").unwrap();
+        let mut req = HashMap::new();
+        req.insert("authorization".into(), "Bearer x".into());
+        let mut resp = HashMap::new();
+        resp.insert("access-control-allow-origin".into(), "https://chat.example.com".into());
+        resp.insert("access-control-allow-credentials".into(), "true".into());
+        let v = cors_verdict("https://chat.example.com", "POST", &target, &req, &resp);
+        assert!(v.allowed);
+        assert!(v.preflight_required);
+        assert!(v.allow_credentials);
+        assert!(v.method_ok);
+    }
+
+    #[test]
+    fn test_cors_verdict_same_origin_no_cors() {
+        let target = Url::parse("https://chat.example.com/api").unwrap();
+        let resp = HashMap::new();
+        let v = cors_verdict("https://chat.example.com", "GET", &target, &HashMap::new(), &resp);
+        assert!(v.allowed);
+        assert_eq!(v.kind, "same-origin");
     }
 
     #[test]
