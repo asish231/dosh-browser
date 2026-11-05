@@ -244,6 +244,39 @@ asyncio.run(main())
 | **Action Resolution** | **Content-Addressed `ref`** | Bounding boxes / Coordinates / JS eval | CSS selectors / XPath |
 | **Anti-Tarpit WASM Metering** | **Native Liftoff CPU Traps** | None (Hangs on infinite WASM loops) | None |
 
+### Verified Benchmarks — Real Runs (2026-11-05)
+
+All figures below are measured on macOS from cold processes (`/usr/bin/time -l`), not estimates. Raw data: [`benchmarks/`](benchmarks/).
+
+**Dual-lane, same task** — read `https://example.com`, both official paths:
+
+| Metric | **Rust lane** (`dosh read`) | Python companion (`webresearch`) |
+| :--- | ---: | ---: |
+| Cold wall time | **0.14 s** | 2.38 s *(device-probe disk cache removes ~1.6 s)* |
+| Peak RSS | **31 MB** | 74–77 MB |
+| JS execution | doshgentv8 (V8), 0 errors | QuickJS |
+| Web search (DDG, "first iPhone release year") | **0.88 s / 16 MB — correct result** | 1.54 s CLI / 0.85 s MCP warm |
+| Warm re-reads | — | **135–285 ms** (persistent MCP server) |
+| Agentic `ask` | 1 round, **$0** (local agent, no LLM key) | LLM-driven tool loop |
+
+**vs. Reference Headless C++ Engine** (`official CLI, same tasks):
+
+| Task | dosh (Rust) | Reference Engine | Result |
+| :--- | ---: | ---: | :--- |
+| Read example.com | **0.14 s / 31 MB** | 0.65 s / 29.9 MB | dosh **4.6× faster** |
+| Title extraction | ✓ structured `TITLE:` field | ✗ heading dropped from dump | dosh |
+| Search (DDG) | **0.88 s — correct result** | 0.79 s — **captcha-blocked, 0 results** | dosh completes; Reference fails the task |
+
+**LLM pool benchmark** (models driving browser tools via `llm-pool-proxy`; cost from a dated provider price table in `webresearch/settings.py`):
+
+| Model | Success | Tokens p50 | Wall p50 | Cost / success |
+| :--- | ---: | ---: | ---: | ---: |
+| mercury-2 | 100% | 164 | 1.9 s | ~$0.0001 |
+| deepseek-v4.1-flash | 67% | 95 | 3.4 s | ~$0.0001 |
+| asi1-ultra | 100% | 201 | 4.6 s | ~$0.0006 |
+
+**Scope honesty:** the Rust lane is the faster engine but has fewer agent layers ported yet (no captcha/login/frames/ws/telemetry). Browser-Use and Chromium were not installed on the benchmark machine — **no numbers were invented for them**; a black-box harness outside this repo is required to measure them.
+
 ---
 
 ## DevOps & Release Workflow

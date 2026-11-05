@@ -12,17 +12,23 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::thread;
 use std::time::Duration;
 
+pub mod actor;
 pub mod protocol;
+pub mod session;
+pub mod watchdog;
+
+pub use actor::{DoshActor, DoshActorHandle};
+pub use session::SessionPool;
+pub use watchdog::{arm as arm_watchdog, WatchdogSupervisor, WatchdogToken};
 
 /// Synchronous host seam. `args` are the JS arguments stringified (the same
 /// marshalling the QuickJS `add_callable` lane uses). `Ok(Some(s))` becomes a
 /// JS string, `Ok(None)` becomes `undefined`, and `Err(msg)` becomes a
 /// catchable JS exception — unlike QuickJS's deferred SystemError, which no
 /// JS try/catch could intercept.
-pub trait HostSeam {
+pub trait HostSeam: Send + Sync {
     fn call(&self, name: &str, args: &[String]) -> Result<Option<String>, String>;
 }
 
@@ -557,6 +563,27 @@ const EXTENSIONS_SCRIPT: &str = r#"
 })();
 "#;
 
+struct ReentrancyGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl ReentrancyGuard {
+    fn enter(flag: &Arc<AtomicBool>) -> Result<Self, String> {
+        if flag.swap(true, Ordering::SeqCst) {
+            return Err("re-entrancy error: nested eval while isolate is already entered".to_string());
+        }
+        Ok(Self {
+            flag: flag.clone(),
+        })
+    }
+}
+
+impl Drop for ReentrancyGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
 /// A V8 isolate + context pair, host-driven: microtasks are explicit and the
 /// pump is `pump_jobs()`. One per browser context, like QuickJS `Context`.
 pub struct DoshEngine {
@@ -566,8 +593,7 @@ pub struct DoshEngine {
     isolate: v8::OwnedIsolate,
     bridge: *mut HostBridge,
     interrupt_handle: v8::IsolateHandle,
-    dropped: Arc<AtomicBool>,
-    wall_gen: Arc<AtomicU64>,
+    is_evaluating: Arc<AtomicBool>,
     wall_limit: f64,
     memory_limit: usize,
     oom: Arc<AtomicBool>,
@@ -668,8 +694,7 @@ impl DoshEngine {
             isolate,
             bridge,
             interrupt_handle,
-            dropped: Arc::new(AtomicBool::new(false)),
-            wall_gen: Arc::new(AtomicU64::new(0)),
+            is_evaluating: Arc::new(AtomicBool::new(false)),
             wall_limit: 0.0,
             memory_limit,
             oom,
@@ -711,24 +736,17 @@ impl DoshEngine {
 
     /// Evaluate JS and return the raw typed `JsValue`.
     pub fn eval_raw(&mut self, code: &str) -> Result<JsValue, String> {
+        let _guard = ReentrancyGuard::enter(&self.is_evaluating)?;
         self.isolate.cancel_terminate_execution();
 
-        // Per-eval wall-clock watchdog, only armed when a limit is set.
-        let watchdog = if self.wall_limit > 0.0 {
-            let gen = self.wall_gen.fetch_add(1, Ordering::SeqCst) + 1;
-            let handle = self.interrupt_handle.clone();
-            let wall_gen = self.wall_gen.clone();
-            let dropped = self.dropped.clone();
-            let limit = self.wall_limit;
-            thread::spawn(move || {
-                thread::sleep(Duration::from_secs_f64(limit));
-                if !dropped.load(Ordering::SeqCst) && wall_gen.load(Ordering::SeqCst) == gen {
-                    handle.terminate_execution();
-                }
-            });
-            true
+        // Process-wide watchdog deadline, only armed when a limit is set.
+        let _watchdog = if self.wall_limit > 0.0 {
+            Some(watchdog::arm(
+                self.interrupt_handle.clone(),
+                Duration::from_secs_f64(self.wall_limit),
+            ))
         } else {
-            false
+            None
         };
 
         HOST_BRIDGE.with(|b| b.set(self.bridge));
@@ -742,10 +760,6 @@ impl DoshEngine {
         HOST_BRIDGE.with(|b| b.set(std::ptr::null_mut()));
 
         self.eval_count += 1;
-        if watchdog {
-            // Disarm: the sleeping thread sees a stale token and no-ops.
-            self.wall_gen.fetch_add(1, Ordering::SeqCst);
-        }
         out
     }
 
@@ -828,6 +842,10 @@ impl DoshEngine {
     /// Returns false — after a checkpoint the queue is empty, so the host's
     /// `while ctx.execute_pending_job():` loop runs one drain and stops.
     pub fn pump_jobs(&mut self) -> bool {
+        let _guard = match ReentrancyGuard::enter(&self.is_evaluating) {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
         self.isolate.cancel_terminate_execution();
         HOST_BRIDGE.with(|b| b.set(self.bridge));
         unsafe {
@@ -1025,7 +1043,6 @@ impl DoshEngine {
 
 impl Drop for DoshEngine {
     fn drop(&mut self) {
-        self.dropped.store(true, Ordering::SeqCst);
         let bridge = self.bridge;
         self.bridge = std::ptr::null_mut();
         unsafe {
@@ -1261,5 +1278,73 @@ mod tests {
         assert_eq!(resp.numeric_val, 1);
         assert_eq!(resp.result_len as usize, std::mem::size_of::<protocol::DoshButterflyRect>());
         assert!(!resp.result_data.is_null());
+    }
+
+    #[test]
+    fn test_reentrancy_guard_catches_nested_eval() {
+        struct ReentrantSeam {
+            engine_ptr: std::sync::atomic::AtomicPtr<DoshEngine>,
+        }
+        impl HostSeam for ReentrantSeam {
+            fn call(&self, name: &str, _args: &[String]) -> Result<Option<String>, String> {
+                if name == "call_reentrant" {
+                    let ptr = self.engine_ptr.load(Ordering::SeqCst);
+                    if !ptr.is_null() {
+                        let engine = unsafe { &mut *ptr };
+                        // Attempt nested eval while isolate is already entered
+                        match engine.eval("1 + 1") {
+                            Ok(_) => Ok(Some("unexpected_success".into())),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+
+        let seam = Arc::new(ReentrantSeam {
+            engine_ptr: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        });
+        let mut engine = DoshEngine::new(seam.clone()).unwrap();
+        seam.engine_ptr.store(&mut engine as *mut DoshEngine, Ordering::SeqCst);
+
+        engine.add_host("call_reentrant").unwrap();
+
+        // When JS calls call_reentrant, it hits the ReentrancyGuard and catches the error in JS
+        let res = engine.eval(r#"
+            let caught = "";
+            try {
+                call_reentrant();
+            } catch (e) {
+                caught = e.toString();
+            }
+            caught;
+        "#).unwrap();
+
+        assert!(res.contains("re-entrancy error"), "expected re-entrancy error, got: {}", res);
+
+        // Disarm pointer before engine drops
+        seam.engine_ptr.store(std::ptr::null_mut(), Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_watchdog_execution_timeout() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        // Set a 50ms time limit
+        engine.set_time_limit(0.05);
+
+        // Infinite loop must be terminated by the process-wide watchdog supervisor
+        let res = engine.eval("while(true) {}");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err, "interrupted");
+
+        // The isolate must recover for subsequent commands
+        engine.set_time_limit(0.0);
+        let recovery = engine.eval("10 + 20").unwrap();
+        assert_eq!(recovery, "30");
     }
 }

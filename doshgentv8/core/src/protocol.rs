@@ -146,6 +146,11 @@ impl DoshResponse {
     }
 }
 
+unsafe impl Send for DoshCommand {}
+unsafe impl Sync for DoshCommand {}
+unsafe impl Send for DoshResponse {}
+unsafe impl Sync for DoshResponse {}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DoshButterflyRect {
