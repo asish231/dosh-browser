@@ -234,6 +234,18 @@ impl HostSeam for SharedSeam {
             "host_ws_connect" | "host_ws_send" | "host_ws_send_binary" | "host_ws_close" => {
                 Ok(Some("{}".to_string()))
             }
+            "host_checkpoint" | "__dosh_checkpoint" => {
+                Ok(Some("0".to_string()))
+            }
+            "host_rewind" | "__dosh_rewind" => {
+                Ok(Some("0".to_string()))
+            }
+            "host_batch_read" | "__dosh_batch_read" => {
+                Ok(Some("".to_string()))
+            }
+            "host_fork" | "__dosh_fork" => {
+                Ok(Some("{}".to_string()))
+            }
             _ => Err(format!("unknown host callable: {name}")),
         }
     }
@@ -340,6 +352,9 @@ impl Runtime {
         self.engine.eval(&format!("__load({payload}, {}); true", json!(url)))?;
         // Clear initial hydration elements from the injected script queue
         self.engine.eval("globalThis.__WR_INJECTED_SCRIPTS = []; true")?;
+        let mut parena = doshgentv8_core::parena::Parena::new();
+        parena.add_node(doshgentv8_core::parena::TagId::Html, 0, &[], "");
+        let _ = self.engine.set_parena(parena);
         Ok(())
     }
 
@@ -610,6 +625,31 @@ impl Runtime {
         args: &[String],
     ) -> Result<String, String> {
         self.engine.eval_bounded(code, control_realm, allow_actions, args)
+    }
+
+    /// Fork the live page arena, creating an independent clone of page state.
+    pub fn fork_parena(&self) -> Result<doshgentv8_core::parena::Parena, String> {
+        self.engine.fork_parena()
+    }
+
+    /// Capture a dirty-diff checkpoint of current arena state.
+    pub fn checkpoint_parena(&self) -> Result<u64, String> {
+        self.engine.checkpoint_parena()
+    }
+
+    /// Roll back the arena state to a previously captured checkpoint.
+    pub fn rewind_parena(&self, cp_id: u64) -> Result<usize, String> {
+        self.engine.rewind_parena(cp_id)
+    }
+
+    /// Read multiple nodes from page arena in a zero-copy batch.
+    pub fn batch_read_parena(&self, node_ids: Vec<u32>) -> Result<Vec<u8>, String> {
+        self.engine.batch_read_parena(node_ids)
+    }
+
+    /// Install or replace the page arena.
+    pub fn set_parena(&self, parena: doshgentv8_core::parena::Parena) -> Result<(), String> {
+        self.engine.set_parena(parena)
     }
 }
 

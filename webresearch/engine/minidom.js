@@ -10483,6 +10483,30 @@ global.__submitPath = function (path) {
         indexedDB: idb,
         cookie: (global.document && global.document.cookie) || ""
       };
+    },
+    checkpoint: function () {
+      if (typeof global.__dispatchHost === "function") {
+        return Number(global.__dispatchHost("__dosh_checkpoint"));
+      }
+      return 0;
+    },
+    rewind: function (checkpointId) {
+      if (typeof global.__dispatchHost === "function") {
+        return Number(global.__dispatchHost("__dosh_rewind", String(checkpointId)));
+      }
+      return 0;
+    },
+    fork: function () {
+      if (typeof global.__dispatchHost === "function") {
+        return global.__dispatchHost("__dosh_fork");
+      }
+      return null;
+    },
+    batchRead: function (nodeIds) {
+      if (typeof global.__dispatchHost === "function") {
+        return global.__dispatchHost("__dosh_batch_read", JSON.stringify(nodeIds));
+      }
+      return null;
     }
   });
 })(this);

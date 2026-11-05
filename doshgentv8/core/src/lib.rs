@@ -136,6 +136,8 @@ pub(crate) struct HostBridge {
     pub eval_allowed: Arc<AtomicBool>,
     pub wasm_allowed: Arc<AtomicBool>,
     pub network_allowed: Arc<AtomicBool>,
+    pub parena: Arc<Mutex<Option<parena::Parena>>>,
+    pub checkpoints: Arc<Mutex<HashMap<u64, parena::Checkpoint>>>,
 }
 
 unsafe extern "C" fn near_heap_limit_callback(
@@ -226,6 +228,76 @@ fn host_dispatch(
         && (name.starts_with("host_fetch") || name.starts_with("host_ws_"))
     {
         let m = v8::String::new(scope, "network capability disallowed for this context")
+            .unwrap_or_else(|| v8::String::empty(scope));
+        scope.throw_exception(m.into());
+        return;
+    }
+
+    // Direct Parena verbs from JS runtime (synchronous, avoids actor channel deadlock)
+    if name == "__dosh_checkpoint" || name == "host_checkpoint" {
+        if let Ok(mut c_map) = bridge.checkpoints.lock() {
+            if let Ok(p_guard) = bridge.parena.lock() {
+                if let Some(p) = p_guard.as_ref() {
+                    let cp = p.checkpoint();
+                    let id = cp.id;
+                    c_map.insert(id, cp);
+                    let s = v8::String::new(scope, &id.to_string())
+                        .unwrap_or_else(|| v8::String::empty(scope));
+                    rv.set(s.into());
+                    return;
+                }
+            }
+        }
+        let m = v8::String::new(scope, "no active parena in engine")
+            .unwrap_or_else(|| v8::String::empty(scope));
+        scope.throw_exception(m.into());
+        return;
+    }
+
+    if name == "__dosh_rewind" || name == "host_rewind" {
+        let cp_id_str = host_args.first().cloned().unwrap_or_default();
+        let cp_id = cp_id_str.parse::<u64>().unwrap_or(0);
+        let cp = bridge.checkpoints.lock().ok().and_then(|m| m.get(&cp_id).cloned());
+        if let Some(checkpoint) = cp {
+            if let Ok(mut p_guard) = bridge.parena.lock() {
+                if let Some(p) = p_guard.as_mut() {
+                    match p.rewind(&checkpoint) {
+                        Ok(reverted_bytes) => {
+                            let s = v8::String::new(scope, &reverted_bytes.to_string())
+                                .unwrap_or_else(|| v8::String::empty(scope));
+                            rv.set(s.into());
+                            return;
+                        }
+                        Err(e) => {
+                            let m = v8::String::new(scope, &e)
+                                .unwrap_or_else(|| v8::String::empty(scope));
+                            scope.throw_exception(m.into());
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        let m = v8::String::new(scope, &format!("checkpoint id {cp_id} not found"))
+            .unwrap_or_else(|| v8::String::empty(scope));
+        scope.throw_exception(m.into());
+        return;
+    }
+
+    if name == "__dosh_batch_read" || name == "host_batch_read" {
+        let ids_json = host_args.first().cloned().unwrap_or_default();
+        let ids: Vec<u32> = serde_json::from_str(&ids_json).unwrap_or_default();
+        if let Ok(p_guard) = bridge.parena.lock() {
+            if let Some(p) = p_guard.as_ref() {
+                let bytes = p.batch_read(&ids);
+                let hex_str = hex::encode(&bytes);
+                let s = v8::String::new(scope, &hex_str)
+                    .unwrap_or_else(|| v8::String::empty(scope));
+                rv.set(s.into());
+                return;
+            }
+        }
+        let m = v8::String::new(scope, "no active parena in engine")
             .unwrap_or_else(|| v8::String::empty(scope));
         scope.throw_exception(m.into());
         return;
@@ -605,6 +677,18 @@ const EXTENSIONS_SCRIPT: &str = r#"
                 return globalThis.__extractActions();
             }
             return [];
+        },
+        checkpoint: function() {
+            return Number(globalThis.__dispatchHost("__dosh_checkpoint"));
+        },
+        rewind: function(cpId) {
+            return Number(globalThis.__dispatchHost("__dosh_rewind", String(cpId)));
+        },
+        fork: function() {
+            return globalThis.__dispatchHost("__dosh_fork");
+        },
+        batchRead: function(nodeIds) {
+            return globalThis.__dispatchHost("__dosh_batch_read", JSON.stringify(nodeIds));
         }
     };
 })();
@@ -655,8 +739,22 @@ pub struct DoshEngine {
     control_realm: Arc<AtomicBool>,
     layout_buffer: Vec<protocol::DoshButterflyRect>,
     pub telemetry_ring: protocol::DoshTelemetryRing,
-    pub parena: Option<parena::Parena>,
-    pub checkpoints: HashMap<u64, parena::Checkpoint>,
+    pub parena: Arc<Mutex<Option<parena::Parena>>>,
+    pub checkpoints: Arc<Mutex<HashMap<u64, parena::Checkpoint>>>,
+}
+
+static V8_INIT: std::sync::Once = std::sync::Once::new();
+
+pub(crate) fn init_v8() {
+    V8_INIT.call_once(|| {
+        let flags = std::env::var("WR_V8_FLAGS").unwrap_or_else(|_| {
+            "--no-opt --no-maglev --max-semi-space-size=1 --stack-trace-limit=10".to_string()
+        });
+        v8::V8::set_flags_from_string(&flags);
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform);
+        v8::V8::initialize();
+    });
 }
 
 impl DoshEngine {
@@ -665,21 +763,7 @@ impl DoshEngine {
     }
 
     pub fn new_with_limit(seam: Arc<dyn HostSeam>, memory_limit: usize) -> Result<Self, String> {
-        static V8_INIT: std::sync::Once = std::sync::Once::new();
-        V8_INIT.call_once(|| {
-            // Prune unneeded V8 subsystems / lean JIT tiering for agent execution:
-            // --no-opt: Prune heavy TurboFan optimizing compiler and SSA graphs
-            // --no-maglev: Prune mid-tier Maglev compiler
-            // --max-semi-space-size=1: Shrink young generation semi-space to 1MB (cuts memory bloat)
-            // --stack-trace-limit=10: Limit stack trace overhead
-            let flags = std::env::var("WR_V8_FLAGS").unwrap_or_else(|_| {
-                "--no-opt --no-maglev --max-semi-space-size=1 --stack-trace-limit=10".to_string()
-            });
-            v8::V8::set_flags_from_string(&flags);
-            let platform = v8::new_default_platform(0, false).make_shared();
-            v8::V8::initialize_platform(platform);
-            v8::V8::initialize();
-        });
+        init_v8();
 
         let mut params = v8::CreateParams::default();
         if memory_limit > 0 {
@@ -697,6 +781,8 @@ impl DoshEngine {
         let action_allowed = Arc::new(AtomicBool::new(true));
         let control_realm = Arc::new(AtomicBool::new(false));
         let virtual_time = Arc::new(Mutex::new(None));
+        let parena = Arc::new(Mutex::new(None));
+        let checkpoints = Arc::new(Mutex::new(HashMap::new()));
 
         let bridge = Box::into_raw(Box::new(HostBridge {
             seam,
@@ -707,6 +793,8 @@ impl DoshEngine {
             eval_allowed: eval_allowed.clone(),
             wasm_allowed: wasm_allowed.clone(),
             network_allowed: network_allowed.clone(),
+            parena: parena.clone(),
+            checkpoints: checkpoints.clone(),
         }));
 
         isolate.add_near_heap_limit_callback(near_heap_limit_callback, bridge as *mut std::ffi::c_void);
@@ -763,8 +851,104 @@ impl DoshEngine {
             control_realm,
             layout_buffer: Vec::new(),
             telemetry_ring: protocol::DoshTelemetryRing::new(),
-            parena: None,
-            checkpoints: HashMap::new(),
+            parena,
+            checkpoints,
+        })
+    }
+
+    /// Create an engine booted warm from a pre-baked binary snapshot blob.
+    pub fn new_with_snapshot(seam: Arc<dyn HostSeam>, snapshot_bytes: &[u8]) -> Result<Self, String> {
+        Self::new_with_snapshot_and_limit(seam, snapshot_bytes, 0)
+    }
+
+    /// Create an engine booted warm from snapshot with heap limit.
+    pub fn new_with_snapshot_and_limit(
+        seam: Arc<dyn HostSeam>,
+        snapshot_bytes: &[u8],
+        memory_limit: usize,
+    ) -> Result<Self, String> {
+        init_v8();
+
+        let mut params = v8::CreateParams::default().snapshot_blob(v8::StartupData::from(snapshot_bytes.to_vec()));
+        if memory_limit > 0 {
+            params = params.heap_limits(0, memory_limit);
+        }
+        let mut isolate = v8::Isolate::new(params);
+        let interrupt_handle = isolate.thread_safe_handle();
+        let oom = Arc::new(AtomicBool::new(false));
+
+        let fuel = Arc::new(AtomicU64::new(0));
+        let fuel_enabled = Arc::new(AtomicBool::new(false));
+        let eval_allowed = Arc::new(AtomicBool::new(true));
+        let wasm_allowed = Arc::new(AtomicBool::new(true));
+        let network_allowed = Arc::new(AtomicBool::new(true));
+        let action_allowed = Arc::new(AtomicBool::new(true));
+        let control_realm = Arc::new(AtomicBool::new(false));
+        let virtual_time = Arc::new(Mutex::new(None));
+        let parena = Arc::new(Mutex::new(None));
+        let checkpoints = Arc::new(Mutex::new(HashMap::new()));
+
+        let bridge = Box::into_raw(Box::new(HostBridge {
+            seam,
+            oom: oom.clone(),
+            interrupt_handle: interrupt_handle.clone(),
+            fuel: fuel.clone(),
+            fuel_enabled: fuel_enabled.clone(),
+            eval_allowed: eval_allowed.clone(),
+            wasm_allowed: wasm_allowed.clone(),
+            network_allowed: network_allowed.clone(),
+            parena: parena.clone(),
+            checkpoints: checkpoints.clone(),
+        }));
+
+        isolate.add_near_heap_limit_callback(near_heap_limit_callback, bridge as *mut std::ffi::c_void);
+        isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+        isolate.set_capture_stack_trace_for_uncaught_exceptions(true, 10);
+
+        let context_global;
+        {
+            v8::scope!(scope, &mut isolate);
+            let context = v8::Context::new(scope, Default::default());
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let global = context.global(scope);
+            let tmpl = v8::FunctionTemplate::new(scope, host_dispatch);
+            let func = tmpl
+                .get_function(scope)
+                .ok_or("FunctionTemplate::get_function failed")?;
+            let key = v8::String::new(scope, "__dispatchHost").ok_or("v8 string alloc")?;
+            if global.set(scope, key.into(), func.into()) != Some(true) {
+                return Err("could not install __dispatchHost".into());
+            }
+
+            context_global = v8::Global::new(scope, context);
+        }
+
+        unsafe {
+            isolate.exit();
+        }
+
+        Ok(Self {
+            context: context_global,
+            isolate,
+            bridge,
+            interrupt_handle,
+            is_evaluating: Arc::new(AtomicBool::new(false)),
+            wall_limit: 0.0,
+            memory_limit,
+            oom,
+            eval_count: 0,
+            fuel,
+            fuel_enabled,
+            virtual_time,
+            eval_allowed,
+            wasm_allowed,
+            network_allowed,
+            action_allowed,
+            control_realm,
+            layout_buffer: Vec::new(),
+            telemetry_ring: protocol::DoshTelemetryRing::new(),
+            parena,
+            checkpoints,
         })
     }
 
@@ -1099,35 +1283,31 @@ impl DoshEngine {
         self.telemetry_ring.drain()
     }
 
-    /// Access the active Parena page arena.
-    pub fn parena(&self) -> Option<&parena::Parena> {
-        self.parena.as_ref()
-    }
-
-    /// Mutably access the active Parena page arena.
-    pub fn parena_mut(&mut self) -> Option<&mut parena::Parena> {
-        self.parena.as_mut()
-    }
-
     /// Set or replace the active Parena page arena.
-    pub fn set_parena(&mut self, arena: parena::Parena) {
-        self.parena = Some(arena);
+    pub fn set_parena(&self, arena: parena::Parena) {
+        if let Ok(mut p) = self.parena.lock() {
+            *p = Some(arena);
+        }
     }
 
     /// Fork the current page arena in microseconds.
     pub fn fork_parena(&self) -> Result<parena::Parena, String> {
         self.parena
+            .lock()
+            .map_err(|e| e.to_string())?
             .as_ref()
             .map(|p| p.fork())
             .ok_or_else(|| "no active parena in engine".to_string())
     }
 
     /// Capture a dirty-diff checkpoint of current arena state.
-    pub fn checkpoint_parena(&mut self) -> Result<u64, String> {
-        if let Some(parena) = &self.parena {
-            let cp = parena.checkpoint();
+    pub fn checkpoint_parena(&self) -> Result<u64, String> {
+        let mut checkpoints = self.checkpoints.lock().map_err(|e| e.to_string())?;
+        let parena = self.parena.lock().map_err(|e| e.to_string())?;
+        if let Some(p) = parena.as_ref() {
+            let cp = p.checkpoint();
             let id = cp.id;
-            self.checkpoints.insert(id, cp);
+            checkpoints.insert(id, cp);
             Ok(id)
         } else {
             Err("no active parena in engine".to_string())
@@ -1135,14 +1315,15 @@ impl DoshEngine {
     }
 
     /// Roll back the arena state to a previously captured checkpoint ID.
-    pub fn rewind_parena(&mut self, checkpoint_id: u64) -> Result<usize, String> {
-        let cp = self
-            .checkpoints
+    pub fn rewind_parena(&self, checkpoint_id: u64) -> Result<usize, String> {
+        let checkpoints = self.checkpoints.lock().map_err(|e| e.to_string())?;
+        let cp = checkpoints
             .get(&checkpoint_id)
             .cloned()
             .ok_or_else(|| format!("checkpoint id {checkpoint_id} not found"))?;
-        if let Some(parena) = &mut self.parena {
-            parena.rewind(&cp)
+        let mut parena = self.parena.lock().map_err(|e| e.to_string())?;
+        if let Some(p) = parena.as_mut() {
+            p.rewind(&cp)
         } else {
             Err("no active parena in engine".to_string())
         }
@@ -1150,8 +1331,9 @@ impl DoshEngine {
 
     /// Zero-copy binary batch read of specified node IDs.
     pub fn batch_read_parena(&self, node_ids: &[u32]) -> Result<Vec<u8>, String> {
-        if let Some(parena) = &self.parena {
-            Ok(parena.batch_read(node_ids))
+        let parena = self.parena.lock().map_err(|e| e.to_string())?;
+        if let Some(p) = parena.as_ref() {
+            Ok(p.batch_read(node_ids))
         } else {
             Err("no active parena in engine".to_string())
         }
@@ -1228,37 +1410,88 @@ impl DoshEngine {
                 protocol::DoshResponse::ok()
             }
             0x0C => {
-                if let Some(parena) = &self.parena {
-                    let mut node_ids = Vec::new();
-                    if cmd.payload_len >= 4 && !cmd.payload.is_null() {
-                        let count = (cmd.payload_len / 4) as usize;
-                        unsafe {
-                            let slice = std::slice::from_raw_parts(cmd.payload as *const u32, count);
-                            node_ids.extend_from_slice(slice);
-                        }
-                    } else if cmd.param > 0 {
-                        node_ids.push(cmd.param as u32);
+                let mut node_ids = Vec::new();
+                if cmd.payload_len >= 4 && !cmd.payload.is_null() {
+                    let count = (cmd.payload_len / 4) as usize;
+                    unsafe {
+                        let slice = std::slice::from_raw_parts(cmd.payload as *const u32, count);
+                        node_ids.extend_from_slice(slice);
                     }
-                    let bytes = parena.batch_read(&node_ids);
-                    protocol::DoshResponse {
+                } else if cmd.param > 0 {
+                    node_ids.push(cmd.param as u32);
+                }
+                match self.batch_read_parena(&node_ids) {
+                    Ok(bytes) => protocol::DoshResponse {
                         status: protocol::DoshStatusCode::Ok as u8,
                         data_type: 4, // Buffer
                         reserved: 0,
                         result_len: bytes.len() as u32,
                         numeric_val: node_ids.len() as u64,
                         result_data: bytes.as_ptr(),
-                    }
-                } else {
-                    protocol::DoshResponse::error("no active parena in engine")
+                    },
+                    Err(e) => protocol::DoshResponse::error(&e),
                 }
             }
             0x0D => {
                 let drained = self.telemetry_ring.drain();
                 protocol::DoshResponse::with_numeric(drained.len() as u64)
             }
+            0x0E => {
+                // ForkParena
+                match self.fork_parena() {
+                    Ok(_) => protocol::DoshResponse::ok(),
+                    Err(e) => protocol::DoshResponse::error(&e),
+                }
+            }
+            0x0F => {
+                // CheckpointParena
+                match self.checkpoint_parena() {
+                    Ok(id) => protocol::DoshResponse::with_numeric(id),
+                    Err(e) => protocol::DoshResponse::error(&e),
+                }
+            }
+            0x10 => {
+                // RewindParena
+                match self.rewind_parena(cmd.param) {
+                    Ok(bytes) => protocol::DoshResponse::with_numeric(bytes as u64),
+                    Err(e) => protocol::DoshResponse::error(&e),
+                }
+            }
             _ => protocol::DoshResponse::error("unknown opcode"),
         }
     }
+}
+
+/// Create a binary snapshot blob pre-baking EXTENSIONS_SCRIPT and optional custom script.
+pub fn create_dosh_snapshot(custom_script: Option<&str>) -> Result<Vec<u8>, String> {
+    init_v8();
+
+    let mut isolate = v8::Isolate::snapshot_creator(None, None);
+    {
+        v8::scope!(scope, &mut isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let ext_src = v8::String::new(scope, EXTENSIONS_SCRIPT).ok_or("extensions alloc failed")?;
+        if let Some(script) = v8::Script::compile(scope, ext_src, None) {
+            script.run(scope);
+        }
+
+        if let Some(extra) = custom_script {
+            let extra_src = v8::String::new(scope, extra).ok_or("custom script alloc failed")?;
+            if let Some(script) = v8::Script::compile(scope, extra_src, None) {
+                script.run(scope);
+            }
+        }
+
+        scope.set_default_context(context);
+    }
+
+    let blob = isolate
+        .create_blob(v8::FunctionCodeHandling::Clear)
+        .ok_or_else(|| "Failed to create V8 snapshot blob".to_string())?;
+
+    Ok(blob.to_vec())
 }
 
 impl Drop for DoshEngine {
@@ -1569,6 +1802,48 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_creator_api() {
+        init_v8();
+
+        let mut isolate = v8::Isolate::snapshot_creator(None, None);
+        {
+            v8::scope!(scope, &mut isolate);
+            let context = v8::Context::new(scope, Default::default());
+            let scope = &mut v8::ContextScope::new(scope, context);
+
+            // Compile EXTENSIONS_SCRIPT into snapshot
+            let ext_src = v8::String::new(scope, EXTENSIONS_SCRIPT).unwrap();
+            let script = v8::Script::compile(scope, ext_src, None).unwrap();
+            script.run(scope);
+
+            let minidom_src_str = include_str!("../../../webresearch/engine/minidom.js");
+            let minidom_src = v8::String::new(scope, minidom_src_str).unwrap();
+            let minidom_script = v8::Script::compile(scope, minidom_src, None).unwrap();
+            minidom_script.run(scope);
+
+            scope.set_default_context(context);
+        }
+
+        let blob = isolate.create_blob(v8::FunctionCodeHandling::Clear).expect("blob");
+        assert!(!blob.is_empty());
+
+        // Now create a normal isolate from this snapshot blob!
+        let params = v8::CreateParams::default().snapshot_blob(blob);
+        let mut iso2 = v8::Isolate::new(params);
+        {
+            v8::scope!(scope, &mut iso2);
+            let ctx2 = v8::Context::new(scope, Default::default());
+            let scope = &mut v8::ContextScope::new(scope, ctx2);
+
+            let code = v8::String::new(scope, "typeof globalThis.__load + ' ' + typeof globalThis.dosh.text").unwrap();
+            let script = v8::Script::compile(scope, code, None).unwrap();
+            let res = script.run(scope).unwrap();
+            let s = res.to_rust_string_lossy(scope);
+            assert_eq!(s, "function function");
+        }
+    }
+
+    #[test]
     fn test_control_realm_top_level_return_and_args() {
         let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
 
@@ -1632,5 +1907,51 @@ mod tests {
         let resp = engine.dispatch_command(&cmd);
         assert_eq!(resp.status, DoshStatusCode::Ok as u8);
         assert!(engine.is_control_realm());
+    }
+
+    #[test]
+    fn test_in_realm_dosh_checkpoint_and_rewind() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        let mut parena = parena::Parena::new();
+        let n1 = parena.add_node(parena::TagId::Div, 0, &[("id", "root")], "Initial Text");
+        engine.set_parena(parena);
+
+        // Capture checkpoint via JS dosh.checkpoint()
+        let cp_res = engine.eval("dosh.checkpoint()").expect("checkpoint from JS");
+        let cp_id: u64 = cp_res.parse().expect("parsed checkpoint id");
+        assert!(cp_id > 0);
+
+        // Mutate node in parena
+        {
+            let mut guard = engine.parena.lock().unwrap();
+            let p = guard.as_mut().unwrap();
+            p.set_text(n1, "Mutated Text in Action");
+            assert_eq!(p.get_text(n1), "Mutated Text in Action");
+        }
+
+        // Rewind via JS dosh.rewind(cp_id)
+        let rew_res = engine.eval(&format!("dosh.rewind({cp_id})")).expect("rewind from JS");
+        let reverted_bytes: usize = rew_res.parse().expect("parsed reverted bytes");
+        assert!(reverted_bytes > 0);
+
+        // Verify node text reverted to initial
+        {
+            let guard = engine.parena.lock().unwrap();
+            let p = guard.as_ref().unwrap();
+            assert_eq!(p.get_text(n1), "Initial Text");
+        }
+    }
+
+    #[test]
+    fn test_engine_boot_from_snapshot() {
+        let snapshot_blob = create_dosh_snapshot(None).expect("snapshot creation");
+        assert!(!snapshot_blob.is_empty());
+
+        let mut engine = DoshEngine::new_with_snapshot(Arc::new(DummySeam), &snapshot_blob)
+            .expect("engine booted from snapshot");
+
+        // Evaluates immediately without needing to re-compile extensions
+        let res = engine.eval("typeof globalThis.Butterfly + ' ' + typeof globalThis.dosh.text").unwrap();
+        assert_eq!(res, "function function");
     }
 }

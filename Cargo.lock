@@ -638,6 +638,9 @@ dependencies = [
 name = "doshgentv8-core"
 version = "1.0.0"
 dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
  "v8",
 ]
 

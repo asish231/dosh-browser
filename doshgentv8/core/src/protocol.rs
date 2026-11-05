@@ -21,6 +21,9 @@ pub enum DoshOpCode {
     SetControlRealm = 0x0B,
     BatchRead = 0x0C,
     PollTelemetryRing = 0x0D,
+    ForkParena = 0x0E,
+    CheckpointParena = 0x0F,
+    RewindParena = 0x10,
 }
 
 #[repr(u8)]

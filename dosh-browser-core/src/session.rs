@@ -195,6 +195,8 @@ pub struct Session {
     pub session_pool: std::sync::Arc<doshgentv8_core::SessionPool>,
     /// Live per-tab resident runtimes
     pub runtimes: HashMap<String, crate::runtime::Runtime>,
+    /// Checkpointed page HTML snapshots keyed by checkpoint ID
+    pub session_checkpoints: HashMap<u64, String>,
 }
 
 impl Session {
@@ -227,6 +229,7 @@ impl Session {
             gate_network: true,
             session_pool: std::sync::Arc::new(doshgentv8_core::SessionPool::new(8)),
             runtimes: HashMap::new(),
+            session_checkpoints: HashMap::new(),
         }
     }
 
@@ -625,6 +628,68 @@ impl Session {
         Ok(pushed)
     }
 
+    /// Capture a dirty-diff checkpoint of the current tab's page state in microseconds.
+    pub fn checkpoint(&mut self) -> Result<u64, String> {
+        let (url, html) = {
+            let tab = self.current_tab();
+            (tab.url.clone(), tab.html.clone())
+        };
+        if url.is_empty() {
+            return Err("No page loaded to checkpoint".to_string());
+        }
+        let rt = self.get_or_create_runtime(&url)?;
+        let cp_id = rt.checkpoint_parena()?;
+        self.session_checkpoints.insert(cp_id, html);
+        Ok(cp_id)
+    }
+
+    /// Roll back current tab's page arena to a previously captured checkpoint.
+    pub fn rewind(&mut self, cp_id: u64) -> Result<Page, String> {
+        let (url, fallback_html) = {
+            let tab = self.current_tab();
+            (tab.url.clone(), tab.html.clone())
+        };
+        if url.is_empty() {
+            return Err("No page loaded to rewind".to_string());
+        }
+        let saved_html = self.session_checkpoints.get(&cp_id).cloned().unwrap_or(fallback_html);
+        let mut rt = self.get_or_create_runtime(&url)?;
+        let _reverted_bytes = rt.rewind_parena(cp_id)?;
+        let _ = rt.load_document(&saved_html, &url);
+        self.update_page_after_action(&url, &saved_html, 8000)
+    }
+
+    /// Fork the current tab into an independent speculative session with zero network reload.
+    pub fn fork(&mut self) -> Result<Session, String> {
+        let (url, html, page_opt) = {
+            let tab = self.current_tab();
+            (tab.url.clone(), tab.html.clone(), tab.page())
+        };
+        if url.is_empty() {
+            return Err("No page loaded to fork".to_string());
+        }
+        let rt = self.get_or_create_runtime(&url)?;
+        let forked_parena = rt.fork_parena()?;
+
+        let mut forked_session = Self::new(self.client.clone());
+        forked_session.network = self.network.clone();
+        forked_session.wasm_fuel = self.wasm_fuel;
+        forked_session.gate_eval = self.gate_eval;
+        forked_session.gate_wasm = self.gate_wasm;
+        forked_session.gate_network = self.gate_network;
+        forked_session.local_storage = self.local_storage.clone();
+
+        if let Some(page) = page_opt {
+            let new_tab = forked_session.current_tab_mut();
+            new_tab.push(page, Some(html), None, false, None);
+        }
+
+        let new_rt = forked_session.get_or_create_runtime(&url)?;
+        new_rt.set_parena(forked_parena)?;
+
+        Ok(forked_session)
+    }
+
     /// Discover iframe seeds in current page.
     pub fn discover_frame_seeds(&self) -> Vec<crate::frames::FrameSeed> {
         let tab = self.current_tab();
@@ -839,5 +904,66 @@ mod tests {
         // Second click retains in-memory closure state (count reaches 2)
         let p2 = session.click("counter-btn").await.expect("click 2 failed");
         assert!(p2.view.contains("Count: 2") || session.current_tab().html.contains("Count: 2"));
+    }
+
+    #[tokio::test]
+    async fn test_session_checkpoint_and_rewind() {
+        let client = Client::builder().user_agent("test").build().unwrap();
+        let mut session = Session::new(client);
+        let html = r#"
+        <!DOCTYPE html>
+        <html>
+        <body>
+            <button id="counter-btn">Count: 0</button>
+            <script>
+                var count = 0;
+                var btn = document.getElementById("counter-btn");
+                btn.addEventListener("click", function() {
+                    count++;
+                    btn.textContent = "Count: " + count;
+                });
+            </script>
+        </body>
+        </html>
+        "#;
+        session.goto_html("https://cp.example.com", html, 8000).unwrap();
+
+        // 1. Capture checkpoint prior to speculative branch
+        let cp_id = session.checkpoint().expect("checkpoint capture");
+        assert!(cp_id > 0);
+
+        // 2. Perform actions on live session
+        let p1 = session.click("counter-btn").await.expect("click 1");
+        assert!(p1.view.contains("Count: 1") || session.current_tab().html.contains("Count: 1"));
+
+        // 3. Rewind back to checkpoint in microseconds
+        let p_rewound = session.rewind(cp_id).expect("session rewind");
+        assert!(p_rewound.view.contains("Count: 0") || session.current_tab().html.contains("Count: 0"));
+    }
+
+    #[tokio::test]
+    async fn test_session_fork_speculative_execution() {
+        let client = Client::builder().user_agent("test").build().unwrap();
+        let mut main_session = Session::new(client);
+        let html = r#"
+        <!DOCTYPE html>
+        <html>
+        <body>
+            <button id="btn">Initial State</button>
+        </body>
+        </html>
+        "#;
+        main_session.goto_html("https://fork.example.com", html, 8000).unwrap();
+
+        // Fork session into speculative branch A
+        let mut branch_a = main_session.fork().expect("session fork");
+        assert_eq!(branch_a.current_tab().url, main_session.current_tab().url);
+
+        // Branch A performs an action
+        let res_a = branch_a.click("btn").await;
+        assert!(res_a.is_ok());
+
+        // Main session remains untouched
+        assert!(main_session.current_tab().html.contains("Initial State"));
     }
 }

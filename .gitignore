@@ -21,6 +21,7 @@ target/
 *.dylib
 *.so
 *.a
+*.bin
 doshgentv8/target/
 downloads/
 
