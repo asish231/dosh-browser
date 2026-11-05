@@ -1,5 +1,5 @@
 # DCP (DOSH Control Protocol) & V8 Unified Shell Master Plan
-## Connecting doshgentv8 (V8 C++), dosh-browser-core (Rust), and the 41-Command DoshShell
+## Connecting doshgentv8 (V8 C++), dosh-browser-core (Rust), and the 55-Command DoshShell
 
 **Author:** Antigravity AI Engine Pair  
 **Status:** Evaluated Master Plan & Implementation Specification  
@@ -38,7 +38,7 @@ flowchart TD
         SEAM["HostSeam Bridge (doshgentv8-core/src/lib.rs)"]
         NET_ENG["Unified NetworkEngine (SSRF, Cache, SingleFlight, Robots, CORS)"]
         RUNTIME["Runtime Coordinator (src/runtime.rs)"]
-        SHELL["41-Command DoshShell (src/shell.rs)"]
+        SHELL["55-Command DoshShell (src/shell.rs)"]
     end
 
     subgraph SURFACES ["Agent Interaction Surfaces"]
