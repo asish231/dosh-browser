@@ -4319,6 +4319,11 @@ DEFINE_BOOL(dosh_control_realm, false,
             "enable dosh agent control realm with top-level return")
 DEFINE_BOOL(dosh_allow_actions, true,
             "native authority flag to allow DOM mutations and agent actions")
+// doshgentv8: allocation-count memory fuel. 0 disables the budget; any
+// positive value turns on a per-isolate fail-stop allocation tripwire.
+DEFINE_UINT64(dosh_allocation_budget, 0,
+              "agent memory fuel: fail V8 allocation after this many "
+              "allocation checkpoints (0 disables)")
 
 //
 // Parallel and concurrent GC (Orinoco) related flags.

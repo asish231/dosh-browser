@@ -2279,6 +2279,62 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   bool is_control_realm() const { return is_control_realm_; }
   void set_control_realm(bool enabled) { is_control_realm_ = enabled; }
 
+  // doshgentv8: agent memory fuel in allocation-checkpoint units.
+  // Unlike `gc_interval`, this is a persistent tripwire: it never resets on GC.
+  // 0 (the flag default) means disabled. Hosts may also set/reset it directly.
+  uint64_t allocation_budget() const { return allocation_budget_; }
+  bool allocation_budget_enabled() const {
+    return allocation_budget_enabled_;
+  }
+  bool allocation_budget_exhausted() const {
+    return allocation_budget_exhausted_;
+  }
+  void set_allocation_budget(uint64_t budget) {
+    DCHECK(!heap()->HasBeenSetUp() || heap()->IsMainThread());
+    // A host-set value of 0 is intentionally enabled and trips at the next
+    // chargeable checkpoint. The process flag's 0 value remains "disabled".
+    allocation_budget_ = budget;
+    allocation_budget_enabled_ = true;
+    allocation_budget_exhausted_ = false;
+    // Inline bump-pointer allocation would bypass the metering checkpoint.
+    if (heap()->HasBeenSetUp()) heap()->DisableInlineAllocation();
+  }
+  void disable_allocation_budget() {
+    // Disabling the fuel does not re-enable inline allocation, because other
+    // allocation observers may have requested that exact V8 behavior.
+    allocation_budget_enabled_ = false;
+    allocation_budget_exhausted_ = false;
+  }
+  // Consume one allocation-checkpoint unit. Returns false on exhaustion.
+  // Deliberately not identical to consume_fuel()'s boundary: a budget of N
+  // permits N checkpoints and trips on checkpoint N+1.
+  bool consume_allocation_budget() {
+    if (!allocation_budget_enabled_) return true;
+    if (allocation_budget_ == 0) {
+      allocation_budget_exhausted_ = true;
+      return false;
+    }
+    --allocation_budget_;
+    return true;
+  }
+
+  // doshgentv8: host notification hook fired once at the trip point, before
+  // the distinct fatal allocation-budget trap. Hosts may query remaining fuel
+  // (0) and record telemetry; returning from the callback does NOT resume.
+  // The callback runs inside the allocator and must not allocate, trigger GC,
+  // or re-enter V8.
+  using AllocationBudgetCallback = void (*)(Isolate*, void*);
+  void SetAllocationBudgetCallback(AllocationBudgetCallback callback,
+                                   void* data) {
+    allocation_budget_callback_ = callback;
+    allocation_budget_callback_data_ = data;
+  }
+  void TriggerAllocationBudgetCallback() {
+    if (allocation_budget_callback_ != nullptr) {
+      allocation_budget_callback_(this, allocation_budget_callback_data_);
+    }
+  }
+
   // doshgentv8: WAASM capabilities mask
   // 1: read_dom, 2: act, 4: emit, 8: net_query, 16: log, 32: snapshot
   uint32_t waasm_capabilities_mask() const { return waasm_capabilities_mask_; }
@@ -3127,6 +3183,14 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   void* checkpoint_callback_data_ = nullptr;
   bool action_allowed_ = true;
   bool is_control_realm_ = false;
+
+  // doshgentv8: allocation fuel state. The flag seed is applied in the
+  // Isolate constructor; hosts can override it through the public overlay.
+  uint64_t allocation_budget_ = 0;
+  bool allocation_budget_enabled_ = false;
+  bool allocation_budget_exhausted_ = false;
+  AllocationBudgetCallback allocation_budget_callback_ = nullptr;
+  void* allocation_budget_callback_data_ = nullptr;
 
   friend class HandleScopeImplementer;
   friend class GlobalSafepoint;

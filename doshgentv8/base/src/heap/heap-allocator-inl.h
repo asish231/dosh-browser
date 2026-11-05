@@ -108,6 +108,19 @@ HeapAllocator::AllocateRaw(int size_in_bytes, AllocationOrigin origin,
     return AllocateRaw(size_in_bytes, AllocationType::kOld, origin, alignment);
   }
 
+  // doshgentv8: persistent allocation fuel, charged at the same runtime
+  // allocation checkpoint as the dormant allocation-timeout machinery. Unlike
+  // that test knob, exhaustion is a distinct fail-stop trap and is not reset
+  // by GC. The overlay is main-thread-only so concurrent local heaps cannot
+  // race on it; background allocations and C++ malloc are not fuel. Bootstrap
+  // always-allocate scopes and allocation retries are not charged.
+  if (V8_UNLIKELY(heap_->isolate()->allocation_budget_enabled()) &&
+      local_heap_->is_main_thread() && !heap_->always_allocate() &&
+      !local_heap_->IsRetryOfFailedAllocation() &&
+      !heap_->isolate()->consume_allocation_budget()) {
+    heap_->FatalDoshAllocationBudgetExhausted();
+  }
+
 #ifdef V8_ENABLE_ALLOCATION_TIMEOUT
   if (V8_UNLIKELY(allocation_timeout_.has_value()) &&
       ReachedAllocationTimeout()) {

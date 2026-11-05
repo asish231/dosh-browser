@@ -4850,7 +4850,10 @@ Isolate::Isolate(IsolateGroup* isolate_group)
       etw_trace_interpreted_frames_(v8_flags.interpreted_frames_native_stack),
       etw_in_rundown_(false),
 #endif  // V8_ENABLE_ETW_STACK_WALKING
-      stack_size_(v8_flags.stack_size * KB) {
+      stack_size_(v8_flags.stack_size * KB),
+      // doshgentv8: seed the optional allocation fuel from the process flag.
+      allocation_budget_(v8_flags.dosh_allocation_budget),
+      allocation_budget_enabled_(v8_flags.dosh_allocation_budget > 0) {
   TRACE_ISOLATE(constructor);
   CheckIsolateLayout();
 
@@ -6493,7 +6496,10 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
     setup_delegate_ = new SetupIsolateDelegate;
   }
 
-  if (!v8_flags.inline_new) heap_.DisableInlineAllocation();
+  // doshgentv8: allocation fuel must also observe generated allocation sites.
+  if (!v8_flags.inline_new || allocation_budget_enabled()) {
+    heap_.DisableInlineAllocation();
+  }
 
   if (!setup_delegate_->SetupHeap(this, create_heap_objects)) {
     V8::FatalProcessOutOfMemory(this, "heap object creation");

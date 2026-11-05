@@ -15,6 +15,7 @@
 
 // Clients of this interface shouldn't depend on lots of heap internals.
 // Do not include anything from src/heap here!
+#include "include/dosh_protocol.h"
 #include "include/v8-callbacks.h"
 #include "include/v8-embedder-heap.h"
 #include "include/v8-internal.h"
@@ -366,6 +367,13 @@ class Heap final {
 
   [[noreturn]] V8_EXPORT_PRIVATE void FatalProcessOutOfMemory(
       const char* location);
+
+  // doshgentv8: fail-stop allocation-fuel trap, distinct from ordinary OOM.
+  [[noreturn]] V8_EXPORT_PRIVATE void FatalDoshAllocationBudgetExhausted();
+
+  // doshgentv8: synchronous DCP marshalling point. Call on the isolate main
+  // thread after heap setup. gc_count is V8's combined minor/major GC epoch.
+  void fill_dosh_heap_stats(DoshHeapStats* stats);
 
   static constexpr std::optional<AllocationSpace>
   TryGetAllocationSpaceFromIndex(size_t index) {

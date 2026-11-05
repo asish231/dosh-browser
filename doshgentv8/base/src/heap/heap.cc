@@ -894,6 +894,21 @@ void Heap::DumpJSONHeapStatistics(std::stringstream& stream) {
   // clang-format on
 }
 
+void Heap::fill_dosh_heap_stats(DoshHeapStats* stats) {
+  DCHECK(IsMainThread());
+  DCHECK(HasBeenSetUp());
+  DCHECK_NOT_NULL(stats);
+  // doshgentv8: reuse V8's canonical accounting rather than maintaining a
+  // second, potentially divergent set of heap counters.
+  v8::HeapStatistics heap_stats;
+  reinterpret_cast<v8::Isolate*>(isolate())->GetHeapStatistics(&heap_stats);
+  stats->total_heap_size = heap_stats.total_heap_size();
+  stats->used_heap_size = heap_stats.used_heap_size();
+  stats->heap_size_limit = heap_stats.heap_size_limit();
+  stats->malloced_memory = heap_stats.malloced_memory();
+  stats->gc_count = gc_count_.value();
+}
+
 void Heap::ReportStatisticsAfterGC() {
   if (deferred_counters_.empty()) return;
   // Move the contents into a new SmallVector first, in case
@@ -5722,7 +5737,11 @@ bool Heap::ShouldStressCompaction() const {
   return v8_flags.stress_compaction && (gc_count_.value() & 1) != 0;
 }
 
-void Heap::EnableInlineAllocation() { inline_allocation_enabled_ = true; }
+void Heap::EnableInlineAllocation() {
+  // doshgentv8: never restore bump-pointer bypass while fuel is active.
+  if (isolate()->allocation_budget_enabled()) return;
+  inline_allocation_enabled_ = true;
+}
 
 void Heap::DisableInlineAllocation() {
   inline_allocation_enabled_ = false;
@@ -6576,6 +6595,13 @@ void Heap::CompactRetainedMaps(Tagged<WeakArrayList> retained_maps) {
 
 void Heap::FatalProcessOutOfMemory(const char* location) {
   V8::FatalProcessOutOfMemory(isolate(), location, V8::kHeapOOM);
+}
+
+void Heap::FatalDoshAllocationBudgetExhausted() {
+  // doshgentv8: notify before the fatal trap. The callback must not allocate
+  // or re-enter V8; returning from it does not resume page execution.
+  isolate()->TriggerAllocationBudgetCallback();
+  FATAL("dosh_allocation_budget_exhausted");
 }
 
 #ifdef DEBUG
