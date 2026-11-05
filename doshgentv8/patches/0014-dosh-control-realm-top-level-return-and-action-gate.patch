@@ -1,0 +1,96 @@
+diff --git a/doshgentv8/base/include/dosh_protocol.h b/doshgentv8/base/include/dosh_protocol.h
+index bdc9a78c..bd076b47 100644
+--- a/doshgentv8/base/include/dosh_protocol.h
++++ b/doshgentv8/base/include/dosh_protocol.h
+@@ -27,8 +27,12 @@ typedef enum {
+     DOSH_OP_SET_PRNG_SEED  = 0x05,  /* Deterministic PRNG seed */
+     DOSH_OP_SET_GATE       = 0x06,  /* Configure security gates (eval/net/wasm) */
+     DOSH_OP_DRAIN_TASKS    = 0x07,  /* Synchronously drain microtask queue */
+-    DOSH_OP_GET_LAYOUT     = 0x08,  /* Retrieve Butterfly layout memory view */
+-    DOSH_OP_GET_HEAP_STATS = 0x09   /* Read 128MB pruned heap metrics */
++    DOSH_OP_GET_LAYOUT          = 0x08,  /* Retrieve Butterfly layout memory view */
++    DOSH_OP_GET_HEAP_STATS      = 0x09,  /* Read 128MB pruned heap metrics */
++    DOSH_OP_SET_ALLOW_ACTIONS   = 0x0A,  /* Native authority flag for DOM mutations */
++    DOSH_OP_SET_CONTROL_REALM   = 0x0B,  /* Toggle control realm (enables top-level return) */
++    DOSH_OP_BATCH_READ          = 0x0C,  /* Zero-copy binary batch read of DOM nodes */
++    DOSH_OP_POLL_TELEMETRY_RING = 0x0D   /* Drain lock-free telemetry ring buffer */
+ } DoshOpCode;
+ 
+ /* Response Status (V8 -> Host) */
+diff --git a/doshgentv8/base/src/builtins/builtins.cc b/doshgentv8/base/src/builtins/builtins.cc
+index 72f5f51b..36e8d14b 100644
+--- a/doshgentv8/base/src/builtins/builtins.cc
++++ b/doshgentv8/base/src/builtins/builtins.cc
+@@ -593,6 +593,10 @@ bool Builtins::AllowDynamicFunction(
+   if (isolate != nullptr && !isolate->is_eval_allowed()) {
+     return false;
+   }
++  // doshgentv8 action gate: if action authority is revoked, deny unauthorized function synthesis.
++  if (isolate != nullptr && !isolate->is_action_allowed()) {
++    return false;
++  }
+   if (v8_flags.allow_unsafe_function_constructor) return true;
+   HandleScopeImplementer* impl = isolate->handle_scope_implementer();
+   DirectHandle<NativeContext> responsible_context = impl->LastEnteredContext();
+diff --git a/doshgentv8/base/src/execution/isolate.h b/doshgentv8/base/src/execution/isolate.h
+index 1726e2a8..571bf043 100644
+--- a/doshgentv8/base/src/execution/isolate.h
++++ b/doshgentv8/base/src/execution/isolate.h
+@@ -2273,6 +2273,12 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
+   bool is_wasm_allowed() const { return wasm_allowed_; }
+   void set_wasm_allowed(bool allowed) { wasm_allowed_ = allowed; }
+ 
++  // doshgentv8: native action gating and control realm
++  bool is_action_allowed() const { return action_allowed_; }
++  void set_action_allowed(bool allowed) { action_allowed_ = allowed; }
++  bool is_control_realm() const { return is_control_realm_; }
++  void set_control_realm(bool enabled) { is_control_realm_ = enabled; }
++
+   // doshgentv8: WAASM capabilities mask
+   // 1: read_dom, 2: act, 4: emit, 8: net_query, 16: log, 32: snapshot
+   uint32_t waasm_capabilities_mask() const { return waasm_capabilities_mask_; }
+@@ -3119,6 +3125,8 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
+   uint32_t waasm_capabilities_mask_ = 0x3F;
+   CheckpointCallback checkpoint_callback_ = nullptr;
+   void* checkpoint_callback_data_ = nullptr;
++  bool action_allowed_ = true;
++  bool is_control_realm_ = false;
+ 
+   friend class HandleScopeImplementer;
+   friend class GlobalSafepoint;
+diff --git a/doshgentv8/base/src/flags/flag-definitions.h b/doshgentv8/base/src/flags/flag-definitions.h
+index 4eff4e4a..6d3789f1 100644
+--- a/doshgentv8/base/src/flags/flag-definitions.h
++++ b/doshgentv8/base/src/flags/flag-definitions.h
+@@ -4314,6 +4314,12 @@ DEFINE_NEG_IMPLICATION(single_threaded, maglev_deopt_data_on_background)
+ DEFINE_NEG_IMPLICATION(single_threaded, maglev_build_code_on_background)
+ #endif  // V8_ENABLE_MAGLEV
+ 
++// doshgentv8: agent-native control realm and action gating
++DEFINE_BOOL(dosh_control_realm, false,
++            "enable dosh agent control realm with top-level return")
++DEFINE_BOOL(dosh_allow_actions, true,
++            "native authority flag to allow DOM mutations and agent actions")
++
+ //
+ // Parallel and concurrent GC (Orinoco) related flags.
+ //
+diff --git a/doshgentv8/base/src/parsing/parser-base.h b/doshgentv8/base/src/parsing/parser-base.h
+index f6d2f396..9fbc4e5d 100644
+--- a/doshgentv8/base/src/parsing/parser-base.h
++++ b/doshgentv8/base/src/parsing/parser-base.h
+@@ -6258,8 +6258,12 @@ typename ParserBase<Impl>::StatementT ParserBase<Impl>::ParseReturnStatement() {
+     case REPL_MODE_SCOPE:
+     case EVAL_SCOPE:
+     case MODULE_SCOPE:
+-      impl()->ReportMessageAt(loc, MessageTemplate::kIllegalReturn);
+-      return impl()->NullStatement();
++      // doshgentv8: allow top-level return when dosh_control_realm is active
++      if (!v8_flags.dosh_control_realm) {
++        impl()->ReportMessageAt(loc, MessageTemplate::kIllegalReturn);
++        return impl()->NullStatement();
++      }
++      break;
+     case BLOCK_SCOPE:
+       // Class static blocks disallow return. They are their own var scopes and
+       // have a varblock scope.

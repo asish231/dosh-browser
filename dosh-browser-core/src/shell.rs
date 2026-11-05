@@ -504,10 +504,18 @@ pub async fn execute_command(
         }
         "eval" => {
             let expr = args.get("source").or_else(|| args.get("expr")).and_then(|v| v.as_str()).unwrap_or("");
+            let allow_actions = args.get("allow_actions").and_then(|v| v.as_bool()).unwrap_or(false);
+            let empty_vec = vec![];
+            let script_args: Vec<String> = args.get("args")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or(empty_vec);
+
             let tab = session.current_tab();
             let mut rt = crate::runtime::Runtime::new(session.client.clone(), &tab.url)?;
+            session.configure_runtime(&mut rt);
             rt.load_document(&tab.html, &tab.url)?;
-            let result = rt.eval(expr)?;
+            let result = rt.engine.eval_bounded(expr, true, allow_actions, &script_args)?;
             Ok(serde_json::json!({ "evaluated": true, "result": result }))
         }
         "skill.save" => {
@@ -543,10 +551,12 @@ pub async fn execute_command(
                 }
             }
             let source = skill.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            let allow_actions = skill.get("allow_actions").and_then(|v| v.as_bool()).unwrap_or(false);
             let tab = session.current_tab();
             let mut rt = crate::runtime::Runtime::new(session.client.clone(), &tab.url)?;
+            session.configure_runtime(&mut rt);
             rt.load_document(&tab.html, &tab.url)?;
-            let result = rt.eval(source)?;
+            let result = rt.engine.eval_bounded(source, true, allow_actions, &[])?;
             Ok(serde_json::json!({
                 "skill": name,
                 "version": skill["version"],

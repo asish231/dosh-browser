@@ -4314,6 +4314,12 @@ DEFINE_NEG_IMPLICATION(single_threaded, maglev_deopt_data_on_background)
 DEFINE_NEG_IMPLICATION(single_threaded, maglev_build_code_on_background)
 #endif  // V8_ENABLE_MAGLEV
 
+// doshgentv8: agent-native control realm and action gating
+DEFINE_BOOL(dosh_control_realm, false,
+            "enable dosh agent control realm with top-level return")
+DEFINE_BOOL(dosh_allow_actions, true,
+            "native authority flag to allow DOM mutations and agent actions")
+
 //
 // Parallel and concurrent GC (Orinoco) related flags.
 //

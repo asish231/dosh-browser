@@ -72,6 +72,9 @@ class DeviceCacheTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         device.reset_cache()
+        # Never leak a fake profile into the shared in-process cache: other
+        # suites (e.g. WebGL renderer checks) read device.current() in-process.
+        self.addCleanup(device.reset_cache)
 
     def _fake_probe(self) -> device.DeviceProfile:
         return device.DeviceProfile(

@@ -27,8 +27,12 @@ typedef enum {
     DOSH_OP_SET_PRNG_SEED  = 0x05,  /* Deterministic PRNG seed */
     DOSH_OP_SET_GATE       = 0x06,  /* Configure security gates (eval/net/wasm) */
     DOSH_OP_DRAIN_TASKS    = 0x07,  /* Synchronously drain microtask queue */
-    DOSH_OP_GET_LAYOUT     = 0x08,  /* Retrieve Butterfly layout memory view */
-    DOSH_OP_GET_HEAP_STATS = 0x09   /* Read 128MB pruned heap metrics */
+    DOSH_OP_GET_LAYOUT          = 0x08,  /* Retrieve Butterfly layout memory view */
+    DOSH_OP_GET_HEAP_STATS      = 0x09,  /* Read 128MB pruned heap metrics */
+    DOSH_OP_SET_ALLOW_ACTIONS   = 0x0A,  /* Native authority flag for DOM mutations */
+    DOSH_OP_SET_CONTROL_REALM   = 0x0B,  /* Toggle control realm (enables top-level return) */
+    DOSH_OP_BATCH_READ          = 0x0C,  /* Zero-copy binary batch read of DOM nodes */
+    DOSH_OP_POLL_TELEMETRY_RING = 0x0D   /* Drain lock-free telemetry ring buffer */
 } DoshOpCode;
 
 /* Response Status (V8 -> Host) */

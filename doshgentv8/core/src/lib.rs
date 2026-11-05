@@ -382,6 +382,7 @@ const EXTENSIONS_SCRIPT: &str = r#"
                 globalThis.WebAssembly = _origWebAssembly;
             }
         }
+        if (cap === 'action') _actionAllowed = !!allowed;
         if (typeof cap === 'string' && cap.indexOf('waasm.') === 0) {
             const sub = cap.slice(6);
             if (sub in _waasmCaps) _waasmCaps[sub] = !!allowed;
@@ -390,6 +391,7 @@ const EXTENSIONS_SCRIPT: &str = r#"
     globalThis.__getCapabilityGate = function(cap) {
         if (cap === 'eval') return _evalAllowed;
         if (cap === 'wasm') return _wasmAllowed;
+        if (cap === 'action') return _actionAllowed;
         if (typeof cap === 'string' && cap.indexOf('waasm.') === 0) {
             const sub = cap.slice(6);
             return sub in _waasmCaps ? _waasmCaps[sub] : false;
@@ -560,6 +562,48 @@ const EXTENSIONS_SCRIPT: &str = r#"
         thunk.__tco_thunk = true;
         return thunk;
     };
+
+    // 7. dosh.* Agent Bridge & Control Realm
+    let _controlRealm = false;
+    let _actionAllowed = true;
+
+    globalThis.__setControlRealm = function(enabled) {
+        _controlRealm = Boolean(enabled);
+    };
+    globalThis.__isControlRealm = function() {
+        return _controlRealm;
+    };
+
+    globalThis.dosh = {
+        args: [],
+        call: function(name, ...args) {
+            return globalThis.__dispatchHost.apply(null, [name].concat(args));
+        },
+        act: function(action) {
+            if (!_actionAllowed) {
+                throw new Error("Action authority disallowed: mutations are blocked in read-only mode");
+            }
+            if (typeof globalThis.__applyAction === 'function') {
+                return globalThis.__applyAction(action);
+            }
+            return globalThis.__dispatchHost("host_action", JSON.stringify(action));
+        },
+        emit: function(event, data) {
+            return globalThis.__dispatchHost("host_emit", event, typeof data === 'string' ? data : JSON.stringify(data));
+        },
+        text: function() {
+            if (typeof document !== 'undefined' && document.body) {
+                return document.body.innerText || document.body.textContent || "";
+            }
+            return "";
+        },
+        actions: function() {
+            if (typeof globalThis.__extractActions === 'function') {
+                return globalThis.__extractActions();
+            }
+            return [];
+        }
+    };
 })();
 "#;
 
@@ -604,6 +648,8 @@ pub struct DoshEngine {
     eval_allowed: Arc<AtomicBool>,
     wasm_allowed: Arc<AtomicBool>,
     network_allowed: Arc<AtomicBool>,
+    action_allowed: Arc<AtomicBool>,
+    control_realm: Arc<AtomicBool>,
     layout_buffer: Vec<protocol::DoshButterflyRect>,
 }
 
@@ -642,6 +688,8 @@ impl DoshEngine {
         let eval_allowed = Arc::new(AtomicBool::new(true));
         let wasm_allowed = Arc::new(AtomicBool::new(true));
         let network_allowed = Arc::new(AtomicBool::new(true));
+        let action_allowed = Arc::new(AtomicBool::new(true));
+        let control_realm = Arc::new(AtomicBool::new(false));
         let virtual_time = Arc::new(Mutex::new(None));
 
         let bridge = Box::into_raw(Box::new(HostBridge {
@@ -705,6 +753,8 @@ impl DoshEngine {
             eval_allowed,
             wasm_allowed,
             network_allowed,
+            action_allowed,
+            control_realm,
             layout_buffer: Vec::new(),
         })
     }
@@ -967,6 +1017,65 @@ impl DoshEngine {
             .unwrap_or(false)
     }
 
+    /// Set action authority gate (allows or blocks DOM mutating actions like click/type/form submit).
+    pub fn set_action_allowed(&mut self, allowed: bool) -> Result<(), String> {
+        self.action_allowed.store(allowed, Ordering::SeqCst);
+        self.eval(&format!("globalThis.__setCapabilityGate('action', {allowed});"))?;
+        Ok(())
+    }
+
+    pub fn is_action_allowed(&self) -> bool {
+        self.action_allowed.load(Ordering::SeqCst)
+    }
+
+    /// Toggle agent control realm (enables agent verbs and top-level return).
+    pub fn set_control_realm(&mut self, enabled: bool) -> Result<(), String> {
+        self.control_realm.store(enabled, Ordering::SeqCst);
+        self.eval(&format!("globalThis.__setControlRealm({enabled});"))?;
+        Ok(())
+    }
+
+    pub fn is_control_realm(&self) -> bool {
+        self.control_realm.load(Ordering::SeqCst)
+    }
+
+    /// Evaluate code in a bounded control realm with explicit action authority and argument injection.
+    pub fn eval_bounded(
+        &mut self,
+        code: &str,
+        control_realm: bool,
+        allow_actions: bool,
+        args: &[String],
+    ) -> Result<String, String> {
+        let prev_realm = self.is_control_realm();
+        let prev_actions = self.is_action_allowed();
+
+        let _ = self.set_control_realm(control_realm);
+        let _ = self.set_action_allowed(allow_actions);
+
+        let args_json = format!(
+            "[{}]",
+            args.iter()
+                .map(|s| format!("{s:?}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let _ = self.eval(&format!("if (globalThis.dosh) {{ globalThis.dosh.args = {args_json}; }}"));
+
+        let wrapped = if control_realm {
+            format!("(function() {{ {code} }})()")
+        } else {
+            code.to_string()
+        };
+
+        let result = self.eval(&wrapped);
+
+        let _ = self.set_control_realm(prev_realm);
+        let _ = self.set_action_allowed(prev_actions);
+
+        result
+    }
+
     /// Update or query the contiguous Butterfly layout rectangle cache.
     pub fn set_layout_rects(&mut self, rects: Vec<protocol::DoshButterflyRect>) {
         self.layout_buffer = rects;
@@ -1035,6 +1144,16 @@ impl DoshEngine {
             0x09 => {
                 let used = self.used_heap_size() as u64;
                 protocol::DoshResponse::with_numeric(used)
+            }
+            0x0A => {
+                let allowed = cmd.param != 0;
+                let _ = self.set_action_allowed(allowed);
+                protocol::DoshResponse::ok()
+            }
+            0x0B => {
+                let enabled = cmd.param != 0;
+                let _ = self.set_control_realm(enabled);
+                protocol::DoshResponse::ok()
             }
             _ => protocol::DoshResponse::error("unknown opcode"),
         }
@@ -1346,5 +1465,71 @@ mod tests {
         engine.set_time_limit(0.0);
         let recovery = engine.eval("10 + 20").unwrap();
         assert_eq!(recovery, "30");
+    }
+
+    #[test]
+    fn test_control_realm_top_level_return_and_args() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+
+        // Control realm allows top-level return and injects dosh.args
+        let res = engine
+            .eval_bounded(
+                "return dosh.args[0] + ' ' + dosh.args[1];",
+                true,
+                true,
+                &["Agent".to_string(), "Native".to_string()],
+            )
+            .expect("eval_bounded failed");
+
+        assert_eq!(res, "Agent Native");
+    }
+
+    #[test]
+    fn test_action_authority_gate_blocks_mutations() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+
+        // When action is allowed
+        assert!(engine.is_action_allowed());
+        let allowed = engine.eval("globalThis.__getCapabilityGate('action')").unwrap();
+        assert_eq!(allowed, "true");
+
+        // Revoke action authority
+        engine.set_action_allowed(false).unwrap();
+        assert!(!engine.is_action_allowed());
+        let disallowed = engine.eval("globalThis.__getCapabilityGate('action')").unwrap();
+        assert_eq!(disallowed, "false");
+
+        // dosh.act must throw an explicit authority error
+        let err = engine.eval("dosh.act({ type: 'click', ref: 'btn_1' });");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("Action authority disallowed"));
+
+        // Re-enable action authority
+        engine.set_action_allowed(true).unwrap();
+        assert!(engine.is_action_allowed());
+    }
+
+    #[test]
+    fn test_dcp_protocol_action_and_realm_opcodes() {
+        use protocol::{DoshCommand, DoshOpCode, DoshStatusCode};
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+
+        // Set Action Gate to false via DCP
+        let cmd = DoshCommand::new(DoshOpCode::SetAllowActions).with_param(0);
+        let resp = engine.dispatch_command(&cmd);
+        assert_eq!(resp.status, DoshStatusCode::Ok as u8);
+        assert!(!engine.is_action_allowed());
+
+        // Set Action Gate to true via DCP
+        let cmd = DoshCommand::new(DoshOpCode::SetAllowActions).with_param(1);
+        let resp = engine.dispatch_command(&cmd);
+        assert_eq!(resp.status, DoshStatusCode::Ok as u8);
+        assert!(engine.is_action_allowed());
+
+        // Set Control Realm via DCP
+        let cmd = DoshCommand::new(DoshOpCode::SetControlRealm).with_param(1);
+        let resp = engine.dispatch_command(&cmd);
+        assert_eq!(resp.status, DoshStatusCode::Ok as u8);
+        assert!(engine.is_control_realm());
     }
 }

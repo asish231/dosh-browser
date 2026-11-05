@@ -29,6 +29,27 @@ pub enum ActorCommand {
         code: String,
         reply: Sender<Result<JsValue, String>>,
     },
+    EvalBounded {
+        code: String,
+        control_realm: bool,
+        allow_actions: bool,
+        args: Vec<String>,
+        reply: Sender<Result<String, String>>,
+    },
+    SetActionAllowed {
+        allowed: bool,
+        reply: Sender<Result<(), String>>,
+    },
+    IsActionAllowed {
+        reply: Sender<bool>,
+    },
+    SetControlRealm {
+        enabled: bool,
+        reply: Sender<Result<(), String>>,
+    },
+    IsControlRealm {
+        reply: Sender<bool>,
+    },
     PumpJobs {
         reply: Sender<bool>,
     },
@@ -158,6 +179,28 @@ impl DoshActorHandle {
             .sender
             .send(ActorCommand::EvalRaw {
                 code: code.to_string(),
+                reply: tx,
+            })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))?
+    }
+
+    /// Evaluate code in a bounded control realm with explicit action authority.
+    pub fn eval_bounded(
+        &self,
+        code: &str,
+        control_realm: bool,
+        allow_actions: bool,
+        args: &[String],
+    ) -> Result<String, String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::EvalBounded {
+                code: code.to_string(),
+                control_realm,
+                allow_actions,
+                args: args.to_vec(),
                 reply: tx,
             })
             .map_err(|e| format!("actor send error: {e}"))?;
@@ -326,6 +369,44 @@ impl DoshActorHandle {
         rx.recv().map_err(|e| format!("actor recv error: {e}"))
     }
 
+    /// Set action authority gate (allows or blocks DOM mutations).
+    pub fn set_action_allowed(&self, allowed: bool) -> Result<(), String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::SetActionAllowed { allowed, reply: tx })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))?
+    }
+
+    pub fn is_action_allowed(&self) -> Result<bool, String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::IsActionAllowed { reply: tx })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))
+    }
+
+    /// Toggle agent control realm.
+    pub fn set_control_realm(&self, enabled: bool) -> Result<(), String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::SetControlRealm { enabled, reply: tx })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))?
+    }
+
+    pub fn is_control_realm(&self) -> Result<bool, String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::IsControlRealm { reply: tx })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))
+    }
+
     /// Allow or disallow specific WAASM capability.
     pub fn set_waasm_capability(&self, cap: &str, allowed: bool) -> Result<(), String> {
         let (tx, rx) = channel();
@@ -458,6 +539,16 @@ impl DoshActor {
                     let res = engine.eval_raw(&code);
                     let _ = reply.send(res);
                 }
+                ActorCommand::EvalBounded {
+                    code,
+                    control_realm,
+                    allow_actions,
+                    args,
+                    reply,
+                } => {
+                    let res = engine.eval_bounded(&code, control_realm, allow_actions, &args);
+                    let _ = reply.send(res);
+                }
                 ActorCommand::PumpJobs { reply } => {
                     let drained = engine.pump_jobs();
                     let _ = reply.send(drained);
@@ -523,6 +614,22 @@ impl DoshActor {
                 }
                 ActorCommand::IsNetworkAllowed { reply } => {
                     let res = engine.is_network_allowed();
+                    let _ = reply.send(res);
+                }
+                ActorCommand::SetActionAllowed { allowed, reply } => {
+                    let res = engine.set_action_allowed(allowed);
+                    let _ = reply.send(res);
+                }
+                ActorCommand::IsActionAllowed { reply } => {
+                    let res = engine.is_action_allowed();
+                    let _ = reply.send(res);
+                }
+                ActorCommand::SetControlRealm { enabled, reply } => {
+                    let res = engine.set_control_realm(enabled);
+                    let _ = reply.send(res);
+                }
+                ActorCommand::IsControlRealm { reply } => {
+                    let res = engine.is_control_realm();
                     let _ = reply.send(res);
                 }
                 ActorCommand::SetWaasmCapability {
@@ -616,4 +723,29 @@ mod tests {
 
         actor.shutdown();
     }
+
+    #[test]
+    fn test_actor_bounded_eval_and_action_gate() {
+        let actor = DoshActor::spawn(Arc::new(DummySeam), 0).expect("spawn actor");
+
+        // Bounded eval with top-level return in control realm
+        let res = actor
+            .eval_bounded("return 'result: ' + dosh.args[0];", true, true, &["ok".to_string()])
+            .expect("eval_bounded failed");
+        assert_eq!(res, "result: ok");
+
+        // Action gate via actor
+        actor.set_action_allowed(false).expect("set action allowed");
+        assert!(!actor.is_action_allowed().expect("is action allowed"));
+
+        let err = actor.eval("dosh.act({ type: 'click' })");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("Action authority disallowed"));
+
+        actor.set_action_allowed(true).expect("set action allowed");
+        assert!(actor.is_action_allowed().expect("is action allowed"));
+
+        actor.shutdown();
+    }
 }
+

@@ -6258,8 +6258,12 @@ typename ParserBase<Impl>::StatementT ParserBase<Impl>::ParseReturnStatement() {
     case REPL_MODE_SCOPE:
     case EVAL_SCOPE:
     case MODULE_SCOPE:
-      impl()->ReportMessageAt(loc, MessageTemplate::kIllegalReturn);
-      return impl()->NullStatement();
+      // doshgentv8: allow top-level return when dosh_control_realm is active
+      if (!v8_flags.dosh_control_realm) {
+        impl()->ReportMessageAt(loc, MessageTemplate::kIllegalReturn);
+        return impl()->NullStatement();
+      }
+      break;
     case BLOCK_SCOPE:
       // Class static blocks disallow return. They are their own var scopes and
       // have a varblock scope.

@@ -2273,6 +2273,12 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   bool is_wasm_allowed() const { return wasm_allowed_; }
   void set_wasm_allowed(bool allowed) { wasm_allowed_ = allowed; }
 
+  // doshgentv8: native action gating and control realm
+  bool is_action_allowed() const { return action_allowed_; }
+  void set_action_allowed(bool allowed) { action_allowed_ = allowed; }
+  bool is_control_realm() const { return is_control_realm_; }
+  void set_control_realm(bool enabled) { is_control_realm_ = enabled; }
+
   // doshgentv8: WAASM capabilities mask
   // 1: read_dom, 2: act, 4: emit, 8: net_query, 16: log, 32: snapshot
   uint32_t waasm_capabilities_mask() const { return waasm_capabilities_mask_; }
@@ -3119,6 +3125,8 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   uint32_t waasm_capabilities_mask_ = 0x3F;
   CheckpointCallback checkpoint_callback_ = nullptr;
   void* checkpoint_callback_data_ = nullptr;
+  bool action_allowed_ = true;
+  bool is_control_realm_ = false;
 
   friend class HandleScopeImplementer;
   friend class GlobalSafepoint;

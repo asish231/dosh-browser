@@ -17,6 +17,10 @@ pub enum DoshOpCode {
     DrainTasks = 0x07,
     GetLayout = 0x08,
     GetHeapStats = 0x09,
+    SetAllowActions = 0x0A,
+    SetControlRealm = 0x0B,
+    BatchRead = 0x0C,
+    PollTelemetryRing = 0x0D,
 }
 
 #[repr(u8)]

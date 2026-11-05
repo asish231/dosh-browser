@@ -593,6 +593,10 @@ bool Builtins::AllowDynamicFunction(
   if (isolate != nullptr && !isolate->is_eval_allowed()) {
     return false;
   }
+  // doshgentv8 action gate: if action authority is revoked, deny unauthorized function synthesis.
+  if (isolate != nullptr && !isolate->is_action_allowed()) {
+    return false;
+  }
   if (v8_flags.allow_unsafe_function_constructor) return true;
   HandleScopeImplementer* impl = isolate->handle_scope_implementer();
   DirectHandle<NativeContext> responsible_context = impl->LastEnteredContext();
