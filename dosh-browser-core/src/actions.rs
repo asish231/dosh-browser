@@ -55,6 +55,82 @@ fn _stable_hash(node: &NodeRef) -> String {
     format!("{:x}", hasher.finalize())[..8].to_string()
 }
 
+/// Escape a value for use inside a CSS identifier (mirrors actions.py
+/// `_escape_ident`). Tailwind emits class names containing ':' and '['
+/// ('lg:tw-flex', 'tw-max-w-300'); unescaped, they produce selectors the
+/// engine rejects.
+fn _escape_ident(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_string()
+            } else {
+                format!("\\{c}")
+            }
+        })
+        .collect()
+}
+
+/// Approximate selector usable against the engine (mirrors actions.py
+/// `_css_path`). Walks up to six ancestors, stops at the nearest id (a unique
+/// id makes every ancestor step unnecessary), escapes class tokens, keeps at
+/// most two classes per element (utility frameworks reorder class lists on
+/// every build), and drops the html/body tail. Repeated identical controls
+/// share one selector; the action lane disambiguates them with the
+/// document-order occurrence (`ref~N`).
+fn _css_path(node: &NodeRef) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cursor = Some(node.clone());
+    let mut hops = 0;
+    while let Some(cur) = cursor {
+        if hops >= 6 {
+            break;
+        }
+        let tag = tag_name(&cur);
+        if tag.is_empty() {
+            // Synthetic document root: including it emits a leading `*`
+            // segment that can never match (the html element's parent is
+            // the document, not an element), defeating the whole chain.
+            break;
+        }
+        if let Some(node_id) = attr(&cur, "id") {
+            if !node_id.is_empty() {
+                parts.push(format!("#{}", _escape_ident(&node_id)));
+                break;
+            }
+        }
+        let classes: Vec<String> = attr(&cur, "class")
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter(|c| !c.is_empty())
+            .take(2)
+            .map(|c| format!(".{}", _escape_ident(c)))
+            .collect();
+        if classes.is_empty() {
+            parts.push(if tag.is_empty() { "*".to_string() } else { tag });
+        } else {
+            parts.push(format!("{}{}", if tag.is_empty() { "*" } else { &tag }, classes.join("")));
+        }
+        cursor = cur.parent();
+        hops += 1;
+    }
+    // Drop ancestors the engine cannot help with: 'html' and 'body' are in
+    // every document, so keeping them only lengthens the selector.
+    while let Some(last) = parts.last() {
+        let base = last.split('.').next().unwrap_or("");
+        if base == "html" || base == "body" {
+            parts.pop();
+        } else {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    parts.iter().rev().cloned().collect::<Vec<_>>().join(" > ")
+}
+
 fn _label_for(node: &NodeRef) -> String {
     // Priority: Visible Text -> aria-label -> title -> alt -> placeholder -> name/value -> id
     let text = text_content(node).chars().take(80).collect::<String>();
@@ -216,6 +292,7 @@ pub fn extract_actions(html: &str, _base_url: &str, max_actions: usize) -> Vec<T
             } else { None },
             challenge: false,
             path: Vec::new(),
+            selector: _css_path(node),
         });
     }
 
@@ -313,6 +390,7 @@ pub fn extract_actions(html: &str, _base_url: &str, max_actions: usize) -> Vec<T
                 continue;
             }
 
+            let selector = _css_path(node);
             targets.push(Target {
                 ref_id,
                 role,
@@ -323,6 +401,7 @@ pub fn extract_actions(html: &str, _base_url: &str, max_actions: usize) -> Vec<T
                 checked: None,
                 challenge: false,
                 path: Vec::new(),
+                selector,
             });
         }
     }
