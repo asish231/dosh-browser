@@ -18,7 +18,13 @@ from urllib.parse import urlsplit
 from quickjs import Context
 from webresearch.config import js_engine
 
-from webresearch.telemetry import NetworkLedger, _redact, _url
+from webresearch.telemetry import (
+    NetworkLedger,
+    _redact,
+    _url,
+    decode_payload_bytes,
+)
+from webresearch.types import Page
 
 if TYPE_CHECKING:
     from webresearch.session import Session
@@ -35,6 +41,12 @@ COMMANDS = {
     "net.rule": "Add runtime fetch/XHR block/header/mock rule: action, pattern, options.",
     "net.unrule": "Remove network rule by id.",
     "net.apis": "Catalog discovered background API endpoints for Site-as-SDK replay.",
+    "net.stream": "Drain captured SSE events for one observation: id, after.",
+    "net.ws": "WebSocket session and frame evidence: action=list|view, session, after.",
+    "net.cors": "CORS verdict for one recorded request: id.",
+    "net.timing": "Measured transport timing waterfall (TTFB/duration only): pattern.",
+    "net.replay": "Return the recorded request contract for one observation: id (secrets redacted).",
+    "net.decode": "Decode a captured body: id|data_b64, encoding.",
     "console": "Query captured page logs/errors: after, limit, level.",
     "eval": "Run bounded control-realm JavaScript: source, args, allow_actions=false.",
     "skill.save": "Save source, name, origins, allow_actions=false to the workspace registry.",
@@ -55,6 +67,7 @@ COMMANDS = {
     "read": "Read the loaded document's reading projection: offset, limit, max_chars.",
     "history": "List history entries, or traverse with move (delta) or goto (absolute index).",
     "cookies": "Inspect session cookie names, domains, paths; values are never echoed.",
+    "gate": "Configure capability gates: gate=secret_reveal, allowed=bool (audited).",
     "wait": "Wait for url substring, action ref, page text, or network idle: timeout-bounded.",
     "caps": "Per-page capability manifest: live counts plus known engine gaps; export=path writes it to disk.",
     "screenshot": "Save the engine's approximate SVG layout diagram: dest_dir, frame.",
@@ -62,6 +75,7 @@ COMMANDS = {
     "ref": "Re-resolve a stable id (from an action's stable field) to the current page's ref.",
     "trace": "Act on a ref and return the causal bundle: DOM delta, network, console, dialogs.",
     "watch": "Subscribe to engine mutations: enable, then drain records with after/limit.",
+    "assist": "Run the in-session DevTools agent walkthrough against the live page: inspects cookies, storage, and discovered APIs, then synthesizes a unified replay command. goal (string).",
 }
 
 _SDK = """
@@ -111,6 +125,12 @@ class ShellStore:
                 id TEXT PRIMARY KEY, created REAL NOT NULL, tab_id TEXT NOT NULL,
                 url TEXT NOT NULL, title TEXT NOT NULL, html TEXT NOT NULL,
                 cookies TEXT NOT NULL, storage TEXT NOT NULL, history TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS state_snapshots (
+                id TEXT PRIMARY KEY, created REAL NOT NULL, tab_id TEXT NOT NULL,
+                url TEXT NOT NULL, title TEXT NOT NULL, html TEXT NOT NULL,
+                cookies TEXT NOT NULL, storage TEXT NOT NULL, history TEXT NOT NULL,
+                ledger TEXT NOT NULL
             );
         """)
         # Warrant TTL migration (upgrade audit #2): persistent workspaces
@@ -239,6 +259,37 @@ class ShellStore:
         ).fetchall()
         return [{"id": r[0], "created": r[1], "tab_id": r[2], "url": r[3], "title": r[4]} for r in rows]
 
+    def save_state_snapshot(
+        self, id: str, tab_id: str, url: str, title: str, html: str,
+        cookies: str, storage: str, history: str, ledger: str,
+    ) -> dict:
+        created = time.time()
+        with self.conn:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO state_snapshots (id, created, tab_id, url, title, html, cookies, storage, history, ledger)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (id, created, tab_id, url, title, html, cookies, storage, history, ledger))
+        return {"id": id, "created": created, "tab_id": tab_id, "url": url, "title": title}
+
+    def get_state_snapshot(self, id: str) -> dict:
+        row = self.conn.execute(
+            "SELECT id, created, tab_id, url, title, html, cookies, storage, history, ledger FROM state_snapshots WHERE id=?",
+            (id,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"state snapshot '{id}' not found")
+        return {
+            "id": row[0], "created": row[1], "tab_id": row[2], "url": row[3],
+            "title": row[4], "html": row[5], "cookies": row[6], "storage": row[7],
+            "history": row[8], "ledger": row[9],
+        }
+
+    def list_state_snapshots(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id, created, tab_id, url, title FROM state_snapshots ORDER BY created DESC"
+        ).fetchall()
+        return [{"id": r[0], "created": r[1], "tab_id": r[2], "url": r[3], "title": r[4]} for r in rows]
+
     def close(self):
         self.conn.close()
 
@@ -258,6 +309,64 @@ def _limit(value: Any, maximum: int = 1000) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
         raise ValueError(f"limit must be an integer from 1 to {maximum}")
     return value
+
+
+def _live_cookie_map(s: "Session") -> dict[str, str]:
+    """Read the live cookie jar (httpx) as name→value. The values are
+    persisted into the state DB but are never echoed into command output."""
+    jar = getattr(getattr(s, "client", None) and s.client.cookies, "jar", None)
+    if jar is not None:
+        return {c.name: c.value for c in jar}
+    cookies = getattr(s.client, "cookies", None) if getattr(s, "client", None) else None
+    if cookies is None:
+        return {}
+    if hasattr(cookies, "keys"):
+        return {k: cookies[k] for k in cookies.keys()}
+    return {}
+
+
+def _restore_cookie_map(s: "Session", saved: dict) -> None:
+    """Replace the session's live cookie jar with the named values from a
+    state snapshot (full replacement, values-only)."""
+    client = getattr(s, "client", None)
+    if client is None:
+        return
+    jar = getattr(client.cookies, "jar", None)
+    if jar is not None:
+        client.cookies.clear()
+        for name, value in saved.items():
+            client.cookies.set(name, value)
+    elif hasattr(client.cookies, "keys"):
+        existing = list(client.cookies.keys())
+        for k in existing:
+            del client.cookies[k]
+        for name, value in saved.items():
+            client.cookies[name] = value
+
+
+def _diff_storage(before: dict, after: dict) -> tuple[list, list, list]:
+    """Structural (value-free) diff of web storage: added/removed/changed keys.
+
+    ``before``/``after`` map origins to {key: value}. The values never appear in
+    the result — only presence and changed status. Repeated keys are sorted.
+    """
+    def _keys(d: dict) -> set[str]:
+        out: set[str] = set()
+        for origin, kv in d.items():
+            out.update(f"{origin}/{k}" for k in kv)
+        return out
+
+    b_keys, a_keys = _keys(before), _keys(after)
+    added = sorted(a_keys - b_keys)
+    removed = sorted(b_keys - a_keys)
+    changed = []
+    for origin in set(before) | set(after):
+        b_map, a_map = before.get(origin, {}), after.get(origin, {})
+        for k in a_map.keys() & b_map.keys():
+            if a_map[k] != b_map[k]:
+                changed.append(f"{origin}/{k}")
+    changed.sort()
+    return added, removed, changed
 
 
 _READING_TYPES = {"heading", "text", "list", "quote", "code", "table"}
@@ -453,7 +562,98 @@ class DoshShell:
             if not isinstance(a.get("enabled"), bool):
                 raise ValueError("enabled must be boolean")
             self.network.capture_bodies = a["enabled"]
-            return {"capture_bodies": a["enabled"], "note": "future responses only; JSON/form, redacted, size limited"}
+            out = {"capture_bodies": a["enabled"], "note": "future responses only; JSON/form, redacted, size limited"}
+            max_bytes = a.get("max_bytes")
+            if max_bytes is not None:
+                if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+                    raise ValueError("max_bytes must be a positive integer")
+                capped = min(max_bytes, 1_048_576)
+                self.network.body_max_bytes = capped
+                out["body_max_bytes"] = capped
+            return out
+        if name == "net.stream":
+            rid = a.get("id")
+            if isinstance(rid, bool) or not isinstance(rid, int):
+                raise ValueError("net.stream requires a numeric record id")
+            after = a.get("after", 0)
+            res = self.network.stream_view(rid, after)
+            if "error" in res:
+                raise LookupError(res["error"])
+            return res
+        if name == "net.ws":
+            from webresearch.engine import ws as ws_mod
+            action = a.get("action", "list")
+            recs = ws_mod.ws_records()
+            if action == "list":
+                return {"sessions": recs["sessions"], "count": len(recs["sessions"])}
+            if action == "view":
+                sid = a.get("session")
+                if isinstance(sid, bool) or not isinstance(sid, int):
+                    raise ValueError("net.ws view requires a numeric session id")
+                after = a.get("after", 0) or 0
+                frames = [f for f in recs["frames"] if f["session"] == sid]
+                sess = next((x for x in recs["sessions"] if x["id"] == sid), None)
+                if sess is None:
+                    raise LookupError(f"no websocket session {sid}")
+                page = frames[int(after):]
+                return {"session_id": sid, "url": sess["url"], "state": sess["state"],
+                        "closed": sess["closed"], "close_code": sess.get("close_code"),
+                        "total": len(frames), "returned": len(page), "frames": page, "after": after}
+            raise ValueError("action must be list or view")
+        if name == "net.cors":
+            rid = a.get("id")
+            if isinstance(rid, bool) or not isinstance(rid, int):
+                raise ValueError("net.cors requires a numeric record id")
+            records = self.network.query(a.get("after", 0) if False else 0, 1_000_000)["records"]
+            target = next((r for r in records if r["id"] == rid), None)
+            if target is None:
+                raise LookupError(f"no record {rid} in the ledger")
+            origin = a.get("origin") or _origin(s.url or "")
+            verdict = self.network.cors_verdict(
+                origin, target.get("method") or "GET", target.get("url") or "",
+                target.get("request_headers") or {}, target.get("response_headers") or {},
+            )
+            return {"record_id": rid, "status": target.get("status"), **verdict}
+        if name == "net.timing":
+            pattern = a.get("pattern", "")
+            if not isinstance(pattern, str):
+                raise TypeError("pattern must be a string")
+            records = self.network.query(0, 1_000_000, pattern)["records"]
+            with_timing = [r for r in records if isinstance(r.get("timing"), dict)]
+            return {"matches": len(records), "records": [{**r, "timing": r.get("timing")} for r in with_timing],
+                    "note": "dns/connect/tls phases are not observable; only ttfb and duration are measured"}
+        if name == "net.replay":
+            rid = a.get("id")
+            if isinstance(rid, bool) or not isinstance(rid, int):
+                raise ValueError("net.replay requires a numeric record id")
+            records = self.network.query(0, 1_000_000)["records"]
+            target = next((r for r in records if r["id"] == rid), None)
+            if target is None:
+                raise LookupError(f"no record {rid} in the ledger")
+            headers_out = {}
+            if a.get("headers", True):
+                for k, v in (target.get("request_headers") or {}).items():
+                    headers_out[k] = self.network._redact_header_value(k, v)
+            return {"record_id": rid, "method": target.get("method"), "url": target.get("url"),
+                    "headers": headers_out, "note": "replay contract built from recorded evidence; "
+                    "secret values stay redacted unless the audited reveal gate is on"}
+        if name == "net.decode":
+            rid, data_b64 = a.get("id"), a.get("data_b64")
+            encoding = a.get("encoding", "auto")
+            if data_b64:
+                import base64 as _b64mod
+                try:
+                    raw = _b64mod.b64decode(str(data_b64))
+                except Exception as exc:
+                    raise ValueError(f"bad data_b64: {exc}") from exc
+                return decode_payload_bytes(raw, encoding)
+            if isinstance(rid, bool) or not isinstance(rid, int):
+                raise ValueError("net.decode requires a numeric id or data_b64")
+            try:
+                res = self.network.decode_view(rid, encoding)
+            except (KeyError, PermissionError, ValueError) as exc:
+                raise LookupError(str(exc)) from exc
+            return res
         if name == "net.rule":
             return self.network.add_rule(a["action"], a["pattern"], a.get("method", "*"), **a.get("options", {}))
         if name == "net.unrule":
@@ -570,6 +770,85 @@ class DoshShell:
                 except Exception:
                     pass
             return {"restored": cid, "url": chk["url"], "title": chk["title"], "note": "session rehydrated from checkpoint"}
+        if name == "state.snapshot":
+            tab = getattr(s, "current_tab", None)
+            title = s.page.title if s.page else ""
+            sid = a.get("id") or f"st_{int(time.time() * 1000)}"
+            cookies_map = _live_cookie_map(s)
+            storage_map = getattr(s, "_web_storage", {})
+            history_list = [{"url": p.url, "title": p.title, "status": p.status} for p in (tab.history if tab else [])]
+            cookies = json.dumps(cookies_map)
+            storage = json.dumps(storage_map)
+            history = json.dumps(history_list)
+            ledger = self.network.query(after=0, limit=2000, pattern="")
+            self.store.save_state_snapshot(
+                sid, s.active_tab_id, _url(s.url), title, s.html or "",
+                cookies, storage, history, json.dumps(ledger),
+            )
+            return {"id": sid, "url": _url(s.url),
+                    "counts": {
+                        "cookies": len(cookies_map),
+                        "storage_origins": len(storage_map),
+                        "history_entries": len(history_list),
+                        "ledger_records": ledger.get("retained_count", 0),
+                    },
+                    "note": "unified state snapshot (DOM + live cookie jar + storage + history + ledger view) in the state DB; values live only in the local DB, never in command output"}
+        if name == "state.diff":
+            before_id = a.get("before")
+            after_id = a.get("after")
+            if not before_id or not after_id:
+                raise ValueError("before and after are required (state.snapshot ids)")
+            b = self.store.get_state_snapshot(before_id)
+            af = self.store.get_state_snapshot(after_id)
+            b_storage = json.loads(b["storage"] or "{}")
+            a_storage = json.loads(af["storage"] or "{}")
+            storage_added, storage_removed, storage_changed = _diff_storage(b_storage, a_storage)
+            b_cookies = json.loads(b["cookies"] or "{}")
+            a_cookies = json.loads(af["cookies"] or "{}")
+            cookie_added = sorted(k for k in a_cookies if k not in b_cookies)
+            cookie_removed = sorted(k for k in b_cookies if k not in a_cookies)
+            cookie_changed = sorted(k for k in a_cookies if k in b_cookies and a_cookies[k] != b_cookies[k])
+            b_history = json.loads(b["history"] or "[]")
+            a_history = json.loads(af["history"] or "[]")
+            b_ledger = json.loads(b["ledger"] or "{}")
+            a_ledger = json.loads(af["ledger"] or "{}")
+            b_ids = {r["id"] for r in b_ledger.get("records", []) if isinstance(r.get("id"), int)}
+            new_urls = [r["url"] for r in a_ledger.get("records", [])
+                        if isinstance(r.get("id"), int) and r["id"] not in b_ids][:20]
+            return {"before": before_id, "after": after_id,
+                    "url": {"before": b["url"], "after": af["url"], "changed": b["url"] != af["url"]},
+                    "storage": {"added": storage_added, "removed": storage_removed, "changed": storage_changed},
+                    "cookies": {"added": cookie_added, "removed": cookie_removed, "changed": cookie_changed},
+                    "history": {"before": len(b_history), "after": len(a_history)},
+                    "ledger": {"records_before": b_ledger.get("retained_count", 0),
+                               "records_after": a_ledger.get("retained_count", 0), "new_urls": new_urls},
+                    "note": "structural diff over the unified state DB; storage/cookie values are never reported — presence and change only"}
+        if name == "state.rollback":
+            cid = a.get("id")
+            if not cid:
+                raise ValueError("id is required to rollback a state snapshot")
+            snap = self.store.get_state_snapshot(cid)
+            tab = getattr(s, "current_tab", None)
+            if tab is not None:
+                tab.html = snap["html"]
+                tab.url = snap["url"]
+                try:
+                    hist = json.loads(snap["history"] or "[]")
+                    # Rebuild Page objects so history traversal stays consistent.
+                    tab.history = [
+                        Page(url=h.get("url", ""),
+                             status=int(h.get("status", 200)),
+                             title=h.get("title", ""))
+                        for h in hist
+                    ]
+                except Exception:
+                    pass
+            if hasattr(s, "_web_storage"):
+                s._web_storage = json.loads(snap["storage"] or "{}")
+            _restore_cookie_map(s, json.loads(snap["cookies"] or "{}"))
+            return {"restored": cid, "url": snap["url"], "title": snap["title"],
+                    "ledger_rolled_back": False,
+                    "note": "document, storage, history, and live cookie jar rehydrated from the state DB; the network ledger is append-only — it is preserved for audit, never rolled back"}
         if name == "layers":
             data = json.loads(self._context(a.get("frame", "")).eval("__inspectLayers()"))
             return {"projection": data, "authoritative_hit_test": False,
@@ -685,6 +964,34 @@ class DoshShell:
                     "returned": len(rows[offset:offset + limit]),
                     "next_offset": offset + limit if offset + limit < len(rows) else None}
         if name == "cookies":
+            mode = a.get("values")
+            if isinstance(mode, bool):
+                want_raw = False
+            else:
+                want_raw = mode == "raw"
+            if want_raw:
+                # N8 audited gate: refuse deployment behind allow_secret_reveal,
+                # audit every use in the ledger.
+                if not self.network.reveal_allowed():
+                    raise PermissionError(
+                        "cookies values=raw refused: secret reveal is governed by "
+                        "the allow_secret_reveal gate (off by default)"
+                    )
+                self.network.audit_reveal(
+                    "cookies_raw", f"origin={_origin(s.url or '')} count={len(getattr(s.client.cookies, 'jar', []) or []) or len(s.client.cookies)}"
+                )
+                rows = []
+                jar = getattr(s.client.cookies, "jar", None)
+                if jar is not None:
+                    for c in jar:
+                        rows.append({"name": c.name, "domain": c.domain, "value": c.value})
+                else:
+                    for k in s.client.cookies.keys():
+                        rows.append({"name": k, "domain": urlsplit(s.url).hostname if s.url else "",
+                                     "value": s.client.cookies[k]})
+                return {"cookies": rows, "total": len(rows), "returned": len(rows),
+                        "audited": True,
+                        "note": "values=raw surfaced real cookie values; this call is in the reveal audit log"}
             jar = getattr(s.client.cookies, "jar", None)
             rows = []
             if jar is not None:
@@ -699,7 +1006,7 @@ class DoshShell:
                     rows.append({"name": n, "domain": host, "path": "/", "secure": False, "expires": 0})
             limit = _limit(a.get("limit", 100))
             return {"cookies": rows[:limit], "total": len(rows), "returned": min(len(rows), limit),
-                    "note": "cookie values are never echoed; names/domains/paths only"}
+                    "note": "cookie values are never echoed; names/domains/paths only (real values need values=raw + the audited reveal gate)"}
         if name == "wait":
             given = {k for k in ("url", "ref", "text", "net_idle_ms") if k in a}
             if not given:
@@ -742,6 +1049,19 @@ class DoshShell:
                     return {"met": False, "elapsed_ms": int((now - start) * 1000), "checks": checks,
                             "text_source": "view" if view else "html",
                             "note": "timeout; latest observation state reported honestly"}
+        if name == "gate":
+            gate_name = a.get("gate") or a.get("name")
+            allowed = a.get("allowed")
+            if not isinstance(allowed, bool):
+                raise ValueError("gate requires allowed (boolean)")
+            if gate_name in ("secret_reveal", "secretReveal"):
+                self.network.set_secret_reveal(allowed)
+                return {"secret_reveal_allowed": self.network.reveal_allowed(),
+                        "audited": True,
+                        "note": "reveal-gate transitions are written to the ledger audit log"}
+            raise ValueError(
+                f"unknown gate '{gate_name}'; supported: secret_reveal (the audited N8 gate)"
+            )
         if name == "caps":
             counts, source, probe_note = self._caps_counts(a.get("frame", ""))
             unavailable = []
@@ -898,7 +1218,92 @@ class DoshShell:
                     "next_after": records[-1]["seq"] if records else after,
                     "omitted_retained": max(0, (data.get("retained", 0)) - len(records)),
                     "note": "engine MutationObserver records; compact node descriptors, never live nodes"}
+        if name == "assist":
+            return await self._assist(a)
         raise ValueError(f"unknown command: {name}; use help")
+
+    async def _assist(self, a: dict) -> dict:
+        """In-session DevTools walkthrough mirroring the Rust lane's `assist`.
+
+        Inspects the live cookie jar, storage keys, and discovered background
+        APIs, then synthesizes a unified replay (cURL) command. Secrets are
+        referenced by NAME only and never echoed.
+        """
+        from urllib.parse import urlsplit
+
+        s = self.session
+        goal = a.get("goal") or a.get("value") or "inspect this page and collect tokens"
+        parts = urlsplit(s.url or "")
+        origin = f"{parts.scheme}://{parts.netloc}" if parts.netloc else (s.url or "")
+        steps: list[dict] = []
+
+        steps.append({"index": 1, "title": "Listing page origin",
+                      "code_executed": "status",
+                      "data_returned": {"origin": origin, "url": s.url or ""}, "ok": True})
+
+        async def step(idx: int, title: str, cmd: str, args: dict) -> dict:
+            try:
+                data = await self._execute(cmd, args)
+                ok = True
+            except Exception as exc:  # noqa: BLE001 - surfaced honestly in the step
+                data, ok = {"error": f"{type(exc).__name__}: {exc}"}, False
+            steps.append({"index": idx, "title": title, "code_executed": cmd,
+                          "data_returned": data, "ok": ok})
+            return data
+
+        cookies_data = await step(2, "Reading cookies", "cookies", {})
+        storage_data = await step(3, "Reading local/session storage keys", "storage", {})
+        apis_data = await step(4, "Cataloging discovered background APIs", "net.apis", {})
+
+        cookie_names = [c.get("name") for c in cookies_data.get("cookies", []) if c.get("name")]
+        storage_keys = list(storage_data.get("local_keys", []))
+        endpoints = apis_data.get("endpoints", []) or []
+
+        artifact = self._synthesize_curl(origin, endpoints, cookie_names, storage_keys)
+        steps.append({"index": 5, "title": "Synthesizing unified data-collection command",
+                      "code_executed": "assemble(curl from net.apis + cookies + storage)",
+                      "data_returned": {"cookie_names": cookie_names, "storage_keys": storage_keys,
+                                        "endpoints_used": len(endpoints)}, "ok": True})
+
+        summary = (f"Inspected origin {origin}: {len(cookie_names)} cookie(s), "
+                   f"{len(storage_keys)} storage key(s), {len(endpoints)} discovered endpoint(s). "
+                   "Synthesized a replay command referencing secrets by name only.")
+        return {"goal": goal, "origin": origin, "steps": steps,
+                "artifact": artifact, "summary": summary}
+
+    @staticmethod
+    def _synthesize_curl(origin: str, endpoints: list, cookie_names: list[str],
+                         storage_keys: list[str]) -> str:
+        def env_name(raw: str) -> str:
+            cleaned = "".join(ch.upper() if ch.isalnum() else "_" for ch in raw)
+            return cleaned or "X"
+
+        target = origin
+        if endpoints:
+            first = endpoints[0]
+            if isinstance(first, dict) and first.get("url"):
+                target = first["url"]
+
+        if cookie_names:
+            pairs = "; ".join(f"{n}=${{{env_name(n)}}}" for n in cookie_names)
+            cookie_header = f"-H 'cookie: {pairs}'"
+        else:
+            cookie_header = "# (no cookies observed on this origin yet)"
+
+        if storage_keys:
+            storage_note = "# localStorage tokens to collect from the session: " + ", ".join(storage_keys)
+        else:
+            storage_note = "# (no localStorage keys observed)"
+
+        return (
+            "# --- DOSH UNIFIED DATA-COLLECTION COMMAND ---\n"
+            "# Secrets are placeholders ($NAME); fill them from your live session.\n"
+            f"{storage_note}\n"
+            f"curl '{target}' \\\n  "
+            "-H 'content-type: application/json' \\\n  "
+            f"{cookie_header}"
+        )
+
 
     async def run_script(self, source: str, args: dict, *, allow_actions: bool = False) -> dict:
         if not isinstance(source, str) or not source or len(source.encode()) > 65536:
