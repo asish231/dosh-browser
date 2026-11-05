@@ -7,4 +7,8 @@ description = "Pure-Rust V8 embedding for the dosh-browser engine (no Python her
 [dependencies]
 # Prebuilt static V8 (aarch64-apple-darwin asset ships with the release);
 # our patched fork drops in later via RUSTY_V8_ARCHIVE without changing this crate.
-v8 = "152.2.0"
+# Phase 0: pointer compression ON — 32-bit tagged pointers shrink every heap
+# object, raise the old-gen ceiling, and unlock RG-heap sharing at
+# IsolateGroup::Create() (read-only-heap.cc). Means our fork's .a must be
+# built with the same flag: RUSTY_V8_ARCHIVE must be a _ptrcomp build.
+v8 = { version = "152.2.0", features = ["v8_enable_pointer_compression"] }
