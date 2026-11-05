@@ -9,17 +9,20 @@
 //! microtask pump; limits are host-set. Page JS runs on a real V8.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
 pub mod actor;
+pub mod parena;
 pub mod protocol;
 pub mod session;
 pub mod watchdog;
 
 pub use actor::{DoshActor, DoshActorHandle};
+pub use parena::{Checkpoint, PackedAction, Parena, TagId};
 pub use session::SessionPool;
 pub use watchdog::{arm as arm_watchdog, WatchdogSupervisor, WatchdogToken};
 
@@ -651,6 +654,9 @@ pub struct DoshEngine {
     action_allowed: Arc<AtomicBool>,
     control_realm: Arc<AtomicBool>,
     layout_buffer: Vec<protocol::DoshButterflyRect>,
+    pub telemetry_ring: protocol::DoshTelemetryRing,
+    pub parena: Option<parena::Parena>,
+    pub checkpoints: HashMap<u64, parena::Checkpoint>,
 }
 
 impl DoshEngine {
@@ -756,6 +762,9 @@ impl DoshEngine {
             action_allowed,
             control_realm,
             layout_buffer: Vec::new(),
+            telemetry_ring: protocol::DoshTelemetryRing::new(),
+            parena: None,
+            checkpoints: HashMap::new(),
         })
     }
 
@@ -1085,6 +1094,69 @@ impl DoshEngine {
         &self.layout_buffer
     }
 
+    /// Poll and drain the lock-free telemetry ring buffer.
+    pub fn poll_telemetry_ring(&mut self) -> Vec<(u32, protocol::DoshEventKind, String, u64)> {
+        self.telemetry_ring.drain()
+    }
+
+    /// Access the active Parena page arena.
+    pub fn parena(&self) -> Option<&parena::Parena> {
+        self.parena.as_ref()
+    }
+
+    /// Mutably access the active Parena page arena.
+    pub fn parena_mut(&mut self) -> Option<&mut parena::Parena> {
+        self.parena.as_mut()
+    }
+
+    /// Set or replace the active Parena page arena.
+    pub fn set_parena(&mut self, arena: parena::Parena) {
+        self.parena = Some(arena);
+    }
+
+    /// Fork the current page arena in microseconds.
+    pub fn fork_parena(&self) -> Result<parena::Parena, String> {
+        self.parena
+            .as_ref()
+            .map(|p| p.fork())
+            .ok_or_else(|| "no active parena in engine".to_string())
+    }
+
+    /// Capture a dirty-diff checkpoint of current arena state.
+    pub fn checkpoint_parena(&mut self) -> Result<u64, String> {
+        if let Some(parena) = &self.parena {
+            let cp = parena.checkpoint();
+            let id = cp.id;
+            self.checkpoints.insert(id, cp);
+            Ok(id)
+        } else {
+            Err("no active parena in engine".to_string())
+        }
+    }
+
+    /// Roll back the arena state to a previously captured checkpoint ID.
+    pub fn rewind_parena(&mut self, checkpoint_id: u64) -> Result<usize, String> {
+        let cp = self
+            .checkpoints
+            .get(&checkpoint_id)
+            .cloned()
+            .ok_or_else(|| format!("checkpoint id {checkpoint_id} not found"))?;
+        if let Some(parena) = &mut self.parena {
+            parena.rewind(&cp)
+        } else {
+            Err("no active parena in engine".to_string())
+        }
+    }
+
+    /// Zero-copy binary batch read of specified node IDs.
+    pub fn batch_read_parena(&self, node_ids: &[u32]) -> Result<Vec<u8>, String> {
+        if let Some(parena) = &self.parena {
+            Ok(parena.batch_read(node_ids))
+        } else {
+            Err("no active parena in engine".to_string())
+        }
+    }
+
     /// Dispatch an in-memory DCP command directly to the V8 C++ engine.
     pub fn dispatch_command(&mut self, cmd: &protocol::DoshCommand) -> protocol::DoshResponse {
         match cmd.opcode {
@@ -1154,6 +1226,35 @@ impl DoshEngine {
                 let enabled = cmd.param != 0;
                 let _ = self.set_control_realm(enabled);
                 protocol::DoshResponse::ok()
+            }
+            0x0C => {
+                if let Some(parena) = &self.parena {
+                    let mut node_ids = Vec::new();
+                    if cmd.payload_len >= 4 && !cmd.payload.is_null() {
+                        let count = (cmd.payload_len / 4) as usize;
+                        unsafe {
+                            let slice = std::slice::from_raw_parts(cmd.payload as *const u32, count);
+                            node_ids.extend_from_slice(slice);
+                        }
+                    } else if cmd.param > 0 {
+                        node_ids.push(cmd.param as u32);
+                    }
+                    let bytes = parena.batch_read(&node_ids);
+                    protocol::DoshResponse {
+                        status: protocol::DoshStatusCode::Ok as u8,
+                        data_type: 4, // Buffer
+                        reserved: 0,
+                        result_len: bytes.len() as u32,
+                        numeric_val: node_ids.len() as u64,
+                        result_data: bytes.as_ptr(),
+                    }
+                } else {
+                    protocol::DoshResponse::error("no active parena in engine")
+                }
+            }
+            0x0D => {
+                let drained = self.telemetry_ring.drain();
+                protocol::DoshResponse::with_numeric(drained.len() as u64)
             }
             _ => protocol::DoshResponse::error("unknown opcode"),
         }

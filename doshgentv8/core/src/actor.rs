@@ -133,6 +133,27 @@ pub enum ActorCommand {
     EvalCount {
         reply: Sender<usize>,
     },
+    PollTelemetryRing {
+        reply: Sender<Vec<(u32, crate::protocol::DoshEventKind, String, u64)>>,
+    },
+    ForkParena {
+        reply: Sender<Result<crate::parena::Parena, String>>,
+    },
+    CheckpointParena {
+        reply: Sender<Result<u64, String>>,
+    },
+    RewindParena {
+        checkpoint_id: u64,
+        reply: Sender<Result<usize, String>>,
+    },
+    BatchReadParena {
+        node_ids: Vec<u32>,
+        reply: Sender<Result<Vec<u8>, String>>,
+    },
+    SetParena {
+        parena: crate::parena::Parena,
+        reply: Sender<()>,
+    },
     Shutdown,
 }
 
@@ -151,6 +172,14 @@ impl Drop for ActorInner {
 #[derive(Clone)]
 pub struct DoshActorHandle {
     inner: Arc<ActorInner>,
+}
+
+impl std::fmt::Debug for DoshActorHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DoshActorHandle")
+            .field("id", &self.id())
+            .finish()
+    }
 }
 
 impl DoshActorHandle {
@@ -483,6 +512,66 @@ impl DoshActorHandle {
         rx.recv().map_err(|e| format!("actor recv error: {e}"))
     }
 
+    /// Drain all pending telemetry events from the actor's ring buffer.
+    pub fn poll_telemetry_ring(&self) -> Result<Vec<(u32, crate::protocol::DoshEventKind, String, u64)>, String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::PollTelemetryRing { reply: tx })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))
+    }
+
+    /// Fork the actor's active page arena.
+    pub fn fork_parena(&self) -> Result<crate::parena::Parena, String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::ForkParena { reply: tx })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))?
+    }
+
+    /// Capture a checkpoint in the actor's active page arena.
+    pub fn checkpoint_parena(&self) -> Result<u64, String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::CheckpointParena { reply: tx })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))?
+    }
+
+    /// Roll back the actor's active page arena to a checkpoint.
+    pub fn rewind_parena(&self, checkpoint_id: u64) -> Result<usize, String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::RewindParena { checkpoint_id, reply: tx })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))?
+    }
+
+    /// Read multiple nodes from the active page arena in a zero-copy batch.
+    pub fn batch_read_parena(&self, node_ids: Vec<u32>) -> Result<Vec<u8>, String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::BatchReadParena { node_ids, reply: tx })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))?
+    }
+
+    /// Install a page arena into the actor.
+    pub fn set_parena(&self, parena: crate::parena::Parena) -> Result<(), String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::SetParena { parena, reply: tx })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))
+    }
+
     /// Explicitly request the actor to shut down.
     pub fn shutdown(&self) {
         let _ = self.inner.sender.send(ActorCommand::Shutdown);
@@ -665,6 +754,30 @@ impl DoshActor {
                     let count = engine.eval_count();
                     let _ = reply.send(count);
                 }
+                ActorCommand::PollTelemetryRing { reply } => {
+                    let evs = engine.poll_telemetry_ring();
+                    let _ = reply.send(evs);
+                }
+                ActorCommand::ForkParena { reply } => {
+                    let res = engine.fork_parena();
+                    let _ = reply.send(res);
+                }
+                ActorCommand::CheckpointParena { reply } => {
+                    let res = engine.checkpoint_parena();
+                    let _ = reply.send(res);
+                }
+                ActorCommand::RewindParena { checkpoint_id, reply } => {
+                    let res = engine.rewind_parena(checkpoint_id);
+                    let _ = reply.send(res);
+                }
+                ActorCommand::BatchReadParena { node_ids, reply } => {
+                    let res = engine.batch_read_parena(&node_ids);
+                    let _ = reply.send(res);
+                }
+                ActorCommand::SetParena { parena, reply } => {
+                    engine.set_parena(parena);
+                    let _ = reply.send(());
+                }
                 ActorCommand::Shutdown => {
                     break;
                 }
@@ -744,6 +857,35 @@ mod tests {
 
         actor.set_action_allowed(true).expect("set action allowed");
         assert!(actor.is_action_allowed().expect("is action allowed"));
+
+        actor.shutdown();
+    }
+
+    #[test]
+    fn test_actor_parena_fork_checkpoint_rewind() {
+        use crate::parena::{Parena, TagId};
+        let actor = DoshActor::spawn(Arc::new(DummySeam), 0).expect("spawn actor");
+
+        let mut arena = Parena::new();
+        let body = arena.add_node(TagId::Body, 0, &[], "");
+        let p = arena.add_node(TagId::P, body, &[], "Initial text");
+        actor.set_parena(arena).expect("set parena");
+
+        // Checkpoint
+        let cp_id = actor.checkpoint_parena().expect("checkpoint");
+
+        // Fork arena in actor
+        let mut forked = actor.fork_parena().expect("fork");
+        forked.set_text(p, "Forked text");
+        assert_eq!(forked.get_text(p), "Forked text");
+
+        // Batch read
+        let bytes = actor.batch_read_parena(vec![p]).expect("batch read");
+        assert!(!bytes.is_empty());
+
+        // Rewind
+        let restored = actor.rewind_parena(cp_id).expect("rewind");
+        assert_eq!(restored, 0); // No mutations were applied to base arena
 
         actor.shutdown();
     }

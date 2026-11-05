@@ -213,11 +213,10 @@ impl Default for DoshRingEvent {
     }
 }
 
-#[repr(C)]
 pub struct DoshTelemetryRing {
     pub write_head: AtomicU32,
     pub read_tail: AtomicU32,
-    pub events: [DoshRingEvent; DOSH_RING_CAPACITY],
+    pub events: Box<[DoshRingEvent]>,
 }
 
 impl DoshTelemetryRing {
@@ -225,7 +224,7 @@ impl DoshTelemetryRing {
         Self {
             write_head: AtomicU32::new(0),
             read_tail: AtomicU32::new(0),
-            events: [DoshRingEvent::default(); DOSH_RING_CAPACITY],
+            events: vec![DoshRingEvent::default(); DOSH_RING_CAPACITY].into_boxed_slice(),
         }
     }
 

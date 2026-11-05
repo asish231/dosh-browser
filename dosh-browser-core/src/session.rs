@@ -191,6 +191,10 @@ pub struct Session {
     pub gate_wasm: bool,
     /// Network capability gate
     pub gate_network: bool,
+    /// Bounded session pool for resident V8 actors
+    pub session_pool: std::sync::Arc<doshgentv8_core::SessionPool>,
+    /// Live per-tab resident runtimes
+    pub runtimes: HashMap<String, crate::runtime::Runtime>,
 }
 
 impl Session {
@@ -221,11 +225,33 @@ impl Session {
             gate_eval: true,
             gate_wasm: true,
             gate_network: true,
+            session_pool: std::sync::Arc::new(doshgentv8_core::SessionPool::new(8)),
+            runtimes: HashMap::new(),
         }
     }
 
+    /// Retrieve or spawn a resident runtime for the current tab.
+    pub fn get_or_create_runtime(&mut self, url: &str) -> Result<crate::runtime::Runtime, String> {
+        let tab_id = self.current_tab().id.clone();
+        if let Some(rt) = self.runtimes.get(&tab_id) {
+            if let Ok(mut u) = rt.seam.0.url.lock() {
+                *u = url.to_string();
+            }
+            return Ok(rt.clone());
+        }
+
+        let rt = crate::runtime::Runtime::new_with_network(
+            self.client.clone(),
+            url,
+            Some(std::sync::Arc::new(self.network.clone())),
+        )?;
+        self.configure_runtime(&rt);
+        self.runtimes.insert(tab_id, rt.clone());
+        Ok(rt)
+    }
+
     /// Apply session's V8 configuration (clock, PRNG, fuel, gates) to a runtime.
-    pub fn configure_runtime(&self, rt: &mut crate::runtime::Runtime) {
+    pub fn configure_runtime(&self, rt: &crate::runtime::Runtime) {
         if let Some(ms) = self.virtual_clock_ms {
             let _ = rt.engine.set_virtual_time(ms as f64);
         }
@@ -233,11 +259,11 @@ impl Session {
             let _ = rt.engine.set_random_seed(seed);
         }
         if let Some(fuel) = self.wasm_fuel {
-            rt.engine.set_fuel(fuel);
+            let _ = rt.engine.set_fuel(fuel);
         }
         let _ = rt.engine.set_eval_allowed(self.gate_eval);
         let _ = rt.engine.set_wasm_allowed(self.gate_wasm);
-        rt.engine.set_network_allowed(self.gate_network);
+        let _ = rt.engine.set_network_allowed(self.gate_network);
     }
 
     pub fn switch_tab(&mut self, tab_id: &str) -> Result<(), String> {
@@ -281,12 +307,8 @@ impl Session {
             if dismissed {
                 html = clean_html;
             }
-            if let Ok(mut rt) = crate::runtime::Runtime::new_with_network(
-                self.client.clone(),
-                &result.final_url,
-                Some(std::sync::Arc::new(self.network.clone())),
-            ) {
-                self.configure_runtime(&mut rt);
+            if let Ok(mut rt) = self.get_or_create_runtime(&result.final_url) {
+                self.configure_runtime(&rt);
                 if let Ok((mutated, info)) = rt.run_scripts(&html, &result.final_url) {
                     html = mutated;
                     js_errors = info.error_messages;
@@ -383,12 +405,8 @@ impl Session {
         let mut js_errors = Vec::new();
         let mut runtime_title = String::new();
 
-        if let Ok(mut rt) = crate::runtime::Runtime::new_with_network(
-            self.client.clone(),
-            url,
-            Some(std::sync::Arc::new(self.network.clone())),
-        ) {
-            self.configure_runtime(&mut rt);
+        if let Ok(mut rt) = self.get_or_create_runtime(url) {
+            self.configure_runtime(&rt);
             if let Ok((mutated, info)) = rt.run_scripts(&final_html, url) {
                 final_html = mutated;
                 js_errors = info.error_messages;
@@ -499,24 +517,19 @@ impl Session {
             }
         }
 
-        // Apply action click via Runtime (V8)
+        // Apply action click via resident Runtime (V8)
         let action_payload = serde_json::json!({
             "type": "click",
             "ref": effective_ref,
         });
 
-        let mut rt = crate::runtime::Runtime::new_with_network(
-            self.client.clone(),
-            &url,
-            Some(std::sync::Arc::new(self.network.clone())),
-        )
-        .map_err(|e| format!("Failed to create runtime: {}", e))?;
-        rt.load_document(&html, &url)?;
-        rt.apply_action(&action_payload)?;
+        let mut rt = self
+            .get_or_create_runtime(&url)
+            .map_err(|e| format!("Failed to get runtime: {e}"))?;
+        let _ = rt.apply_action(&action_payload)?;
         let mutated = rt.serialize()?;
 
-        self.goto_html(&url, &mutated, 8000)
-            .map_err(|e| e.to_string())
+        self.update_page_after_action(&url, &mutated, 8000)
     }
 
     /// Perform text typing into a target ref in the live session.
@@ -541,18 +554,75 @@ impl Session {
             "text": text,
         });
 
-        let mut rt = crate::runtime::Runtime::new_with_network(
-            self.client.clone(),
-            &url,
-            Some(std::sync::Arc::new(self.network.clone())),
-        )
-        .map_err(|e| format!("Failed to create runtime: {}", e))?;
-        rt.load_document(&html, &url)?;
-        rt.apply_action(&action_payload)?;
+        let mut rt = self
+            .get_or_create_runtime(&url)
+            .map_err(|e| format!("Failed to get runtime: {e}"))?;
+        let _ = rt.apply_action(&action_payload)?;
         let mutated = rt.serialize()?;
 
-        self.goto_html(&url, &mutated, 8000)
-            .map_err(|e| e.to_string())
+        self.update_page_after_action(&url, &mutated, 8000)
+    }
+
+    /// Update page ACD and history after a live in-realm action without re-executing document scripts.
+    pub fn update_page_after_action(
+        &mut self,
+        url: &str,
+        html: &str,
+        max_chars: usize,
+    ) -> Result<Page, String> {
+        let targets = crate::actions::extract_actions(html, url, 100);
+        self.identity_tracker.update(&targets);
+        let links = crate::links::links(html, url, 50);
+        let iframes = crate::tree::collect_iframes(html);
+        let frame_infos: Vec<crate::types::FrameInfo> = iframes
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| crate::types::FrameInfo {
+                ref_id: format!("frame-{}", i + 1),
+                url: f.src,
+                title: f.title,
+                name: f.name,
+                ..Default::default()
+            })
+            .collect();
+
+        let title = extract_title(html);
+        let acd_obj = crate::acd::build_acd(
+            url,
+            &title,
+            html,
+            &targets,
+            &links,
+            &frame_infos,
+            &serde_json::json!({}),
+            max_chars / 80 + 10,
+        );
+
+        let view = crate::acd::acd_view(&acd_obj, max_chars);
+        let chars = view.chars().count();
+        let acd_json: Vec<serde_json::Value> = acd_obj
+            .blocks
+            .into_iter()
+            .map(|b| serde_json::to_value(b).unwrap_or_default())
+            .collect();
+
+        let page = Page {
+            url: url.to_string(),
+            title,
+            view,
+            chars,
+            status: 200,
+            content_type: "text/html".into(),
+            headers: HashMap::new(),
+            kind: "html".into(),
+            acd: acd_json,
+            errors: Vec::new(),
+            truncated: false,
+        };
+
+        let tab = self.current_tab_mut();
+        let pushed = tab.push(page, Some(html.to_string()), None, false, None);
+        Ok(pushed)
     }
 
     /// Discover iframe seeds in current page.
@@ -734,5 +804,40 @@ mod tests {
         let tab = session.current_tab();
         assert!(tab.html.contains("Hydrated SPA Paragraph"));
         assert!(tab.html.contains("action-btn"));
+    }
+
+    #[tokio::test]
+    async fn test_resident_actor_click_persists_closure_state() {
+        let client = Client::builder().user_agent("test").build().unwrap();
+        let mut session = Session::new(client);
+        let html = r#"
+        <!DOCTYPE html>
+        <html>
+        <body>
+            <button id="counter-btn">Count: 0</button>
+            <div id="status">idle</div>
+            <script>
+                var count = 0;
+                var btn = document.getElementById("counter-btn");
+                btn.addEventListener("click", function() {
+                    count++;
+                    btn.textContent = "Count: " + count;
+                    document.getElementById("status").textContent = "clicked-" + count;
+                });
+            </script>
+        </body>
+        </html>
+        "#;
+        let page = session.goto_html("https://counter.example.com", html, 8000).unwrap();
+        assert!(session.runtimes.contains_key("tab-1"));
+        assert!(page.view.contains("Count: 0") || page.chars > 0);
+
+        // First click on resident actor
+        let p1 = session.click("counter-btn").await.expect("click 1 failed");
+        assert!(p1.view.contains("Count: 1") || session.current_tab().html.contains("Count: 1"));
+
+        // Second click retains in-memory closure state (count reaches 2)
+        let p2 = session.click("counter-btn").await.expect("click 2 failed");
+        assert!(p2.view.contains("Count: 2") || session.current_tab().html.contains("Count: 2"));
     }
 }

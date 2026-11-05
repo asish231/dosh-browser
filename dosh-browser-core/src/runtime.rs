@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use doshgentv8_core::{DoshEngine, HostSeam};
+use doshgentv8_core::{DoshActor, DoshActorHandle, HostSeam};
 
 use crate::fetch;
 use crate::tree::{self};
@@ -239,12 +239,14 @@ impl HostSeam for SharedSeam {
     }
 }
 
-/// The Live Page JavaScript Runtime.
+/// The Live Page JavaScript Runtime, backed by a resident V8 actor.
+#[derive(Clone)]
 pub struct Runtime {
-    pub engine: DoshEngine,
+    pub engine: DoshActorHandle,
     pub seam: Arc<SharedSeam>,
     pub url: String,
     pub ctx_key: String,
+    layout_cache: Arc<Mutex<Vec<doshgentv8_core::protocol::DoshButterflyRect>>>,
 }
 
 impl Runtime {
@@ -278,7 +280,7 @@ impl Runtime {
             ctx_key: ctx_key.clone(),
         }));
 
-        let mut engine = DoshEngine::new(seam.clone())?;
+        let engine = DoshActor::spawn(seam.clone(), 128 * 1024 * 1024)?;
 
         // 1. Register host callables
         engine.add_host("host_parse_html")?;
@@ -323,6 +325,7 @@ impl Runtime {
             seam,
             url: url.to_string(),
             ctx_key,
+            layout_cache: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -497,17 +500,18 @@ impl Runtime {
     /// Apply an agent action against the live DOM (click, type, drag, submit)
     /// and return the serialized mutated DOM.
     pub fn apply_action(&mut self, action: &Value) -> Result<String, String> {
-        let kind = action["kind"].as_str().unwrap_or("click");
+        let kind = action["kind"].as_str().or_else(|| action["type"].as_str()).unwrap_or("click");
         let path_json = serde_json::to_string(&action["path"]).unwrap_or_else(|_| "[]".into());
-        let selector = action["selector"].as_str().unwrap_or_default();
+        let selector = action["selector"].as_str().or_else(|| action["ref"].as_str()).unwrap_or_default();
         let stealth = action["stealth"].as_bool().unwrap_or(false);
+        let nth = action["occurrence"].as_i64().unwrap_or(1);
 
         match kind {
             "click" | "activate" => {
                 if !selector.is_empty() {
                     let _ = self.engine.eval(&format!(
-                        "__activateSelector({}, null, false, {}, 1)",
-                        json!(selector), stealth
+                        "__activateSelector({}, null, false, {}, {})",
+                        json!(selector), stealth, nth
                     ));
                 } else {
                     let _ = self.engine.eval(&format!("__clickPath({path_json}, {stealth})"));
@@ -517,8 +521,8 @@ impl Runtime {
                 let text = action["text"].as_str().unwrap_or_default();
                 if !selector.is_empty() {
                     let _ = self.engine.eval(&format!(
-                        "__activateSelector({}, {}, false, {}, 1)",
-                        json!(selector), json!(text), stealth
+                        "__activateSelector({}, {}, false, {}, {})",
+                        json!(selector), json!(text), stealth, nth
                     ));
                 } else {
                     let _ = self.engine.eval(&format!(
@@ -582,7 +586,10 @@ impl Runtime {
                 }
             }
             let count = rects.len();
-            self.engine.set_layout_rects(rects);
+            if let Ok(mut cache) = self.layout_cache.lock() {
+                *cache = rects.clone();
+            }
+            let _ = self.engine.set_layout_rects(rects);
             Ok(count)
         } else {
             Ok(0)
@@ -590,8 +597,19 @@ impl Runtime {
     }
 
     /// Access zero-copy contiguous Butterfly layout rectangle memory slice.
-    pub fn get_butterfly_layout(&self) -> &[doshgentv8_core::protocol::DoshButterflyRect] {
-        self.engine.get_layout_rects()
+    pub fn get_butterfly_layout(&self) -> Vec<doshgentv8_core::protocol::DoshButterflyRect> {
+        self.layout_cache.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// Evaluate code in a bounded control realm with explicit action authority.
+    pub fn eval_bounded(
+        &self,
+        code: &str,
+        control_realm: bool,
+        allow_actions: bool,
+        args: &[String],
+    ) -> Result<String, String> {
+        self.engine.eval_bounded(code, control_realm, allow_actions, args)
     }
 }
 

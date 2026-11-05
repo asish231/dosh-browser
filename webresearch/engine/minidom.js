@@ -10400,12 +10400,40 @@ global.__submitPath = function (path) {
     global.__WR_DOSH_EMITS = [];
     return JSON.stringify(out);
   };
-  global.dosh = {
-    args: {},
+  global.dosh = Object.assign(global.dosh || {}, {
+    args: (global.dosh && global.dosh.args) || {},
     emit: function (key, value) {
       global.__WR_DOSH_EMITS = global.__WR_DOSH_EMITS || [];
       global.__WR_DOSH_EMITS.push({ key: String(key), value: value, ts: Date.now() });
+      if (typeof global.__dispatchHost === "function") {
+        try { global.__dispatchHost("host_emit", String(key), typeof value === "string" ? value : JSON.stringify(value)); } catch (e) {}
+      }
       return value;
+    },
+    act: function (action) {
+      if (global.__getCapabilityGate && !global.__getCapabilityGate('action')) {
+        throw new Error("Action authority disallowed: mutations are blocked in read-only mode");
+      }
+      var kind = (action && (action.kind || action.type)) || "click";
+      var sel = (action && (action.selector || action.ref)) || "";
+      if (kind === "click" || kind === "activate") {
+        return global.dosh.click(sel);
+      } else if (kind === "type") {
+        return global.dosh.type(sel, action.text || "");
+      }
+      return false;
+    },
+    click: function (selector) {
+      if (global.__getCapabilityGate && !global.__getCapabilityGate('action')) {
+        throw new Error("Action authority disallowed: mutations are blocked in read-only mode");
+      }
+      return global.__activateSelector(String(selector), null, false, !!global.__stealthMode);
+    },
+    type: function (selector, text) {
+      if (global.__getCapabilityGate && !global.__getCapabilityGate('action')) {
+        throw new Error("Action authority disallowed: mutations are blocked in read-only mode");
+      }
+      return global.__activateSelector(String(selector), String(text == null ? "" : text), false, !!global.__stealthMode);
     },
     query: function (selector) {
       if (!global.document || !global.document.querySelectorAll) return [];
@@ -10441,12 +10469,6 @@ global.__submitPath = function (path) {
       }
       return el.getAttribute(String(name));
     },
-    click: function (selector) {
-      return global.__activateSelector(String(selector), null, false, !!global.__stealthMode);
-    },
-    type: function (selector, text) {
-      return global.__activateSelector(String(selector), String(text == null ? "" : text), false, !!global.__stealthMode);
-    },
     layers: function () {
       try { return JSON.parse(global.__inspectLayers()); } catch (e) { return {}; }
     },
@@ -10462,5 +10484,5 @@ global.__submitPath = function (path) {
         cookie: (global.document && global.document.cookie) || ""
       };
     }
-  };
+  });
 })(this);
