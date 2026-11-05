@@ -21,3 +21,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Successfully wrote {} bytes snapshot blob to {}", blob.len(), out_path);
     Ok(())
 }
+
