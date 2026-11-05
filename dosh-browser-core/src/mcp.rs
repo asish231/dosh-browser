@@ -32,11 +32,12 @@ pub fn get_tools_list() -> Value {
     json!([
         {
             "name": "browser_search",
-            "description": "Search the web with automatic fallback. Returns clean markdown hits.",
+            "description": "Search the web with automatic fallback across Bing, Google, DuckDuckGo, and Yahoo. Returns clean markdown hits.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query terms" },
+                    "engine": { "type": "string", "description": "Search engine: auto (default), bing, google, ddg, yahoo, lite", "enum": ["auto", "bing", "google", "ddg", "yahoo", "lite"] },
                     "max_hits": { "type": "integer", "default": 8 }
                 },
                 "required": ["query"]

@@ -156,6 +156,10 @@ async fn main() {
 
     let cmd = &args[1];
     match cmd.as_str() {
+        "--version" | "-v" | "version" => {
+            println!("dosh {} (doshgentv8 1.0.0, pointer compression enabled)", env!("CARGO_PKG_VERSION"));
+            process::exit(0);
+        }
         "--help" | "-h" | "help" => {
             eprintln!("dosh — Agent-native browser (pure Rust core, doshgentv8 V8 engine)");
             eprintln!("Usage: dosh [-p|--python] [-d|--rust] <command> [args...]");
@@ -164,13 +168,15 @@ async fn main() {
             eprintln!("  -p, --py, --python        Optional Python companion SDK (webresearch)");
             eprintln!("\nCommands:");
             eprintln!("  read <url> [--json]       Read and project an LLM-ready page model");
-            eprintln!("  search <query> [--json]   Web search with DuckDuckGo fallback");
+            eprintln!("  search <query> [--json] [--engine <auto|bing|google|ddg|yahoo|lite>]");
+            eprintln!("                            Web search with multi-engine waterfall fallback");
             eprintln!("  download <url>            Download file or PDF streaming to disk with SHA-256");
             eprintln!("  ask <prompt>              Let an agent research and answer using browser tools");
             eprintln!("  shell [-c <command>]      Agent browser terminal (41 commands)");
             eprintln!("  server / serve [--port N] Run REST HTTP API & tool invoke endpoints");
             eprintln!("  mcp                       Run Model Context Protocol server over stdio");
             eprintln!("  product / status          Show official lane and engine status");
+            eprintln!("  version / --version / -v  Show binary and engine version");
             process::exit(0);
         }
         "read" => {
@@ -196,13 +202,16 @@ async fn main() {
         }
         "search" => {
             if args.len() < 3 {
-                eprintln!("Usage: dosh search <query> [--json]");
+                eprintln!("Usage: dosh search <query> [--json] [--engine <auto|bing|google|ddg|yahoo|lite>]");
                 process::exit(1);
             }
             let query = &args[2];
             let as_json = args.iter().any(|a| a == "--json");
+            let engine = args.iter().position(|a| a == "--engine")
+                .and_then(|idx| args.get(idx + 1).map(|s| s.as_str()))
+                .unwrap_or("auto");
             let client = reqwest::Client::new();
-            match search(&client, query, 8, "auto").await {
+            match search(&client, query, 8, engine).await {
                 Ok(res) => {
                     if as_json {
                         println!("{}", serde_json::to_string_pretty(&res).unwrap_or_default());
