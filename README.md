@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/asish231/dosh-browser/actions/workflows/ci.yml/badge.svg)](https://github.com/asish231/dosh-browser/actions/workflows/ci.yml)
 [![Release](https://github.com/asish231/dosh-browser/actions/workflows/release.yml/badge.svg)](https://github.com/asish231/dosh-browser/releases)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/github/v/release/asish231/dosh-browser)](https://github.com/asish231/dosh-browser/releases)
+[![License](https://img.shields.io/badge/license-research%20only-lightgrey.svg)](LICENSE)
 [![Engine](https://img.shields.io/badge/engine-doshgentv8%20(V8%2015.9)-orange.svg)](doshgentv8/)
 [![Pure Rust](https://img.shields.io/badge/core-pure--rust%20(zero--python)-black.svg)](dosh-browser-core/)
 
@@ -27,6 +28,8 @@ DOSH is a standalone agent browser engineered from the ground up: an owned HTTP/
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
+*Browser-Use figures in this chart are from the original 2026-10-10 comparison (commit `ca7e6b46`); Browser-Use and Chromium are not installed on the benchmark machine, so those numbers were not re-measured in the 2026-11-05 audit — see the Scope honesty note under [Benchmarks](#benchmarks-dosh-vs-browser-use-playwright-vs-scrapers).*
+
 ---
 
 ## ⚡ Quick Install
@@ -47,20 +50,53 @@ curl -fsSL https://raw.githubusercontent.com/asish231/dosh-browser/main/install.
 irm https://raw.githubusercontent.com/asish231/dosh-browser/main/install.ps1 | iex
 ```
 
-The installer detects your platform (macOS Apple Silicon/Intel, Linux x86_64/aarch64, Windows x64), installs `dosh` into your local bin directory (`~/.dosh/bin` or `%USERPROFILE%\.dosh\bin`), and automatically configures your `PATH`.
+The installer detects your platform, installs `dosh` into your local bin directory (`~/.dosh/bin` or `%USERPROFILE%\.dosh\bin`), verifies the release archive against its published SHA-256 checksum, and configures your `PATH`.
 
-### 2. Install from Cargo
+### 2. Verify Your Download
+
+Every release asset ships with a `.sha256` sibling plus a combined `SHA256SUMS.txt`. Example (macOS Apple Silicon):
 
 ```bash
-cargo install --git https://github.com/asish231/dosh-browser.git dosh-browser-core --bin dosh
+curl -fLO https://github.com/asish231/dosh-browser/releases/latest/download/dosh-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/asish231/dosh-browser/releases/latest/download/dosh-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c dosh-aarch64-apple-darwin.tar.gz.sha256   # → OK
 ```
 
-### 3. Install Python Companion Package (For Python Agent Frameworks)
+On Linux use `sha256sum -c`; on Windows compare against `SHA256SUMS.txt` from the release page.
+
+### Supported Platforms
+
+| Platform | Release asset |
+| :--- | :--- |
+| macOS (Apple Silicon) | `dosh-aarch64-apple-darwin.tar.gz` |
+| macOS (Intel) | `dosh-x86_64-apple-darwin.tar.gz` |
+| Linux (x86_64) | `dosh-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows (x64) | `dosh-x86_64-pc-windows-msvc.zip` |
+| Linux (aarch64) | No prebuilt asset yet — [build from source](#3-build-from-source) |
+
+### 3. Build From Source
 
 ```bash
-pip install dosh-browser
-# or
-uv add dosh-browser
+git clone https://github.com/asish231/dosh-browser.git
+cd dosh-browser
+cargo build --release --bin dosh    # → target/release/dosh (a few minutes; prebuilt V8 downloads on first build)
+./target/release/dosh product       # smoke test: lane + engine status
+```
+
+> **Note:** `cargo install --git …` is not usable yet: the repository carries `research_repos/` submodule placeholders (`browser-use`, `chromium`) with no registered submodule URLs, so Cargo's submodule-update step fails. A plain `git clone` builds fine — that is the supported source path for now.
+
+### 4. Install Python Companion Package (For Python Agent Frameworks)
+
+Not yet on PyPI — install from the repository:
+
+```bash
+pip install "webresearch @ git+https://github.com/asish231/dosh-browser.git"
+
+# Or pin the latest tagged release:
+pip install "webresearch @ git+https://github.com/asish231/dosh-browser.git@v1.0.1"
+
+# Or with uv (inside an activated virtual environment):
+uv pip install "webresearch @ git+https://github.com/asish231/dosh-browser.git"
 ```
 
 ---
@@ -78,11 +114,11 @@ Every surface respects our two-lane architecture:
 │    - Custom agentic V8 engine (doshgentv8) with Liftoff fuel traps      │
 │    - In-Memory C-ABI Control Protocol (DCP) with zero-copy dispatch     │
 │    - Unified NetworkEngine: SSRF IpFilter, RFC 9111 Cache, SingleFlight │
-│    - 41 shell commands, stdio MCP server, and REST HTTP API             │
+│    - 45 shell commands, stdio MCP server, and REST HTTP API             │
 │    - Zero Python runtime dependency.                                    │
 ├────────────────────────────────────────────────────────────────────────┤
 │ 2. OPTIONAL COMPANION: Python Companion SDK (webresearch)              │
-│    - Agent framework integration (LangChain, LlamaIndex, AutoGen)       │
+│    - OpenAI-style tool schemas + MCP server; any tool-calling agent     │
 │    - Native PyO3 V8 bridge (doshgentv8_rust) + QuickJS fallback         │
 │    - ReCAPTCHA v2 protocol solver, OTP checkpoints, and video lane      │
 │    - Triggered via `dosh -p <cmd>` or `python -m webresearch`           │
@@ -92,7 +128,7 @@ Every surface respects our two-lane architecture:
 ### Switching Lanes via CLI Flags
 
 - **`dosh <cmd>`** *(Default)*: Runs the official pure-Rust browser core with embedded V8.
-- **`dosh -p <cmd>`** *(or `--python`)*: Invokes the Python companion SDK (`webresearch`).
+- **`dosh -p <cmd>`** *(or `--python`)*: Runs the Python companion SDK CLI (`webresearch` subcommands: `read`, `search`, `images`, `captcha`, `ask`, `models`, `mcp`, `serve`, `shell`, `profile`).
 - **`dosh -d <cmd>`** *(or `--rust`)*: Explicitly forces pure-Rust execution.
 
 ```bash
@@ -107,19 +143,27 @@ dosh -p read https://news.ycombinator.com
 
 ## CLI Usage
 
+`dosh --help` output:
+
 ```bash
 dosh — Agent-native browser (pure Rust core, doshgentv8 V8 engine)
 Usage: dosh [-p|--python] [-d|--rust] <command> [args...]
 
+Lanes:
+  -d, --rust, --default     Official standalone pure-Rust browser (default)
+  -p, --py, --python        Optional Python companion SDK (webresearch)
+
 Commands:
   read <url> [--json]       Read and project an LLM-ready page model
-  search <query> [--json]   Web search with DuckDuckGo fallback
+  search <query> [--json] [--engine <auto|bing|google|ddg|yahoo|lite>]
+                            Web search with multi-engine waterfall fallback
   download <url>            Download file or PDF streaming to disk with SHA-256
   ask <prompt>              Let an agent research and answer using browser tools
-  shell [-c <command>]      Agent browser terminal (41 commands)
+  shell [-c <command>]      Agent browser terminal (45 commands)
   server / serve [--port N] Run REST HTTP API & tool invoke endpoints
   mcp                       Run Model Context Protocol server over stdio
   product / status          Show official lane and engine status
+  version / --version / -v  Show binary and engine version
 ```
 
 ### Examples
@@ -134,8 +178,8 @@ dosh search "latest AI agent frameworks 2026"
 # 3. Stream a PDF or dataset directly to disk with SHA-256 verification
 dosh download https://arxiv.org/pdf/2301.00001.pdf
 
-# 4. Multi-step autonomous research loop
-dosh ask "Look up the pricing of Cloudflare Workers and summarize tier limits"
+# 4. Local research agent: search + read the top hit (no LLM key required)
+dosh ask "Cloudflare Workers pricing and tier limits"
 
 # 5. Start the REST API server
 dosh serve --port 4747
@@ -148,7 +192,7 @@ dosh status
 
 ## Model Context Protocol (MCP) Setup
 
-DOSH natively supports the **Model Context Protocol (MCP)** over stdio, allowing any AI assistant (Claude Desktop, Cursor, Antigravity) to browse the web autonomously with sub-millisecond control.
+DOSH natively supports the **Model Context Protocol (MCP)** over stdio: `dosh mcp` exposes the browser to any MCP-capable assistant (Claude Desktop, Cursor, and others).
 
 ### Configuration (`claude_desktop_config.json` or `cursor_config.json`)
 
@@ -179,11 +223,13 @@ DOSH natively supports the **Model Context Protocol (MCP)** over stdio, allowing
 | `browser_clock` | Freeze or advance the deterministic virtual host clock (`clock.set`, `clock.advance`). |
 | `browser_gate` | Dynamically toggle runtime capability gates (`eval`, `wasm`, `net`). |
 | `browser_heap` | Inspect V8 128MB pruned heap metrics and GC pauses. |
-| `browser_shell` | Execute any of the 41 terminal commands directly. |
+| `browser_shell` | Execute any of the 45 terminal commands directly. |
+
+The Python companion lane runs its own MCP server (`dosh -p mcp`) with an extended tool set — uploads, downloads, video, CAPTCHA, OTP, tab management, and stealth state.
 
 ---
 
-## DoshShell: 41 Terminal Commands
+## DoshShell: 45 Terminal Commands
 
 Run `dosh shell` for an interactive agent terminal or batch commands with `dosh shell -c "<cmd>"`:
 
@@ -196,37 +242,42 @@ dosh shell -c "wasm fuel=50000" -c "open https://example.com" -c "actions"
 | :--- | :--- |
 | **Navigation & DOM** | `open`, `read`, `actions`, `act`, `ref`, `wait`, `tabs`, `frames`, `layers`, `screenshot` |
 | **V8 Engine Controls** | `wasm` (fuel traps), `clock` (virtual time), `rng` (seeded PRNG), `heap` (128MB limit), `gate` (capabilities) |
-| **Network & Security** | `net.rule` (mock/block), `net.ledger` (causal trace), `net.apis` (API discovery), `cookies`, `video` |
+| **Network & Security** | `net` (observations), `net.capture` (redacted bodies), `net.rule` / `net.unrule` (block/mock), `net.apis` (API discovery), `cookies`, `video` |
 | **State & Checkpoints** | `checkpoint` (durable SQLite save), `restore` (rehydrate session), `storage`, `db`, `history` |
-| **Evidence & Diff** | `snapshot`, `diff`, `trace` (causal action footprint), `watch` (mutation observer) |
-| **Scripting & Automation**| `eval`, `frame.eval`, `skill.save`, `skill.run`, `skill.list`, `skill.delete`, `skill.update`, `caps`, `product` |
+| **Evidence & Diff** | `snapshot`, `diff`, `trace` (causal action footprint), `watch` (mutation observer), `console` |
+| **Captcha & Login** | `solve_captcha` (challenge inspection in the Rust lane), `login` (delegates to the Python runner) |
+| **Scripting & Automation** | `eval`, `frame.eval`, `skill.save`, `skill.run`, `skill.list`, `skill.delete`, `skill.update`, `caps` |
+| **Help & Status** | `help`, `product`, `status` |
 
 ---
 
 ## Python Companion SDK
 
-For Python agents using LangChain, LlamaIndex, or AutoGen:
+For Python agents, and any framework that consumes OpenAI-style tool schemas (`webresearch.tools.TOOLS`, `{"type": "function", ...}`) or speaks MCP:
 
 ```python
 import asyncio
-from webresearch import Session
+from webresearch import Browser
 
 async def main():
-    async with Session() as session:
-        # Navigate and execute scripts
-        page = await session.goto("https://news.ycombinator.com")
-        print(f"Title: {page.title}")
-        print(f"Content:\n{page.view}")
+    browser = Browser()
+    session = await browser.create()
 
-        # List reachable actions
-        actions = session.actions()
-        print(f"Reachable controls: {len(actions)}")
+    # Navigate and run page scripts
+    page = await session.goto("https://news.ycombinator.com")
+    print(f"Title: {page.title}")
+    print(f"Content:\n{page.view[:300]}")
 
-        # Click first link
-        await session.click("e1")
+    # List reachable controls
+    actions = session.actions()
+    print(f"Reachable controls: {len(actions)}")
+
+    await browser.close_all()
 
 asyncio.run(main())
 ```
+
+This exact script was run against the companion package; it prints `Title: Hacker News` and a reachable-controls count (200 on Hacker News at the time of writing).
 
 ---
 
@@ -244,16 +295,18 @@ asyncio.run(main())
 | **Action Resolution** | **Content-Addressed `ref`** | Bounding boxes / Coordinates / JS eval | CSS selectors / XPath |
 | **Anti-Tarpit WASM Metering** | **Native Liftoff CPU Traps** | None (Hangs on infinite WASM loops) | None |
 
+*The ranges in this table (DOSH, Browser-Use, and scrapers) are from the original 2026-10-10 comparison; Browser-Use/Chromium were not installed on the benchmark machine and were not re-measured in the 2026-11-05 audit — today's measured numbers are under [Verified Benchmarks](#verified-benchmarks--real-runs-2026-11-05).*
+
 ### Verified Benchmarks — Real Runs (2026-11-05)
 
-All figures below are measured on macOS from cold processes (`/usr/bin/time -l`), not estimates. Raw data: [`benchmarks/`](benchmarks/).
+Cold-process wall time and peak RSS measured on macOS with `/usr/bin/time -l`; warm-path figures are labeled as such. Raw data and run logs: [`benchmarks/`](benchmarks/).
 
 **Dual-lane, same task** — read `https://example.com`, both official paths:
 
 | Metric | **Rust lane** (`dosh read`) | Python companion (`webresearch`) |
 | :--- | ---: | ---: |
-| Cold wall time | **0.14 s** | 2.38 s *(device-probe disk cache removes ~1.6 s)* |
-| Peak RSS | **31 MB** | 74–77 MB |
+| Cold wall time | **0.14 s median** (0.11–0.22 s across 5 runs) | 1.1–1.5 s (3 runs; device probe disk-cached — 2.38 s pre-cache) |
+| Peak RSS | **~31 MB** | ~75–78 MB |
 | JS execution | doshgentv8 (V8), 0 errors | QuickJS |
 | Web search (DDG, "first iPhone release year") | **0.88 s / 16 MB — correct result** | 1.54 s CLI / 0.85 s MCP warm |
 | Warm re-reads | — | **135–285 ms** (persistent MCP server) |
@@ -275,26 +328,60 @@ All figures below are measured on macOS from cold processes (`/usr/bin/time -l`)
 | deepseek-v4.1-flash | 67% | 95 | 3.4 s | ~$0.0001 |
 | asi1-ultra | 100% | 201 | 4.6 s | ~$0.0006 |
 
-**Scope honesty:** the Rust lane is the faster engine but has fewer agent layers ported yet (no captcha/login/frames/ws/telemetry). Browser-Use and Chromium were not installed on the benchmark machine — **no numbers were invented for them**; a black-box harness outside this repo is required to measure them.
+**Scope honesty:** the Rust lane is the faster engine but not at full parity yet: CAPTCHA solving is inspection-only (the `solve_captcha` probe), the shell's `login` command delegates to the Python runner, and the Rust core has no WebSocket client yet. Neither lane sends telemetry. The multi-engine search waterfall has no query-relevance gate yet — junk hits can win, as recorded in `benchmarks/`. Browser-Use and Chromium were not installed on the benchmark machine — **no numbers were invented for them**; a black-box harness outside this repo is required to measure them.
 
 ---
 
 ## DevOps & Release Workflow
 
 ### Automated CI/CD
-- **Continuous Integration (`.github/workflows/ci.yml`)**: Runs Rust workspace tests (`cargo test --workspace`) and the full Python test suite (`uv run pytest`) on every push to `main`.
-- **Automated Releases (`.github/workflows/release.yml`)**: Triggers on tag pushes (`v*.*.*`), cross-compiles release binaries for macOS (ARM64, x86_64) and Linux (x86_64), generates SHA-256 checksums, and publishes assets directly to GitHub Releases.
+- **Continuous Integration (`.github/workflows/ci.yml`)**: Runs Rust workspace tests (`cargo test --workspace`) and the full Python test suite (`uv run pytest`) on every push to `main` and every pull request.
+- **Automated Releases (`.github/workflows/release.yml`)**: Triggers on version tag pushes (`v*.*.*`), cross-compiles release binaries for macOS (arm64, x86_64), Linux (x86_64), and Windows (x86_64 MSVC), generates SHA-256 checksums, and publishes them to GitHub Releases.
 
 ### Creating a Production Release
 To ship a new version:
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.1.0
+git push origin v1.1.0
 ```
 GitHub Actions will automatically build, package, and publish the release binaries.
 
 ---
 
+## Testing
+
+```bash
+cargo test --workspace                       # Rust core + doshgentv8 engine
+python3 -m venv .venv
+.venv/bin/pip install -e ".[test]"
+.venv/bin/python -m pytest tests/            # Python companion (or: uv sync --all-extras && uv run pytest tests/)
+```
+
+As of 2026-11-05: **228 Rust tests** (199 core + 29 engine) and **926 Python tests** pass; 8 Python tests self-skip when optional dependencies are absent.
+
+## Repository Layout
+
+| Path | What it is |
+| :--- | :--- |
+| `dosh-browser-core/` | Official pure-Rust browser core and the `dosh` binary |
+| `doshgentv8/` | Agent-tuned V8 engine — Rust embedding (`core/`, `py/`) + patched V8 source (`base/`) |
+| `webresearch/` | Optional Python companion SDK + MCP and REST servers |
+| `benchmarks/`, `scripts/` | Benchmark harness and committed raw results |
+| `research_repos/` | Third-party reading material only — never built, imported, or shipped |
+
+## Privacy & Telemetry
+
+No analytics and no telemetry: the browser reports nothing beyond the pages you ask it to fetch. The Python companion's `webresearch/telemetry.py` is a local, in-process network ledger for the owned HTTP client — it is not attached on import and has no remote endpoint.
+
+## Project Docs
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development setup, tests, and the PR checklist
+- [SECURITY.md](SECURITY.md) — private vulnerability reporting
+- [CHANGELOG.md](CHANGELOG.md) — releases and unreleased changes
+- [AGENTS.md](AGENTS.md) — the working rules for agents in this repo
+
 ## License
 
-Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)).
+Copyright (c) 2026 Asish Kumar Sharma. All rights reserved.
+
+Licensed under the DOSH Browser software license ([LICENSE](LICENSE)): **research and study only; no commercial usage**. Any other use requires a prior written grant from the copyright holder — see [LICENSE](LICENSE) for the exact terms.
