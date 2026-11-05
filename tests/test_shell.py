@@ -736,3 +736,141 @@ async def test_session_close_closes_explicit_workspace_shell(workspace):
         await session.close()
         assert shell.closed is True
         assert getattr(session.client, "_dosh_runtime_observer", None) is None
+
+
+@pytest.mark.asyncio
+async def test_assist_walkthrough_synthesizes_command_without_leaking_values(workspace):
+    # A page that sets a cookie via Set-Cookie; the assist walkthrough must
+    # surface the cookie BY NAME in the synthesized command and never echo value.
+    cookie_page = httpx.Response(
+        200,
+        text="<!doctype html><html><head><title>Auth</title></head><body>ok</body></html>",
+        headers={
+            "content-type": "text/html",
+            "cache-control": "no-store",
+            "set-cookie": "auth_token=supersecretvalue; Path=/",
+        },
+    )
+    async with workspace(pages={BASE + "/auth": cookie_page}) as (shell, session, _):
+        await command(shell, "open", url=BASE + "/auth", js="never")
+        result = await command(shell, "assist", goal="collect tokens")
+
+        # Full walkthrough recorded.
+        assert len(result["steps"]) >= 5
+        titles = [s["title"] for s in result["steps"]]
+        assert any("cookies" in t for t in titles)
+        assert any("storage" in t for t in titles)
+        assert any("APIs" in t for t in titles)
+
+        # Artifact references the cookie by name; the raw value never leaks.
+        artifact = result["artifact"]
+        assert "auth_token" in artifact
+        assert "supersecretvalue" not in json.dumps(result)
+        assert "curl" in artifact
+
+
+@pytest.mark.asyncio
+async def test_assist_empty_page_is_honest(workspace):
+    async with workspace() as (shell, session, _):
+        await opened(shell)
+        result = await command(shell, "assist", goal="collect tokens")
+        assert result["artifact"]
+        assert "0 cookie" in result["summary"] or "cookie(s)" in result["summary"]
+
+
+@pytest.mark.asyncio
+async def test_state_snapshot_diff_rollback(workspace):
+    """S1 (Python lane): one state DB with DOM + live cookies + storage +
+    history + ledger, and snapshot/diff/rollback over it. Diff is structural
+    and never echoes values; rollback rehydrates the session state."""
+    async with workspace() as (shell, session, _):
+        origin = "https://shell.test"
+        await opened(shell)
+
+        a = await command(shell, "state.snapshot", id="A")
+        assert a["id"] == "A"
+        assert a["counts"]["history_entries"] >= 1
+        assert a["counts"]["cookies"] == 0
+
+        # Mutate: a live cookie, a storage key, and a second navigation.
+        session.client.cookies.set("sid", "abc123")
+        session._web_storage[origin] = {"theme": "dark"}
+        await command(shell, "open", url=BASE + "/next")
+
+        b = await command(shell, "state.snapshot", id="B")
+        assert b["counts"]["cookies"] == 1
+        assert b["counts"]["history_entries"] == a["counts"]["history_entries"] + 1
+
+        # Diff A->B: url changed, cookie added, storage key added, history grew.
+        d = await command(shell, "state.diff", before="A", after="B")
+        assert d["url"]["changed"] is True
+        assert "sid" in d["cookies"]["added"]
+        assert any("theme" in k for k in d["storage"]["added"])
+        assert d["history"]["after"] == d["history"]["before"] + 1
+        # Secret hygiene: the raw cookie value never appears in diff output.
+        assert "abc123" not in json.dumps(d), "diff must not leak cookie values"
+
+        # Roll back to A: document, live jar, storage, and history rehydrate.
+        r = await command(shell, "state.rollback", id="A")
+        assert r["ledger_rolled_back"] is False
+        assert session.url == BASE + "/"
+        assert "sid" not in session.client.cookies
+        assert "theme" not in session._web_storage.get(origin, {})
+        assert len(session.history) == a["counts"]["history_entries"]
+
+
+@pytest.mark.asyncio
+async def test_state_diff_reports_value_change_without_the_value(workspace):
+    async with workspace() as (shell, session, _):
+        origin = "https://shell.test"
+        await opened(shell)
+        session._web_storage[origin] = {"theme": "dark"}
+        await command(shell, "state.snapshot", id="A")
+        session._web_storage[origin] = {"theme": "light"}
+        await command(shell, "state.snapshot", id="B")
+        d = await command(shell, "state.diff", before="A", after="B")
+        assert d["storage"]["changed"] == [f"{origin}/theme"]
+        assert "dark" not in json.dumps(d) and "light" not in json.dumps(d)
+
+
+@pytest.mark.asyncio
+async def test_state_snapshot_unknown_id_is_honest(workspace):
+    async with workspace() as (shell, session, _):
+        await opened(shell)
+        res = await shell.execute("state.diff", {"before": "nope", "after": "alsomissing"})
+        assert res["ok"] is False
+        assert "nope" in res["error"]
+
+
+R1 = ('<html><head><title>r1</title></head><body>'
+      '<div id="toolbar"><button id="save">Save</button>'
+      '<button id="cancel">Cancel</button></div></body></html>')
+R2 = ('<html><head><title>r2</title></head><body>'
+      '<div class="banner">promo</div>'
+      '<div id="toolbar"><button id="new">New</button>'
+      '<button id="save">Save</button>'
+      '<button id="cancel">Cancel</button></div></body></html>')
+
+
+@pytest.mark.asyncio
+async def test_ref_stable_survives_rerender_shift(workspace):
+    """S2 (Python lane): content-addressed stable ids survive SPA re-renders —
+    a banner and a new sibling shift document order, the stable id does not,
+    and `ref` re-binds it onto the current document's ref."""
+    async with workspace(pages={BASE + "/r1": R1, BASE + "/r2": R2}) as (shell, session, _):
+        await command(shell, "open", url=BASE + "/r1")
+        inv1 = await command(shell, "actions")
+        save1 = next(a for a in inv1["actions"] if a["label"] == "Save")
+        stable = save1["stable"]
+
+        await command(shell, "open", url=BASE + "/r2")
+        inv2 = await command(shell, "actions")
+        save2 = next(a for a in inv2["actions"] if a["label"] == "Save")
+        new1 = next(a for a in inv2["actions"] if a["label"] == "New")
+
+        assert stable == save2["stable"], "stable identity must be URL/position-free"
+        assert stable != new1["stable"]
+
+        r = await command(shell, "ref", stable=stable)
+        assert r["ref"] == save2["ref"]
+        assert r["label"] == "Save"
