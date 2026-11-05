@@ -171,8 +171,10 @@ pub struct Session {
     pub last_dialogs: Vec<serde_json::Value>,
     /// Popup tabs
     pub last_popups: Vec<serde_json::Value>,
-    /// Network ledger for telemetry
-    pub network_ledger: crate::telemetry::NetworkLedger,
+    /// Network ledger for telemetry. This IS the engine's ledger (same Arc):
+    /// the shell's `net` view sees the real dispatch evidence, not a divergent
+    /// copy (Phase 1 reconciliation of the two-ledger divergence).
+    pub network_ledger: std::sync::Arc<tokio::sync::Mutex<crate::telemetry::NetworkLedger>>,
     /// Central Network Engine
     pub network: crate::network::NetworkEngine,
     /// Console event log
@@ -191,10 +193,18 @@ pub struct Session {
     pub gate_wasm: bool,
     /// Network capability gate
     pub gate_network: bool,
+    /// Secret-reveal gate (N8): mirrors the ledger's audited gate; a field
+    /// flag so the session can report the state quickly.
+    pub gate_secret_reveal: bool,
     /// Bounded session pool for resident V8 actors
     pub session_pool: std::sync::Arc<doshgentv8_core::SessionPool>,
     /// Live per-tab resident runtimes
     pub runtimes: HashMap<String, crate::runtime::Runtime>,
+    /// Tab ids whose resident runtime has a document loaded into it.
+    /// Used so an `eval`/`skill.run` against a freshly-navigated runtime does
+    /// not pointlessly reload the DOM (which would wipe live JS/cookie state),
+    /// while a runtime created lazily before any navigation still gets a DOM.
+    pub loaded_runtimes: std::collections::HashSet<String>,
     /// Checkpointed page HTML snapshots keyed by checkpoint ID
     pub session_checkpoints: HashMap<u64, String>,
 }
@@ -209,6 +219,8 @@ impl Session {
                 .unwrap_or(0)
         );
         let tab = Tab::new("tab-1");
+        let network = crate::network::NetworkEngine::default();
+        let network_ledger = network.ledger.clone();
         Self {
             id,
             tabs: vec![tab],
@@ -217,8 +229,8 @@ impl Session {
             local_storage: HashMap::new(),
             last_dialogs: Vec::new(),
             last_popups: Vec::new(),
-            network_ledger: crate::telemetry::NetworkLedger::new(1000, false),
-            network: crate::network::NetworkEngine::default(),
+            network_ledger,
+            network,
             console_logs: Vec::new(),
             identity_tracker: crate::identity::IdentityTracker::new(),
             virtual_clock_ms: None,
@@ -227,8 +239,10 @@ impl Session {
             gate_eval: true,
             gate_wasm: true,
             gate_network: true,
+            gate_secret_reveal: false,
             session_pool: std::sync::Arc::new(doshgentv8_core::SessionPool::new(8)),
             runtimes: HashMap::new(),
+            loaded_runtimes: std::collections::HashSet::new(),
             session_checkpoints: HashMap::new(),
         }
     }
@@ -267,6 +281,34 @@ impl Session {
         let _ = rt.engine.set_eval_allowed(self.gate_eval);
         let _ = rt.engine.set_wasm_allowed(self.gate_wasm);
         let _ = rt.engine.set_network_allowed(self.gate_network);
+    }
+
+    /// True when the current tab's resident runtime has no document loaded yet,
+    /// so an `eval`/`skill.run` should load the stored HTML before evaluating.
+    pub fn runtime_needs_document(&self, _url: &str) -> bool {
+        let tab_id = self.current_tab().id.clone();
+        !self.loaded_runtimes.contains(&tab_id)
+    }
+
+    /// Record that the current tab's resident runtime now has a document loaded.
+    /// Called by eval/skill after a lazy load, and by navigation paths.
+    pub fn mark_runtime_loaded(&mut self, _url: &str) {
+        let tab_id = self.current_tab().id.clone();
+        self.loaded_runtimes.insert(tab_id);
+    }
+
+    /// Read the current tab's resident runtime live cookie jar as (name, value)
+    /// pairs. Returns an empty map when no resident runtime exists yet. This is
+    /// the real jar the page's `document.cookie` reads/writes through the
+    /// `host_get_cookie`/`host_set_cookie` host callables.
+    pub fn current_cookies(&self) -> HashMap<String, String> {
+        let tab_id = self.current_tab().id.clone();
+        if let Some(rt) = self.runtimes.get(&tab_id) {
+            if let Ok(map) = rt.seam.0.cookies.lock() {
+                return map.clone();
+            }
+        }
+        HashMap::new()
     }
 
     pub fn switch_tab(&mut self, tab_id: &str) -> Result<(), String> {
@@ -322,6 +364,7 @@ impl Session {
                     }
                 }
             }
+            self.mark_runtime_loaded(&result.final_url);
         }
 
         // 3. Build action targets, links, and frame inventory
@@ -420,6 +463,7 @@ impl Session {
                 }
             }
         }
+        self.mark_runtime_loaded(url);
 
         let targets = crate::actions::extract_actions(&final_html, url, 100);
         self.identity_tracker.update(&targets);
@@ -498,41 +542,98 @@ impl Session {
             return Err("No document loaded in session".to_string());
         }
 
-        let targets = crate::actions::extract_actions(&html, &url, 100);
-        let effective_ref = if let Ok((resolved, _)) = self.identity_tracker.resolve(ref_id, &targets) {
-            resolved.ref_id.clone()
-        } else {
-            ref_id.to_string()
-        };
-
-        if let Some(target) = targets.into_iter().find(|t| t.ref_id == effective_ref) {
-            if target.tag == "a"
-                && !target.href.is_empty()
-                && !target.href.starts_with('#')
-                && !target.href.to_lowercase().starts_with("javascript:")
-            {
-                let full_url = if let Ok(base) = Url::parse(&url) {
-                    base.join(&target.href).map(|u| u.to_string()).unwrap_or(target.href)
-                } else {
-                    target.href
-                };
-                return self.goto(&full_url, 8000).await.map_err(|e| e.to_string());
-            }
-        }
-
-        // Apply action click via resident Runtime (V8)
-        let action_payload = serde_json::json!({
-            "type": "click",
-            "ref": effective_ref,
-        });
+        // 1000 not 100: an agent may hold a ref from a paged `actions`
+        // query; resolving only the first 100 made deeper refs no-op.
+        let targets = crate::actions::extract_actions(&html, &url, 1000);
+        let resolved = self.identity_tracker.resolve(ref_id, &targets).ok();
+        let target = resolved
+            .map(|(t, _)| t)
+            .or_else(|| targets.iter().find(|t| t.ref_id == ref_id));
 
         let mut rt = self
             .get_or_create_runtime(&url)
             .map_err(|e| format!("Failed to get runtime: {e}"))?;
-        let _ = rt.apply_action(&action_payload)?;
+
+        let (selector, occurrence) = match target {
+            Some(t) => {
+                if t.tag == "a"
+                    && !t.href.is_empty()
+                    && !t.href.starts_with('#')
+                    && !t.href.to_lowercase().starts_with("javascript:")
+                {
+                    let full_url = if let Ok(base) = Url::parse(&url) {
+                        base.join(&t.href).map(|u| u.to_string()).unwrap_or(t.href.clone())
+                    } else {
+                        t.href.clone()
+                    };
+                    return self.goto(&full_url, 8000).await.map_err(|e| e.to_string());
+                }
+                // Resolve through the element's CSS selector, never through
+                // the content-hash ref (a bare hash matches no id and no CSS
+                // selector — acting on it was a silent no-op). Repeated
+                // identical controls share one selector; the ref's `~N`
+                // suffix carries the occurrence.
+                let sel = if !t.selector.is_empty() {
+                    t.selector.clone()
+                } else {
+                    t.ref_id.clone()
+                };
+                let nth = t
+                    .ref_id
+                    .rsplit('~')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                (sel, nth)
+            }
+            None => {
+                // Legacy path: a raw id or CSS selector passed as the ref.
+                // Verify it resolves the same way `__activateSelector` does
+                // (getElementById first, then querySelector) before acting —
+                // an unresolvable ref must error, not no-op.
+                let probe = rt
+                    .eval(&format!(
+                        "(function(){{ var el = document.getElementById({}) || document.querySelector({}); return el ? '1' : ''; }})()",
+                        serde_json::json!(ref_id),
+                        serde_json::json!(ref_id)
+                    ))
+                    .unwrap_or_default();
+                if probe.trim() != "1" {
+                    return Err(format!(
+                        "no actionable target [{ref_id}] on this document (not an action ref and no element matches it as an id or selector); re-run `actions` for the current surface"
+                    ));
+                }
+                (ref_id.to_string(), 1)
+            }
+        };
+
+        // Apply action click via resident Runtime (V8)
+        let action_payload = serde_json::json!({
+            "type": "click",
+            "selector": selector,
+            "occurrence": occurrence,
+        });
+
+        rt.apply_action(&action_payload)?;
         let mutated = rt.serialize()?;
+        Self::check_action_error(&mut rt)?;
 
         self.update_page_after_action(&url, &mutated, 8000)
+    }
+
+    /// Surface the engine's `__lastActionError` so a failed actuate (element
+    /// vanished, occluded, disabled) is an error, not a silent no-op.
+    fn check_action_error(rt: &mut crate::runtime::Runtime) -> Result<(), String> {
+        let err = rt
+            .eval("String(globalThis.__lastActionError || '')")
+            .unwrap_or_default();
+        let trimmed = err.trim();
+        if trimmed.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("action failed in engine: {trimmed}"))
+        }
     }
 
     /// Perform text typing into a target ref in the live session.
@@ -544,24 +645,61 @@ impl Session {
             return Err("No document loaded in session".to_string());
         }
 
-        let targets = crate::actions::extract_actions(&html, &url, 100);
-        let effective_ref = if let Ok((resolved, _)) = self.identity_tracker.resolve(ref_id, &targets) {
-            resolved.ref_id.clone()
-        } else {
-            ref_id.to_string()
-        };
-
-        let action_payload = serde_json::json!({
-            "type": "type",
-            "ref": effective_ref,
-            "text": text,
-        });
+        let targets = crate::actions::extract_actions(&html, &url, 1000);
+        let resolved = self.identity_tracker.resolve(ref_id, &targets).ok();
+        let target = resolved
+            .map(|(t, _)| t)
+            .or_else(|| targets.iter().find(|t| t.ref_id == ref_id));
 
         let mut rt = self
             .get_or_create_runtime(&url)
             .map_err(|e| format!("Failed to get runtime: {e}"))?;
-        let _ = rt.apply_action(&action_payload)?;
+
+        let (selector, occurrence) = match target {
+            Some(t) => {
+                let sel = if !t.selector.is_empty() {
+                    t.selector.clone()
+                } else {
+                    t.ref_id.clone()
+                };
+                let nth = t
+                    .ref_id
+                    .rsplit('~')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                (sel, nth)
+            }
+            None => {
+                // Legacy path: a raw id or CSS selector passed as the ref.
+                // Verify it resolves before acting — never a silent no-op.
+                let probe = rt
+                    .eval(&format!(
+                        "(function(){{ var el = document.getElementById({}) || document.querySelector({}); return el ? '1' : ''; }})()",
+                        serde_json::json!(ref_id),
+                        serde_json::json!(ref_id)
+                    ))
+                    .unwrap_or_default();
+                if probe.trim() != "1" {
+                    return Err(format!(
+                        "no actionable target [{ref_id}] on this document (not an action ref and no element matches it as an id or selector); re-run `actions` for the current surface"
+                    ));
+                }
+                (ref_id.to_string(), 1)
+            }
+        };
+
+        let action_payload = serde_json::json!({
+            "type": "type",
+            "selector": selector,
+            "text": text,
+            "occurrence": occurrence,
+        });
+
+        rt.apply_action(&action_payload)?;
         let mutated = rt.serialize()?;
+        Self::check_action_error(&mut rt)?;
 
         self.update_page_after_action(&url, &mutated, 8000)
     }
@@ -681,11 +819,17 @@ impl Session {
 
         if let Some(page) = page_opt {
             let new_tab = forked_session.current_tab_mut();
-            new_tab.push(page, Some(html), None, false, None);
+            new_tab.push(page, Some(html.clone()), None, false, None);
         }
 
-        let new_rt = forked_session.get_or_create_runtime(&url)?;
+        let mut new_rt = forked_session.get_or_create_runtime(&url)?;
         new_rt.set_parena(forked_parena)?;
+        // Materialize the document in the branch's resident runtime. Without
+        // this the branch's minidom is an empty document and every action on
+        // it was a silent no-op (the arena fork alone does not repopulate the
+        // live DOM — same re-load `rewind` performs after truncating it).
+        new_rt.load_document(&html, &url)?;
+        forked_session.mark_runtime_loaded(&url);
 
         Ok(forked_session)
     }
