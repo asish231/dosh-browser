@@ -24,7 +24,7 @@ use crate::rate_limiter::RateLimiter;
 use crate::robots::RobotsStore;
 use crate::safebrowsing::is_blocked_host;
 use crate::singleflight::SingleFlight;
-use crate::telemetry::{NetworkLedger, NetworkRecord};
+use crate::telemetry::{NetworkLedger, NetworkRecord, SealedRequest};
 use crate::trackers::TrackerGraph;
 use crate::web_bot_auth::{sign_request, BotAuthConfig};
 
@@ -78,6 +78,8 @@ pub struct NetworkRequest {
     pub client_origin: Option<String>,
     pub caused_by: Option<String>,
     pub is_subresource: bool,
+    /// Sanitized JS call-site hint for the launch point (N9).
+    pub initiator_stack: Vec<String>,
 }
 
 impl NetworkRequest {
@@ -90,6 +92,7 @@ impl NetworkRequest {
             client_origin: None,
             caused_by: None,
             is_subresource: false,
+            initiator_stack: Vec::new(),
         }
     }
 }
@@ -180,7 +183,9 @@ impl NetworkEngine {
         let cors = CorsGate::new();
         let cache = SqliteCache::new(None).expect("Failed to initialize SQLite cache");
         let trackers = Arc::new(TrackerGraph::new());
-        let ledger = Arc::new(Mutex::new(NetworkLedger::new(200, true)));
+        // Shared with the owning Session (same Arc): 1000 records so the
+        // shell's `net` view keeps the deep history it always documented.
+        let ledger = Arc::new(Mutex::new(NetworkLedger::new(1000, true)));
 
         Self {
             config,
@@ -393,6 +398,8 @@ impl NetworkEngine {
         // and the host is explicitly allowed, retry once with the insecure client.
         let parsed = Url::parse(&req.url).map_err(|e| e.to_string())?;
         let host = parsed.host_str().unwrap_or("");
+        // N4: timing起点 is the transport dispatch itself.
+        let t0_ms = crate::telemetry::epoch_ms_f64();
         let resp = match builder.send().await {
             Ok(r) => r,
             Err(err) => {
@@ -415,14 +422,14 @@ impl NetworkEngine {
                         }
                         let resp2 = builder2.send().await.map_err(|e2| e2.to_string())?;
                         // Attach x-webresearch-tls header to mark the response
-                        return self.build_fetch_result(req, resp2, Some(format!("proceeded-unverified:{}", interstitial.kind)), stale_cache).await;
+                        return self.build_fetch_result(req, resp2, Some(format!("proceeded-unverified:{}", interstitial.kind)), stale_cache, t0_ms).await;
                     }
                 }
                 return Err(err_text);
             }
         };
 
-        self.build_fetch_result(req, resp, None, stale_cache).await
+        self.build_fetch_result(req, resp, None, stale_cache, t0_ms).await
     }
 
     /// Common path for building a FetchResult from a successful reqwest Response.
@@ -433,6 +440,7 @@ impl NetworkEngine {
         resp: reqwest::Response,
         tls_header: Option<String>,
         stale_cache: Option<CacheEntry>,
+        t0_ms: f64,
     ) -> Result<FetchResult, String> {
         let status = resp.status().as_u16();
         let final_url = resp.url().as_str().to_string();
@@ -475,7 +483,30 @@ impl NetworkEngine {
             }
         }
 
-        let raw_bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        // ---- N1/N4: chunked body read with real arrival timestamps --------
+        // Each chunk's byte-end offset + epoch-ms is recorded so SSE event
+        // boundaries can be stamped with when they actually arrived. This is
+        // measured, not simulated.
+        let mut raw_bytes: Vec<u8> = Vec::new();
+        let mut arrivals: Vec<(usize, f64)> = Vec::new();
+        let mut ttfb_ms: Option<f64> = None;
+        {
+            use futures_util::StreamExt as _;
+            let mut chunk_stream = resp;
+            while let Some(chunk) = chunk_stream
+                .chunk()
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                let now = crate::telemetry::epoch_ms_f64();
+                if ttfb_ms.is_none() {
+                    ttfb_ms = Some(now - t0_ms);
+                }
+                raw_bytes.extend_from_slice(&chunk);
+                arrivals.push((raw_bytes.len(), now));
+            }
+        }
+        let duration_ms = Some(crate::telemetry::epoch_ms_f64() - t0_ms);
         let truncated = raw_bytes.len() > self.config.max_bytes;
         let body_slice = if truncated {
             &raw_bytes[..self.config.max_bytes]
@@ -503,22 +534,56 @@ impl NetworkEngine {
             }
         }
 
-        // Record in telemetry ledger
+        // Record in telemetry ledger with sealed (unredacted) transport
+        // evidence for authorized replay/decode/reveal, measured timing, and
+        // arrival-stamped SSE events.
         {
-            let mut ledger = self.ledger.lock().await;
-            ledger.append(NetworkRecord {
-                source: "network".into(),
+            let mut sealed = SealedRequest {
+                record_id: 0,
                 url: req.url.clone(),
                 method: req.method.clone(),
-                status: Some(status),
-                request_headers: req.headers.clone(),
-                response_headers: resp_headers.clone(),
-                state: "complete".into(),
-                network_sent: Some(true),
-                bytes: raw_bytes.len(),
+                headers: req.headers.clone(),
+                body: req.body.clone().unwrap_or_default().into_bytes(),
+                response_body: raw_bytes
+                    .iter()
+                    .take(crate::telemetry::SEALED_MAX_BYTES_DEFAULT)
+                    .copied()
+                    .collect(),
                 content_type: content_type.clone(),
-                ..Default::default()
-            });
+            };
+            let stream_events = if content_type.to_lowercase().contains("text/event-stream") {
+                crate::telemetry::parse_sse_with_arrivals(
+                    &String::from_utf8_lossy(&raw_bytes),
+                    &arrivals,
+                )
+            } else {
+                Vec::new()
+            };
+            let mut ledger = self.ledger.lock().await;
+            ledger.append_with_sealed(
+                NetworkRecord {
+                    source: "network".into(),
+                    url: req.url.clone(),
+                    method: req.method.clone(),
+                    status: Some(status),
+                    request_headers: req.headers.clone(),
+                    response_headers: resp_headers.clone(),
+                    state: "complete".into(),
+                    network_sent: Some(true),
+                    bytes: raw_bytes.len(),
+                    content_type: content_type.clone(),
+                    stream_events,
+                    timing: Some(crate::telemetry::TimingBreakdown {
+                        started_at_ms: t0_ms,
+                        ttfb_ms,
+                        duration_ms,
+                    }),
+                    initiator_stack: req.initiator_stack.clone(),
+                    truncated,
+                    ..Default::default()
+                },
+                Some(std::mem::take(&mut sealed)),
+            );
         }
 
         let body = decode_body(body_slice, &content_type);
