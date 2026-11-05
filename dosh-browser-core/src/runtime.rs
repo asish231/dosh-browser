@@ -76,6 +76,12 @@ pub struct InnerSeam {
     pub post_messages: Mutex<Vec<PostMessageEntry>>,
     pub post_uid: AtomicUsize,
     pub ctx_key: String,
+    /// WebSocket evidence ledger: the engine's ledger when the runtime was
+    /// built with network access, else a runtime-local one (disclosed: not
+    /// visible to the shell's `net` view in that mode).
+    pub ws_ledger: Option<crate::ws::SharedLedger>,
+    /// Live socket registry (pump tasks + send/close channels + inbox).
+    pub ws_registry: Mutex<Option<crate::ws::WsRegistry>>,
 }
 
 /// Thread-safe wrapper implementing HostSeam.
@@ -188,6 +194,14 @@ impl HostSeam for SharedSeam {
                     req_url
                 };
 
+                // N9: the page-level fetch wrapper captures the JS call site
+                // (new Error().stack) at dispatch time; sanitize here (query
+                // strings stripped, bounded).
+                let initiator_stack = args
+                    .get(5)
+                    .map(|s| crate::telemetry::sanitize_initiator_stack(s))
+                    .unwrap_or_default();
+
                 let network_opt = self.0.network.clone();
                 let client = self.0.client.clone();
                 let page_origin = crate::shell::get_origin(&page_url);
@@ -200,6 +214,7 @@ impl HostSeam for SharedSeam {
                         req.client_origin = Some(page_origin);
                         req.caused_by = Some("v8_script".into());
                         req.is_subresource = true;
+                        req.initiator_stack = initiator_stack;
                         if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&headers_json) {
                             req.headers = map;
                         }
@@ -231,8 +246,86 @@ impl HostSeam for SharedSeam {
             "host_load_module" => {
                 Ok(Some(json!({"url": "", "code": ""}).to_string()))
             }
-            "host_ws_connect" | "host_ws_send" | "host_ws_send_binary" | "host_ws_close" => {
-                Ok(Some("{}".to_string()))
+            "host_ws_connect" => {
+                // args: [url, protocols_json]. RFC 6455 handshake, recorded
+                // in the ledger, with a hard timeout so a hanging server
+                // cannot wedge the page thread. Result shape matches minidom:
+                // {"ok":true,"id":N,"protocol":...} or {"ok":false,...}.
+                let ws_url = args.first().cloned().unwrap_or_default();
+                let protocols = args.get(1).cloned().unwrap_or_default();
+                if ws_url.is_empty() {
+                    return Ok(Some(json!({"ok": false, "code": 1002, "error": "ws url required"}).to_string()));
+                }
+                let Some(ws_ledger) = self.0.ws_ledger.clone() else {
+                    return Ok(Some(json!({"ok": false, "code": 1002, "error": "no network capability"}).to_string()));
+                };
+                let extra_headers: HashMap<String, String> = HashMap::new();
+                let fut = {
+                    let ws_ledger = ws_ledger.clone();
+                    async move { crate::ws::handshake_open(&ws_url, &ws_ledger, &extra_headers).await }
+                };
+                let outcome = run_async_host_call_inner(fut, &protocols);
+                match outcome {
+                    Ok((session_id, stream, protocol)) => {
+                        if let Ok(mut slot) = self.0.ws_registry.lock() {
+                            let reg = slot.get_or_insert_with(|| crate::ws::WsRegistry::new(ws_ledger.clone()));
+                            reg.admit(session_id, stream);
+                        }
+                        Ok(Some(json!({"ok": true, "id": session_id, "protocol": protocol}).to_string()))
+                    }
+                    Err(e) => {
+                        // Handshake failed before ws_open: nothing to close in
+                        // the ledger; report the honest code.
+                        let _ = &e;
+                        Ok(Some(json!({"ok": false, "code": 1006, "error": e}).to_string()))
+                    }
+                }
+            }
+            "host_ws_send" => {
+                let session = args.first().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let text = args.get(1).cloned().unwrap_or_default();
+                let send_fut = async {
+                    let mut slot = self
+                        .0
+                        .ws_registry
+                        .lock()
+                        .map_err(|_| "ws registry poisoned".to_string())?;
+                    slot.as_mut()
+                        .ok_or("websocket transport not initialized")?
+                        .send_text(session, &text)
+                        .await
+                };
+                run_async_host_call(send_fut).map(|_| json!({"ok": true}).to_string()).map(Some)
+            }
+            "host_ws_send_binary" => {
+                let session = args.first().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let b64 = args.get(1).cloned().unwrap_or_default();
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .map_err(|e| format!("bad base64 payload: {e}"))?;
+                let send_fut = async {
+                    let mut slot = self
+                        .0
+                        .ws_registry
+                        .lock()
+                        .map_err(|_| "ws registry poisoned".to_string())?;
+                    slot.as_mut()
+                        .ok_or("websocket transport not initialized")?
+                        .send_binary(session, &bytes)
+                        .await
+                };
+                run_async_host_call(send_fut).map(|_| json!({"ok": true}).to_string()).map(Some)
+            }
+            "host_ws_close" => {
+                let session = args.first().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let code = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(1000);
+                if let Ok(mut slot) = self.0.ws_registry.lock() {
+                    if let Some(reg) = slot.as_mut() {
+                        let _ = reg.close(session, code);
+                    }
+                }
+                Ok(Some(json!({"ok": true}).to_string()))
             }
             "host_checkpoint" | "__dosh_checkpoint" => {
                 Ok(Some("0".to_string()))
@@ -249,6 +342,31 @@ impl HostSeam for SharedSeam {
             _ => Err(format!("unknown host callable: {name}")),
         }
     }
+}
+
+/// Execute an async fence from the sync host-seam context, using the current
+/// tokio runtime when one is present (block_in_place) or a temporary one-off
+/// runtime otherwise.
+fn run_async_host_call_inner<F, T>(fut: F, ctx: &str) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let _ = ctx;
+        rt.block_on(fut)
+    } else {
+        unreachable!("no tokio runtime available for host call")
+    }
+}
+
+/// The usual form: plain async work, no extra context string.
+fn run_async_host_call<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    run_async_host_call_inner(fut, "")
 }
 
 /// The Live Page JavaScript Runtime, backed by a resident V8 actor.
@@ -283,13 +401,15 @@ impl Runtime {
 
         let seam = Arc::new(SharedSeam(InnerSeam {
             client,
-            network,
+            network: network.clone(),
             url: Mutex::new(url.to_string()),
             cookies: Mutex::new(HashMap::new()),
             console: Mutex::new(Vec::new()),
             post_messages: Mutex::new(Vec::new()),
             post_uid: AtomicUsize::new(0),
             ctx_key: ctx_key.clone(),
+            ws_ledger: network.as_ref().map(|n| n.ledger.clone()),
+            ws_registry: Mutex::new(None),
         }));
 
         let engine = DoshActor::spawn(seam.clone(), 128 * 1024 * 1024)?;
@@ -360,6 +480,32 @@ impl Runtime {
 
     /// Drain pending timers and microtasks.
     pub fn drain_timers(&mut self) -> Result<(), String> {
+        // N2 parity with the Python lane's `_pump_websockets`: deliver queued
+        // inbound text frames to the page as `globalThis.__wsDeliver`.
+        if let Ok(mut slot) = self.seam.0.ws_registry.lock() {
+            if let Some(reg) = slot.as_mut() {
+                let mut frames = 0;
+                for f in reg.take_inbound() {
+                    if f.binary {
+                        // Text delivery matches the Python lane, which records
+                        // binary frames but does not deliver them to script.
+                        continue;
+                    }
+                    if frames >= 128 {
+                        break;
+                    }
+                    frames += 1;
+                    let data = String::from_utf8_lossy(&f.data);
+                    let js = format!(
+                        "if (typeof globalThis.__wsDeliver === 'function') globalThis.__wsDeliver({}, {});",
+                        f.session,
+                        json!(data.as_ref())
+                    );
+                    let _ = self.engine.eval(&js);
+                    self.engine.pump_jobs();
+                }
+            }
+        }
         for _ in 0..MAX_TIMER_PASSES {
             let left = self.engine.eval("__drainTimers()")?;
             self.engine.pump_jobs();
