@@ -7653,7 +7653,13 @@ var decl = new CSSStyleDeclaration(el);
       body = opts.body == null ? "" : (opts.body._content != null ? opts.body._content : String(opts.body));
       if (opts.body && opts.body._binary) bodyB64 = global.btoa(body);
     }
-    var raw = typeof host_fetch === "function" ? host_fetch(String(url), method, body, JSON.stringify(customHeaders), bodyB64) : "{\"status\":599,\"body\":\"\"}";
+    /* N9 (Phase 1): capture the JS call site at dispatch time so the
+       network ledger can show what code launched this request. The stack
+       string travels as host_fetch's 6th argument; the host sanitizes it
+       (query strings redacted, line-capped). */
+    var initiatorStack = "";
+    try { initiatorStack = (new Error()).stack || ""; } catch (e) { initiatorStack = ""; }
+    var raw = typeof host_fetch === "function" ? host_fetch(String(url), method, body, JSON.stringify(customHeaders), bodyB64, initiatorStack) : "{\"status\":599,\"body\":\"\"}";
     var res = typeof raw === "string" ? JSON.parse(raw) : raw;
     var respHeaders = new Headers();
     if (res.content_type) respHeaders.set("content-type", res.content_type);
@@ -7677,7 +7683,9 @@ var decl = new CSSStyleDeclaration(el);
     setTimeout(function () {
       try {
         if (typeof host_fetch === "function") {
-          var raw = host_fetch(self.url, "GET", "");
+          var esStack = "";
+          try { esStack = (new Error()).stack || ""; } catch (e) { esStack = ""; }
+          var raw = host_fetch(self.url, "GET", "", "", "", esStack);
           var res = typeof raw === "string" ? JSON.parse(raw) : raw;
           if (res.status >= 200 && res.status < 300) {
             self.readyState = 1; // OPEN
@@ -7934,7 +7942,7 @@ var decl = new CSSStyleDeclaration(el);
         if (body && body._binary) reqBodyB64 = global.btoa(reqBody);
       }
       var raw = typeof host_fetch === "function"
-        ? host_fetch(this._url, this._method, reqBody, JSON.stringify(this._headers), reqBodyB64)
+        ? host_fetch(this._url, this._method, reqBody, JSON.stringify(this._headers), reqBodyB64, (function () { try { return (new Error()).stack || ""; } catch (e) { return ""; } })())
         : "{\"status\":599,\"body\":\"\"}";
       var res = typeof raw === "string" ? JSON.parse(raw) : raw;
       this.status = res.status || 0;
@@ -8115,7 +8123,7 @@ var decl = new CSSStyleDeclaration(el);
           } else if (typeof data === "object") body = JSON.stringify(data);
           else body = String(data);
           if (typeof host_fetch === "function") {
-            host_fetch(abs, "POST", body, JSON.stringify({ "content-type": "text/plain;charset=UTF-8" }), "");
+            host_fetch(abs, "POST", body, JSON.stringify({ "content-type": "text/plain;charset=UTF-8" }), "", (function () { try { return (new Error()).stack || ""; } catch (e) { return ""; } })());
             return true;
           }
           return false;
@@ -9537,10 +9545,13 @@ var decl = new CSSStyleDeclaration(el);
       var am = global.document.querySelectorAll(selector);
       el = am && am.length >= nth ? am[nth - 1] : null;
     }
-    if (!el) return false;
+    if (!el) { global.__lastActionError = "element_not_found"; return false; }
+    /* Element resolved: clear any stale error from a previous action. Later
+       failure paths set it again explicitly. */
+    global.__lastActionError = null;
     if (stealth !== undefined) global.__stealthMode = !!stealth;
     if (el.nodeName === "select") {
-      if (__controlDisabled(el)) return false;
+      if (__controlDisabled(el)) { global.__lastActionError = "control_disabled"; return false; }
       /* Typing into a select means choosing an option (by value, then by
          visible text) — never appending text to a value that is derived
          from the chosen option. A bare activate just focuses it. */
@@ -9564,7 +9575,7 @@ var decl = new CSSStyleDeclaration(el);
       el.dispatchEvent(new global.Event("click", { bubbles: true, isTrusted: true, __trusted: true }));
       clickOk = true;
     }
-    if (!clickOk) return false;
+    if (!clickOk) { global.__lastActionError = "click_refused"; return false; }
     var kind = (el.getAttribute("type") || "").toLowerCase();
     if (kind === "checkbox" || kind === "radio") {
       el.setAttribute("aria-checked", el.checked ? "true" : "false");
