@@ -202,6 +202,16 @@ pub fn get_tools_list() -> Value {
                 "type": "object",
                 "properties": {}
             }
+        },
+        {
+            "name": "browser_assist",
+            "description": "Run the in-session DevTools agent walkthrough against the live page: inspects the live cookie jar, local/session storage keys, and discovered background APIs, then synthesizes a unified replay (cURL) command. Secrets are referenced by name only, never echoed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "goal": { "type": "string", "description": "What to collect or investigate, e.g. 'collect all tokens for this chat API'" }
+                }
+            }
         }
     ])
 }
@@ -380,6 +390,15 @@ pub async fn handle_mcp_message(
                         Err(e) => format!("Heap error: {}", e),
                     }
                 }
+                "browser_assist" => {
+                    let mut sess = session.lock().await;
+                    let goal = arguments.get("goal").cloned().unwrap_or(json!("inspect this page and collect tokens"));
+                    let args = json!({ "goal": goal });
+                    match execute_command("assist", &args, &mut sess, store).await {
+                        Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_default(),
+                        Err(e) => format!("Assist error: {}", e),
+                    }
+                }
                 _ => {
                     if name.starts_with("browser_") {
                         let args_map: std::collections::HashMap<String, Value> = match arguments {
@@ -534,5 +553,48 @@ mod tests {
         assert!(resp_clock.error.is_none());
         let text_clock = resp_clock.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
         assert!(text_clock.contains("1700000000000"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_assist_tool_listed_and_callable() {
+        let store = Arc::new(ShellStore::new(None).unwrap());
+        let session = Arc::new(Mutex::new(Session::new(Client::new())));
+
+        // Listed.
+        let list = handle_mcp_message(
+            JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(10)),
+                method: "tools/list".into(),
+                params: None,
+            },
+            &session,
+            &store,
+        )
+        .await
+        .unwrap();
+        let tools = list.result.unwrap()["tools"].as_array().unwrap().clone();
+        assert!(tools.iter().any(|t| t["name"] == "browser_assist"));
+
+        // Callable (empty page: honest zero-finding walkthrough).
+        let call = handle_mcp_message(
+            JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(11)),
+                method: "tools/call".into(),
+                params: Some(json!({
+                    "name": "browser_assist",
+                    "arguments": { "goal": "collect tokens" }
+                })),
+            },
+            &session,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert!(call.error.is_none());
+        let text = call.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+        assert!(text.contains("steps"));
+        assert!(text.contains("artifact"));
     }
 }
