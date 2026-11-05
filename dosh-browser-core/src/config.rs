@@ -24,7 +24,7 @@ pub fn project_status() -> serde_json::Value {
             "rust": {
                 "path": "dosh-browser-core/",
                 "status": "official",
-                "summary": "Full pure-Rust browser core with doshgentv8 V8 engine, RFC 9111 caching, ANBF binary packaging, 41 shell commands, and HTTP/REST server."
+                "summary": "Full pure-Rust browser core with doshgentv8 V8 engine, RFC 9111 caching, ANBF binary packaging, 55 shell commands, and HTTP/REST server."
             },
             "python": {
                 "path": "webresearch/",
