@@ -37,6 +37,7 @@ fn parse_shell_line(line: &str) -> (&str, serde_json::Value) {
                 "act" => (cmd, serde_json::json!({ "ref": rest })),
                 "ref" => (cmd, serde_json::json!({ "stable": rest })),
                 "tabs" => (cmd, serde_json::json!({ "id": rest })),
+                "assist" => (cmd, serde_json::json!({ "goal": rest })),
                 "eval" => (cmd, serde_json::json!({ "source": rest })),
                 "frame.eval" => (cmd, serde_json::json!({ "expr": rest })),
                 "query" => (cmd, serde_json::json!({ "category": rest })),
@@ -147,7 +148,8 @@ async fn main() {
         eprintln!("  search <query> [--json]   Web search with DuckDuckGo fallback");
         eprintln!("  download <url>            Download file or PDF streaming to disk with SHA-256");
         eprintln!("  ask <prompt>              Let an agent research and answer using browser tools");
-        eprintln!("  shell [-c <command>]      Agent browser terminal (41 commands)");
+        eprintln!("  assist <goal> [--url U]   In-session DevTools walkthrough -> unified command");
+        eprintln!("  shell [-c <command>]      Agent browser terminal (46 commands)");
         eprintln!("  server / serve [--port N] Run REST HTTP API & tool invoke endpoints");
         eprintln!("  mcp                       Run Model Context Protocol server over stdio");
         eprintln!("  product / status          Show official lane and engine status");
@@ -172,7 +174,8 @@ async fn main() {
             eprintln!("                            Web search with multi-engine waterfall fallback");
             eprintln!("  download <url>            Download file or PDF streaming to disk with SHA-256");
             eprintln!("  ask <prompt>              Let an agent research and answer using browser tools");
-            eprintln!("  shell [-c <command>]      Agent browser terminal (41 commands)");
+        eprintln!("  assist <goal> [--url U]   In-session DevTools walkthrough -> unified command");
+            eprintln!("  shell [-c <command>]      Agent browser terminal (46 commands)");
             eprintln!("  server / serve [--port N] Run REST HTTP API & tool invoke endpoints");
             eprintln!("  mcp                       Run Model Context Protocol server over stdio");
             eprintln!("  product / status          Show official lane and engine status");
@@ -254,6 +257,26 @@ async fn main() {
                     process::exit(1);
                 }
             }
+        }
+        "assist" => {
+            // In-session DevTools walkthrough. Optionally open a URL first.
+            let url = args.iter().position(|a| a == "--url")
+                .and_then(|idx| args.get(idx + 1).map(|s| s.as_str()));
+            let goal = args.get(2).map(|s| s.as_str())
+                .filter(|s| !s.starts_with("--"))
+                .unwrap_or("inspect this page and collect tokens");
+            let client = reqwest::Client::new();
+            let mut session = Session::new(client);
+            let store = dosh_browser_core::shell::ShellStore::new(None)
+                .expect("Failed to initialize shell store");
+            if let Some(u) = url {
+                if let Err(e) = session.goto(u, 8000).await {
+                    eprintln!("Error opening {}: {}", u, e);
+                    process::exit(1);
+                }
+            }
+            let result = dosh_browser_core::assist::plan_walkthrough(goal, &mut session, &store).await;
+            println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
         }
         "shell" => {
             let client = reqwest::Client::new();
