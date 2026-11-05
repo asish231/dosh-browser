@@ -92,30 +92,55 @@ if [ -n "$LATEST_TAG" ]; then
   echo "==> Fetching DOSH ${LATEST_TAG} release binary..."
   if curl -fsSL -I "$RELEASE_URL" >/dev/null 2>&1; then
     TEMP_DIR=$(mktemp -d)
-    curl -fsSL "$RELEASE_URL" | tar -xz -C "$TEMP_DIR"
-    if [ -f "${TEMP_DIR}/dosh" ]; then
-      mv "${TEMP_DIR}/dosh" "$TARGET_FILE"
-      chmod +x "$TARGET_FILE"
-      INSTALLED=true
+    ASSET="dosh-${TARGET}.tar.gz"
+    if curl -fsSL "$RELEASE_URL" -o "${TEMP_DIR}/${ASSET}"; then
+      if curl -fsSL "${RELEASE_URL}.sha256" -o "${TEMP_DIR}/${ASSET}.sha256" 2>/dev/null; then
+        if (cd "$TEMP_DIR" && { shasum -a 256 -c "${ASSET}.sha256" >/dev/null 2>&1 || sha256sum -c "${ASSET}.sha256" >/dev/null 2>&1; }); then
+          echo "==> SHA-256 checksum verified."
+        else
+          echo "Error: SHA-256 checksum verification FAILED for ${ASSET}. Refusing to install." >&2
+          rm -rf "$TEMP_DIR"
+          exit 1
+        fi
+      else
+        echo "==> Warning: no .sha256 asset published for ${LATEST_TAG}; skipping verification."
+      fi
+      tar -xzf "${TEMP_DIR}/${ASSET}" -C "$TEMP_DIR"
+      if [ -f "${TEMP_DIR}/dosh" ]; then
+        mv "${TEMP_DIR}/dosh" "$TARGET_FILE"
+        chmod +x "$TARGET_FILE"
+        INSTALLED=true
+      fi
     fi
     rm -rf "$TEMP_DIR"
   fi
 fi
 
-# Fallback: If precompiled tarball not on GitHub Releases yet, build or copy from local repo/cargo
+# Fallback: If no precompiled tarball exists for this target, build from source or copy locally
 if [ "$INSTALLED" = false ]; then
   if [ -f "./target/release/dosh" ]; then
     echo "==> Found locally compiled release binary. Installing to ${TARGET_FILE}..."
     cp "./target/release/dosh" "$TARGET_FILE"
     chmod +x "$TARGET_FILE"
     INSTALLED=true
-  elif command -v cargo >/dev/null 2>&1; then
-    echo "==> No precompiled binary found on GitHub Releases yet."
-    echo "==> Building standalone dosh binary from source via Cargo (this takes ~1-2 min)..."
-    cargo install --git "https://github.com/${REPO}.git" dosh-browser-core --bin dosh --root "${HOME}/.dosh"
-    INSTALLED=true
+  elif command -v cargo >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
+    echo "==> No precompiled binary available for ${TARGET}${LATEST_TAG:+ in ${LATEST_TAG}}."
+    echo "==> Building dosh from source (git clone + cargo build; can take a few minutes)..."
+    SRC_DIR="${HOME}/.dosh/src/dosh-browser"
+    if [ -d "${SRC_DIR}/.git" ]; then
+      git -C "$SRC_DIR" pull --ff-only 2>/dev/null || true
+    else
+      mkdir -p "$(dirname "$SRC_DIR")"
+      git clone --depth 1 "https://github.com/${REPO}.git" "$SRC_DIR"
+    fi
+    (cd "$SRC_DIR" && cargo build --release --bin dosh)
+    if [ -f "${SRC_DIR}/target/release/dosh" ]; then
+      cp "${SRC_DIR}/target/release/dosh" "$TARGET_FILE"
+      chmod +x "$TARGET_FILE"
+      INSTALLED=true
+    fi
   else
-    echo "Error: Could not download precompiled release for ${TARGET} and cargo is not available."
+    echo "Error: Could not download precompiled release for ${TARGET} and cargo+git are not both available."
     echo "Please visit https://github.com/${REPO}/releases to download manually."
     exit 1
   fi
@@ -148,12 +173,20 @@ fi
 if [ "$INSTALL_PYTHON" = true ]; then
   echo ""
   echo "==> Installing optional Python companion SDK (webresearch)..."
+  SDK_SPEC="webresearch @ git+https://github.com/${REPO}.git"
   if command -v uv >/dev/null 2>&1; then
-    uv pip install dosh-browser 2>/dev/null || uv pip install -e . 2>/dev/null || true
+    uv pip install "$SDK_SPEC" 2>/dev/null || uv pip install -e . 2>/dev/null || true
   elif command -v pip3 >/dev/null 2>&1; then
-    pip3 install dosh-browser 2>/dev/null || pip3 install -e . 2>/dev/null || true
+    pip3 install "$SDK_SPEC" 2>/dev/null || pip3 install -e . 2>/dev/null || true
   elif command -v pip >/dev/null 2>&1; then
-    pip install dosh-browser 2>/dev/null || pip install -e . 2>/dev/null || true
+    pip install "$SDK_SPEC" 2>/dev/null || pip install -e . 2>/dev/null || true
+  fi
+  if command -v python3 >/dev/null 2>&1 && python3 -c "import webresearch" >/dev/null 2>&1; then
+    echo "==> webresearch SDK import OK."
+  else
+    echo "==> Could not verify the webresearch import (pip may need a virtual environment)."
+    echo "    Install manually with:"
+    echo "      pip install \"$SDK_SPEC\""
   fi
 fi
 
