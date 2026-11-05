@@ -70,6 +70,12 @@ pub struct Target {
     pub challenge: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path: Vec<i64>,
+    /// CSS selector the engine can resolve to this element (mirrors
+    /// webresearch/actions.py `_css_path`). Empty only when no usable
+    /// selector could be built; the action lane must not treat a bare
+    /// content-hash ref as a selector.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub selector: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
