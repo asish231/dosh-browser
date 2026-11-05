@@ -56,6 +56,47 @@ class _Conn:
 
 _REGISTRY: dict[int, _Conn] = {}
 
+# Phase 1 (N2): session + frame evidence log, mirrored from the Rust lane's
+# ledger-shaped records so `net.ws` can present what the page exchanged.
+# Payload capture is capped; the real length is kept on the record.
+_FRAME_LOG: list[dict] = []
+_WS_STATE: dict[int, dict] = {}
+_FRAME_RECORD_MAX = 4096
+
+
+def _ws_record_frame(conn_id: int, direction: str, opcode: int, payload: bytes) -> None:
+    state = _WS_STATE.setdefault(conn_id, {"id": conn_id, "state": "open", "frame_count": 0})
+    state["frame_count"] = state.get("frame_count", 0) + 1
+    capped = payload[:_FRAME_RECORD_MAX]
+    if opcode == 1:
+        try:
+            text = capped.decode("utf-8")
+            b64 = ""
+        except UnicodeDecodeError:
+            text = ""
+            b64 = base64.b64encode(capped).decode("ascii")
+    else:
+        text = ""
+        b64 = base64.b64encode(capped).decode("ascii")
+    _FRAME_LOG.append(
+        {"session": conn_id, "t": time.time() * 1000.0, "direction": direction,
+         "opcode": opcode, "len": len(payload), "text": text, "payload_b64": b64}
+    )
+
+
+def ws_records() -> dict:
+    """Evidence view: open/closed sessions and every recorded frame."""
+    sessions = []
+    for conn_id, conn in sorted(_REGISTRY.items()):
+        state = _WS_STATE.get(conn_id, {})
+        sessions.append({
+            "id": conn_id, "url": conn.url,
+            "state": "closed" if conn.closed else "open",
+            "closed": bool(conn.closed), "close_code": conn.close_code or None,
+            "frame_count": state.get("frame_count", 0),
+        })
+    return {"sessions": sessions, "frames": [dict(f) for f in _FRAME_LOG]}
+
 
 def _fail(error: str) -> str:
     return json.dumps({"ok": False, "error": str(error)[:200], "code": 1006})
@@ -129,6 +170,9 @@ def connect(url: str, protocols: str = "") -> str:
         conn.buffer = rest
         raw.setblocking(False)
         _REGISTRY[conn.id] = conn
+        # N2 evidence: session open is recorded (url is sanitized form only).
+        _WS_STATE[conn.id] = {"id": conn.id, "t": time.time() * 1000.0,
+                              "url": url.split("?")[0], "state": "open", "frame_count": 0}
         return json.dumps({"ok": True, "id": conn.id, "protocol": protocol})
     except Exception as exc:
         return _fail(exc)
@@ -161,6 +205,7 @@ def send(conn_id: int, data: str) -> int:
         return 0
     try:
         _send_frame(conn, 0x1, str(data).encode("utf-8"))
+        _ws_record_frame(conn.id, "out", 1, str(data).encode("utf-8"))
         return 1
     except Exception:
         return 0
@@ -178,6 +223,7 @@ def send_binary(conn_id: int, data_b64: str) -> int:
         return 0
     try:
         _send_frame(conn, 0x2, payload)
+        _ws_record_frame(conn.id, "out", 2, payload)
         return 1
     except Exception:
         return 0
@@ -199,6 +245,9 @@ def close(conn_id: int, code: int = 1000) -> int:
         pass
     conn.closed = True
     conn.sock = None
+    state = _WS_STATE.get(conn.id)
+    if state is not None:
+        state["state"], state["closed"], state["close_code"] = "closed", True, int(code)
     return 1
 
 
@@ -245,6 +294,10 @@ def _parse_frames(conn: _Conn) -> None:
                 _send_frame(conn, 0x8, payload[:2])
             conn.close_code = code
             conn.close_reason = unquote(payload[2:].decode("utf-8", "replace")[:120])
+            _ws_record_frame(conn.id, "in", 8, struct.pack("!H", code))
+            state = _WS_STATE.get(conn.id)
+            if state is not None:
+                state["state"], state["closed"], state["close_code"] = "closed", True, code
             with contextlib.suppress(Exception):
                 if conn.sock is not None:
                     conn.sock.close()
@@ -256,13 +309,15 @@ def _parse_frames(conn: _Conn) -> None:
             # server-initiated close NEVER reached JS — onclose never fired,
             # readyState stayed OPEN, and later sends silently vanished.
             return
-        if opcode == 0x9:  # ping -> pong
+        if opcode == 0x9:  # ping -> pong (ping recorded as inbound control)
+            _ws_record_frame(conn.id, "in", 9, payload)
             with contextlib.suppress(Exception):
                 _send_frame(conn, 0xA, payload)
             continue
         if opcode == 0xA:  # pong
             continue
-        if opcode == 0x2:  # binary: counted, not delivered (disclosed gap)
+        if opcode == 0x2:  # binary: recorded, not delivered (disclosed gap)
+            _ws_record_frame(conn.id, "in", 2, payload)
             conn.binary_skipped += 1
             # A fragmented binary message's continuation frames belong to the
             # binary lane: track the state so opcode-0 frames that follow are
@@ -291,6 +346,7 @@ def _parse_frames(conn: _Conn) -> None:
                 conn.frag_buffer += payload
             if fin:
                 conn.inbox.append(conn.frag_buffer.decode("utf-8", "replace"))
+                _ws_record_frame(conn.id, "in", 1, conn.frag_buffer[:_FRAME_RECORD_MAX])
                 conn.frag_buffer = b""
                 conn.frag_opcode = 0
 
