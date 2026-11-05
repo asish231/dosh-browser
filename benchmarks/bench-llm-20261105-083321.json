@@ -1,0 +1,87 @@
+{
+  "pricing_version": "2026-11-05",
+  "pricing_sources": {
+    "deepseek-v4.1-flash": "https://api-docs.deepseek.com/quick_start/pricing/ off-peak tier; peak is 2x (01:00-04:00 & 06:00-10:00 UTC Mon-Fri).",
+    "glm-4.7-flash": "https://docs.z.ai/guides/overview/pricing (free tier)",
+    "mercury-2": "https://docs.inceptionlabs.ai/get-started/models verified 2026-10-31.",
+    "asi1": "https://docs.asi1.ai/documentation/models (reasoning billed at output rate)",
+    "asi1-mini": "https://docs.asi1.ai/documentation/models",
+    "asi1-ultra": "https://docs.asi1.ai/documentation/models"
+  },
+  "run_at": "2026-11-05T08:33:32+0530",
+  "base_url": "http://127.0.0.1:3001/v1",
+  "summary": {
+    "deepseek-v4.1-flash": {
+      "runs": 3,
+      "success_rate": 0.667,
+      "tokens_total": 464,
+      "tokens_p50": 137,
+      "tokens_p95": 137,
+      "cached_tokens_total": 0,
+      "reasoning_tokens_total": 45,
+      "cost_usd_total": 0.000216,
+      "cost_usd_per_success": 0.000108,
+      "wall_s_p50": 3.628,
+      "wall_s_p95": 3.628,
+      "rss_delta_mb_max": 7.406,
+      "pricing_key": "deepseek-v4.1-flash"
+    }
+  },
+  "sessions_probe": null,
+  "runs": [
+    {
+      "model": "deepseek-v4.1-flash",
+      "prompt": "What is the capital of Australia? Answer in one word.",
+      "answer": "Canberra",
+      "usage": {
+        "prompt_tokens": 16,
+        "completion_tokens": 2,
+        "total_tokens": 18,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "cost_usd": 3.6e-06,
+      "wall_s": 3.628,
+      "rss_delta_mb": 7.406,
+      "task": "raw:simple",
+      "repeat": 0,
+      "success": true
+    },
+    {
+      "model": "deepseek-v4.1-flash",
+      "prompt": "A train travels 120 km in 1.5 hours, then 180 km in 2 hours. What is its average speed in km/h for the whole trip? Show your math.",
+      "answer": "Let\u2019s go step-by-step.\n\n---\n\n**Step 1: Find total distance traveled**\n\nFirst part: \\( 120 \\, \\text{km} \\)  \nSecond part: \\( 180 \\, \\text{km} \\)\n\nTotal distance:  \n\\[\n120 + 180 = 300 \\, \\text{km}\n\\]\n\n---\n\n**Step 2: Find total time taken**\n\nFirst part: \\( 1.5 \\, \\text{hours} \\)  \nSecond part: \\( 2 \\, \\text{hours} \\)\n\nTotal time:  \n\\[\n1.5 + 2 = 3.5 \\, \\text{hours}\n\\]\n\n---\n\n**Step 3: Calculate average",
+      "usage": {
+        "prompt_tokens": 43,
+        "completion_tokens": 266,
+        "total_tokens": 309,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "cost_usd": 0.00016604999999999997,
+      "wall_s": 3.824,
+      "rss_delta_mb": 0.0,
+      "task": "raw:reasoning",
+      "repeat": 0,
+      "success": false
+    },
+    {
+      "model": "deepseek-v4.1-flash",
+      "prompt": "Read this passage and answer in one sentence: The Amazon rainforest covers much of South America and is home to roughly 10% of known species. Deforestation threatens its carbon storage. Question: what",
+      "answer": "Deforestation threatens the Amazon rainforest\u2019s carbon storage.",
+      "usage": {
+        "prompt_tokens": 79,
+        "completion_tokens": 58,
+        "total_tokens": 137,
+        "cached_tokens": 0,
+        "reasoning_tokens": 45
+      },
+      "cost_usd": 4.6649999999999996e-05,
+      "wall_s": 2.923,
+      "rss_delta_mb": 0.0,
+      "task": "raw:context",
+      "repeat": 0,
+      "success": true
+    }
+  ]
+}

@@ -1,0 +1,392 @@
+{
+  "pricing_version": "2026-11-05",
+  "pricing_sources": {
+    "deepseek-v4.1-flash": "https://api-docs.deepseek.com/quick_start/pricing/ off-peak tier; peak is 2x (01:00-04:00 & 06:00-10:00 UTC Mon-Fri).",
+    "glm-4.7-flash": "https://docs.z.ai/guides/overview/pricing (free tier)",
+    "mercury-2": "https://docs.inceptionlabs.ai/get-started/models verified 2026-10-31.",
+    "asi1": "https://docs.asi1.ai/documentation/models (reasoning billed at output rate)",
+    "asi1-mini": "https://docs.asi1.ai/documentation/models",
+    "asi1-ultra": "https://docs.asi1.ai/documentation/models"
+  },
+  "run_at": "2026-11-05T08:52:55+0530",
+  "base_url": "http://127.0.0.1:3001/v1",
+  "summary": {
+    "deepseek-v4.1-flash": {
+      "runs": 6,
+      "success_rate": 0.667,
+      "tokens_total": 693,
+      "tokens_p50": 95.0,
+      "tokens_p95": 224,
+      "cached_tokens_total": 0,
+      "reasoning_tokens_total": 40,
+      "cost_usd_total": 0.000306,
+      "cost_usd_per_success": 7.7e-05,
+      "wall_s_p50": 3.38,
+      "wall_s_p95": 3.766,
+      "rss_delta_mb_max": 7.344,
+      "pricing_key": "deepseek-v4.1-flash"
+    },
+    "mercury-2": {
+      "runs": 6,
+      "success_rate": 1.0,
+      "tokens_total": 808,
+      "tokens_p50": 163.5,
+      "tokens_p95": 167,
+      "cached_tokens_total": 0,
+      "reasoning_tokens_total": 221,
+      "cost_usd_total": 0.000431,
+      "cost_usd_per_success": 7.2e-05,
+      "wall_s_p50": 1.937,
+      "wall_s_p95": 2.318,
+      "rss_delta_mb_max": 0.0,
+      "pricing_key": "mercury-2"
+    },
+    "asi1-ultra": {
+      "runs": 6,
+      "success_rate": 1.0,
+      "tokens_total": 1350,
+      "tokens_p50": 200.5,
+      "tokens_p95": 359,
+      "cached_tokens_total": 0,
+      "reasoning_tokens_total": 358,
+      "cost_usd_total": 0.003812,
+      "cost_usd_per_success": 0.000635,
+      "wall_s_p50": 4.641,
+      "wall_s_p95": 5.086,
+      "rss_delta_mb_max": 0.0,
+      "pricing_key": "asi1-ultra"
+    }
+  },
+  "sessions_probe": {
+    "model": "deepseek-v4.1-flash",
+    "sessions": 4,
+    "succeeded": 0,
+    "wall_s": 0.003
+  },
+  "runs": [
+    {
+      "model": "deepseek-v4.1-flash",
+      "prompt": "What is the capital of Australia? Answer in one word.",
+      "answer": "Canberra",
+      "usage": {
+        "prompt_tokens": 16,
+        "completion_tokens": 2,
+        "total_tokens": 18,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "cost_usd": 3.6e-06,
+      "wall_s": 4.012,
+      "rss_delta_mb": 7.344,
+      "task": "raw:simple",
+      "repeat": 0,
+      "success": true
+    },
+    {
+      "model": "deepseek-v4.1-flash",
+      "prompt": "What is the capital of Australia? Answer in one word.",
+      "answer": "Canberra",
+      "usage": {
+        "prompt_tokens": 16,
+        "completion_tokens": 2,
+        "total_tokens": 18,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "cost_usd": 3.6e-06,
+      "wall_s": 2.76,
+      "rss_delta_mb": 0.0,
+      "task": "raw:simple",
+      "repeat": 1,
+      "success": true
+    },
+    {
+      "model": "deepseek-v4.1-flash",
+      "prompt": "A train travels 120 km in 1.5 hours, then 180 km in 2 hours. What is its average speed in km/h for the whole trip? Show your math.",
+      "answer": "Let\u2019s go step-by-step.\n\n**Step 1: Total distance**  \nFirst part: 120 km  \nSecond part: 180 km  \n\\[\n\\text{Total distance} = 120 + 180 = 300 \\text{ km}\n\\]\n\n**Step 2: Total time**  \nFirst part: 1.5 hours  \nSecond part: 2 hours  \n\\[\n\\text{Total time} = 1.5 + 2 = 3.5 \\text{ hours}\n\\]\n\n**Step 3: Average speed**  \nAverage speed is total distance divided by total time:\n\\[\n\\text{Average speed} = \\frac{300}",
+      "usage": {
+        "prompt_tokens": 43,
+        "completion_tokens": 200,
+        "total_tokens": 243,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "cost_usd": 0.00012645,
+      "wall_s": 3.766,
+      "rss_delta_mb": 0.0,
+      "task": "raw:reasoning",
+      "repeat": 0,
+      "success": false
+    },
+    {
+      "model": "deepseek-v4.1-flash",
+      "prompt": "A train travels 120 km in 1.5 hours, then 180 km in 2 hours. What is its average speed in km/h for the whole trip? Show your math.",
+      "answer": "Let's go step-by-step.\n\n**Step 1: Find total distance**  \nFirst part: 120 km  \nSecond part: 180 km  \nTotal distance = 120 + 180 = **300 km**\n\n**Step 2: Find total time**  \nFirst part: 1.5 hours  \nSecond part: 2 hours  \nTotal time = 1.5 + 2 = **3.5 hours**\n\n**Step 3: Calculate average speed**  \nAverage speed = Total distance \u00f7 Total time  \n= 300 \u00f7 3.5  \n= \\( \\frac{300}{3.5} \\)  \n= \\( \\frac{3000}{35",
+      "usage": {
+        "prompt_tokens": 43,
+        "completion_tokens": 181,
+        "total_tokens": 224,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "cost_usd": 0.00011504999999999999,
+      "wall_s": 3.245,
+      "rss_delta_mb": 0.0,
+      "task": "raw:reasoning",
+      "repeat": 1,
+      "success": false
+    },
+    {
+      "model": "deepseek-v4.1-flash",
+      "prompt": "Read this passage and answer in one sentence: The Amazon rainforest covers much of South America and is home to roughly 10% of known species. Deforestation threatens its carbon storage. Question: what",
+      "answer": "Deforestation threatens the Amazon rainforest's carbon storage.",
+      "usage": {
+        "prompt_tokens": 47,
+        "completion_tokens": 11,
+        "total_tokens": 58,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "cost_usd": 1.3649999999999998e-05,
+      "wall_s": 3.372,
+      "rss_delta_mb": 0.0,
+      "task": "raw:context",
+      "repeat": 0,
+      "success": true
+    },
+    {
+      "model": "deepseek-v4.1-flash",
+      "prompt": "Read this passage and answer in one sentence: The Amazon rainforest covers much of South America and is home to roughly 10% of known species. Deforestation threatens its carbon storage. Question: what",
+      "answer": "Deforestation threatens the Amazon rainforest\u2019s carbon storage.",
+      "usage": {
+        "prompt_tokens": 79,
+        "completion_tokens": 53,
+        "total_tokens": 132,
+        "cached_tokens": 0,
+        "reasoning_tokens": 40
+      },
+      "cost_usd": 4.365e-05,
+      "wall_s": 3.388,
+      "rss_delta_mb": 0.0,
+      "task": "raw:context",
+      "repeat": 1,
+      "success": true
+    },
+    {
+      "model": "mercury-2",
+      "prompt": "What is the capital of Australia? Answer in one word.",
+      "answer": "Canberra",
+      "usage": {
+        "prompt_tokens": 11,
+        "completion_tokens": 20,
+        "total_tokens": 31,
+        "cached_tokens": 0,
+        "reasoning_tokens": 16
+      },
+      "cost_usd": 1.775e-05,
+      "wall_s": 2.836,
+      "rss_delta_mb": 0.0,
+      "task": "raw:simple",
+      "repeat": 0,
+      "success": true
+    },
+    {
+      "model": "mercury-2",
+      "prompt": "What is the capital of Australia? Answer in one word.",
+      "answer": "Canberra",
+      "usage": {
+        "prompt_tokens": 11,
+        "completion_tokens": 25,
+        "total_tokens": 36,
+        "cached_tokens": 0,
+        "reasoning_tokens": 15
+      },
+      "cost_usd": 2.15e-05,
+      "wall_s": 1.754,
+      "rss_delta_mb": 0.0,
+      "task": "raw:simple",
+      "repeat": 1,
+      "success": true
+    },
+    {
+      "model": "mercury-2",
+      "prompt": "A train travels 120 km in 1.5 hours, then 180 km in 2 hours. What is its average speed in km/h for the whole trip? Show your math.",
+      "answer": "Total distance = 120 km + 180 km = 300 km  \nTotal time = 1.5 hours + 2 hours = 3.5 hours  \n\nAverage speed = Total distance \u00f7 Total time  \n= 300 km \u00f7 3.5 hours  \n= 85.71 km/h (rounded to 2 decimal places)\n\n**Average speed = 85.71 km/h**",
+      "usage": {
+        "prompt_tokens": 38,
+        "completion_tokens": 122,
+        "total_tokens": 160,
+        "cached_tokens": 0,
+        "reasoning_tokens": 40
+      },
+      "cost_usd": 0.000101,
+      "wall_s": 1.536,
+      "rss_delta_mb": 0.0,
+      "task": "raw:reasoning",
+      "repeat": 0,
+      "success": true
+    },
+    {
+      "model": "mercury-2",
+      "prompt": "A train travels 120 km in 1.5 hours, then 180 km in 2 hours. What is its average speed in km/h for the whole trip? Show your math.",
+      "answer": "Average speed is total distance divided by total time.\n\n**Total distance**  \n120 km + 180 km = 300 km\n\n**Total time**  \n1.5 hours + 2 hours = 3.5 hours\n\n**Average speed**  \n\\[\n\\frac{300 \\text{ km}}{3.5 \\text{ h}} = \\frac{300}{3.5} = \\frac{600}{7} \\approx 85.71 \\text{ km/h}\n\\]\n\nSo the average speed for the whole trip is **\u2248 85.71 km/h**.",
+      "usage": {
+        "prompt_tokens": 37,
+        "completion_tokens": 210,
+        "total_tokens": 247,
+        "cached_tokens": 0,
+        "reasoning_tokens": 94
+      },
+      "cost_usd": 0.00016675,
+      "wall_s": 1.702,
+      "rss_delta_mb": 0.0,
+      "task": "raw:reasoning",
+      "repeat": 1,
+      "success": true
+    },
+    {
+      "model": "mercury-2",
+      "prompt": "Read this passage and answer in one sentence: The Amazon rainforest covers much of South America and is home to roughly 10% of known species. Deforestation threatens its carbon storage. Question: what",
+      "answer": "Deforestation threatens the Amazon rainforest\u2019s carbon storage.",
+      "usage": {
+        "prompt_tokens": 126,
+        "completion_tokens": 41,
+        "total_tokens": 167,
+        "cached_tokens": 0,
+        "reasoning_tokens": 28
+      },
+      "cost_usd": 6.225e-05,
+      "wall_s": 2.318,
+      "rss_delta_mb": 0.0,
+      "task": "raw:context",
+      "repeat": 0,
+      "success": true
+    },
+    {
+      "model": "mercury-2",
+      "prompt": "Read this passage and answer in one sentence: The Amazon rainforest covers much of South America and is home to roughly 10% of known species. Deforestation threatens its carbon storage. Question: what",
+      "answer": "Deforestation threatens the Amazon rainforest\u2019s carbon storage.",
+      "usage": {
+        "prompt_tokens": 126,
+        "completion_tokens": 41,
+        "total_tokens": 167,
+        "cached_tokens": 0,
+        "reasoning_tokens": 28
+      },
+      "cost_usd": 6.225e-05,
+      "wall_s": 2.119,
+      "rss_delta_mb": 0.0,
+      "task": "raw:context",
+      "repeat": 1,
+      "success": true
+    },
+    {
+      "model": "asi1-ultra",
+      "prompt": "What is the capital of Australia? Answer in one word.",
+      "answer": "Canberra",
+      "usage": {
+        "prompt_tokens": 73,
+        "completion_tokens": 31,
+        "total_tokens": 104,
+        "cached_tokens": 0,
+        "reasoning_tokens": 26
+      },
+      "cost_usd": 0.00021474000000000002,
+      "wall_s": 4.617,
+      "rss_delta_mb": 0.0,
+      "task": "raw:simple",
+      "repeat": 0,
+      "success": true
+    },
+    {
+      "model": "asi1-ultra",
+      "prompt": "What is the capital of Australia? Answer in one word.",
+      "answer": "Canberra",
+      "usage": {
+        "prompt_tokens": 73,
+        "completion_tokens": 36,
+        "total_tokens": 109,
+        "cached_tokens": 0,
+        "reasoning_tokens": 32
+      },
+      "cost_usd": 0.00023454000000000001,
+      "wall_s": 3.602,
+      "rss_delta_mb": 0.0,
+      "task": "raw:simple",
+      "repeat": 1,
+      "success": true
+    },
+    {
+      "model": "asi1-ultra",
+      "prompt": "A train travels 120 km in 1.5 hours, then 180 km in 2 hours. What is its average speed in km/h for the whole trip? Show your math.",
+      "answer": "Total distance:\n\n\\[\n120 \\text{ km} + 180 \\text{ km} = 300 \\text{ km}\n\\]\n\nTotal time:\n\n\\[\n1.5 \\text{ h} + 2 \\text{ h} = 3.5 \\text{ h}\n\\]\n\nAverage speed:\n\n\\[\n\\text{Average speed} = \\frac{\\text{Total distance}}{\\text{Total time}}\n= \\frac{300}{3.5}\n\\]\n\n\\[\n\\frac{300}{3.5} = \\frac{600}{7} \\approx 85.71\n\\]\n\nSo the train\u2019s average speed for the whole trip is:\n\n\\[\n\\boxed{85.7 \\text{ km/h}}\n\\]",
+      "usage": {
+        "prompt_tokens": 104,
+        "completion_tokens": 255,
+        "total_tokens": 359,
+        "cached_tokens": 0,
+        "reasoning_tokens": 68
+      },
+      "cost_usd": 0.00114084,
+      "wall_s": 5.086,
+      "rss_delta_mb": 0.0,
+      "task": "raw:reasoning",
+      "repeat": 0,
+      "success": true
+    },
+    {
+      "model": "asi1-ultra",
+      "prompt": "A train travels 120 km in 1.5 hours, then 180 km in 2 hours. What is its average speed in km/h for the whole trip? Show your math.",
+      "answer": "Total distance:\n\n\\[\n120 \\text{ km} + 180 \\text{ km} = 300 \\text{ km}\n\\]\n\nTotal time:\n\n\\[\n1.5 \\text{ h} + 2 \\text{ h} = 3.5 \\text{ h}\n\\]\n\nAverage speed:\n\n\\[\n\\text{Average speed} = \\frac{\\text{total distance}}{\\text{total time}}\n\\]\n\n\\[\n\\text{Average speed} = \\frac{300}{3.5}\n\\]\n\n\\[\n\\text{Average speed} = \\frac{600}{7} \\approx 85.71 \\text{ km/h}\n\\]\n\nSo the train\u2019s average speed for the whole trip is:\n",
+      "usage": {
+        "prompt_tokens": 104,
+        "completion_tokens": 273,
+        "total_tokens": 377,
+        "cached_tokens": 0,
+        "reasoning_tokens": 73
+      },
+      "cost_usd": 0.00121212,
+      "wall_s": 7.105,
+      "rss_delta_mb": 0.0,
+      "task": "raw:reasoning",
+      "repeat": 1,
+      "success": true
+    },
+    {
+      "model": "asi1-ultra",
+      "prompt": "Read this passage and answer in one sentence: The Amazon rainforest covers much of South America and is home to roughly 10% of known species. Deforestation threatens its carbon storage. Question: what",
+      "answer": "Deforestation threatens the Amazon rainforest\u2019s carbon storage.",
+      "usage": {
+        "prompt_tokens": 107,
+        "completion_tokens": 91,
+        "total_tokens": 198,
+        "cached_tokens": 0,
+        "reasoning_tokens": 77
+      },
+      "cost_usd": 0.00049518,
+      "wall_s": 4.665,
+      "rss_delta_mb": 0.0,
+      "task": "raw:context",
+      "repeat": 0,
+      "success": true
+    },
+    {
+      "model": "asi1-ultra",
+      "prompt": "Read this passage and answer in one sentence: The Amazon rainforest covers much of South America and is home to roughly 10% of known species. Deforestation threatens its carbon storage. Question: what",
+      "answer": "Deforestation threatens the Amazon rainforest's carbon storage.",
+      "usage": {
+        "prompt_tokens": 107,
+        "completion_tokens": 96,
+        "total_tokens": 203,
+        "cached_tokens": 0,
+        "reasoning_tokens": 82
+      },
+      "cost_usd": 0.0005149800000000001,
+      "wall_s": 3.8,
+      "rss_delta_mb": 0.0,
+      "task": "raw:context",
+      "repeat": 1,
+      "success": true
+    }
+  ]
+}

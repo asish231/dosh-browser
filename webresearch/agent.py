@@ -76,13 +76,39 @@ class Usage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    reasoning_tokens: int = 0
+    cached_tokens: int = 0
+
+    @staticmethod
+    def _int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
 
     def add(self, raw: dict[str, Any] | None) -> None:
         if not isinstance(raw, dict):
             return
-        self.prompt_tokens += int(raw.get("prompt_tokens") or 0)
-        self.completion_tokens += int(raw.get("completion_tokens") or 0)
-        self.total_tokens += int(raw.get("total_tokens") or 0)
+        prompt = self._int(raw.get("prompt_tokens"))
+        completion = self._int(raw.get("completion_tokens"))
+        total = self._int(raw.get("total_tokens")) or (prompt + completion)
+        reasoning = 0
+        details = raw.get("completion_tokens_details")
+        if isinstance(details, dict):
+            reasoning = self._int(details.get("reasoning_tokens"))
+        if not reasoning:
+            reasoning = self._int(raw.get("reasoning_tokens"))
+        cached = 0
+        pdetails = raw.get("prompt_tokens_details")
+        if isinstance(pdetails, dict):
+            cached = self._int(pdetails.get("cached_tokens"))
+        if not cached:
+            cached = self._int(raw.get("cached_tokens"))
+        self.prompt_tokens += prompt
+        self.completion_tokens += completion
+        self.total_tokens += total
+        self.reasoning_tokens += reasoning
+        self.cached_tokens += cached
 
 
 class AgentResult(BaseModel):

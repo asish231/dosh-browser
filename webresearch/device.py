@@ -15,13 +15,43 @@ credential -- see ``attestation-lab/ANALYSIS.md`` §5 for why the two differ.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import re
 import subprocess
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 UNKNOWN = "unknown"
+
+# Cache location, overridable for tests. The device profile is host facts
+# that cost ~1.6s of system_profiler subprocesses to gather and essentially
+# never change between runs, so we persist it and re-probe only when a cheap
+# identity check says the machine materially changed.
+_DEFAULT_CACHE_DIR = Path.home() / ".dosh"
+
+
+def _cache_path() -> Path:
+    override = os.environ.get("WR_DEVICE_CACHE")
+    if override:
+        return Path(override)
+    return _DEFAULT_CACHE_DIR / "device-cache.json"
+
+
+def _cheap_identity() -> tuple:
+    """Fast facts that change only when the machine materially changes.
+
+    Built from syscalls and one ~ms sysctl -- never from system_profiler.
+    If these match, the expensive device profile is safe to reuse.
+    """
+    return (
+        platform.system(),
+        platform.machine(),
+        platform.release(),
+        os.cpu_count(),
+        _sysctl("machdep.cpu.brand_string") if platform.system() == "Darwin" else (platform.processor() or UNKNOWN),
+    )
 
 
 def _sysctl(name: str) -> str:
@@ -277,11 +307,75 @@ def probe() -> DeviceProfile:
 
 _CACHED: DeviceProfile | None = None
 
+_CACHE_VERSION = 1
+
+
+def _profile_from_dict(data: dict) -> DeviceProfile | None:
+    """Rebuild a DeviceProfile from a cached dict; None when malformed."""
+    try:
+        profile = DeviceProfile(**{k: v for k, v in data.items() if k in DeviceProfile.__dataclass_fields__})
+        if profile.cpu_count is not None and not isinstance(profile.cpu_count, int):
+            return None
+        return profile
+    except (TypeError, KeyError):
+        return None
+
+
+def _load_disk_cache() -> DeviceProfile | None:
+    """Reuse the cached profile only when the machine still matches exactly."""
+    try:
+        path = _cache_path()
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if raw.get("version") != _CACHE_VERSION:
+            return None
+        if tuple(raw.get("identity")) != tuple(_cheap_identity()):
+            return None
+        profile = _profile_from_dict(raw.get("profile") or {})
+        if profile is None:
+            return None
+        # Some fields are derived; keep them honest rather than trusting the
+        # blob blindly. host_profile_id is recomputed over real facts.
+        profile.host_profile_id = hashlib.sha256(
+            "|".join(
+                [
+                    profile.platform,
+                    profile.machine_model,
+                    profile.cpu_brand,
+                    str(profile.cpu_count or ""),
+                    profile.gpu,
+                    profile.secure_hardware,
+                    str(profile.is_virtual),
+                ]
+            ).encode()
+        ).hexdigest()[:32]
+        return profile
+    except Exception:
+        return None
+
+
+def _save_disk_cache(profile: DeviceProfile) -> None:
+    try:
+        path = _cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": _CACHE_VERSION,
+            "identity": list(_cheap_identity()),
+            "profile": asdict(profile),
+        }
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, path)  # atomic: a crash never leaves a half-written cache
+    except Exception:
+        pass  # caching is an optimization; a failure must never break the probe
+
 
 def current() -> DeviceProfile:
     global _CACHED
     if _CACHED is None:
-        _CACHED = probe()
+        _CACHED = _load_disk_cache()
+        if _CACHED is None:
+            _CACHED = probe()
+            _save_disk_cache(_CACHED)
     return _CACHED
 
 

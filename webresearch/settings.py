@@ -93,6 +93,86 @@ ALIASES: dict[str, str] = {
 
 DEFAULT_MODEL = "glm-4.7-flash"
 
+# ---------------------------------------------------------------------------
+# Provider list pricing (USD per 1M tokens). Sourced from each provider's own
+# pricing docs, verified 2026-11-05. Unknown pool models price at None —
+# the benchmark reports tokens for them but never invents a cost.
+# ---------------------------------------------------------------------------
+PRICING_VERSION = "2026-11-05"
+PRICING_SOURCES = {
+    "deepseek-v4.1-flash": (
+        "https://api-docs.deepseek.com/quick_start/pricing/ off-peak tier; "
+        "peak is 2x (01:00-04:00 & 06:00-10:00 UTC Mon-Fri)."
+    ),
+    "glm-4.7-flash": "https://docs.z.ai/guides/overview/pricing (free tier)",
+    "mercury-2": (
+        "https://docs.inceptionlabs.ai/get-started/models verified 2026-10-31."
+    ),
+    "asi1": "https://docs.asi1.ai/documentation/models (reasoning billed at output rate)",
+    "asi1-mini": "https://docs.asi1.ai/documentation/models",
+    "asi1-ultra": "https://docs.asi1.ai/documentation/models",
+}
+PRICES: dict[str, dict[str, float]] = {
+    "deepseek-v4.1-flash": {
+        "input": 0.15, "cached": 0.003, "output": 0.60,
+    },
+    "glm-4.7-flash": {"input": 0.0, "cached": 0.0, "output": 0.0},
+    "mercury-2": {"input": 0.25, "cached": 0.025, "output": 0.75},
+    "asi1": {"input": 0.50, "cached": 0.05, "output": 1.90},
+    "asi1-mini": {"input": 0.18, "cached": 0.018, "output": 0.45},
+    "asi1-ultra": {"input": 1.26, "cached": 0.126, "output": 3.96},
+}
+
+# Pool namespaced / versioned variants -> canonical pricing key.
+PRICE_ALIASES = {
+    "deepseek-flash": "deepseek-v4.1-flash",
+    "deepseek-v4.1-flash-1017": "deepseek-v4.1-flash",
+    "deepseek-v4-flash": "deepseek-v4.1-flash",
+    "asi-one/asi1": "asi1",
+    "asi-one/asi1-mini": "asi1-mini",
+    "asi-one/asi1-ultra": "asi1-ultra",
+    "inception/mercury-2": "mercury-2",
+    "zai-org/glm-4.7-flash": "glm-4.7-flash",
+}
+
+
+def price_key(model: str | None) -> str | None:
+    """Canonical pricing key for a wire model id, or None if unknown."""
+    if not model:
+        return None
+    key = model.strip().lower()
+    if key in PRICES:
+        return key
+    if key in PRICE_ALIASES:
+        return PRICE_ALIASES[key]
+    for prefix, canonical in PRICE_ALIASES.items():
+        if key.startswith(prefix + "/") or key.endswith("/" + prefix):
+            return canonical
+    return None
+
+
+def token_cost(
+    model: str | None,
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cached_tokens: int = 0,
+) -> float | None:
+    """Cost in USD, or None when no verified list price exists.
+
+    Cached input tokens are billed at the cached rate and excluded from the
+    uncached prompt count (providers bill them separately).
+    """
+    key = price_key(model)
+    if key is None:
+        return None
+    rates = PRICES[key]
+    uncached = max(prompt_tokens - cached_tokens, 0)
+    return (
+        uncached * rates["input"] + cached_tokens * rates["cached"]
+        + completion_tokens * rates["output"]
+    ) / 1_000_000
+
 
 def load_dotenv(path: Path | None = None) -> Path | None:
     candidates = []
