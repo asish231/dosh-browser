@@ -5,10 +5,13 @@ from __future__ import annotations
 import base64
 import json
 import re
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import httpx
+
+from webresearch.telemetry import _sanitize_initiator_stack
 from quickjs import Context
 from webresearch.config import js_engine
 
@@ -620,7 +623,7 @@ async def run_scripts(
             return False
         return True
 
-    def host_fetch(req_url: str, method: str, body: str, headers_json: str = "{}", body_b64: str = "") -> str:
+    def host_fetch(req_url: str, method: str, body: str, headers_json: str = "{}", body_b64: str = "", initiator_stack: str = "") -> str:
         try:
             abs_url = urljoin(url, req_url)
             parsed = urlparse(abs_url)
@@ -653,6 +656,8 @@ async def run_scripts(
                         headers.update(custom_hdrs)
                 except Exception:
                     pass
+            # N4 (Phase 1): transport timing starts at real dispatch.
+            _fetch_t0 = time.time() * 1000.0
             # Selective network rules (block / header / mock) configured by DOSH shell.
             net_rules = getattr(client, "_dosh_network_rules", None) or []
             req_method = (method or "GET").upper()
@@ -761,6 +766,17 @@ async def run_scripts(
                                        "content_type": entry.resp_headers.get("content-type", ""),
                                        "body": text[:800_000]})
             status, final, ctype, text, resp_headers, raw_bytes = do_request(method, abs_url, body, headers, body_b64)
+            # N4 (Phase 1): measured transport timing wall-clock diary only
+            # spans dispatch→response here; DNS/connect/TLS stay unmeasured
+            # (absent, never invented), matching the Rust lane's disclosure.
+            _t_end = time.time() * 1000.0
+            _timing = {
+                "started_at_ms": _fetch_t0,
+                "ttfb_ms": _t_end - _fetch_t0,
+                "duration_ms": _t_end - _fetch_t0,
+            }
+            # N9 (Phase 1): sanitized JS call-site hint from the page wrapper.
+            _sanitized_stack = _sanitize_initiator_stack(initiator_stack)
             if (method or "GET").upper() == "GET" and status == 200 and raw_bytes:
                 try:
                     _SW_CACHE.store("GET", final or abs_url, {}, status,
@@ -801,6 +817,16 @@ async def run_scripts(
                     "initiatorType": "fetch",
                     "disposition": f"sw:{sw_tag}" if sw_tag else "network",
                     **({"sw": sw_tag} if sw_tag else {}),
+                    # N9: where in page code this fetch originated.
+                    **({"initiator_stack": _sanitized_stack} if _sanitized_stack else {}),
+                    # N4: measured transport timing for the waterfall.
+                    "timing": _timing,
+                    # N5 evidence: sealed raw transport bytes (ledger-only).
+                    "sealed": {
+                        "request_body_b64": base64.b64encode(body.encode("utf-8")[:262144]).decode("ascii") if body else "",
+                        "response_body_b64": base64.b64encode(raw_bytes[:262144]).decode("ascii") if raw_bytes else "",
+                        "len": len(raw_bytes or b""),
+                    },
                 }
             )
             # Enforce CORS for cross-origin reads (like a real browser).
