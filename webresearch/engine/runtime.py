@@ -1389,10 +1389,11 @@ async def run_scripts(
                 elif kind == "activate":
                     target = selector or path
                     nth = int((action or {}).get("occurrence", 1) or 1)
+                    gate = bool((action or {}).get("occlusion_gate", False))
                     ok = ctx.eval(
-                        f"__activateSelector({_json.dumps(target)}, null, false, {str(stealth).lower()}, {nth})"
+                        f"__activateSelector({_json.dumps(target)}, null, false, {str(stealth).lower()}, {nth}, {str(gate).lower()})"
                         if isinstance(target, str)
-                        else f"__clickPath({_json.dumps(target)}, {str(stealth).lower()})"
+                        else f"__clickPath({_json.dumps(target)}, {str(stealth).lower()}, {str(gate).lower()})"
                     )
                 elif kind == "click_frame":
                     # The fetched frame is its own realm. Clicking the parent
@@ -1468,6 +1469,19 @@ async def run_scripts(
                     ok = ctx.eval(
                         f"__pressKey({_json.dumps(target)}, {_json.dumps(key_name)}, {str(stealth).lower()})"
                     )
+                elif kind == "text_select":
+                    # E2: drag-select text in a field or editable region
+                    target = selector or path
+                    start = (action or {}).get("start", 0)
+                    end = (action or {}).get("end")
+                    if end is not None:
+                        ok = ctx.eval(
+                            f"__selectText({_json.dumps(target)}, {start}, {end})"
+                        )
+                    else:
+                        ok = ctx.eval(
+                            f"__selectText({_json.dumps(target)}, {start})"
+                        )
                 elif kind == "scroll":
                     x = (action or {}).get("x", 0)
                     y = (action or {}).get("y", 800)
@@ -1491,6 +1505,14 @@ async def run_scripts(
                     "path": path or selector,
                     "ok": bool(ok),
                 }
+                # L10: Check for engine-reported errors (occlusion, disabled, etc.)
+                if not ok:
+                    try:
+                        error_msg = ctx.eval("String(globalThis.__lastActionError || '')")
+                        if error_msg and error_msg != "null":
+                            applied_item["error"] = error_msg
+                    except Exception:
+                        pass
                 if kind in {"upload", "file"}:
                     applied_item["files"] = [f.get("name") if isinstance(f, dict) else str(f) for f in files]
                 info["actions_applied"].append(applied_item)
