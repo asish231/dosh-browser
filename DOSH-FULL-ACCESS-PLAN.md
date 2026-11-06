@@ -396,6 +396,117 @@ Todos (status: pending → done as they land, both lanes, hermetic tests):
       + full `uv run pytest tests/` (**932 passed, 8 skipped**; 4 new Phase-2
       tests included).
 
+Committed 2026-11-06 as 32 detailed commits (Phase 1 carry-over from the
+freebuff session, Phase 2 work, plus earlier-session carry-overs: assist/
+attach bridge, README/installer, Skillion doc).
+
+### Phase 3 — execution (started 2026-11-06)
+
+Interaction fidelity `[L10, L7, L8, E2, E3, E4, S4, S5]`. Order per §3:
+occlusion gate first (inspector exists), then caret/selection, then the frame
+clock, then the input-subset gaps, then frame storage.
+
+- [x] **L10** — occlusion-gated clicks: consult `__isElementOccluded` in the
+      actuate path (`__activateSelector` gains the gate `__clickPath` already
+      has); refused clicks surface `occluded_by:<desc>` in the lane's
+      `__lastActionError`; both lanes report the refusal honestly (never a
+      silent success). Tests: overlay-over-button fixture → refused; same
+      button with overlay removed → click lands.
+      → Rust `test_occlusion_gate_refuses_click_under_overlay`
+      (`__activateSelector(…, 6th-arg gate)` + Rust `apply_action` gate,
+      default on, `occlusion_gate:false` override; `check_action_error`
+      surfaces it), Python `test_occlusion_gate_refuses_click_under_overlay`
+      (runtime gate-pass + `_apply` raises on `actions_applied.error`).
+      Rust 237/237; Python shell+action subsets green.
+- [x] **L7** — minimal caret + Selection/Range in minidom.js:
+      `selectionStart/End/setSelectionRange/select` on text inputs +
+      textareas (spec model: unset caret defaults to end of value,
+      IndexSizeError on start>end), `selectionchange` on the document,
+      upgraded `Selection` (anchor/focus node+offset, `isCollapsed`,
+      spec `addRange` replace semantics, `collapse(node,offset)`),
+      `Range.toString/deleteContents`, focus links the caret to
+      `window.getSelection()`, typing/backspace/enter/space insert at the
+      caret (replacing an active selection first).
+      → `tests/test_engine_apis.py::test_field_selection_model_and_selectionchange`,
+      `test_typing_lands_at_the_caret`, `test_typing_replaces_an_active_selection`,
+      `test_backspace_at_caret`, `test_contenteditable_caret_and_getselection`.
+      Both engines green (V8 via Rust suite, QuickJS via Python suite).
+- [x] **L8** — real rAF frame clock: replace the `setTimeout(fn,16)` shim with
+      a frame queue driven by the virtual clock; `__drainTimers` steps frames;
+      rAF callbacks receive the frame timestamp; nested rAF bounded per pass.
+      Test: rAF ordering vs timers + timestamp monotonicity under the virtual
+      clock.
+      → `tests/test_minidom_layout_upgrades.py`: `test_raf_frame_clock_cadence`
+      (frame not due until the 16.6 ms boundary passes),
+      `test_raf_frame_clock_nested_next_frame` (inner waits for a LATER
+      boundary, never fires in the same batch),
+      `test_raf_shim_mode_fires_on_next_drain` (`__setRafFrameInterval(0)`
+      restores the immediate shim). Frames scheduled on the deterministic
+      `__timerNow` virtual clock (not wall-clock `performance.now()`, which
+      has a 150 ms boot baseline). Existing monotonic-delivery + batch-
+      isolation tests still green.
+- [x] **E2** — text-selection drag lane: a drag over selectable text produces
+      a real selection (select event), distinct from the element DnD lane.
+      → engine `__selectText` (mousedown → selection extends →
+      selectstart/select/selectionchange → mouseup; never a click),
+      action kind `text_select` (both lanes), `Session.select_text` +
+      shell `select ref start end` command (56th command; count test
+      updated). Offsets clamped/swapped like a real drag; non-text
+      targets refuse with `not_selectable_text`.
+      Tests: `test_select_text_drag_lane` + `test_select_text_rejects_non_text_targets`
+      (engine), `tests/test_shell.py::test_select_text_drag_lane` (Python),
+      `shell::test_select_text_drag_lane_rust` (Rust). Rust 238/238.
+- [x] **E3** — mid-flight `fetch` abort: AbortSignal fired while the host
+      fetch is outstanding rejects the promise with `AbortError` (currently
+      only pre-dispatch abort works); both engine lanes.
+      → `tests/test_engine_apis.py::test_fetch_in_flight_abort_rejects`,
+      `test_fetch_in_flight_abort_wins_over_resolve`,
+      `test_fetch_without_abort_resolves_after_pump`. `fetch` defers
+      resolution one microtask: a synchronous `abort()` between dispatch and
+      settle rejects with the signal's reason (documented window, not a
+      faked delay — the engine itself is synchronous). Stale "honest shape"
+      comment updated.
+- [x] **E4** — full Popover semantics: `popover=auto|manual`, light dismiss,
+      top-layer stacking order, beforetoggle/toggle events.
+      → `tests/test_small_apis.py::test_popover_declarative_target_and_light_dismiss`:
+      declarative `popovertarget`/`popovertargetaction` (toggle/show/hide)
+      via a delegated document click listener; click-outside light dismiss
+      closes open AUTO popovers and never a manual one; click inside keeps
+      it open. Top-layer stacking stays with Phase 6 (R4) — no paint stack
+      here yet, disclosed.
+- [ ] **S4** — same-origin frame storage sharing: a loaded frame's realm is
+      seeded from the session storage for its origin; writes flow back to the
+      session (shared area, not per-frame copies).
+- [x] **S4** — same-origin frame storage sharing: a loaded frame's realm is
+      seeded from the session storage for its origin; writes flow back to the
+      session (shared area, not per-frame copies).
+      → `load_frames` gains `storage_seed_for: Callable[[str], dict] | None`;
+      both `run_scripts` call sites in `load_frames` (new frames at line 849,
+      reused frames at line 898) pass the per-frame-origin seed; `read_live`
+      threads the callable through; `session.goto`, `_apply`, and
+      `_act_submit_field` pass `self._storage_seed` and absorb each frame's
+      drained storage back (order: parent first, frames second — fixes a
+      regression where the parent's drained dict popped the frame's writes).
+      → `tests/test_shell.py::test_same_origin_frame_storage_shared`:
+      same-origin frame sees the session's seeded key and writes back;
+      cross-origin frame sees nothing of the parent's storage and its
+      writes stay isolated under its own origin.
+- [x] **S5** — storage events broadened: same-origin frame realms receive
+      `storage` events too (today: same-origin other tabs only); cross-origin
+      never (per spec) and that stays disclosed.
+      → `_broadcast_storage_events` now broadcasts to both other same-origin
+      tabs AND same-origin frame realms (each frame has its own QuickJS
+      context, separate from the parent's, but same-origin frames share the
+      underlying storage area via `_web_storage`). The originating tab's
+      frames receive the event (they're not the one that made the change);
+      cross-origin frames never receive it (per spec).
+      → `tests/test_shell.py::test_storage_events_reach_same_origin_frames`:
+      parent writes via action pass (full drain + broadcast), same-origin
+      frame receives the event and the value is applied; cross-origin frame
+      receives nothing.
+- [ ] **Docs** — §2.3/§2.5/§2.6 rows + AGENTS.md tables.
+- [ ] **Green** — both full suites.
+
 ### Phase 2 — bugs the Phase-2 tests exposed (fixed in-lane, both lanes benefit)
 
 - **`act` was a silent no-op in the Rust lane.** `Target` had no CSS selector;
