@@ -408,8 +408,14 @@ async def run_scripts(
     # vanished. The queue now lives on the context: run_scripts still sees it
     # through its own info dict, and drain_pending_posts() hands the rest to
     # the routing layers.
-    _this_inbox = _CTX_POST_INBOX.setdefault(_post_queue_key(ctx), [])
-
+    #
+    # A1 (Phase 7): the inbox is resolved PER CALL, not bound at registration.
+    # The bridge registers BEFORE the context nonce is injected (nonce happens
+    # later in this pass, at document load), so a registration-time
+    # setdefault() keyed the queue on id(ctx) — and take_pending_posts(),
+    # which resolves by nonce, never saw the posts (the id-keyed ghost-list
+    # bug). Resolving the key inside the handler means the FIRST post after
+    # nonce injection lands in the nonce-keyed inbox every bridge agrees on.
     def host_post_message_handler(data, origin="*", target="parent", sender_origin="", ports_json="") -> None:
         # Binary channel payloads (typed arrays) hex-encode inside the clone
         # envelope. 16KB cut those envelopes in half and the far realm
@@ -437,7 +443,10 @@ async def run_scripts(
                     entry["ports"] = metas
             except Exception:
                 pass
-        _this_inbox.append(entry)
+        # A1: append to the inbox the CURRENT key resolves to — the nonce
+        # key once injected, so out-of-pass posts (bare evals) reach the
+        # same queue take_pending_posts() drains.
+        _CTX_POST_INBOX.setdefault(_qkey, []).append(entry)
         info["post_messages"].append(entry)
         if "cookie" in data_str and "datadome=" in data_str:
             try:
