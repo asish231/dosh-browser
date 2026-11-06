@@ -105,6 +105,14 @@ class Tab:
         # entry represented, so back()/forward() can restore a live document
         # instead of leaving the engine on the navigated-away page.
         self.snapshots: list[dict] = []
+        # S8 bfcache: parked LIVE engine contexts per history entry. A real
+        # browser's bfcache restores the whole JS heap on back/forward; this
+        # engine parks the leaving entry's ctx in its snapshot and restores
+        # that same ctx on traversal — heap, DOM, timers, and JS state
+        # survive exactly like a same-document traversal. Entries whose ctx
+        # was never parked (cleared tabs, engine drops) rebuild + re-run
+        # their scripts (disclosed fallback), so restore is never faked.
+        self.bf_ctx: list[Any | None] = []
         # Absolute scroll position to re-apply after the next fresh engine pass
         # (history restore replays page scripts, then wheels back to where the
         # entry was left).
@@ -148,6 +156,10 @@ class Tab:
         if not replace:
             self.history = self.history[: self.index + 1]
             del self.snapshots[self.index + 1 :]
+            # S8: the parked-ctx list tracks history length entry-for-entry.
+            del self.bf_ctx[self.index + 1 :]
+            while len(self.bf_ctx) < len(self.history):
+                self.bf_ctx.append(None)
         if replace:
             # An in-page action (scroll/type/mutation) that stayed on this
             # document rewrites the current entry, like a real browser: these
@@ -204,6 +216,10 @@ class Tab:
             self.snapshots[self.index] = snap
         else:
             self.snapshots.append(snap)
+            # S8: keep the parked-ctx list aligned entry-for-entry (the
+            # live ctx parks here when a LATER navigation moves away).
+            while len(self.bf_ctx) < len(self.snapshots):
+                self.bf_ctx.append(None)
         return pushed_page
 
 
@@ -693,6 +709,13 @@ class Session:
         )
         self.frame_documents = frames
         self.captcha_inspection = captcha
+        # S8 bfcache: a goto leaves the previous entry — park its live ctx
+        # on that history entry so back() restores the HEAP (no re-run).
+        tab = self.current_tab
+        while len(tab.bf_ctx) < len(tab.history):
+            tab.bf_ctx.append(None)
+        if tab.ctx is not None and 0 <= tab.index < len(tab.bf_ctx):
+            tab.bf_ctx[tab.index] = tab.ctx
         self.current_tab.ctx = js_info.get("ctx") if js_info else None
         # S4: absorb the parent's drained storage first, then each frame's
         # drained storage. Order matters: `_absorb_storage` pops keys that
@@ -956,6 +979,13 @@ class Session:
             # stale previous document (a real bug: an OTP submit re-sent
             # the old login form's credentials).
             if result.kind == "html":
+                # S8 bfcache: the submit leaves the previous document — park
+                # its live ctx for a back() heap restore.
+                _tab = self.current_tab
+                while len(_tab.bf_ctx) < len(_tab.history):
+                    _tab.bf_ctx.append(None)
+                if _tab.ctx is not None and 0 <= _tab.index < len(_tab.bf_ctx):
+                    _tab.bf_ctx[_tab.index] = _tab.ctx
                 self.current_tab.ctx = js_info.get("ctx") if js_info else None
         frames = (
             await load_frames(html, result.final_url or form.action, self.client,
@@ -2747,8 +2777,50 @@ resolve a selector directly.
             # shared document: refresh the target entry's page model from it.
             self._refresh_entry_page_from_ctx(i)
             return True
+        # ---- S8 bfcache: park the LEAVING document's live ctx on its entry,
+        # then restore the TARGET's parked ctx if one exists. A parked ctx
+        # means the destination's heap/DOM/timers survive the traversal —
+        # a real-browser bfcache restore. No parked ctx -> the rebuild+
+        # re-run fallback below (disclosed, never faked).
+        while len(tab.bf_ctx) < len(tab.history):
+            tab.bf_ctx.append(None)
+        if 0 <= tab.index < len(tab.bf_ctx) and tab.ctx is not None:
+            tab.bf_ctx[tab.index] = tab.ctx
+        parked = tab.bf_ctx[i] if i < len(tab.bf_ctx) else None
         # Cross-document restore: the entry's document is not the live one.
         tab.index = i
+        if parked is not None:
+            # LIVE HEAP RESTORE: the destination's ctx comes back exactly as
+            # it was parked. location reflects the traversal, popstate fires
+            # into the LIVE context (bfcache parity), and scroll restores
+            # like the same-document lane.
+            tab.ctx = parked
+            tab.bf_ctx[i] = None  # the ctx is now live again (single owner)
+            self.html = snap["html"] if snap and snap.get("html") is not None else self.html
+            self.url = snap["url"] if snap else self.url
+            tab.headers = dict((snap or {}).get("headers") or {})
+            self.frame_documents = list((snap or {}).get("frames") or [])
+            tab.captcha_inspection = (snap or {}).get("captcha")
+            try:
+                ctx_js_url = json.dumps(self.url)
+                tab.ctx.eval(
+                    "if (typeof _updateLocationQuietly === 'function') "
+                    f"_updateLocationQuietly({ctx_js_url}); true"
+                )
+            except Exception:
+                pass
+            self._dispatch_popstate((snap or {}).get("history_state"))
+            try:
+                restoration = str(tab.ctx.eval("history.scrollRestoration") or "auto")
+            except Exception:
+                restoration = "auto"
+            if restoration != "manual":
+                try:
+                    tab.ctx.eval(f"scrollTo(0, {int((snap or {}).get('scroll_y') or 0)}); true")
+                except Exception:
+                    pass
+            self._refresh_entry_page_from_ctx(i)
+            return True
         if snap is None or snap.get("html") is None:
             # Synthetic entry (no stored document): clear the live state.
             self.html = ""
