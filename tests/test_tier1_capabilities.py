@@ -294,7 +294,11 @@ async def test_download_tool_saves_bytes_and_hash(tmp_path):
     assert Path(rec.path).read_bytes() == payload
     assert rec.sha256 == sha
     assert rec.verified is True
-    assert rec.scanned is False  # no verdict engine: disclosed, not faked
+    # M6: the pluggable scanner hook runs on every successful download
+    # (builtin heuristics here; 'clean' means not flagged, never safe).
+    assert rec.scanned is True
+    assert rec.malware_verdict == "clean"
+    assert rec.malware_scanner == "builtin-heuristic"
 
 
 @pytest.mark.asyncio
@@ -331,7 +335,8 @@ async def test_goto_attachment_intercepts_as_download(tmp_path):
     assert page.view.startswith("DOWNLOAD:")
     assert str(len(payload)) in page.view
     assert "sha256" in page.view
-    assert "not scanned" in page.view
+    assert "malware verdict: clean" in page.view
+    assert "builtin-heuristic" in page.view
     saved_match = [line for line in page.view.splitlines() if "saved to" in line]
     assert saved_match, page.view
     saved_path = Path(saved_match[0].split("saved to", 1)[1].strip())

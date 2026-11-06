@@ -561,7 +561,11 @@ class SubresourceSecurityTests(unittest.TestCase):
         self.assertTrue(rec.verified)
         self.assertEqual(rec.bytes, len(payload))
         self.assertEqual(rec.sha256, hashlib.sha256(payload).hexdigest())
-        self.assertFalse(rec.scanned)
+        # M6: every successful download is scanned by the pluggable hook
+        # (builtin heuristics; a clean verdict never claims safety).
+        self.assertTrue(rec.scanned)
+        self.assertEqual(rec.malware_verdict, "clean")
+        self.assertEqual(rec.malware_scanner, "builtin-heuristic")
         import os
         if rec.path:
             os.unlink(rec.path)

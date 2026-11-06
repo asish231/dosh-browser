@@ -106,7 +106,10 @@ class CategoryATests(unittest.TestCase):
             out, info = await run_scripts(html, "https://example.com/", client, force=True)
             self.assertIn('data-perm-state="granted"', out)
             self.assertIn('data-clipboard="ok"', out)
-            self.assertIn('data-devices="0"', out)
+            # M2: enumerateDevices reports the engine's real virtual
+            # devices (audio input/output), honestly labeled — the old
+            # stub returned [] and the test pinned '0'.
+            self.assertIn('data-devices="2"', out)
 
         asyncio.run(run())
 

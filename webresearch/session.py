@@ -713,12 +713,18 @@ class Session:
         if _is_download_response(page.kind, page.content_type, disposition):
             rec = await self.download(url, expected=None)
             if rec.path:
+                verdict_line = f"  malware verdict: {rec.malware_verdict}"
+                if rec.malware_scanner:
+                    verdict_line += f" (scanner: {rec.malware_scanner}"
+                    if rec.malware_signature:
+                        verdict_line += f", signature: {rec.malware_signature}"
+                    verdict_line += ")"
                 note = (
                     f"DOWNLOAD: {rec.bytes} bytes saved to {rec.path}\n"
                     f"  url: {url}\n"
                     f"  content_type: {rec.content_type}\n"
                     f"  sha256: {rec.sha256}\n"
-                    "  malware verdict: not scanned (no verdict engine; hash is provided)"
+                    + verdict_line
                 )
                 page = page.model_copy(update={"view": note, "chars": len(note)})
             elif rec.error:
