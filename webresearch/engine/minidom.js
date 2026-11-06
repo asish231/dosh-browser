@@ -6248,6 +6248,20 @@ var decl = new CSSStyleDeclaration(el);
     }
   }
 
+  /* W3: type-aware value coercion. The old entry path coerced every
+     argument with `| 0` (int32 truncation), so float params/locals/returns
+     died on arrival. Valtype bytes: 0x7F i32, 0x7E i64, 0x7D f32, 0x7C f64.
+     i64 is approximated as i32 throughout this engine (disclosed). */
+  function __wasmCoerceIn(v, t) {
+    if (t === 0x7D) return Math.fround(+v || 0);
+    if (t === 0x7C) return +v || 0;
+    return (v | 0);
+  }
+  function __wasmCoerceOut(v, t) {
+    if (t === 0x7D) return Math.fround(+v || 0);
+    if (t === 0x7C) return +v || 0;
+    return (v | 0);
+  }
   WasmInstance.prototype._executeFunction = function (funcIdx, args) {
     var importFuncCount = this.importedFuncs.length;
     if (funcIdx < importFuncCount) {
@@ -6256,7 +6270,11 @@ var decl = new CSSStyleDeclaration(el);
     var fnObj = this.module.functions[funcIdx - importFuncCount];
     var sig = this.module.types[fnObj.typeIdx];
     var locals = [];
-    for (var a = 0; a < args.length; a++) locals.push(args[a] | 0);
+    /* W3: localTypes = signature params + declared locals, so local.get/
+       local.set/tee coerce per the declared type instead of blanket |0. */
+    var localTypes = sig.params.slice();
+    for (var lt = 0; lt < fnObj.locals.length; lt++) localTypes.push(fnObj.locals[lt]);
+    for (var a = 0; a < args.length; a++) locals.push(__wasmCoerceIn(args[a], sig.params[a]));
     for (var l = 0; l < fnObj.locals.length; l++) locals.push(0);
 
     var code = fnObj.code;
@@ -6312,7 +6330,7 @@ var decl = new CSSStyleDeclaration(el);
         var cArgs = [];
         for (var p = 0; p < cSig.params.length; p++) cArgs.unshift(stack.pop());
         var cRes = this._executeFunction(cIdx, cArgs);
-        if (cSig.results.length > 0 && cRes !== undefined) stack.push(cRes | 0);
+        if (cSig.results.length > 0 && cRes !== undefined) stack.push(__wasmCoerceOut(cRes, cSig.results[0]));
       } else if (op === 0x1A) {
         stack.pop();
       } else if (op === 0x1B) {
@@ -6320,13 +6338,13 @@ var decl = new CSSStyleDeclaration(el);
         stack.push(c !== 0 ? v1 : v2);
       } else if (op === 0x20) {
         var rLoc = __readU32Leb(code, pc); var lIdx = rLoc[0]; pc = rLoc[1];
-        stack.push(locals[lIdx] | 0);
+        stack.push(__wasmCoerceOut(locals[lIdx] || 0, localTypes[lIdx]));
       } else if (op === 0x21) {
         var rLoc = __readU32Leb(code, pc); var lIdx = rLoc[0]; pc = rLoc[1];
-        locals[lIdx] = (stack.pop() || 0) | 0;
+        locals[lIdx] = __wasmCoerceIn(stack.pop(), localTypes[lIdx]);
       } else if (op === 0x22) {
         var rLoc = __readU32Leb(code, pc); var lIdx = rLoc[0]; pc = rLoc[1];
-        locals[lIdx] = (stack[stack.length - 1] || 0) | 0;
+        locals[lIdx] = __wasmCoerceIn(stack[stack.length - 1], localTypes[lIdx]);
       } else if (op === 0x28) {
         var rAl = __readU32Leb(code, pc); pc = rAl[1];
         var rOff = __readU32Leb(code, pc); var memOff = rOff[0]; pc = rOff[1];
@@ -6485,57 +6503,96 @@ var decl = new CSSStyleDeclaration(el);
         else if (op === 0x66) r61 = (a >= b) ? 1 : 0;      /* f64.ge */
         stack.push(r61);
       }
-      /* ---- W3: f32 unary arithmetic (0x7B–0x81) ---- */
-      else if (op >= 0x7B && op <= 0x81) {
+      /* ---- W3: i64 integer ops (0x79–0x8A), i32-approximated.
+         The engine represents i64 as i32 (i64.const reads via __readI32Leb),
+         so these compute the i32-twin semantics on the approximated values —
+         disclosed approximation, not a spec-exact 64-bit lane. ---- */
+      else if (op >= 0x79 && op <= 0x8A) {
+        var i64a, i64b;
+        if (op <= 0x7A) {
+          /* clz/ctz/popcnt: count in the 32-bit representation */
+          var v79 = (stack.pop() | 0) >>> 0;
+          if (v79 === 0) { stack.push(op === 0x79 ? 32 : 32); }
+          else if (op === 0x79) { /* i64.clz */
+            var c79 = 0, t79 = v79;
+            while (!(t79 & 0x80000000)) { t79 <<= 1; c79++; }
+            stack.push(c79);
+          } else if (op === 0x7A) { /* i64.ctz */
+            var c7A = 0, t7A = v79;
+            while (!(t7A & 1)) { t7A >>>= 1; c7A++; }
+            stack.push(c7A);
+          } else { /* 0x7B i64.popcnt */
+            var pc7B = 0, t7B = v79;
+            while (t7B) { pc7B += t7B & 1; t7B >>>= 1; }
+            stack.push(pc7B);
+          }
+        } else if (op === 0x7C) { i64b = stack.pop() | 0; i64a = stack.pop() | 0; stack.push((i64a + i64b) | 0); } /* i64.add */
+        else if (op === 0x7D) { i64b = stack.pop() | 0; i64a = stack.pop() | 0; stack.push((i64a - i64b) | 0); } /* i64.sub */
+        else if (op === 0x7E) { i64b = stack.pop() | 0; i64a = stack.pop() | 0; stack.push(Math.imul(i64a, i64b) | 0); } /* i64.mul */
+        else if (op === 0x7F) { i64b = stack.pop() | 0; i64a = stack.pop() | 0; if (i64b === 0) throw new Error("integer divide by zero"); stack.push((i64a / i64b) | 0); } /* i64.div_s */
+        else if (op === 0x80) { i64b = (stack.pop() | 0) >>> 0; i64a = (stack.pop() | 0) >>> 0; if (i64b === 0) throw new Error("integer divide by zero"); stack.push(Math.floor(i64a / i64b) | 0); } /* i64.div_u */
+        else if (op === 0x81) { i64b = stack.pop() | 0; i64a = stack.pop() | 0; if (i64b === 0) throw new Error("integer divide by zero"); stack.push((i64a % i64b) | 0); } /* i64.rem_s */
+        else if (op === 0x82) { i64b = (stack.pop() | 0) >>> 0; i64a = (stack.pop() | 0) >>> 0; if (i64b === 0) throw new Error("integer divide by zero"); stack.push((i64a % i64b) | 0); } /* i64.rem_u */
+        else if (op === 0x83) { i64b = stack.pop() | 0; i64a = stack.pop() | 0; stack.push((i64a & i64b) | 0); } /* i64.and */
+        else if (op === 0x84) { i64b = stack.pop() | 0; i64a = stack.pop() | 0; stack.push((i64a | i64b) | 0); } /* i64.or */
+        else if (op === 0x85) { i64b = stack.pop() | 0; i64a = stack.pop() | 0; stack.push((i64a ^ i64b) | 0); } /* i64.xor */
+        else if (op === 0x86) { i64b = (stack.pop() | 0) & 0x3F; i64a = stack.pop() | 0; stack.push((i64a << i64b) | 0); } /* i64.shl */
+        else if (op === 0x87) { i64b = (stack.pop() | 0) & 0x3F; i64a = stack.pop() | 0; stack.push((i64a >> i64b) | 0); } /* i64.shr_s */
+        else if (op === 0x88) { i64b = (stack.pop() | 0) & 0x3F; i64a = (stack.pop() | 0) >>> 0; stack.push((i64a >>> i64b) | 0); } /* i64.shr_u */
+        else if (op === 0x89) { i64b = (stack.pop() | 0) & 0x3F; i64a = (stack.pop() | 0) >>> 0; var sh89 = i64b & 31; stack.push((((i64a << sh89) | (i64a >>> (32 - sh89))) | 0)); } /* i64.rotl */
+        else if (op === 0x8A) { i64b = (stack.pop() | 0) & 0x3F; i64a = (stack.pop() | 0) >>> 0; var sh8A = i64b & 31; stack.push((((i64a >>> sh8A) | (i64a << (32 - sh8A))) | 0)); } /* i64.rotr */
+      }
+      /* ---- W3: f32 unary arithmetic (0x8B–0x91, spec numbers) ---- */
+      else if (op >= 0x8B && op <= 0x91) {
         var a = +stack.pop();
-        var r7B = 0;
-        if (op === 0x7B) r7B = -a;                          /* f32.neg */
-        else if (op === 0x7C) r7B = Math.abs(a);            /* f32.abs */
-        else if (op === 0x7D) r7B = Math.ceil(a);           /* f32.ceil */
-        else if (op === 0x7E) r7B = Math.floor(a);          /* f32.floor */
-        else if (op === 0x7F) r7B = Math.trunc(a);          /* f32.trunc */
-        else if (op === 0x80) r7B = Math.round(a);          /* f32.nearest */
-        else if (op === 0x81) r7B = Math.sqrt(a);           /* f32.sqrt */
-        stack.push(Math.fround(r7B));
+        var r8B = 0;
+        if (op === 0x8B) r8B = Math.abs(a);            /* f32.abs */
+        else if (op === 0x8C) r8B = -a;               /* f32.neg */
+        else if (op === 0x8D) r8B = Math.ceil(a);     /* f32.ceil */
+        else if (op === 0x8E) r8B = Math.floor(a);    /* f32.floor */
+        else if (op === 0x8F) r8B = Math.trunc(a);    /* f32.trunc */
+        else if (op === 0x90) r8B = Math.round(a);    /* f32.nearest (ties-away, spec is ties-even — disclosed) */
+        else if (op === 0x91) r8B = Math.sqrt(a);     /* f32.sqrt */
+        stack.push(Math.fround(r8B));
       }
-      /* ---- W3: f32 binary arithmetic (0x82–0x88) ---- */
-      else if (op >= 0x82 && op <= 0x88) {
+      /* ---- W3: f32 binary arithmetic (0x92–0x98, spec numbers) ---- */
+      else if (op >= 0x92 && op <= 0x98) {
         var b = +stack.pop(); var a = +stack.pop();
-        var r82 = 0;
-        if (op === 0x82) r82 = a + b;                       /* f32.add */
-        else if (op === 0x83) r82 = a - b;                  /* f32.sub */
-        else if (op === 0x84) r82 = a * b;                  /* f32.mul */
-        else if (op === 0x85) r82 = a / b;                  /* f32.div */
-        else if (op === 0x86) r82 = Math.min(a, b);         /* f32.min */
-        else if (op === 0x87) r82 = Math.max(a, b);         /* f32.max */
-        else if (op === 0x88) r82 = Math.abs(a) * Math.sign(b); /* f32.copysign */
-        stack.push(Math.fround(r82));
+        var r92 = 0;
+        if (op === 0x92) r92 = a + b;                        /* f32.add */
+        else if (op === 0x93) r92 = a - b;                   /* f32.sub */
+        else if (op === 0x94) r92 = a * b;                   /* f32.mul */
+        else if (op === 0x95) r92 = a / b;                   /* f32.div */
+        else if (op === 0x96) r92 = Math.min(a, b);          /* f32.min */
+        else if (op === 0x97) r92 = Math.max(a, b);          /* f32.max */
+        else if (op === 0x98) r92 = (b < 0) ? -Math.abs(a) : Math.abs(a); /* f32.copysign */
+        stack.push(Math.fround(r92));
       }
-      /* ---- W3: f64 unary arithmetic (0x89–0x8F) ---- */
-      else if (op >= 0x89 && op <= 0x8F) {
+      /* ---- W3: f64 unary arithmetic (0x99–0x9F, spec numbers) ---- */
+      else if (op >= 0x99 && op <= 0x9F) {
         var a = +stack.pop();
-        var r89 = 0;
-        if (op === 0x89) r89 = -a;                          /* f64.neg */
-        else if (op === 0x8A) r89 = Math.abs(a);            /* f64.abs */
-        else if (op === 0x8B) r89 = Math.ceil(a);           /* f64.ceil */
-        else if (op === 0x8C) r89 = Math.floor(a);          /* f64.floor */
-        else if (op === 0x8D) r89 = Math.trunc(a);          /* f64.trunc */
-        else if (op === 0x8E) r89 = Math.round(a);          /* f64.nearest */
-        else if (op === 0x8F) r89 = Math.sqrt(a);           /* f64.sqrt */
-        stack.push(r89);
+        var r99 = 0;
+        if (op === 0x99) r99 = Math.abs(a);            /* f64.abs */
+        else if (op === 0x9A) r99 = -a;                /* f64.neg */
+        else if (op === 0x9B) r99 = Math.ceil(a);      /* f64.ceil */
+        else if (op === 0x9C) r99 = Math.floor(a);     /* f64.floor */
+        else if (op === 0x9D) r99 = Math.trunc(a);     /* f64.trunc */
+        else if (op === 0x9E) r99 = Math.round(a);     /* f64.nearest (ties-away, spec is ties-even — disclosed) */
+        else if (op === 0x9F) r99 = Math.sqrt(a);      /* f64.sqrt */
+        stack.push(r99);
       }
-      /* ---- W3: f64 binary arithmetic (0x90–0x96) ---- */
-      else if (op >= 0x90 && op <= 0x96) {
+      /* ---- W3: f64 binary arithmetic (0xA0–0xA6, spec numbers) ---- */
+      else if (op >= 0xA0 && op <= 0xA6) {
         var b = +stack.pop(); var a = +stack.pop();
-        var r90 = 0;
-        if (op === 0x90) r90 = a + b;                       /* f64.add */
-        else if (op === 0x91) r90 = a - b;                  /* f64.sub */
-        else if (op === 0x92) r90 = a * b;                  /* f64.mul */
-        else if (op === 0x93) r90 = a / b;                  /* f64.div */
-        else if (op === 0x94) r90 = Math.min(a, b);         /* f64.min */
-        else if (op === 0x95) r90 = Math.max(a, b);         /* f64.max */
-        else if (op === 0x96) r90 = Math.abs(a) * Math.sign(b); /* f64.copysign */
-        stack.push(r90);
+        var rA0 = 0;
+        if (op === 0xA0) rA0 = a + b;                        /* f64.add */
+        else if (op === 0xA1) rA0 = a - b;                   /* f64.sub */
+        else if (op === 0xA2) rA0 = a * b;                   /* f64.mul */
+        else if (op === 0xA3) rA0 = a / b;                   /* f64.div */
+        else if (op === 0xA4) rA0 = Math.min(a, b);          /* f64.min */
+        else if (op === 0xA5) rA0 = Math.max(a, b);          /* f64.max */
+        else if (op === 0xA6) rA0 = (b < 0) ? -Math.abs(a) : Math.abs(a); /* f64.copysign */
+        stack.push(rA0);
       }
       /* ---- W3: conversions (0xA7–0xBF) ---- */
       else if (op >= 0xA7 && op <= 0xBF) {
@@ -6580,19 +6637,20 @@ var decl = new CSSStyleDeclaration(el);
         }
         stack.push(cvVal);
       }
-      /* ---- W3: sign extensions (0xA0–0xA4, 0xC0–0xC4) ---- */
-      else if (op >= 0xA0 && op <= 0xA4) {
+      /* ---- W3: sign extensions (0xC0–0xC4, spec numbers). The earlier
+         0xA0–0xA4 range wrongly captured the f64 binary ops. ---- */
+      else if (op >= 0xC0 && op <= 0xC4) {
         var v = stack.pop() || 0;
-        var rA0 = 0;
-        if (op === 0xA0) rA0 = ((v & 0xFF) << 24) >> 24;   /* i32.extend8_s */
-        else if (op === 0xA1) rA0 = ((v & 0xFFFF) << 16) >> 16; /* i32.extend16_s */
-        else if (op === 0xA2) rA0 = ((v & 0xFF) << 24) >> 24;   /* i64.extend8_s (i32 the engine) */
-        else if (op === 0xA3) rA0 = ((v & 0xFFFF) << 16) >> 16; /* i64.extend16_s */
-        else if (op === 0xA4) rA0 = v | 0;                     /* i64.extend32_s */
-        stack.push(rA0 | 0);
+        var rC0 = 0;
+        if (op === 0xC0) rC0 = ((v & 0xFF) << 24) >> 24;   /* i32.extend8_s */
+        else if (op === 0xC1) rC0 = ((v & 0xFFFF) << 16) >> 16; /* i32.extend16_s */
+        else if (op === 0xC2) rC0 = ((v & 0xFF) << 24) >> 24;   /* i64.extend8_s (i32-approximated) */
+        else if (op === 0xC3) rC0 = ((v & 0xFFFF) << 16) >> 16; /* i64.extend16_s (i32-approximated) */
+        else if (op === 0xC4) rC0 = v | 0;                      /* i64.extend32_s */
+        stack.push(rC0 | 0);
       }
     }
-    if (sig.results.length > 0 && stack.length > 0) return stack[stack.length - 1] | 0;
+    if (sig.results.length > 0 && stack.length > 0) return __wasmCoerceOut(stack[stack.length - 1], sig.results[0]);
     return undefined;
   };
 
