@@ -1483,6 +1483,9 @@
       prev.dispatchEvent(outEv);
     }
     doc._activeElement = this;
+    /* L7: the focused text container's caret becomes the document selection,
+       so window.getSelection() reports the caret the editor model expects. */
+    __syncDocumentSelection(this);
     var inEv = (typeof global.FocusEvent === "function")
       ? new global.FocusEvent("focusin", { bubbles: true, cancelable: false, relatedTarget: prev })
       : (typeof global.Event === "function" ? new global.Event("focusin", { bubbles: true, cancelable: false }) : { type: "focusin", target: this, bubbles: true });
@@ -1505,6 +1508,57 @@
       : (typeof global.Event === "function" ? new global.Event("focusout", { bubbles: true, cancelable: false }) : { type: "focusout", target: this, bubbles: true });
     this.dispatchEvent(outEv);
     doc._activeElement = next;
+  };
+  /* L7: text-field selection model (spec HTMLInputElement/HTMLTextAreaElement
+     surface, scoped to text inputs + textareas). Caret defaults to end of
+     value when never explicitly set; setSelectionRange clamps and throws
+     IndexSizeError for start > end (spec). selectionchange fires on the
+     document (see __notifySelectionChange). */
+  Object.defineProperty(Element.prototype, "selectionStart", {
+    get: function () {
+      if (!__isTextEditable(this)) return null;
+      return this._selStart != null ? this._selStart : String(this.value || "").length;
+    }
+  });
+  Object.defineProperty(Element.prototype, "selectionEnd", {
+    get: function () {
+      if (!__isTextEditable(this)) return null;
+      return this._selEnd != null ? this._selEnd : String(this.value || "").length;
+    }
+  });
+  Element.prototype.setSelectionRange = function (start, end) {
+    if (!__isTextEditable(this)) {
+      throw new TypeError("setSelectionRange: element is not a text input or textarea");
+    }
+    start = Number(start);
+    end = (end === undefined) ? start : Number(end);
+    if (!(start <= end)) {
+      throw new RangeError("IndexSizeError: start > end in setSelectionRange");
+    }
+    var len = String(this.value || "").length;
+    if (start < 0) start = 0;
+    if (start > len) start = len;
+    if (end < 0) end = 0;
+    if (end > len) end = len;
+    this._selStart = start;
+    this._selEnd = end;
+    __notifySelectionChange();
+  };
+  Element.prototype.select = function () {
+    if (__isTextEditable(this)) {
+      this._selStart = 0;
+      this._selEnd = String(this.value || "").length;
+      __notifySelectionChange();
+      return;
+    }
+    if (this.isContentEditable) {
+      var sel = global.getSelection();
+      if (sel) {
+        sel.removeAllRanges();
+        sel.selectAllChildren(this);
+        this._caretOffset = String(this.textContent || "").length;
+      }
+    }
   };
   /* Trusted Types enforcement (real, disclosed subset).
    * trustedTypes.createPolicy with allowlist + duplicate control from the
@@ -3883,33 +3937,73 @@ var pos = (st.position || "").toLowerCase();
     return id;
   };
   global.clearInterval = function (id) { __timerDrop(id); };
+  /* L8: the real frame clock. Animation callbacks step deterministically
+     instead of firing on every timer drain: a requested frame belongs to the
+     next frame boundary (16.6 ms, ~60 fps). Nested rAF requests inside a
+     draining callback wait for a later boundary, never in the same batch.
+     The immediate-shim stays reachable for hosts that drain without an
+     advancing clock: __setRafFrameInterval(0) fires any pending frame on
+     the next drain (the old behavior). */
   var __rafSeq = 1;
   var __rafQueue = [];
+  var __rafDrainNow = null;      /* frame timestamp of the drain in flight */
+  var __rafFrameInterval = 16.6; /* ms between frame boundaries; 0 = shim  */
+  function __engineNow() {
+    return (global.performance && typeof global.performance.now === "function")
+      ? global.performance.now() : __timerNow;
+  }
   global.requestAnimationFrame = function (fn) {
     if (typeof fn !== "function") throw new TypeError("Argument 1 to Window.requestAnimationFrame must be a function");
     var id = __rafSeq++;
-    var originTime = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : __timerNow;
-    __rafQueue.push({ id: id, fn: fn, scheduledAt: originTime });
+    /* Frames are scheduled on the VIRTUAL timer clock (__timerNow), the same
+       clock the host advances via __advanceTimerClock and that setTimeout
+       eligibility uses. Wall-clock performance.now() has a 150 ms boot
+       baseline and would desync the frame clock from timer deadlines. */
+    var at = __timerNow;
+    /* Requests during a drainOfFrames are scheduled from the boundary that is
+       just firing — never the boundary we're inside (spec: next frame). */
+    var base = (__rafDrainNow !== null && __rafDrainNow > at) ? __rafDrainNow : at;
+    __rafQueue.push({
+      id: id,
+      fn: fn,
+      scheduledAt: at,
+      due: (__rafFrameInterval > 0) ? base + __rafFrameInterval : base,
+    });
     return id;
   };
   global.cancelAnimationFrame = function (id) {
     __rafQueue = __rafQueue.filter(function (item) { return item.id !== id; });
   };
+  global.__setRafFrameInterval = function (ms) {
+    __rafFrameInterval = Math.max(0, Number(ms) || 0);
+  };
+  global.__getRafFrameInterval = function () { return __rafFrameInterval; };
   global.__drainRaf = function (frameTime) {
     if (__rafQueue.length === 0) return 0;
-    var now = (frameTime !== undefined) ? frameTime : ((global.performance && typeof global.performance.now === "function") ? global.performance.now() : __timerNow);
-    var batch = __rafQueue.slice();
-    __rafQueue = [];
-    var executed = 0;
-    for (var i = 0; i < batch.length; i++) {
-      try {
-        batch[i].fn(now);
-        executed++;
-      } catch (e) {
-        if (typeof global.__recordError === "function") global.__recordError(e);
-      }
+    var now = (frameTime !== undefined) ? frameTime : __timerNow;
+    var prevDrain = __rafDrainNow;
+    __rafDrainNow = now;
+    var batch = [];
+    var rest = [];
+    for (var i = 0; i < __rafQueue.length; i++) {
+      var item = __rafQueue[i];
+      if (now >= item.due) { batch.push(item); } else { rest.push(item); }
     }
-    return executed;
+    __rafQueue = rest;
+    var executed = 0;
+    try {
+      for (var b = 0; b < batch.length; b++) {
+        try {
+          batch[b].fn(now);
+          executed++;
+        } catch (e) {
+          if (typeof global.__recordError === "function") global.__recordError(e);
+        }
+      }
+      return executed;
+    } finally {
+      __rafDrainNow = prevDrain;
+    }
   };
   global.queueMicrotask = function (fn) {
     if (_nativePromiseResolve) {
@@ -7523,9 +7617,10 @@ var decl = new CSSStyleDeclaration(el);
      Production flight clients (React server components) construct
      AbortController for every streamed fetch; a missing global is a render
      crash (LinkedIn's login: "ReferenceError: 'AbortController' is not
-     defined"). Our fetch is synchronous so signals never actually abort a
-     request in flight; the controller faithfully reports abort state and
-     fires its events for listeners — the honest shape of this engine. */
+     defined"). The controller faithfully reports abort state and fires its
+     events for listeners; fetch honors an in-flight abort (see global.fetch:
+     resolution is deferred one microtask so an abort() between dispatch and
+     settle rejects with AbortError, matching an async engine). */
   function AbortSignal() {
     this.aborted = false;
     this.reason = undefined;
@@ -7663,11 +7758,39 @@ var decl = new CSSStyleDeclaration(el);
     var res = typeof raw === "string" ? JSON.parse(raw) : raw;
     var respHeaders = new Headers();
     if (res.content_type) respHeaders.set("content-type", res.content_type);
-    return Promise.resolve(new Response(res.body || "", {
+    var response = new Response(res.body || "", {
       status: res.status || 0,
       url: res.url || String(url),
       headers: respHeaders
-    }));
+    });
+    /* E3: in-flight abort. host_fetch is synchronous (the bytes are resolved
+       by the time it returns), so there is no network delay to model. But a
+       real fetch is async: an abort() fired between dispatch and settle
+       rejects with AbortError. We model that window honestly by deferring
+       resolution one microtask — a synchronous abort() right after the fetch
+       call (the common flight-fetch pattern) fires the signal's abort
+       listener first and wins; without an abort the pump resolves normally,
+       exactly one drain pass later. */
+    if (!opts.signal) {
+      return Promise.resolve(response);
+    }
+    var signal = opts.signal;
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      function onAbort() {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        reject(signal.reason || new Error("This operation was aborted"));
+      }
+      signal.addEventListener("abort", onAbort);
+      Promise.resolve().then(function () {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolve(response);
+      });
+    });
   };
 
   /* EventSource for Server-Sent Events (SSE text/event-stream) */
@@ -7982,6 +8105,45 @@ var decl = new CSSStyleDeclaration(el);
       doc.appendChild(doc.body);
     }
     global.document = doc;
+    /* E4: full Popover semantics. A single delegated click listener on the
+       document handles (a) the declarative `popovertarget` trigger
+       (with `popovertargetaction` show/hide/toggle) and (b) light dismiss:
+       a click outside an open AUTO popover closes it (manual popovers stay).
+       Runs in the bubble phase, after the page's own handlers, and yields to
+       preventDefault — the "default action" contract. */
+    doc.addEventListener("click", function (ev) {
+      try {
+        if (ev && ev.defaultPrevented) return;
+        var t = ev ? ev.target : null;
+        var trigger = null;
+        var node = t;
+        while (node && node !== doc) {
+          if (node.hasAttribute && node.hasAttribute("popovertarget")) { trigger = node; break; }
+          node = node.parentNode;
+        }
+        if (trigger) {
+          var tid = trigger.getAttribute("popovertarget");
+          var action = String(trigger.getAttribute("popovertargetaction") || "toggle").toLowerCase();
+          var target = tid ? doc.getElementById(tid) : null;
+          if (target && typeof target.showPopover === "function") {
+            if (action === "show" && !target.__popoverOpen) target.showPopover();
+            else if (action === "hide" && target.__popoverOpen) target.hidePopover();
+            else if (action === "toggle") target.togglePopover();
+          }
+          return;
+        }
+        var open = doc.__openAutoPopovers;
+        if (open && open.length) {
+          var list = open.slice();
+          for (var i = list.length - 1; i >= 0; i--) {
+            var pop = list[i];
+            if (!pop.__popoverOpen) continue;
+            if (pop.contains && pop.contains(t)) continue;
+            try { pop.hidePopover(); } catch (e) {}
+          }
+        }
+      } catch (e) {}
+    });
     try {
       var allRadios = doc.querySelectorAll("input[type=radio]");
       var radioGroups = {};
@@ -8886,29 +9048,243 @@ var decl = new CSSStyleDeclaration(el);
     Range.prototype.getClientRects = function () {
       return [this.getBoundingClientRect()];
     };
+    /* Minimal selection text: substring for text-node containers, whole
+       children between the offsets for element containers. Disclosed:
+       no cross-container traversal, no caret geometry. */
+    Range.prototype.toString = function () {
+      if (!this.startContainer) return "";
+      if (this.startContainer.nodeType === 3) {
+        var data = String(this.startContainer.data || "");
+        var end = this.endContainer === this.startContainer ? this.endOffset : data.length;
+        return data.substring(this.startOffset, end);
+      }
+      var out = "";
+      var nodes = this.startContainer.childNodes || [];
+      var endAt = this.endContainer === this.startContainer ? this.endOffset : nodes.length;
+      for (var i = this.startOffset; i < nodes.length && i < endAt; i++) {
+        out += nodes[i].textContent || "";
+      }
+      return out;
+    };
+    Range.prototype.deleteContents = function () {
+      if (!this.startContainer || this.startContainer.nodeType === 3) return;
+      var nodes = this.startContainer.childNodes || [];
+      var endAt = this.endContainer === this.startContainer ? this.endOffset : nodes.length;
+      var toRemove = [];
+      for (var i = this.startOffset; i < nodes.length && i < endAt; i++) {
+        toRemove.push(nodes[i]);
+      }
+      for (var j = 0; j < toRemove.length; j++) {
+        try { this.startContainer.removeChild(toRemove[j]); } catch (e) {}
+      }
+      this.endContainer = this.endOffset = this.startOffset;
+      this.collapsed = true;
+    };
     global.Range = Range;
+
+    /* L7: selectionchange fires on the DOCUMENT (spec), never on the element.
+       Editors and agent tooling observe it there; the focused element's
+       selection is what changed. */
+    function __notifySelectionChange() {
+      try {
+        var doc = global.document;
+        if (!doc || typeof doc.dispatchEvent !== "function") return;
+        var ev = new global.Event("selectionchange", { bubbles: false, cancelable: false });
+        doc.dispatchEvent(ev);
+      } catch (e) {}
+    }
+    /* Which elements expose selectionStart/End: single-line text inputs and
+       textareas (spec HTMLInputElement/HTMLTextAreaElement surface). */
+    function __isTextEditable(el) {
+      var t = (el && el.nodeName || "").toLowerCase();
+      if (t === "textarea") return true;
+      if (t === "input") {
+        var ty = ((el.getAttribute && el.getAttribute("type")) || "text").toLowerCase();
+        return ty === "text" || ty === "search" || ty === "url" || ty === "tel" ||
+               ty === "password" || ty === "email" || ty === "";
+      }
+      return false;
+    }
+    /* The caret offset for any focusable text container: fields keep
+       _selStart/_selEnd (spec model), contenteditable keeps _caretOffset
+       (minimal caret — no caret geometry, disclosed). */
+    function __caretOffsetOf(el) {
+      if (!el) return 0;
+      if (__isTextEditable(el)) {
+        return el._selStart != null ? el._selStart : String(el.value || "").length;
+      }
+      if (el._caretOffset != null) return el._caretOffset;
+      return String(el.textContent || "").length;
+    }
+    /* Reflect the focused element's caret as the document selection (a
+       collapsed range), the way real engines expose it to getSelection(). */
+    function __syncDocumentSelection(el) {
+      try {
+        var sel = global.getSelection();
+        if (!sel || typeof Range === "undefined") return;
+        var off = __caretOffsetOf(el);
+        var r = new Range();
+        r.setStart(el, off);
+        r.setEnd(el, off);
+        sel._ranges = [r];
+        sel._anchorNode = sel._focusNode = el;
+        sel._anchorOffset = sel._focusOffset = off;
+      } catch (e) {}
+    }
+    /* Insert text at the caret (replacing an active selection first) or
+       delete one char / the selection backward. Used by __pressKey's
+       enter / backspace / space handling and by caret-aware typing. */
+    function __insertAtCaret(el, str) {
+      if (!el) return null;
+      if (__isTextEditable(el)) {
+        var before = el._selStart != null ? el._selStart : String(el.value || "").length;
+        var after = el._selEnd != null ? el._selEnd : before;
+        var val = String(el.value || "");
+        el.value = val.slice(0, before) + str + val.slice(after);
+        el._selStart = el._selEnd = before + str.length;
+        __notifySelectionChange();
+        return el.value;
+      }
+      if (el.isContentEditable) {
+        var off = __caretOffsetOf(el);
+        var tv = String(el.textContent || "");
+        el.textContent = tv.slice(0, off) + str + tv.slice(off);
+        el._caretOffset = off + str.length;
+        __notifySelectionChange();
+        return el.textContent;
+      }
+      return null;
+    }
+    function __deleteBackwardAtCaret(el) {
+      if (!el) return null;
+      if (__isTextEditable(el)) {
+        var start = el._selStart != null ? el._selStart : String(el.value || "").length;
+        var end = el._selEnd != null ? el._selEnd : start;
+        var val = String(el.value || "");
+        var nv;
+        if (end > start) {
+          nv = val.slice(0, start) + val.slice(end);
+          el._selStart = el._selEnd = start;
+        } else if (start > 0) {
+          nv = val.slice(0, start - 1) + val.slice(start);
+          el._selStart = el._selEnd = start - 1;
+        } else {
+          nv = val;
+        }
+        el.value = nv;
+        __notifySelectionChange();
+        return nv;
+      }
+      if (el.isContentEditable) {
+        var off = __caretOffsetOf(el);
+        var tv = String(el.textContent || "");
+        el.textContent = off > 0 ? tv.slice(0, off - 1) + tv.slice(off) : tv;
+        el._caretOffset = Math.max(0, off - 1);
+        __notifySelectionChange();
+        return el.textContent;
+      }
+      return null;
+    }
+
+    /* The caret helpers are declared in this nested scope; the property
+       accessors (Element.prototype.selectionStart at ~line 1519) and the
+       action lanes (__dispatchTypeSequence, __pressKey) live in the outer
+       IIFE scope and reach these through `global` — bare-identifier
+       resolution finds them at call time (global === the real global object:
+       this IIFE is invoked with top-level `this`). */
+    global.__isTextEditable = __isTextEditable;
+    global.__caretOffsetOf = __caretOffsetOf;
+    global.__notifySelectionChange = __notifySelectionChange;
+    global.__syncDocumentSelection = __syncDocumentSelection;
+    global.__insertAtCaret = __insertAtCaret;
+    global.__deleteBackwardAtCaret = __deleteBackwardAtCaret;
 
     function Selection() {
       this._ranges = [];
+      this._anchorNode = null;
+      this._focusNode = null;
+      this._anchorOffset = 0;
+      this._focusOffset = 0;
     }
     Object.defineProperty(Selection.prototype, "rangeCount", {
       get: function () { return this._ranges.length; }
     });
+    Object.defineProperty(Selection.prototype, "anchorNode", {
+      get: function () { return this._anchorNode; }
+    });
+    Object.defineProperty(Selection.prototype, "focusNode", {
+      get: function () { return this._focusNode; }
+    });
+    Object.defineProperty(Selection.prototype, "anchorOffset", {
+      get: function () { return this._anchorOffset; }
+    });
+    Object.defineProperty(Selection.prototype, "focusOffset", {
+      get: function () { return this._focusOffset; }
+    });
+    Object.defineProperty(Selection.prototype, "isCollapsed", {
+      get: function () {
+        if (!this._ranges.length) return true;
+        var r = this._ranges[this._ranges.length - 1];
+        return !!(r.collapsed);
+      }
+    });
     Selection.prototype.getRangeAt = function (i) { return this._ranges[i] || null; };
-    Selection.prototype.addRange = function (r) { if (this._ranges.indexOf(r) < 0) this._ranges.push(r); };
+    Selection.prototype.addRange = function (r) {
+      /* Spec: addRange REPLACES the range set (it is not an append). */
+      this._ranges = [r];
+      this._anchorNode = r.startContainer;
+      this._focusNode = r.endContainer;
+      this._anchorOffset = r.startOffset;
+      this._focusOffset = r.endOffset;
+    };
     Selection.prototype.removeRange = function (r) {
       var idx = this._ranges.indexOf(r);
-      if (idx >= 0) this._ranges.splice(idx, 1);
+      if (idx >= 0) {
+        this._ranges.splice(idx, 1);
+        if (!this._ranges.length) { this._anchorNode = null; this._focusNode = null; }
+        else {
+          var last = this._ranges[this._ranges.length - 1];
+          this._anchorNode = last.startContainer;
+          this._focusNode = last.endContainer;
+          this._anchorOffset = last.startOffset;
+          this._focusOffset = last.endOffset;
+        }
+      }
     };
-    Selection.prototype.removeAllRanges = function () { this._ranges = []; };
-    Selection.prototype.collapse = function () { this._ranges = []; };
-    Selection.prototype.selectAllChildren = function (node) {
+    Selection.prototype.removeAllRanges = function () {
       this._ranges = [];
+      this._anchorNode = null;
+      this._focusNode = null;
+      this._anchorOffset = 0;
+      this._focusOffset = 0;
+    };
+    Selection.prototype.collapse = function (node, offset) {
+      if (node == null) {
+        this.removeAllRanges();
+        return;
+      }
+      var r = new Range();
+      r.setStart(node, offset || 0);
+      r.setEnd(node, offset || 0);
+      this._ranges = [r];
+      this._anchorNode = this._focusNode = node;
+      this._anchorOffset = this._focusOffset = offset || 0;
+      __notifySelectionChange();
+    };
+    Selection.prototype.selectAllChildren = function (node) {
       var r = new Range();
       r.selectNodeContents(node);
-      this._ranges.push(r);
+      this._ranges = [r];
+      this._anchorNode = this._focusNode = node;
+      this._anchorOffset = 0;
+      this._focusOffset = r.endOffset;
+      __notifySelectionChange();
     };
-    Selection.prototype.toString = function () { return ""; };
+    Selection.prototype.toString = function () {
+      if (!this._ranges.length) return "";
+      var r = this._ranges[this._ranges.length - 1];
+      return typeof r.toString === "function" ? r.toString() : "";
+    };
     var currentSelection = new Selection();
     global.Selection = Selection;
     global.getSelection = function () { return currentSelection; };
@@ -9459,6 +9835,14 @@ var decl = new CSSStyleDeclaration(el);
     var curVal = el.value || "";
     var editable = !!el.isContentEditable;
     if (editable) curVal = el.textContent || "";
+    /* L7: typing inserts at the caret, replacing an active selection first —
+       the real-engine contract. An unset caret defaults to the end of the
+       value (the old append behavior). */
+    var caret = __caretOffsetOf(el);
+    if (editable && el._caretOffset == null) caret = curVal.length;
+    if (!editable && __isTextEditable(el) && el._selEnd != null && el._selEnd > caret) {
+      curVal = curVal.slice(0, caret) + curVal.slice(el._selEnd);
+    }
     var isStealth = (stealth !== undefined) ? !!stealth : (Array.isArray(delays) || !!global.__stealthMode);
     delays = Array.isArray(delays) ? delays : null;
 
@@ -9488,7 +9872,8 @@ var decl = new CSSStyleDeclaration(el);
         : new global.Event("keypress", { bubbles: true, cancelable: true, isTrusted: true, timeStamp: tNow + 1 });
       el.dispatchEvent(kp);
 
-      curVal += ch;
+      curVal = curVal.slice(0, caret) + ch + curVal.slice(caret);
+      caret += 1;
       if (editable) {
         /* Rich editors (Quill/ProseMirror) read the DOM via MutationObserver,
            so the text goes into textContent and the input event carries data. */
@@ -9514,13 +9899,19 @@ var decl = new CSSStyleDeclaration(el);
       el.dispatchEvent(ku);
     }
     if (editable) {
+      el._caretOffset = caret;
       var tEnd = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
       el.dispatchEvent(new global.Event("change", { bubbles: true, cancelable: false, isTrusted: true, timeStamp: tEnd }));
+      __syncDocumentSelection(el);
+      __notifySelectionChange();
       return true;
     }
+    el._selStart = el._selEnd = caret;
     el.setAttribute("value", curVal);
     var tEnd2 = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : Date.now();
     el.dispatchEvent(new global.Event("change", { bubbles: true, cancelable: false, isTrusted: true, timeStamp: tEnd2 }));
+    __syncDocumentSelection(el);
+    __notifySelectionChange();
     return true;
   }
 
@@ -9530,7 +9921,7 @@ var decl = new CSSStyleDeclaration(el);
     return __dispatchTypeSequence(el, text, delays, stealth);
   };
 
-  global.__activateSelector = function (selector, text, delays, stealth, nth) {
+  global.__activateSelector = function (selector, text, delays, stealth, nth, gateOcclusion) {
     var el = null;
     nth = Math.max(1, parseInt(nth, 10) || 1);
     if (nth <= 1) {
@@ -9549,6 +9940,17 @@ var decl = new CSSStyleDeclaration(el);
     /* Element resolved: clear any stale error from a previous action. Later
        failure paths set it again explicitly. */
     global.__lastActionError = null;
+    /* L10 occlusion gate: same `__isElementOccluded` contract `__clickPath`
+       uses. A real browser does not deliver a click to a control hidden
+       behind a covering overlay, so gated activation refuses and reports
+       which element won hit-testing (`occluded_by:<selector>`). */
+    if (gateOcclusion && typeof global.__isElementOccluded === "function") {
+      var occ = global.__isElementOccluded(el);
+      if (occ) {
+        global.__lastActionError = "occluded_by:" + (occ.occluded_by || "unknown");
+        return false;
+      }
+    }
     if (stealth !== undefined) global.__stealthMode = !!stealth;
     if (el.nodeName === "select") {
       if (__controlDisabled(el)) { global.__lastActionError = "control_disabled"; return false; }
@@ -9674,18 +10076,13 @@ var decl = new CSSStyleDeclaration(el);
               try { form.submit(); } catch (e) {}
             }
           }
-        } else if (el.isContentEditable) {
-          el.textContent = (el.textContent || "") + "\n";
+        } else if (el.isContentEditable || tag === "textarea") {
+          /* L7: the newline lands at the caret, not blindly at the end. */
+          __insertAtCaret(el, "\n");
           var nlEv = new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true });
           nlEv.data = "\n";
           nlEv.inputType = "insertLineBreak";
           el.dispatchEvent(nlEv);
-        } else if (tag === "textarea") {
-          el.value = (el.value || "") + "\n";
-          var taEv = new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true });
-          taEv.data = "\n";
-          taEv.inputType = "insertLineBreak";
-          el.dispatchEvent(taEv);
         }
       } else if (lower === "tab") {
         var list = __focusables();
@@ -9710,11 +10107,9 @@ var decl = new CSSStyleDeclaration(el);
           }
         }
       } else if (lower === "backspace") {
-        if (tag === "input" || tag === "textarea") {
-          el.value = String(el.value || "").slice(0, -1);
-        } else if (el.isContentEditable) {
-          el.textContent = String(el.textContent || "").slice(0, -1);
-        }
+        /* L7: delete at the caret (or the active selection first), matching
+           the real keyboard contract. */
+        __deleteBackwardAtCaret(el);
         var bsEv = new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true });
         bsEv.inputType = "deleteContentBackward";
         el.dispatchEvent(bsEv);
@@ -9723,8 +10118,7 @@ var decl = new CSSStyleDeclaration(el);
           if (typeof el.__nativeClick === "function") el.__nativeClick();
           else if (typeof el.click === "function") el.click();
         } else if (tag === "input" || tag === "textarea" || el.isContentEditable) {
-          if (tag === "input" || tag === "textarea") el.value = (el.value || "") + " ";
-          else el.textContent = (el.textContent || "") + " ";
+          __insertAtCaret(el, " ");
           var spEv = new global.Event("input", { bubbles: true, cancelable: false, isTrusted: true });
           spEv.data = " ";
           spEv.inputType = "insertText";
@@ -9772,6 +10166,79 @@ var decl = new CSSStyleDeclaration(el);
 
     el.dispatchEvent(__keyEvent("keyup", def));
     return true;
+  };
+
+  /* E2: the text-selection drag lane. A real browser distinguishes dragging
+     a draggable ELEMENT (DnD lane) from dragging across SELECTABLE TEXT
+     (mousedown on text, extend, mouseup → a real selection + events). This
+     engine has no hit-testing, so the lane is addressed by the plain text
+     container and the character offsets the drag spans — a distinct lane
+     from __dragSelector/__dragPath, modeling the same observable contract:
+     mousedown → selection extends → 'selectstart'/'select'/selectionchange
+     fire → mouseup. No click fires (a selection drag is not a click). */
+  global.__selectText = function (selector, start, end) {
+    var el = null;
+    if (typeof selector === "string") {
+      el = global.document.getElementById(selector) || global.document.querySelector(selector);
+    } else if (selector && selector.nodeType) {
+      el = selector;
+    }
+    if (!el) { global.__lastActionError = "element_not_found"; return JSON.stringify({ ok: false, error: "element_not_found" }); }
+    var isField = __isTextEditable(el);
+    var isEditable = !!el.isContentEditable;
+    if (!isField && !isEditable) {
+      global.__lastActionError = "not_selectable_text";
+      return JSON.stringify({ ok: false, error: "not_selectable_text" });
+    }
+    if (typeof el.focus === "function") el.focus();
+    var len = isField ? String(el.value || "").length : String(el.textContent || "").length;
+    var s = parseInt(start, 10) || 0;
+    var e = (end === undefined || end === null) ? len : parseInt(end, 10);
+    if (s < 0) s = 0;
+    if (e > len) e = len;
+    if (s > e) { var swap = s; s = e; e = swap; }
+
+    var rect = (typeof el.getBoundingClientRect === "function") ? el.getBoundingClientRect() : { left: 10, top: 10, width: 20, height: 20 };
+    var cx = Math.round(rect.left + rect.width / 2), cy = Math.round(rect.top + rect.height / 2);
+    var t = (global.performance && typeof global.performance.now === "function") ? global.performance.now() : 100.0;
+    var downInit = { clientX: cx, clientY: cy, pageX: cx, pageY: cy, button: 0, buttons: 1, bubbles: true, cancelable: true, isTrusted: true, __trusted: true, timeStamp: t };
+    var upX = cx + Math.max(1, Math.round((e - s) * 6));
+    var upInit = { clientX: upX, clientY: cy, pageX: upX, pageY: cy, button: 0, buttons: 0, bubbles: true, cancelable: true, isTrusted: true, __trusted: true, timeStamp: t + 1 };
+    if (typeof global.PointerEvent === "function") el.dispatchEvent(new global.PointerEvent("pointerdown", downInit));
+    el.dispatchEvent((typeof global.MouseEvent === "function") ? new global.MouseEvent("mousedown", downInit) : new global.Event("mousedown", downInit));
+    /* selectstart: spec — a new selection is beginning on this document. */
+    try {
+      el.dispatchEvent(new global.Event("selectstart", { bubbles: true, cancelable: true, isTrusted: true, __trusted: true, timeStamp: t }));
+    } catch (e2) {}
+    /* The selection the drag produced (L7 selection model). */
+    var selected = "";
+    try {
+      if (isField) {
+        el.setSelectionRange(s, e);
+        selected = String(el.value || "").substring(s, e);
+      } else {
+        var sel = global.getSelection();
+        sel.removeAllRanges();
+        var r = new global.Range();
+        r.setStart(el, s);
+        r.setEnd(el, e);
+        sel.addRange(r);
+        el._caretOffset = e;
+        __notifySelectionChange();
+        selected = String(el.textContent || "").substring(s, e);
+      }
+    } catch (e3) {
+      global.__lastActionError = "selection_failed";
+      return JSON.stringify({ ok: false, error: "selection_failed" });
+    }
+    /* input/textarea fire 'select' when text is selected. */
+    if (isField) {
+      el.dispatchEvent(new global.Event("select", { bubbles: true, cancelable: false, isTrusted: true, __trusted: true, timeStamp: t }));
+    }
+    if (typeof global.PointerEvent === "function") el.dispatchEvent(new global.PointerEvent("pointerup", upInit));
+    el.dispatchEvent((typeof global.MouseEvent === "function") ? new global.MouseEvent("mouseup", upInit) : new global.Event("mouseup", upInit));
+    global.__lastActionError = null;
+    return JSON.stringify({ ok: true, selected: selected, start: s, end: e });
   };
 
   function __executeDrag(el, dx, dy, steps, trajectory, stealth) {
