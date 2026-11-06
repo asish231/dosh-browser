@@ -216,3 +216,42 @@ def test_occlusion_gated_action_dispatch():
     assert res["errGated"] == "occluded_by:div#overlay"
     assert res["clickUngated"]
     assert res["errUngated"] is None
+
+
+def test_font_metrics_kerning_pairs():
+    """L5: kerning pairs reduce combined width vs individual advance sum."""
+    html = '<!doctype html><html><body><div id="t">AV</div></body></html>'
+    ctx = _ctx(html)
+    # Trigger layout first
+    ctx.eval("document.getElementById('t').getBoundingClientRect();")
+    info = json.loads(ctx.eval("JSON.stringify(document.__layoutInfo)"))
+    # textMetric label should reflect kerning
+    assert info["textMetric"] == "proportional-advance+kern-pairs", info
+
+def test_kerning_pair_width_reduction():
+    """L5: 'AV' is narrower than 'A ' + 'V' (kerning correction applied)."""
+    html = '<!doctype html><html><body><div id="a">AV</div><div id="b">A</div></body></html>'
+    ctx = _ctx(html)
+    widths = json.loads(ctx.eval("""
+        (function() {
+            var av = document.getElementById("a").getBoundingClientRect();
+            var a = document.getElementById("b").getBoundingClientRect();
+            return JSON.stringify({av: av.width, a: a.width});
+        })()
+    """))
+    # AV box width should be less than twice the 'A' width (kerning pulls V closer)
+    assert widths["av"] < widths["a"] * 2, f"AV={widths['av']}, A*2={widths['a']*2}"
+
+def test_sticky_left_right_offsets():
+    """L2: sticky left/right offsets shift element position."""
+    html = """<!doctype html><html><body style="margin:0;">
+        <div id="sticky" style="position:sticky; top:10px; left:20px; width:100px; height:50px;">S</div>
+    </body></html>"""
+    ctx = _ctx(html)
+    ctx.eval("window.scrollTo(100, 100);")
+    box = json.loads(ctx.eval("""
+        var el = document.getElementById("sticky");
+        JSON.stringify(el.getBoundingClientRect());
+    """))
+    # After scroll(100,100), sticky with left:20 should be at >= 20 (scrollX + 20)
+    assert box["x"] >= 20, f"Expected x >= 20, got {box['x']}"

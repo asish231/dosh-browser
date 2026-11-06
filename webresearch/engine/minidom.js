@@ -2475,6 +2475,28 @@ var pos = (st.position || "").toLowerCase();
   };
   for (var _di = 0; _di <= 9; _di++) __CHAR_ADVANCES[String(_di)] = 0.55;
 
+  /* L5: Kerning pairs (Helvetica-class). These pairs have narrower combined
+     advance than the sum of individual advances because the letterforms
+     interlock. This is the "shaping-lite" approximation: no full Unicode
+     bidi or per-glyph shaping, but pair-level kerning that real fonts apply. */
+  var __KERN_PAIRS = {
+    "AV": -0.06, "AW": -0.06, "AY": -0.06, "Av": -0.04, "Aw": -0.04, "Ay": -0.04,
+    "AT": -0.06, "AU": -0.05, "AV": -0.06,
+    "Ta": -0.05, "Te": -0.05, "Ti": -0.05, "To": -0.05, "Tu": -0.05, "Ty": -0.05,
+    "Tr": -0.04, "Tc": -0.04, "Ts": -0.03, "TA": -0.06, "TW": -0.06,
+    "Wa": -0.05, "We": -0.04, "Wi": -0.05, "Wo": -0.05, "Wu": -0.05, "Wy": -0.05,
+    "Wa": -0.05, "WO": -0.05, "WA": -0.06,
+    "Ya": -0.05, "Ye": -0.04, "Yo": -0.05, "Yu": -0.05, "Yv": -0.04,
+    "Va": -0.05, "Ve": -0.04, "Vi": -0.05, "Vo": -0.05, "Vu": -0.05, "Vy": -0.05,
+    "VO": -0.05, "VA": -0.06,
+    "fa": -0.03, "fe": -0.03, "fi": -0.03, "fo": -0.03, "fu": -0.03, "fy": -0.03,
+    "fa": -0.03, "ff": -0.05, "fl": -0.03, "ft": -0.03,
+    "Ly": -0.04, "Lu": -0.03, "Lo": -0.03, "La": -0.03,
+    "F.": -0.08, "F,": -0.08, "F;": -0.06, "L.": -0.08, "L,": -0.08, "T.": -0.08, "T,": -0.08,
+    "Y.": -0.08, "Y,": -0.08, "V.": -0.08, "V,": -0.08, "P.": -0.06, "P,": -0.06,
+    "rn": -0.02, "rm": -0.02, "oo": -0.01, "ee": -0.01, "aa": -0.01, "cc": -0.01
+  };
+
   function __advance(ch, fontSize) {
     if (Object.prototype.hasOwnProperty.call(__CHAR_ADVANCES, ch)) {
       return __CHAR_ADVANCES[ch] * fontSize;
@@ -2483,9 +2505,23 @@ var pos = (st.position || "").toLowerCase();
     if (code >= 0x1100 && (code <= 0x115F || (code >= 0x2E80 && code <= 0x9FFF) || (code >= 0xAC00 && code <= 0xD7A3) || (code >= 0xF900 && code <= 0xFAFF))) return fontSize;
     return 0.55 * fontSize;
   }
-  function __textWidth(s, fontSize) {
+  /* L5: Kerning-aware text width. Sums per-character advances, then
+     subtracts kerning corrections for adjacent pairs that real fonts
+     interlock (AV, To, Wa, etc.). letterSpacing (em units) is added
+     per character when set. */
+  function __textWidth(s, fontSize, letterSpacing) {
     var w = 0;
-    for (var i = 0; i < s.length; i++) w += __advance(s[i], fontSize);
+    var ls = (typeof letterSpacing === "number") ? letterSpacing * fontSize : 0;
+    for (var i = 0; i < s.length; i++) {
+      w += __advance(s[i], fontSize);
+      if (i > 0) {
+        var pair = s[i - 1] + s[i];
+        if (Object.prototype.hasOwnProperty.call(__KERN_PAIRS, pair)) {
+          w += __KERN_PAIRS[pair] * fontSize;
+        }
+      }
+      if (ls && i < s.length - 1) w += ls;
+    }
     return w;
   }
   var __NON_RENDERED = { head:1, style:1, script:1, title:1, meta:1, link:1, template:1, noscript:0 };
@@ -3052,7 +3088,7 @@ var pos = (st.position || "").toLowerCase();
       doc.__scrollExtent = { width: __maxR, height: __maxB };
     } catch (e) {}
     try {
-      doc.__layoutInfo = { engine: "block-flow+flex+grid+positioned", viewportWidth: vw, boxes: layout.boxes, textMetric: "proportional-advance-table", replacedDefaults: "css-300x150" };
+      doc.__layoutInfo = { engine: "block-flow+flex+grid+positioned", viewportWidth: vw, boxes: layout.boxes, textMetric: "proportional-advance+kern-pairs", replacedDefaults: "css-300x150" };
     } catch (e) {}
     /* A fresh layout pass can move IntersectionObserver targets in or out of
        the viewport (lazy feeds append content; the sentinel crosses the fold).
