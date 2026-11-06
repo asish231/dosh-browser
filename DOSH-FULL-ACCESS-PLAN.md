@@ -647,7 +647,7 @@ item. Both suites green before the phase is called done.
       reported per-download (clean/suspicious/unknown + why); no
       signature engine is faked.
 - [x] **Docs** — §2.4 + §2.8 rows + AGENTS.md roadmap rows.
-- [ ] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`.
+- [x] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`. (Python 1023 passed/8 skipped at a34817f7 incl. 47 Phase-6 tests + the 3 stale-test fixes; the 1040-passed Phase-7 run at Phase-7 HEAD re-covers them; Rust 243 passed/0 failed)
 
 Execution evidence (2026-11-06):
 - R1: commit 6cc94886; tests/test_r1_canvas_raster.py → 9 passed.
@@ -732,8 +732,8 @@ decisions + divergence-documenting tests. Both suites green before done.
 - [x] **A5** Login/OTP: verify the capped/never-guess behavior with
       tests; extend only with honest capabilities.
 - [x] **Docs** — §2.2/§2.9 rows + AGENTS.md roadmap rows.
-- [ ] **Green** — Python full suite + `cargo test -p dosh-browser-core
-      --lib` + `doshgentv8` core-crate tests.
+- [x] **Green** — Python full suite + `cargo test -p dosh-browser-core
+      --lib` + `doshgentv8` core-crate tests. (Python 1040 passed/8 skipped; Rust 243 passed/0 failed; doshgentv8 core 29 passed/0 failed; QuickJS↔V8 oracle bridge GREEN)
 
 Phase 7 execution evidence (continued, 2026-11-06):
 - J3: commit (J3) tests/test_j3_weakref.py → 4 passed. WeakRef rejects
