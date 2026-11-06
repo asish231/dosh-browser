@@ -376,3 +376,29 @@ def test_css_keyframes_parsed_from_stylesheet():
     """))
     assert "pulse" in kf["names"], f"pulse should be parsed, got {kf['names']}"
     assert kf["pulseSteps"] == [0, 0.5, 1.0], f"steps should be 0/0.5/1, got {kf['pulseSteps']}"
+
+
+def test_css_transition_property_change():
+    """L9: transition shorthand animates a changed property from old to new value."""
+    html = """<!doctype html><html><head><style>
+        #t { transition: opacity 0.5s linear; opacity: 0; }
+    </style></head><body>
+        <div id="t">T</div>
+    </body></html>"""
+    ctx = _ctx(html)
+    # Set opacity to 1 via style — should trigger a transition from 0 to 1
+    ctx.eval("document.getElementById('t').style.opacity = '1';")
+    # Immediately after, the transition should be at the start (opacity ~0)
+    # but the animation engine needs a layout pass to register
+    ctx.eval("document.getElementById('t').getBoundingClientRect();")
+    # Advance halfway through the 0.5s transition
+    ctx.eval("__advanceClock(250);")
+    mid = ctx.eval("getComputedStyle(document.getElementById('t')).opacity")
+    mid_f = float(mid) if mid else 0.0
+    assert 0.0 < mid_f < 1.0, f"mid-transition opacity should be between 0 and 1, got {mid}"
+    # Advance past the end
+    ctx.eval("__advanceClock(300);")
+    end = ctx.eval("getComputedStyle(document.getElementById('t')).opacity")
+    end_f = float(end) if end else 1.0
+    assert end_f >= mid_f, f"end opacity should be >= mid, got {end} vs {mid}"
+    assert end_f == 1.0 or end_f == 1, f"end opacity should be 1, got {end}"

@@ -902,15 +902,33 @@
   var __styleProxyHandler = {
     set: function (target, prop, value) {
       if (prop === "_el" || prop === "__parsing") { target[prop] = value; return true; }
+      /* L9: CSS transition — capture the old value before the write so the
+         transition engine can animate from it to the new value. Only fires
+         when the element has a transition shorthand covering this property. */
+      var camel = String(prop).replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
+      /* Old value: inline first, else the computed cascade value */
+      var __oldValForTransition = target[camel] != null ? target[camel] : (target[prop] != null ? target[prop] : null);
+      if (__oldValForTransition == null && target._el) {
+        try {
+          var doc0 = target._el.ownerDocument || global.document;
+          var kebab0 = camel.replace(/[A-Z]/g, function (c) { return "-" + c.toLowerCase(); });
+          var cs0 = __computedStyle(target._el, doc0 ? __collectStyleRules(doc0) : [], 16);
+          __oldValForTransition = cs0[camel] != null ? cs0[camel] : (cs0[kebab0] != null ? cs0[kebab0] : null);
+        } catch (e) {}
+      }
+      var __newValForTransition = (value == null || value === "") ? null : String(value);
       if (value == null || value === "") {
         /* Real browsers: assigning '' removes the declaration (un-hides). */
-        var camel = String(prop).replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
         delete target[camel];
         delete target[prop];
       } else {
         target[prop] = String(value);
       }
       target.__syncAttr();
+      /* L9: fire the transition after the style write */
+      if (__oldValForTransition !== __newValForTransition && __oldValForTransition != null && __newValForTransition != null) {
+        try { __startTransition(target._el, camel, __oldValForTransition, __newValForTransition); } catch (e) {}
+      }
       return true;
     },
     deleteProperty: function (target, prop) {
@@ -4817,6 +4835,67 @@ var pos = (st.position || "").toLowerCase();
       still.push(anim);
     });
     doc.__activeAnimations = still;
+  }
+  /* L9: CSS transition shorthand support.
+     transition: PROPERTY DURATION TIMING-FUNCTION DELAY
+     When a property changes on an element with a transition, the old
+     value animates to the new one over the duration. The transition is
+     registered as a one-shot animation with synthetic keyframes. */
+  function __parseTransitionShorthand(st) {
+    var sh = st.transition;
+    if (!sh) return [];
+    return String(sh).split(",").map(function (part) {
+      var parts = part.trim().split(/\s+/);
+      var prop = null, duration = "0s", timing = "ease", delay = "0s";
+      parts.forEach(function (p) {
+        if (/^\d+(\.\d+)?(s|ms)$/.test(p)) {
+          if (duration === "0s") duration = p;
+          else if (delay === "0s") delay = p;
+        } else if (/^(linear|ease|ease-in|ease-out|ease-in-out)$/.test(p)) {
+          timing = p;
+        } else if (prop === null) {
+          prop = p;
+        }
+      });
+      return { prop: prop, duration: duration, timing: timing, delay: delay };
+    }).filter(function (t) { return t.prop && t.prop !== "none"; });
+  }
+  /* Start a transition on an element for a changed property. Called from
+     the style proxy when a transition property is set. */
+  function __startTransition(el, prop, oldVal, newVal) {
+    if (oldVal === newVal) return;
+    var doc = el.ownerDocument || global.document;
+    if (!doc) return;
+    var rules = __collectStyleRules(doc);
+    var cs = __computedStyle(el, rules, 16);
+    var transitions = __parseTransitionShorthand(cs);
+    /* The changed property must match a transition property (or 'all') */
+    var match = null;
+    for (var i = 0; i < transitions.length; i++) {
+      if (transitions[i].prop === "all" || transitions[i].prop === prop) {
+        match = transitions[i];
+        break;
+      }
+    }
+    if (!match) return;
+    var dur = __parseTime(match.duration);
+    if (dur <= 0) return;
+    /* Build synthetic keyframes: from oldVal to newVal */
+    var kebab = prop.replace(/[A-Z]/g, function (c) { return "-" + c.toLowerCase(); });
+    var kf = [
+      { offset: 0, props: {} },
+      { offset: 1, props: {} }
+    ];
+    kf[0].props[kebab] = oldVal;
+    kf[1].props[kebab] = newVal;
+    doc.__activeAnimations = doc.__activeAnimations || [];
+    doc.__activeAnimations.push({
+      el: el, keyframes: kf,
+      spec: { name: null, duration: match.duration, timing: match.timing,
+              delay: match.delay, iterations: "1", direction: "normal",
+              fill: "none" },
+      elapsed: 0
+    });
   }
   /* Register animations for elements with animation: NAME DURATION. Called
      during layout passes (cheap no-op when no keyframes defined). */
