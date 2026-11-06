@@ -2346,6 +2346,8 @@
       overflowX: null,
       overflowY: null,
       cursor: null,
+      float: null,
+      clear: null,
       tableLayout: null,
       borderCollapse: null,
 borderSpacing: null,
@@ -2600,14 +2602,18 @@ var pos = (st.position || "").toLowerCase();
       }
       if (cs.display === "flex" || cs.display === "inline-flex") {
         var gap = __parsePx(cs.gap, contentW, cs.fontSize) || 0;
-        var curX = x;
-        var curY = y;
-        var maxRowH = 0;
-        var totalColW = 0;
         var isCol = (cs.flexDirection === "column");
+        var justify = (cs.justifyContent || "flex-start").toLowerCase();
+        var align = (cs.alignItems || "stretch").toLowerCase();
         var children = (el.childNodes || []).filter(function (c) {
           return c.nodeType === 1 && !__nonRendered(c);
         });
+        /* L3: Two-pass flex layout. Pass 1: measure items and collect into rows. */
+        var rows = [];
+        var curRow = [];
+        var curMain = 0;
+        var maxCross = 0;
+        var availMain = contentW;
         children.forEach(function (c, idx) {
           var ccs = __computedStyle(c, rules, cs.fontSize);
           if (ccs.display === "none") {
@@ -2621,18 +2627,17 @@ var pos = (st.position || "").toLowerCase();
           }
           var margin = __parseSides(ccs.margin, contentW, ccs.fontSize);
           var padding = __parseSides(ccs.padding, contentW, ccs.fontSize);
-          var w = __parsePx(ccs.width, contentW, ccs.fontSize);
-          var h = __parsePx(ccs.height, null, ccs.fontSize);
+          var w = __parsePx(ccs.width, contentW, cs.fontSize);
+          var h = __parsePx(ccs.height, null, cs.fontSize);
+          var mainSize, crossSize;
           if (isCol) {
             if (w == null) w = Math.max(0, contentW - margin[1] - margin[3]);
+            crossSize = margin[3] + w + margin[1];
             var itemContentW = Math.max(0, w - padding[1] - padding[3]);
-            var r = layoutChildren(c, ccs, x + margin[3] + padding[3], curY + margin[0] + padding[0], itemContentW);
-            var itemH = (h == null) ? Math.max(0, r.bottom - (curY + margin[0] + padding[0])) : h;
+            var r = layoutChildren(c, ccs, 0, 0, itemContentW);
+            var itemH = (h == null) ? Math.max(0, r.bottom) : h;
             var boxH = padding[0] + itemH + padding[2];
-            c.__box = { x: x + margin[3], y: curY + margin[0], width: w, height: boxH };
-            layout.boxes++;
-            curY += margin[0] + boxH + margin[2] + (idx < children.length - 1 ? gap : 0);
-            if (w + margin[1] + margin[3] > totalColW) totalColW = w + margin[1] + margin[3];
+            mainSize = margin[0] + boxH + margin[2];
           } else {
             if (w == null) {
               if (__REPLACED_TAGS[c.nodeName]) {
@@ -2642,23 +2647,110 @@ var pos = (st.position || "").toLowerCase();
                 w = Math.max(30, Math.min(contentW, tw + padding[1] + padding[3] + 20));
               }
             }
-            var fullItemW = margin[3] + w + margin[1];
-            if (cs.flexWrap === "wrap" && curX + fullItemW > x + contentW && curX > x) {
-              curX = x;
-              curY += maxRowH + gap;
-              maxRowH = 0;
-            }
+            mainSize = margin[3] + w + margin[1];
             var itemContentW = Math.max(0, w - padding[1] - padding[3]);
-            var r = layoutChildren(c, ccs, curX + margin[3] + padding[3], curY + margin[0] + padding[0], itemContentW);
-            var itemH = (h == null) ? Math.max(0, r.bottom - (curY + margin[0] + padding[0])) : h;
+            var r = layoutChildren(c, ccs, 0, 0, itemContentW);
+            var itemH = (h == null) ? Math.max(0, r.bottom) : h;
             var boxH = padding[0] + itemH + padding[2];
-            c.__box = { x: curX + margin[3], y: curY + margin[0], width: w, height: boxH };
-            layout.boxes++;
-            curX += fullItemW + (idx < children.length - 1 ? gap : 0);
-            if (boxH + margin[0] + margin[2] > maxRowH) maxRowH = boxH + margin[0] + margin[2];
+            crossSize = margin[0] + boxH + margin[2];
+          }
+          if (cs.flexWrap === "wrap" && curRow.length > 0 && curMain + mainSize > availMain) {
+            rows.push({ items: curRow, mainSize: curMain, crossSize: maxCross });
+            curRow = [];
+            curMain = 0;
+            maxCross = 0;
+          }
+          curRow.push({ el: c, ccs: ccs, w: w, h: h, mainSize: mainSize, crossSize: crossSize, margin: margin, padding: padding });
+          curMain += mainSize + (curRow.length > 1 ? gap : 0);
+          if (crossSize > maxCross) maxCross = crossSize;
+        });
+        if (curRow.length > 0) {
+          rows.push({ items: curRow, mainSize: curMain, crossSize: maxCross });
+        }
+        /* L3: Pass 2 - position items with justify-content and align-items. */
+        var rowY = y;
+        var totalW = 0;
+        rows.forEach(function (row) {
+          var freeMain = availMain - row.mainSize;
+          var mainOffset = 0;
+          var mainGap = gap;
+          if (justify === "flex-end") mainOffset = freeMain;
+          else if (justify === "center") mainOffset = freeMain / 2;
+          else if (justify === "space-between" && row.items.length > 1) {
+            mainGap = gap + (freeMain / (row.items.length - 1));
+          } else if (justify === "space-around" && row.items.length > 0) {
+            mainOffset = freeMain / (row.items.length * 2);
+            mainGap = gap + (freeMain / row.items.length);
+          } else if (justify === "space-evenly" && row.items.length > 0) {
+            mainOffset = freeMain / (row.items.length + 1);
+            mainGap = gap + (freeMain / (row.items.length + 1));
+          }
+          var pos = isCol ? rowY : (x + mainOffset);
+          var rowMaxW = 0;
+          row.items.forEach(function (item, idx) {
+            var c = item.el;
+            var ccs = item.ccs;
+            if (isCol) {
+              var itemX = x;
+              if (align === "flex-end") itemX = x + contentW - item.w - item.margin[1];
+              else if (align === "center") itemX = x + (contentW - item.w) / 2;
+              else if (align === "stretch") {
+                item.w = contentW - item.margin[1] - item.margin[3];
+                itemX = x + item.margin[3];
+              } else {
+                itemX = x + item.margin[3];
+              }
+              var itemY = pos + item.margin[0];
+              var itemContentW = Math.max(0, item.w - item.padding[1] - item.padding[3]);
+              var r = layoutChildren(c, ccs, itemX + item.padding[3], itemY + item.padding[0], itemContentW);
+              var itemH = (item.h == null) ? Math.max(0, r.bottom - itemY - item.padding[0]) : item.h;
+              var boxH = item.padding[0] + itemH + item.padding[2];
+              c.__box = { x: itemX, y: itemY, width: item.w, height: boxH };
+              layout.boxes++;
+              pos += item.mainSize + (idx < row.items.length - 1 ? mainGap : 0);
+              if (item.w + item.margin[1] + item.margin[3] > rowMaxW) rowMaxW = item.w + item.margin[1] + item.margin[3];
+            } else {
+              var itemX = pos + item.margin[3];
+              var itemY = rowY;
+              if (align === "flex-end") itemY = rowY + row.crossSize - item.crossSize;
+              else if (align === "center") itemY = rowY + (row.crossSize - item.crossSize) / 2;
+              else if (align === "stretch") {
+                item.h = row.crossSize - item.margin[0] - item.margin[2] - item.padding[0] - item.padding[2];
+              }
+              itemY += item.margin[0];
+              var itemContentW = Math.max(0, item.w - item.padding[1] - item.padding[3]);
+              var r = layoutChildren(c, ccs, itemX + item.padding[3], itemY + item.padding[0], itemContentW);
+              var itemH = (item.h == null) ? Math.max(0, r.bottom - itemY - item.padding[0]) : item.h;
+              var boxH = item.padding[0] + itemH + item.padding[2];
+              c.__box = { x: itemX, y: itemY, width: item.w, height: boxH };
+              layout.boxes++;
+              pos += item.mainSize + (idx < row.items.length - 1 ? mainGap : 0);
+              if (pos - x > rowMaxW) rowMaxW = pos - x;
+            }
+          });
+          if (isCol) {
+            rowY = pos;
+            if (rowMaxW > totalW) totalW = rowMaxW;
+          } else {
+            rowY += row.crossSize + gap;
+            if (pos - x > totalW) totalW = pos - x;
           }
         });
-        return { bottom: isCol ? curY : (curY + maxRowH), maxW: isCol ? totalColW : (curX - x) };
+        return { bottom: rowY, maxW: totalW };
+      }
+      /* L1: CSS floats. Track left/right float regions and shrink-wrap
+         content around them. Floats are block-level elements that are shifted
+         to the left or right, with inline content flowing around them. */
+      var floats = [];
+      function getFloatBounds(yPos) {
+        var leftW = 0, rightW = 0;
+        floats.forEach(function (f) {
+          if (yPos >= f.y && yPos < f.y + f.h) {
+            if (f.side === "left") leftW += f.w;
+            else if (f.side === "right") rightW += f.w;
+          }
+        });
+        return { leftW: leftW, rightW: rightW };
       }
       var cursor = y;
       var line = null;
@@ -2668,48 +2760,81 @@ var pos = (st.position || "").toLowerCase();
         var h = 0;
         line.runs.forEach(function (r) { if (r.h > h) h = r.h; });
         if (h <= 0) h = cs.fontSize * 1.2;
-        line.runs.forEach(function (r) {
-          var rec = { x: r.x, y: cursor, h: h, text: r.text || "" };
-          (r.el.__lines = r.el.__lines || []).push(rec);
-          if (!r.el.__box) {
-            r.el.__box = { x: r.x, y: cursor, width: r.w, height: h };
-            layout.boxes++;
-          } else if (r.el !== el && r.el.nodeName !== "body" && r.el.nodeName !== "html") {
-            var bx1 = Math.min(r.el.__box.x, r.x);
-            var by1 = Math.min(r.el.__box.y, cursor);
-            var bx2 = Math.max(r.el.__box.x + r.el.__box.width, r.x + r.w);
-            var by2 = Math.max(r.el.__box.y + r.el.__box.height, cursor + h);
-            r.el.__box = { x: bx1, y: by1, width: bx2 - bx1, height: by2 - by1 };
-          }
-        });
+        /* L4: For RTL, reposition runs from right edge of available width */
+        if (line.isRTL) {
+          var lineX = x + contentW - line.w;
+          var currentX = lineX;
+          /* For RTL, iterate through runs in reverse order so the first
+             element in the DOM ends up on the right */
+          var runs = line.runs.slice().reverse();
+          runs.forEach(function (r) {
+            var rec = { x: currentX, y: cursor, h: h, text: r.text || "" };
+            (r.el.__lines = r.el.__lines || []).push(rec);
+            if (!r.el.__box) {
+              r.el.__box = { x: currentX, y: cursor, width: r.w, height: h };
+              layout.boxes++;
+            } else if (r.el !== el && r.el.nodeName !== "body" && r.el.nodeName !== "html") {
+              var bx1 = Math.min(r.el.__box.x, currentX);
+              var by1 = Math.min(r.el.__box.y, cursor);
+              var bx2 = Math.max(r.el.__box.x + r.el.__box.width, currentX + r.w);
+              var by2 = Math.max(r.el.__box.y + r.el.__box.height, cursor + h);
+              r.el.__box = { x: bx1, y: by1, width: bx2 - bx1, height: by2 - by1 };
+            }
+            currentX += r.w;
+          });
+        } else {
+          line.runs.forEach(function (r) {
+            var rec = { x: r.x, y: cursor, h: h, text: r.text || "" };
+            (r.el.__lines = r.el.__lines || []).push(rec);
+            if (!r.el.__box) {
+              r.el.__box = { x: r.x, y: cursor, width: r.w, height: h };
+              layout.boxes++;
+            } else if (r.el !== el && r.el.nodeName !== "body" && r.el.nodeName !== "html") {
+              var bx1 = Math.min(r.el.__box.x, r.x);
+              var by1 = Math.min(r.el.__box.y, cursor);
+              var bx2 = Math.max(r.el.__box.x + r.el.__box.width, r.x + r.w);
+              var by2 = Math.max(r.el.__box.y + r.el.__box.height, cursor + h);
+              r.el.__box = { x: bx1, y: by1, width: bx2 - bx1, height: by2 - by1 };
+            }
+          });
+        }
         cursor += h;
         if (line.w > maxW) maxW = line.w;
         line = null;
       }
-      function pushRun(targetEl, text, fontSize) {
+      function pushRun(targetEl, text, fontSize, isRTL) {
         var words = String(text).split(/(\s+)/);
         words.forEach(function (word) {
           if (word === "") return;
           if (/^\s+$/.test(word)) {
             var sp = __textWidth(" ", fontSize);
-            if (!line) line = { x: x, w: 0, runs: [] };
+            if (!line) line = { x: x, w: 0, runs: [], isRTL: isRTL };
             if (line.w + sp > contentW && line.w > 0) flushLine();
-            if (!line) line = { x: x, w: 0, runs: [] };
+            if (!line) line = { x: x, w: 0, runs: [], isRTL: isRTL };
             line.runs.push({ el: targetEl, x: x + line.w, w: sp, h: fontSize * 1.2, text: " " });
             line.w += sp;
             return;
           }
           var ww = __textWidth(word, fontSize);
-          if (!line) line = { x: x, w: 0, runs: [] };
+          if (!line) line = { x: x, w: 0, runs: [], isRTL: isRTL };
           if (line.w + ww > contentW && line.w > 0) flushLine();
-          if (!line) line = { x: x, w: 0, runs: [] };
+          if (!line) line = { x: x, w: 0, runs: [], isRTL: isRTL };
           line.runs.push({ el: targetEl, x: x + line.w, w: ww, h: fontSize * 1.2, text: word });
           line.w += ww;
         });
       }
-      function flowInline(targetEl, node, fontSize) {
-        (node.childNodes || []).forEach(function (c) {
-          if (c.nodeType === 3) { pushRun(targetEl, __nodeText(c), fontSize); return; }
+      function flowInline(targetEl, node, fontSize, inheritedRTL) {
+        /* L4: Bidi support - direction:rtl reverses inline element ordering.
+           direction is inherited: a child without its own direction property
+           inherits the parent container's direction. */
+        var nodeStyle = __computedStyle(node, rules, fontSize);
+        var isRTL = (nodeStyle.direction === "rtl") || (nodeStyle.direction !== "ltr" && inheritedRTL);
+        var children = (node.childNodes || []).slice();
+        if (isRTL) {
+          children.reverse();
+        }
+        children.forEach(function (c) {
+          if (c.nodeType === 3) { pushRun(targetEl, __nodeText(c), fontSize, isRTL); return; }
           if (c.nodeType !== 1) return;
           var ccs = __computedStyle(c, rules, fontSize);
           if (ccs.display === "none") { __clearBoxes(c); return; }
@@ -2731,11 +2856,11 @@ var pos = (st.position || "").toLowerCase();
             if (rb.w > maxW) maxW = rb.w;
             return;
           }
-          flowInline(c, c, ccs.fontSize);
+          flowInline(c, c, ccs.fontSize, isRTL);
         });
       }
       (el.childNodes || []).forEach(function (c) {
-        if (c.nodeType === 3) { pushRun(el, __nodeText(c), cs.fontSize); return; }
+        if (c.nodeType === 3) { pushRun(el, __nodeText(c), cs.fontSize, cs.direction === "rtl"); return; }
         if (c.nodeType !== 1) return;
         var ccs = __computedStyle(c, rules, cs.fontSize);
         if (ccs.display === "none") { __clearBoxes(c); layout.boxes++; return; }
@@ -2743,9 +2868,38 @@ var pos = (st.position || "").toLowerCase();
           layoutAbsolute(c, ccs, x, cursor, contentW, 0);
           return;
         }
+        /* L1: Handle floated elements */
+        if (ccs.float && ccs.float !== "none") {
+          flushLine();
+          var fb = layoutBlock(c, x, cursor, contentW, cs.fontSize);
+          var floatW = fb.w;
+          var floatH = fb.bottom - cursor;
+          if (ccs.float === "left") {
+            c.__box.x = x;
+            floats.push({ y: cursor, h: floatH, w: floatW, side: "left" });
+          } else if (ccs.float === "right") {
+            c.__box.x = x + contentW - floatW;
+            floats.push({ y: cursor, h: floatH, w: floatW, side: "right" });
+          }
+          cursor = fb.bottom;
+          if (floatW > maxW) maxW = floatW;
+          return;
+        }
+        /* L1: Handle clear property - push cursor below matching floats */
+        if (ccs.clear && ccs.clear !== "none") {
+          var clearSide = ccs.clear;
+          floats.forEach(function (f) {
+            if (clearSide === "both" || clearSide === f.side) {
+              if (cursor < f.y + f.h) cursor = f.y + f.h;
+            }
+          });
+        }
         if (isBlockDisplay(ccs)) {
           flushLine();
-          var cb = layoutBlock(c, x, cursor, contentW, cs.fontSize);
+          var bounds = floats.length > 0 ? getFloatBounds(cursor) : { leftW: 0, rightW: 0 };
+          var adjustedX = x + bounds.leftW;
+          var adjustedW = contentW - bounds.leftW - bounds.rightW;
+          var cb = layoutBlock(c, adjustedX, cursor, adjustedW, cs.fontSize);
           cursor = cb.bottom;
           if (cb.w > maxW) maxW = cb.w;
           return;
@@ -2757,7 +2911,7 @@ var pos = (st.position || "").toLowerCase();
           if (rb.w > maxW) maxW = rb.w;
           return;
         }
-        flowInline(c, c, ccs.fontSize);
+        flowInline(c, c, ccs.fontSize, cs.direction === "rtl");
       });
       flushLine();
       return { bottom: cursor, maxW: maxW };
@@ -2825,16 +2979,32 @@ var pos = (st.position || "").toLowerCase();
         if (relTop != null) el.__box.y += relTop;
         else if (relBottom != null) el.__box.y -= relBottom;
       } else if (cs.position === "sticky") {
+        /* L2: position: sticky — element sticks within its containing block
+           when scrolled past the offset threshold. Clamps between natural
+           position and container bounds (approximated as viewport here). */
         var stickyTop = __parsePx(cs.top, null, cs.fontSize);
         var stickyBottom = __parsePx(cs.bottom, null, cs.fontSize);
+        var stickyLeft = __parsePx(cs.left, availW, cs.fontSize);
+        var stickyRight = __parsePx(cs.right, availW, cs.fontSize);
         var curScrollY = global.scrollY || 0;
+        var curScrollX = global.scrollX || 0;
+        var naturalY = el.__box.y;
+        var naturalX = el.__box.x;
         if (stickyTop != null) {
           var targetY = curScrollY + stickyTop;
-          if (el.__box.y < targetY) el.__box.y = targetY;
+          if (naturalY < targetY) el.__box.y = targetY;
         } else if (stickyBottom != null) {
           var vh = Number(global.innerHeight) || 720;
           var targetY2 = curScrollY + vh - stickyBottom - totalH;
-          if (el.__box.y > targetY2) el.__box.y = targetY2;
+          if (naturalY > targetY2) el.__box.y = targetY2;
+        }
+        if (stickyLeft != null) {
+          var targetX = curScrollX + stickyLeft;
+          if (naturalX < targetX) el.__box.x = targetX;
+        } else if (stickyRight != null) {
+          var vwSticky = Number(global.innerWidth) || 1280;
+          var targetX2 = curScrollX + vwSticky - stickyRight - el.__box.width;
+          if (naturalX > targetX2) el.__box.x = targetX2;
         }
       }
       layout.boxes++;

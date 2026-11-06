@@ -100,6 +100,67 @@ def test_flex_wrap_layout_distribution():
     assert info["r2"]["y"] >= info["r1"]["y"] + info["r1"]["height"]  # Item 2 is placed beneath Item 1
 
 
+def test_css_float_left_right_clear():
+    """L1: CSS floats position elements left/right, clear prevents wrapping."""
+    html = """<!doctype html><html><body style="margin:0; padding:0;">
+        <div id="float-left" style="float:left; width:100px; height:50px;">L</div>
+        <div id="float-right" style="float:right; width:80px; height:40px;">R</div>
+        <div id="clear-both" style="clear:both; width:200px; height:30px;">C</div>
+    </body></html>"""
+    ctx = _ctx(html)
+    boxes = json.loads(ctx.eval("""
+        (function() {
+            var left = document.getElementById("float-left").getBoundingClientRect();
+            var right = document.getElementById("float-right").getBoundingClientRect();
+            var clear = document.getElementById("clear-both").getBoundingClientRect();
+            return JSON.stringify({
+                left: { x: left.x, w: left.width },
+                right: { x: right.x, w: right.width },
+                clear: { y: clear.y }
+            });
+        })()
+    """))
+    # Left float should be at x=0 (or very close due to body margins)
+    assert boxes["left"]["x"] <= 10
+    assert boxes["left"]["w"] == 100
+    # Right float should be near the right edge (viewport ~1280px)
+    assert boxes["right"]["x"] > 1100
+    assert boxes["right"]["w"] == 80
+    # Clear:both should be below both floats (at least 50px down)
+    assert boxes["clear"]["y"] >= 40
+
+
+def test_bidi_direction_rtl_layout():
+    """L4: direction:rtl reverses text flow and inline element ordering."""
+    html = """<!doctype html><html><body style="margin:0; padding:0;">
+        <div id="ltr-container" style="direction:ltr; width:400px;">
+            <span id="ltr-first">First</span>
+            <span id="ltr-second">Second</span>
+        </div>
+        <div id="rtl-container" style="direction:rtl; width:400px;">
+            <span id="rtl-first">First</span>
+            <span id="rtl-second">Second</span>
+        </div>
+    </body></html>"""
+    ctx = _ctx(html)
+    boxes = json.loads(ctx.eval("""
+        (function() {
+            var ltrFirst = document.getElementById("ltr-first").getBoundingClientRect();
+            var ltrSecond = document.getElementById("ltr-second").getBoundingClientRect();
+            var rtlFirst = document.getElementById("rtl-first").getBoundingClientRect();
+            var rtlSecond = document.getElementById("rtl-second").getBoundingClientRect();
+            return JSON.stringify({
+                ltr: { first: ltrFirst.x, second: ltrSecond.x, firstW: ltrFirst.width, secondW: ltrSecond.width },
+                rtl: { first: rtlFirst.x, second: rtlSecond.x, firstW: rtlFirst.width, secondW: rtlSecond.width }
+            });
+        })()
+    """))
+    # LTR: first element should be left of second
+    assert boxes["ltr"]["first"] < boxes["ltr"]["second"]
+    # RTL: first element should be RIGHT of second (reversed)
+    assert boxes["rtl"]["first"] > boxes["rtl"]["second"]
+
+
 def test_position_sticky_bounds_clamping():
     html = """<!doctype html><html><body>
         <div id="sticky-header" style="position:sticky; top:15px; height:40px;">Header</div>
