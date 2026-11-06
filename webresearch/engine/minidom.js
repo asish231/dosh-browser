@@ -6181,18 +6181,28 @@ var decl = new CSSStyleDeclaration(el);
      Used by bot detection systems (DataDome, FingerprintJS, CreepJS) for
      audio fingerprinting. Produces deterministic, non-zero audio buffers
      matching Blink's DynamicsCompressor and Oscillator response. */
-  function _createAudioBuffer(channels, len, rate) {
+  function _createAudioBuffer(channels, len, rate, silent) {
+    /* M1: buffers are REAL sample containers. A created buffer starts at
+       digital silence (zeros) — the old stub pre-filled a canned 10kHz
+       decaying sine into EVERY buffer, which startRendering() then
+       handed back no matter what the graph did. Fingerprint noise stays
+       available for stealth contexts that explicitly want it via
+       __createNoiseBuffer. */
     channels = channels || 1;
     len = len || 1;
     rate = rate || 44100;
     var chData = [];
     for (var c = 0; c < channels; c++) {
       var f32 = new Float32Array(len);
-      for (var i = 0; i < len; i++) {
-        var t = i / rate;
-        var osc = Math.sin(2 * Math.PI * 10000 * t);
-        var env = Math.exp(-t * 2.5);
-        f32[i] = Math.tanh(osc * env * 2.0) * 0.15;
+      if (silent !== true) {
+        /* Only the LEGACY stealth noise lane fills canned data; every
+           normal createBuffer/decodeAudioData path passes silent=true. */
+        for (var i = 0; i < len; i++) {
+          var t = i / rate;
+          var osc = Math.sin(2 * Math.PI * 10000 * t);
+          var env = Math.exp(-t * 2.5);
+          f32[i] = Math.tanh(osc * env * 2.0) * 0.15;
+        }
       }
       chData.push(f32);
     }
@@ -6246,16 +6256,26 @@ var decl = new CSSStyleDeclaration(el);
       numberOfInputs: 1,
       numberOfOutputs: 0,
       channelCountMode: "explicit",
-      channelInterpretation: "speakers"
+      channelInterpretation: "speakers",
+      /* M1: the destination is a real graph sink — connected sources
+         record their edge here so startRendering() can pull them. */
+      _audioInputs: []
     };
     self.createOscillator = function () {
+      /* M1: oscillators are real graph nodes — connect() records the
+         edge and start(when) schedules generation for rendering. */
       var osc = {
         type: "sine",
         frequency: new AudioParam(440),
         detune: new AudioParam(0),
-        connect: function (t) { this._target = t; return t; },
-        disconnect: function () {},
-        start: function () { this._started = true; },
+        _started: false, _startWhen: 0,
+        connect: function (t) {
+          if (t && t._audioInputs) t._audioInputs.push(this);
+          this._target = t;
+          return t;
+        },
+        disconnect: function () { this._target = null; },
+        start: function (when) { this._started = true; this._startWhen = when || 0; },
         stop: function () { this._stopped = true; }
       };
       __cloakObject(osc, { connect: 1, disconnect: 0, start: 1, stop: 1 });
@@ -6289,7 +6309,18 @@ var decl = new CSSStyleDeclaration(el);
       return a;
     };
     self.createGain = function () {
-      var g = { gain: new AudioParam(1), connect: function (t) { return t; }, disconnect: function () {} };
+      /* M1: gain nodes are real graph nodes — OfflineAudioContext pulls
+         their gain.value at render time. */
+      var g = {
+        gain: new AudioParam(1),
+        _audioInputs: [],
+        connect: function (t) {
+          if (t && t._audioInputs) t._audioInputs.push(this);
+          this._target = t;
+          return t;
+        },
+        disconnect: function () { this._target = null; }
+      };
       __cloakObject(g, { connect: 1, disconnect: 0 });
       return g;
     };
@@ -6306,18 +6337,35 @@ var decl = new CSSStyleDeclaration(el);
       return f;
     };
     self.createBuffer = function (ch, len, rate) {
-      return _createAudioBuffer(ch || 1, len || 1, rate || self.sampleRate);
+      /* M1: spec behavior — a fresh buffer is digital silence. */
+      return _createAudioBuffer(ch || 1, len || 1, rate || self.sampleRate, true);
     };
     self.createBufferSource = function () {
+      /* M1: a buffer source holds the graph edge so rendering can pull
+         its buffer's samples; start(when, offset) records scheduling. */
       var bs = {
         buffer: null, playbackRate: new AudioParam(1), loop: false,
-        connect: function (t) { return t; }, disconnect: function () {}, start: function () {}, stop: function () {}
+        _started: false, _startWhen: 0, _startOffset: 0,
+        connect: function (t) {
+          if (t && t._audioInputs) t._audioInputs.push(this);
+          this._target = t;
+          return t;
+        },
+        disconnect: function () { this._target = null; },
+        start: function (when, offset) { this._started = true; this._startWhen = when || 0; this._startOffset = offset || 0; },
+        stop: function () { this._stopped = true; }
       };
       __cloakObject(bs, { connect: 1, disconnect: 0, start: 1, stop: 1 });
       return bs;
     };
     self.decodeAudioData = function (arrBuf) {
-      return Promise.resolve(_createAudioBuffer(2, 44100, self.sampleRate));
+      /* M1: no codec — honest silence at a plausible frame count derived
+         from the input's byte length (2ch 16-bit assumption), instead of
+         the old fixed 44100-frame canned-sine buffer. Disclosed: the
+         samples are zeros; real decode needs a codec (out of scope). */
+      var bytes = (arrBuf && arrBuf.byteLength) || 0;
+      var frames = Math.max(1, Math.floor(bytes / 4)) || 44100;
+      return Promise.resolve(_createAudioBuffer(2, frames, self.sampleRate, true));
     };
   }
 
@@ -6343,9 +6391,91 @@ var decl = new CSSStyleDeclaration(el);
     this.oncomplete = null;
 
     var self = this;
+    /* M1: OfflineAudioContext renders the REAL graph, not a canned buffer.
+       Walk from destination backwards: each connected source contributes
+       its samples; each gain node on the path scales by gain.value at
+       render time. Sources without a buffer contribute silence.
+       Oscillators contribute a real sine at their frequency (the only
+       generated waveform, disclosed: type is honored for 'sine' only). */
+    function _renderGraph() {
+      var out = _createAudioBuffer(self.numberOfChannels, self.length, self.sampleRate, true);
+      var channels = out.getChannelData ? null : null;
+      /* collect input chains into destination */
+      function pullInputs(node, sampleOffset, applyGain) {
+        var produced = null; /* array of Float32Array per channel */
+        var inputs = node._audioInputs || [];
+        for (var i = 0; i < inputs.length; i++) {
+          var src = inputs[i];
+          var samples = pullNode(src, sampleOffset);
+          if (!samples) continue;
+          if (!produced) produced = samples;
+          else {
+            /* SUM multiple inputs (spec: inputs mix) */
+            for (var c = 0; c < samples.length && c < produced.length; c++) {
+              for (var s = 0; s < samples[c].length; s++) produced[c][s] += samples[c][s];
+            }
+          }
+        }
+        if (produced && applyGain && node.gain && typeof node.gain.value === "number") {
+          var g = node.gain.value;
+          for (var c2 = 0; c2 < produced.length; c2++) {
+            for (var s2 = 0; s2 < produced[c2].length; s2++) produced[c2][s2] *= g;
+          }
+        }
+        return produced;
+      }
+      function pullNode(node, sampleOffset) {
+        if (!node) return null;
+        if (node.buffer && node.buffer.getChannelData) {
+          /* Buffer source: real samples, offset honored. */
+          var chans = [];
+          var n = Math.min(self.length, node.buffer.length - (node._startOffset || 0));
+          for (var c = 0; c < self.numberOfChannels; c++) {
+            var srcCh = node.buffer.getChannelData(Math.min(c, node.buffer.numberOfChannels - 1));
+            var dst = new Float32Array(self.length);
+            var off = (node._startOffset || 0);
+            for (var i = 0; i < self.length; i++) {
+              var idx = off + i;
+              dst[i] = (idx >= 0 && idx < srcCh.length) ? srcCh[idx] : 0;
+            }
+            chans.push(dst);
+          }
+          return chans;
+        }
+        if (node.frequency && node.type !== undefined && !node.gain) {
+          /* Oscillator: real sine at frequency.value over the render
+             length, from its start time. Disclosed: only the 'sine'
+             waveform is generated; other types render as sine. */
+          var freq = (node.frequency && typeof node.frequency.value === "number") ? node.frequency.value : 440;
+          var chans2 = [];
+          for (var c2 = 0; c2 < self.numberOfChannels; c2++) {
+            var d = new Float32Array(self.length);
+            var startIdx = Math.max(0, Math.floor((node._startWhen || 0) * self.sampleRate));
+            for (var i2 = startIdx; i2 < self.length; i2++) {
+              d[i2] = Math.sin(2 * Math.PI * freq * ((i2 - startIdx) / self.sampleRate));
+            }
+            chans2.push(d);
+          }
+          return chans2;
+        }
+        if (node.gain) {
+          /* Gain node: pull its inputs, then scale (handled in pullInputs). */
+          return pullInputs(node, sampleOffset, true);
+        }
+        return null;
+      }
+      var graphSamples = pullInputs(self.destination, 0, false);
+      for (var c = 0; c < self.numberOfChannels; c++) {
+        var dstCh = out.getChannelData(c);
+        if (!graphSamples || !graphSamples[c]) continue;
+        var srcCh2 = graphSamples[c];
+        for (var i = 0; i < dstCh.length && i < srcCh2.length; i++) dstCh[i] = srcCh2[i];
+      }
+      return out;
+    }
     this.startRendering = function () {
       self.state = "running";
-      var buf = _createAudioBuffer(self.numberOfChannels, self.length, self.sampleRate);
+      var buf = _renderGraph();
       self.state = "closed";
       if (typeof self.oncomplete === "function") {
         try { self.oncomplete({ renderedBuffer: buf, type: "complete", target: self }); } catch (e) {}
