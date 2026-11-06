@@ -107,10 +107,10 @@ shipped behavior, not the gap.
 
 | # | Capability | State |
 |---|---|---|
-| E1 | Blocking alert/confirm/prompt | 🟡 record + default, re-run model |
-| E2 | Text-selection drag lane | ❌ |
-| E3 | Mid-flight `fetch` abort | 🟡 pre-abort only |
-| E4 | Full Popover API semantics | 🟡 subset |
+| E1 | Blocking alert/confirm/prompt | 🟡 structurally impossible in a synchronous engine — record + default + re-run model, disclosed (never-built by design) |
+| E2 | Text-selection drag lane | ✅ text_select action kind + `select` shell command (Phase 3) |
+| E3 | Mid-flight `fetch` abort | ✅ AbortError on in-flight abort, resolves one microtask later (Phase 3) |
+| E4 | Full Popover API semantics | ✅ declarative target + light dismiss + beforetoggle/toggle + top-layer promotion (Phase 3 + R4) |
 | E5 | Trusted CDP input | 🚫 out of scope |
 
 ### 2.6 Storage / state
@@ -120,13 +120,13 @@ shipped behavior, not the gap.
 | S1 | Unified SQL state DB (history+cookies+storage+ledger, snapshot/diff/rollback) | ✅ `state_snapshots` + `state.snapshot/diff/rollback` both lanes (ledger append-only on rollback) |
 | S2 | Element identity tracker (stable refs across re-renders) | ✅ `identity.rs` (Rust) + content-identity inventory (Python); `ref` re-resolves across re-renders |
 | S3 | Mutation subscription stream (deltas, not re-reads) | ✅ `watch` = host-side MutationObserver drain (`__wrWatch*`), after/limit/next_after, both lanes |
-| S4 | Same-origin frame storage sharing | 🟡 unseeded, not shared |
-| S5 | Cross-tab/cross-origin storage events | 🟡 same-origin-other-tab only |
-| S6 | Cookie/site-data partitioning (3rd-party isolation) | ❌ |
-| S7 | Deterministic replay engine (ledger+snapshots+seeds) | ❌ |
-| S8 | bfcache live-heap restore | 🟡 rebuild + re-run |
+| S4 | Same-origin frame storage sharing | ✅ per-frame-origin seed + write-back, absorb order fixed (Phase 3) |
+| S5 | Cross-tab/cross-origin storage events | ✅ same-origin other tabs AND same-origin frames; cross-origin never (spec) (Phase 3) |
+| S6 | Cookie/site-data partitioning (3rd-party isolation) | ✅ double-key (top_site, frame_origin) jars; storage partitions identically (Phase 8) |
+| S7 | Deterministic replay engine (ledger+snapshots+seeds) | ✅ ordered step log + seeded transport + per-step DOM digests (Phase 8) |
+| S8 | bfcache live-heap restore | ✅ parked live ctx restores on back/forward (no re-run); rebuild fallback disclosed (Phase 8) |
 | S9 | Capability manifest per page (formalized) | ✅ `caps` both lanes: live-realm counts (static fallback labeled), tabs/frames/dialogs, unavailable+why, absolute-path export |
-| S10 | IndexedDB full semantics | 🟡 per-pass drain partial |
+| S10 | IndexedDB full semantics | ✅ real indexes, cursors, ConstraintError, abort rollback, onupgradeneeded (Phase 8) |
 
 ### 2.7 Workers / threads / WASM substrate
 
@@ -136,7 +136,7 @@ shipped behavior, not the gap.
 | W2 | Service Worker real execution + interception | ✅ SW script runs in a ServiceWorkerGlobalScope realm; in-scope fetches route through respondWith |
 | W3 | Scoped WASM float/extended opcodes | ✅ f32/f64 consts/arith/compare/memory/conversions at spec opcodes; i64 i32-approximated (disclosed) |
 | W4 | MessagePort across realms | ✅ receiver materializes live proxies; both directions + buffering verified |
-| W5 | structuredClone of class instances | 🟡 subset codec |
+| W5 | structuredClone of class instances | ✅ prototype-preserving (methods survive); honest unknown-ctor degradation (Phase 8) |
 
 ### 2.8 Media / video / audio
 
@@ -146,7 +146,7 @@ shipped behavior, not the gap.
 | M2 | MediaStream / capture | ✅ real tracks + lifecycle, canvas captureStream binding, structured webm MediaRecorder (content honest-silent, disclosed) |
 | M3 | DRM video | 🚫 refused by policy |
 | M4 | Piracy mirrors | 🚫 refused by policy |
-| M5 | HLS/DASH extraction without external yt-dlp | 🟡 needs yt-dlp |
+| M5 | HLS/DASH extraction without external yt-dlp | ✅ native m3u8/MPD parsing; DRM reported, complex platforms still use the extractor (Phase 8) |
 | M6 | Malware verdict on downloads | ✅ pluggable scanner hook (builtin EICAR/exe-magic heuristics + external registry), honest per-download verdicts |
 
 ### 2.9 Security / adversarial
@@ -474,9 +474,6 @@ clock, then the input-subset gaps, then frame storage.
       closes open AUTO popovers and never a manual one; click inside keeps
       it open. Top-layer stacking stays with Phase 6 (R4) — no paint stack
       here yet, disclosed.
-- [ ] **S4** — same-origin frame storage sharing: a loaded frame's realm is
-      seeded from the session storage for its origin; writes flow back to the
-      session (shared area, not per-frame copies).
 - [x] **S4** — same-origin frame storage sharing: a loaded frame's realm is
       seeded from the session storage for its origin; writes flow back to the
       session (shared area, not per-frame copies).
