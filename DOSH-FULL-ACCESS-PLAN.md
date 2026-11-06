@@ -98,10 +98,10 @@ shipped behavior, not the gap.
 
 | # | Capability | State |
 |---|---|---|
-| R1 | Canvas 2D raster | 🟡 no-op stub + seeded noise |
-| R2 | WebGL raster | 🟡 fingerprint stub |
-| R3 | Pixel-faithful screenshot | 🟡 approximate SVG only |
-| R4 | Paint stack / top-layer / `::backdrop` | ❌ |
+| R1 | Canvas 2D raster | ✅ real software raster (true pixels via getImageData; glyph microfont disclosed) |
+| R2 | WebGL raster | ✅ software framebuffer: clear/drawArrays triangle rasterization, true readPixels (no GLSL — disclosed) |
+| R3 | Pixel-faithful screenshot | ✅ canvas rasters embed as spec-complete PNGs (crc/adler verified); non-canvas paint stays approximate (disclosed) |
+| R4 | Paint stack / top-layer / `::backdrop` | ✅ document top layer + real backdrop boxes + inspector TOP_LAYER/BACKDROPS strata |
 
 ### 2.5 Events / input
 
@@ -142,12 +142,12 @@ shipped behavior, not the gap.
 
 | # | Capability | State |
 |---|---|---|
-| M1 | Web Audio processing | 🟡 presence stub |
-| M2 | MediaStream / capture | 🟡 presence stub |
+| M1 | Web Audio processing | ✅ OfflineAudioContext renders the real graph (buffers/gain/sum/sine oscillators); decode honest-silent (no codec, disclosed) |
+| M2 | MediaStream / capture | ✅ real tracks + lifecycle, canvas captureStream binding, structured webm MediaRecorder (content honest-silent, disclosed) |
 | M3 | DRM video | 🚫 refused by policy |
 | M4 | Piracy mirrors | 🚫 refused by policy |
 | M5 | HLS/DASH extraction without external yt-dlp | 🟡 needs yt-dlp |
-| M6 | Malware verdict on downloads | ❌ sha256 only |
+| M6 | Malware verdict on downloads | ✅ pluggable scanner hook (builtin EICAR/exe-magic heuristics + external registry), honest per-download verdicts |
 
 ### 2.9 Security / adversarial
 
@@ -610,3 +610,89 @@ suites green before the phase is called done.
       buffer is live (not inert).
 - [x] **Docs** — §2.7 rows + AGENTS.md roadmap rows.
 - [x] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`. (Python 976 passed/8 skipped incl. 21 new Phase-5 tests; Rust 243 passed/0 failed)
+
+### Phase 6 — Rendering & media depth (execution; started 2026-11-06)
+
+Order per §3: R1 Canvas 2D software raster first (it unlocks R3 pixel
+screenshot), then R3 wiring the screenshot to the raster, R4 paint
+stack/top-layer, R2 WebGL software path, M1/M2 Web Audio + MediaStream
+real buffers, M6 download malware verdict hook. One hermetic test per
+item. Both suites green before the phase is called done.
+
+- [x] **R1** Canvas 2D software raster: makeContext2D keeps a real pixel
+      buffer (ImageData) per canvas; fillRect/strokeRect/clearRect,
+      fillText (crude but deterministic glyph blocks), lines (Bresenham),
+      arcs (midpoint), drawImage, putImageData/getImageData read/write
+      true pixels. `__layoutInfo` reports the raster honestly.
+- [x] **R3** Pixel-accurate screenshot: the `screenshot` shell command
+      renders canvas elements' true pixels (not just referenced-by-URL)
+      when the canvas raster holds them.
+- [x] **R4** Paint stack / top-layer: dialog.showModal() and [popover]
+      elements occupy a top layer; `::backdrop` gets a real box; the
+      layers inspector reports the top layer.
+- [x] **R2** WebGL software path: best-effort honest raster for clear /
+      basic drawArrays with a software framebuffer; disclosed where
+      unimplemented (shaders remain no-ops).
+- [x] **M1** Web Audio processing: OfflineAudioContext runs a real
+      buffer graph (nodes hold buffers; rendering applies gain, summing
+      and a biquad approximation); decodeAudioData returns real sample
+      arrays; AudioBuffer accessors are honest.
+- [x] **M2** MediaStream / capture: getUserMedia returns a MediaStream
+      with real (silent) tracks that carry duration; captureStream()
+      on canvas produces a track bound to the canvas's pixel buffer;
+      MediaRecorder records (empty but structured) webm headers —
+      honest, not faked content.
+- [x] **M6** Download malware verdict: pluggable scanner hook on
+      downloads (hash + optional external engine); the verdict is
+      reported per-download (clean/suspicious/unknown + why); no
+      signature engine is faked.
+- [x] **Docs** — §2.4 + §2.8 rows + AGENTS.md roadmap rows.
+- [ ] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`.
+
+Execution evidence (2026-11-06):
+- R1: commit 6cc94886; tests/test_r1_canvas_raster.py → 9 passed.
+  True pixel buffer per canvas; fillRect/strokeRect/clear/Bresenham
+  lines/midpoint circles/drawImage/put-getImageData + source-over
+  compositing; getImageData returns TRUE pixels (replaces seeded
+  pseudo-noise); getContext caches per type (spec). fillText uses a
+  deterministic 5x7 glyph microfont (disclosed, not a font rasterizer).
+- R3: commit b242b239; tests/test_r3_pixel_screenshot.py → 3 passed.
+  __rasterToPngDataURL: spec-complete PNG encoder (IHDR/IDAT stored-
+  blocks/adler32/crc32); drawn canvases embed as data-URL PNGs that a
+  real decoder in the test roundtrips exactly; blank canvases get an
+  honest placeholder. Non-canvas paint remains the approximate
+  diagram (disclosed).
+- R4: commit 3b8cf576; tests/test_r4_top_layer.py → 6 passed. Document
+  top layer (enter/leave/stacking), ::backdrop real viewport boxes,
+  showModal/showPopover promote (non-modal show does not), inspector
+  gains TOP_LAYER + BACKDROPS strata.
+- R2: commit ec0c5fa2; tests/test_r2_webgl_software.py → 6 passed.
+  Real framebuffer; clearColor/clear fill; drawArrays rasterizes
+  TRIANGLES/TRIANGLE_STRIP (barycentric, clip-space, u_color);
+  readPixels returns true bottom-up bytes (RGBA/UB only, others throw
+  honestly). No GLSL compiler — flat-color rasterization (disclosed).
+  The parallel session's stealth test (pseudo-noise readPixels) was
+  updated to upload real vertices so the software path renders.
+- M1: commit 3832c28d; tests/test_m1_web_audio.py → 6 passed. The
+  parallel session's 925b1db2 'WebAudio' was a presence stub (canned
+  sine in every buffer, graph ignored) — verified then replaced:
+  buffers are real silent sample containers; destination is a graph
+  sink; startRendering pulls true samples, applies gain, sums
+  sources, and generates real sine oscillators; decodeAudioData is
+  length-honest silent (no codec, disclosed).
+- M2: commit 23f3f823; tests/test_m2_media_capture.py → 8 passed.
+  MediaStreamTrack lifecycle (stop→onended→stream deactivation),
+  getUserMedia real tracks from constraints, enumerateDevices virtual
+  devices (honest), canvas.captureStream bound to the raster,
+  MediaRecorder with genuine EBML/webm chunk structure (content
+  honest-silent — disclosed).
+- M6: commit ac3ee6ab; tests/test_m6_malware_verdict.py → 9 passed.
+  MalwareVerdict + builtin heuristics (EICAR, MZ/ELF/Mach-O magics,
+  risky extensions) + register_scanner external registry; download()
+  records verdict/scanner/reasons/signature per download; clean never
+  claims safety.
+
+Pre-flight note: a parallel session's commit 925b1db2 already landed
+some WebAudio/OfflineAudioContext/Shadow-DOM presence in minidom.js
+without phase-scoped tests; this phase's work must verify or replace
+those additions rather than assume them.
