@@ -666,23 +666,32 @@ impl Runtime {
         let selector = action["selector"].as_str().or_else(|| action["ref"].as_str()).unwrap_or_default();
         let stealth = action["stealth"].as_bool().unwrap_or(false);
         let nth = action["occurrence"].as_i64().unwrap_or(1);
+        // L10: occlusion-gated clicks. Agent clicks are gated by default —
+        // a control covered by an overlay refuses with
+        // `__lastActionError = occluded_by:<selector>` (surfaced by the
+        // session lane as an error). Callers may opt out explicitly via
+        // `occlusion_gate: false` (documented bypass, never silent).
+        // Typing stays ungated: keyboard input reaches a focused field even
+        // when an overlay covers its box.
+        let gate = action["occlusion_gate"].as_bool().unwrap_or(true);
 
         match kind {
             "click" | "activate" => {
                 if !selector.is_empty() {
                     let _ = self.engine.eval(&format!(
-                        "__activateSelector({}, null, false, {}, {})",
-                        json!(selector), stealth, nth
+                        "__activateSelector({}, null, false, {}, {}, {})",
+                        json!(selector), stealth, nth, gate
                     ));
                 } else {
-                    let _ = self.engine.eval(&format!("__clickPath({path_json}, {stealth})"));
+                    let _ = self.engine
+                        .eval(&format!("__clickPath({path_json}, {stealth}, {gate})"));
                 }
             }
             "type" => {
                 let text = action["text"].as_str().unwrap_or_default();
                 if !selector.is_empty() {
                     let _ = self.engine.eval(&format!(
-                        "__activateSelector({}, {}, false, {}, {})",
+                        "__activateSelector({}, {}, false, {}, {}, false)",
                         json!(selector), json!(text), stealth, nth
                     ));
                 } else {
@@ -694,6 +703,24 @@ impl Runtime {
             }
             "submit" => {
                 let _ = self.engine.eval(&format!("__submitPath({path_json})"));
+            }
+            "text_select" => {
+                // E2: the text-selection drag lane (minidom.js __selectText):
+                // mousedown → selection extends → selectstart/select/
+                // selectionchange fire → mouseup. Distinct lane from the
+                // element DnD path; no click fires.
+                let target = if !selector.is_empty() {
+                    json!(selector).to_string()
+                } else {
+                    path_json
+                };
+                let start = action["start"].as_i64().unwrap_or(0);
+                let end = action["end"].as_i64();
+                let code = match end {
+                    Some(e) => format!("__selectText({target}, {start}, {e})"),
+                    None => format!("__selectText({target}, {start})"),
+                };
+                let _ = self.engine.eval(&code);
             }
             _ => {}
         }

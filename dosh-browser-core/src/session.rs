@@ -704,6 +704,91 @@ impl Session {
         self.update_page_after_action(&url, &mutated, 8000)
     }
 
+    /// E2: drag-select text in a text input, textarea, or contenteditable.
+    ///
+    /// A distinct lane from element drag-and-drop: models the
+    /// mousedown → selection → mouseup contract and fires
+    /// selectstart/select/selectionchange. `start`/`end` are character
+    /// offsets; `end` defaults to the end of the text. A text-select target
+    /// need not be in the action surface (an untyped input still has a
+    /// selection), so a raw id/CSS selector is accepted after verification.
+    pub async fn select_text(
+        &mut self,
+        ref_id: &str,
+        start: i64,
+        end: Option<i64>,
+    ) -> Result<Page, String> {
+        let tab = self.current_tab();
+        let html = tab.html.clone();
+        let url = tab.url.clone();
+        if html.is_empty() {
+            return Err("No document loaded in session".to_string());
+        }
+        if start < 0 {
+            return Err("start must be a nonnegative integer".to_string());
+        }
+        if let Some(e) = end {
+            if e < 0 {
+                return Err("end must be a nonnegative integer".to_string());
+            }
+        }
+
+        let targets = crate::actions::extract_actions(&html, &url, 1000);
+        let resolved = self.identity_tracker.resolve(ref_id, &targets).ok();
+        let target = resolved
+            .map(|(t, _)| t)
+            .or_else(|| targets.iter().find(|t| t.ref_id == ref_id));
+
+        let mut rt = self
+            .get_or_create_runtime(&url)
+            .map_err(|e| format!("Failed to get runtime: {e}"))?;
+
+        let selector = match target {
+            Some(t) => {
+                if !t.selector.is_empty() {
+                    t.selector.clone()
+                } else {
+                    t.ref_id.clone()
+                }
+            }
+            None => {
+                let probe = rt
+                    .eval(&format!(
+                        "(function(){{ var el = document.getElementById({}) || document.querySelector({}); return el ? '1' : ''; }})()",
+                        serde_json::json!(ref_id),
+                        serde_json::json!(ref_id)
+                    ))
+                    .unwrap_or_default();
+                if probe.trim() != "1" {
+                    return Err(format!(
+                        "no target [{ref_id}] for text selection (not an action ref and no element matches it as an id or selector)"
+                    ));
+                }
+                ref_id.to_string()
+            }
+        };
+
+        let action_payload = match end {
+            Some(e) => serde_json::json!({
+                "type": "text_select",
+                "selector": selector,
+                "start": start,
+                "end": e,
+            }),
+            None => serde_json::json!({
+                "type": "text_select",
+                "selector": selector,
+                "start": start,
+            }),
+        };
+
+        rt.apply_action(&action_payload)?;
+        let mutated = rt.serialize()?;
+        Self::check_action_error(&mut rt)?;
+
+        self.update_page_after_action(&url, &mutated, 8000)
+    }
+
     /// Update page ACD and history after a live in-realm action without re-executing document scripts.
     pub fn update_page_after_action(
         &mut self,
