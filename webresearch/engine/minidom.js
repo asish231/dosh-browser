@@ -6461,7 +6461,10 @@ var decl = new CSSStyleDeclaration(el);
         detune: new AudioParam(0),
         _started: false, _startWhen: 0,
         connect: function (t) {
-          if (t && t._audioInputs) t._audioInputs.push(this);
+          if (t) {
+            if (!t._audioInputs) t._audioInputs = [];
+            t._audioInputs.push(this);
+          }
           this._target = t;
           return t;
         },
@@ -6473,6 +6476,9 @@ var decl = new CSSStyleDeclaration(el);
       return osc;
     };
     self.createDynamicsCompressor = function () {
+      /* M1: the compressor is a real graph node. Rendering passes its
+         input through (a soft-knee approximation is disclosed as not
+         modeled); its parameters remain real AudioParams. */
       var comp = {
         threshold: new AudioParam(-24),
         knee: new AudioParam(30),
@@ -6480,8 +6486,16 @@ var decl = new CSSStyleDeclaration(el);
         reduction: 0,
         attack: new AudioParam(0.003),
         release: new AudioParam(0.25),
-        connect: function (t) { this._target = t; return t; },
-        disconnect: function () {}
+        _audioInputs: [],
+        connect: function (t) {
+          if (t) {
+            if (!t._audioInputs) t._audioInputs = [];
+            t._audioInputs.push(this);
+          }
+          this._target = t;
+          return t;
+        },
+        disconnect: function () { this._target = null; }
       };
       __cloakObject(comp, { connect: 1, disconnect: 0 });
       return comp;
@@ -6506,7 +6520,10 @@ var decl = new CSSStyleDeclaration(el);
         gain: new AudioParam(1),
         _audioInputs: [],
         connect: function (t) {
-          if (t && t._audioInputs) t._audioInputs.push(this);
+          if (t) {
+            if (!t._audioInputs) t._audioInputs = [];
+            t._audioInputs.push(this);
+          }
           this._target = t;
           return t;
         },
@@ -6538,7 +6555,10 @@ var decl = new CSSStyleDeclaration(el);
         buffer: null, playbackRate: new AudioParam(1), loop: false,
         _started: false, _startWhen: 0, _startOffset: 0,
         connect: function (t) {
-          if (t && t._audioInputs) t._audioInputs.push(this);
+          if (t) {
+            if (!t._audioInputs) t._audioInputs = [];
+            t._audioInputs.push(this);
+          }
           this._target = t;
           return t;
         },
@@ -6652,6 +6672,13 @@ var decl = new CSSStyleDeclaration(el);
         if (node.gain) {
           /* Gain node: pull its inputs, then scale (handled in pullInputs). */
           return pullInputs(node, sampleOffset, true);
+        }
+        if (node._audioInputs && node._audioInputs.length) {
+          /* M1: intermediate graph node (dynamics compressor, filter,
+             analyser): pass its inputs through. The compressor's soft-
+             knee curve is not modeled (disclosed); filters/analysers
+             pass audio unchanged (disclosed). */
+          return pullInputs(node, sampleOffset, false);
         }
         return null;
       }

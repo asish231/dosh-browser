@@ -899,6 +899,16 @@ mod tests {
                 gl.attachShader(prog, vs);
                 gl.linkProgram(prog);
                 gl.useProgram(prog);
+                // R2 software path: upload a real fullscreen triangle and a
+                // u_color uniform so drawArrays actually rasterizes pixels
+                // (the software framebuffer returns true drawn bytes; the
+                // old pseudo-noise readPixels is gone).
+                var buf = gl.createBuffer();
+                gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+                gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+                    -1, -1,   1, -1,   0, 1
+                ]), gl.STATIC_DRAW);
+                gl.uniform4f(gl.getUniformLocation(prog, 'u_color'), 0.4, 0.6, 0.2, 1.0);
                 gl.drawArrays(gl.TRIANGLES, 0, 3);
                 var px = new Uint8Array(4);
                 gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
