@@ -3282,15 +3282,20 @@ var pos = (st.position || "").toLowerCase();
     }
     return targetStart;
   }
+  /* L6: Smooth scroll animation — ease-out (fast start, slow end) driven
+     by the rAF frame clock (__advanceClock advances the frame pump). */
   function __smoothElementScroll(el, targetLeft, targetTop, steps) {
     steps = Math.max(3, Math.min(25, Number(steps) || 8));
     var startLeft = Number(el.__scrollLeft) || 0;
     var startTop = Number(el.__scrollTop) || 0;
+    var dx = targetLeft - startLeft, dy = targetTop - startTop;
+    if (dx === 0 && dy === 0) return;
     for (var i = 1; i <= steps; i++) {
       var progress = i / steps;
-      var ease = progress < 0.5 ? 2 * progress * progress : -1 + (4 - 2 * progress) * progress;
-      __setElementScroll(el, startLeft + (targetLeft - startLeft) * ease, startTop + (targetTop - startTop) * ease);
-      if (typeof global.__advanceClock === "function") global.__advanceClock(12);
+      /* ease-out cubic: 1 - (1-t)^3 */
+      var ease = 1 - Math.pow(1 - progress, 3);
+      __setElementScroll(el, startLeft + dx * ease, startTop + dy * ease);
+      if (typeof global.__advanceClock === "function") global.__advanceClock(16);
     }
   }
   function __scrollIntoViewInternal(el, opts, ifNeeded) {
@@ -6559,8 +6564,18 @@ var decl = new CSSStyleDeclaration(el);
       } catch (e) {}
     }
   }
-  global.scrollTo = _doScroll;
-  global.scroll = _doScroll;
+  global.scrollTo = function (x, y) {
+    if (typeof x === "object" && x !== null) {
+      var behavior = String(x.behavior || "auto").toLowerCase();
+      var tx = (x.left != null) ? Number(x.left) : scrollState.x;
+      var ty = (x.top != null) ? Number(x.top) : scrollState.y;
+      if (behavior === "smooth") { __scrollSmooth(tx, ty); return; }
+      _doScroll(tx, ty);
+      return;
+    }
+    _doScroll((x != null) ? Number(x) : scrollState.x, (y != null) ? Number(y) : scrollState.y);
+  };
+  global.scroll = global.scrollTo;
   global.__scrollSmooth = function (targetX, targetY, steps) {
     targetX = Number(targetX) || 0;
     targetY = Number(targetY) || 0;
@@ -6573,7 +6588,8 @@ var decl = new CSSStyleDeclaration(el);
 
     for (var i = 1; i <= steps; i++) {
       var progress = i / steps;
-      var ease = progress < 0.5 ? 2 * progress * progress : -1 + (4 - 2 * progress) * progress;
+      /* L6: ease-out cubic for window smooth scroll */
+      var ease = 1 - Math.pow(1 - progress, 3);
       var cl = _clampScroll(startX + totalDx * ease, startY + totalDy * ease);
       var curX = Math.round(cl[0]);
       var curY = Math.round(cl[1]);
@@ -6599,7 +6615,13 @@ var decl = new CSSStyleDeclaration(el);
     return true;
   };
   global.scrollBy = function (x, y) {
-    if (typeof x === "object" && x !== null) { y = x.top || 0; x = x.left || 0; }
+    if (typeof x === "object" && x !== null) {
+      var behavior = String(x.behavior || "auto").toLowerCase();
+      var dx = Number(x.left || 0), dy = Number(x.top || 0);
+      if (behavior === "smooth") { __scrollSmooth(scrollState.x + dx, scrollState.y + dy); return; }
+      _doScroll(scrollState.x + dx, scrollState.y + dy);
+      return;
+    }
     _doScroll(scrollState.x + (Number(x) || 0), scrollState.y + (Number(y) || 0));
   };
   Object.defineProperty(global, "scrollX", { get: function () { return scrollState.x; } });

@@ -255,3 +255,50 @@ def test_sticky_left_right_offsets():
     """))
     # After scroll(100,100), sticky with left:20 should be at >= 20 (scrollX + 20)
     assert box["x"] >= 20, f"Expected x >= 20, got {box['x']}"
+
+
+def test_smooth_scroll_behavior_object_form():
+    """L6: scrollTo/scrollBy with {behavior:'smooth'} animates via the frame clock."""
+    html = """<!doctype html><html><body>
+        <div style="height:3000px;"></div>
+    </body></html>"""
+    ctx = _ctx(html)
+    # scrollTo with smooth behavior — should reach target
+    ctx.eval("window.scrollTo({top: 500, behavior: 'smooth'});")
+    y_after = ctx.eval("window.scrollY")
+    assert y_after == 500, f"scrollTo smooth: expected 500, got {y_after}"
+
+    # scrollBy with smooth behavior — should advance by delta
+    ctx.eval("window.scrollBy({top: 200, behavior: 'smooth'});")
+    y_after = ctx.eval("window.scrollY")
+    assert y_after == 700, f"scrollBy smooth: expected 700, got {y_after}"
+
+    # scrollTo with default (auto) behavior — instant
+    ctx.eval("window.scrollTo(0, 0);")
+    y0 = ctx.eval("window.scrollY")
+    assert y0 == 0, f"scrollTo auto reset: expected 0, got {y0}"
+
+
+def test_smooth_scroll_reports_intermediate_positions():
+    """L6: smooth scroll passes through intermediate positions (not instant jump)."""
+    html = """<!doctype html><html><body>
+        <div style="height:5000px;"></div>
+    </body></html>"""
+    ctx = _ctx(html)
+    positions = json.loads(ctx.eval("""
+        (function() {
+            var seen = [];
+            var origDispatch = window.dispatchEvent;
+            // Capture intermediate scrollY values by hooking the scroll event
+            window.addEventListener('scroll', function() {
+                seen.push(window.scrollY);
+            });
+            window.scrollTo({top: 1000, behavior: 'smooth'});
+            return JSON.stringify(seen);
+        })()
+    """))
+    # With 8 steps of ease-out, there should be intermediate positions
+    # between 0 and 1000 (not just [1000])
+    assert len(positions) >= 2, f"Expected intermediate positions, got {positions}"
+    assert positions[0] < 1000, f"First intermediate should be < 1000, got {positions[0]}"
+    assert positions[-1] == 1000, f"Last should be target 1000, got {positions[-1]}"
