@@ -402,3 +402,51 @@ def test_css_transition_property_change():
     end_f = float(end) if end else 1.0
     assert end_f >= mid_f, f"end opacity should be >= mid, got {end} vs {mid}"
     assert end_f == 1.0 or end_f == 1, f"end opacity should be 1, got {end}"
+
+
+def test_worker_blob_script_execution():
+    """W1: Worker emulation executes a blob URL script and communicates via postMessage."""
+    html = """<!doctype html><html><body></body></html>"""
+    ctx = _ctx(html)
+    
+    # Create a blob with worker code, register it, create a Worker
+    result = json.loads(ctx.eval("""
+        (function() {
+            var workerCode = 'postMessage("hello from worker"); self.close();';
+            var blob = new Blob([workerCode], {type: "application/javascript"});
+            var url = URL.createObjectURL(blob);
+            var w = new Worker(url);
+            var received = [];
+            w.onmessage = function(e) { received.push(e.data); };
+            w.onerror = function(e) { received.push("error: " + e.message); };
+            /* Advance the clock to trigger the drain that starts the worker */
+            __advanceTimerClock(1);
+            return JSON.stringify(received);
+        })()
+    """))
+    assert "hello from worker" in result, f"Expected 'hello from worker', got {result}"
+
+
+def test_worker_parent_to_worker_message():
+    """W1: parent.postMessage() delivers to worker.onmessage."""
+    html = """<!doctype html><html><body></body></html>"""
+    ctx = _ctx(html)
+    
+    result = json.loads(ctx.eval("""
+        (function() {
+            var workerCode = 'self.onmessage = function(e) { postMessage("echo: " + e.data); };';
+            var blob = new Blob([workerCode], {type: "application/javascript"});
+            var url = URL.createObjectURL(blob);
+            var w = new Worker(url);
+            var received = [];
+            w.onmessage = function(e) { received.push(e.data); };
+            /* Advance clock to start the worker */
+            __advanceTimerClock(1);
+            /* Now send a message from parent to worker */
+            w.postMessage("ping");
+            /* Advance again to deliver the message */
+            __advanceTimerClock(1);
+            return JSON.stringify(received);
+        })()
+    """))
+    assert "echo: ping" in result, f"Expected 'echo: ping', got {result}"

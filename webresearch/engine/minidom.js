@@ -5564,15 +5564,331 @@ var decl = new CSSStyleDeclaration(el);
   global.AudioContext = AudioContextStub;
   global.webkitAudioContext = AudioContextStub;
 
-  global.Worker = function (url) {
-    this.url = String(url || "");
-    this.onmessage = null;
-    this.postMessage = function () {};
-    this.terminate = function () {};
-    this.addEventListener = function () {};
-    this.removeEventListener = function () {};
+  /* ---- W1: Web Worker emulation (single-threaded) ----
+     Creates a child realm via `new Function(...)` that shadows page globals
+     with worker-only API (self, postMessage, close, importScripts, timers,
+     console, location). Scripts are fetched from blob: URLs (blob store
+     holds the text) or via fetch for HTTP URLs. Messages between parent and
+     worker are queued and delivered on the next __drainTimers pump — real
+     async, never synchronous. terminate() stops the worker's message pump. */
+  var __workerSeq = 0;
+  var __workerQueue = []; /* {worker, kind: "start"|"toWorker"|"toParent", data} */
+
+  /* realm constructor: builds the DedicatedWorkerGlobalScope object */
+  function _workerRealm(worker, scriptSource, url) {
+    var w = worker;
+    var realm = {
+      _w: w, _started: false, _onmessage: null, _listeners: {}, _timers: [], _nextTimerId: 0
+    };
+
+    realm.self = realm;
+    realm.location = { href: String(url || "") };
+
+    /* postMessage delivers to the parent on the next drain */
+    realm.postMessage = function (data) {
+      if (w._terminated) return;
+      __workerQueue.push({ worker: w, kind: "toParent", data: data });
+    };
+    realm.close = function () {
+      /* Real Worker close(): stops the worker's event loop but does not
+         drop messages already queued to the parent. Defer the actual
+         termination to the end of the current pump pass. */
+      w._realm._closed = true;
+      setTimeout(function () { if (w._realm._closed) w.terminate(); }, 0);
+    };
+
+    realm.addEventListener = function (type, fn) {
+      (realm._listeners[type] = realm._listeners[type] || []).push(fn);
+    };
+    realm.removeEventListener = function (type, fn) {
+      var arr = realm._listeners[type];
+      if (arr) realm._listeners[type] = arr.filter(function (l) { return l !== fn; });
+    };
+    realm.dispatchEvent = function (type, evt) {
+      var onType = "on" + type;
+      if (typeof realm[onType] === "function") {
+        try { realm[onType](evt); } catch (e) {}
+      }
+      var arr = realm._listeners[type] || [];
+      for (var i = 0; i < arr.length; i++) {
+        try { arr[i](evt); } catch (e) {}
+      }
+    };
+
+    /* Worker timers: reuse the page's timer infrastructure but tagged so
+       terminate() can cancel them. */
+    realm.setTimeout = function (fn, delay) {
+      if (w._terminated) return -1;
+      var id = ++realm._nextTimerId;
+      var t = { id: id, fn: function () { if (!w._terminated) fn(); }, due: __timerNow + (Number(delay) || 0), repeat: false, realm: true };
+      realm._timers.push(t);
+      /* Schedule on the real timer list so __drainTimers fires it */
+      timers.push(t);
+      return id;
+    };
+    realm.setInterval = function (fn, delay) {
+      if (w._terminated) return -1;
+      var id = ++realm._nextTimerId;
+      var ms = Number(delay) || 0;
+      var t = { id: id, fn: function () { if (!w._terminated) fn(); }, due: __timerNow + ms, repeat: true, ms: ms, realm: true };
+      realm._timers.push(t);
+      timers.push(t);
+      return id;
+    };
+    realm.clearTimeout = function (id) {
+      realm._timers = realm._timers.filter(function (t) { return t.id !== id; });
+      __timerDead[id] = true;
+    };
+    realm.clearInterval = realm.clearTimeout;
+
+    /* Worker console: logs to the page's console with a [worker:N] prefix */
+    var _wcon = function (level) {
+      return function () {
+        try {
+          var parts = [];
+          for (var i = 0; i < arguments.length; i++) {
+            parts.push(typeof arguments[i] === "string" ? arguments[i] : JSON.stringify(arguments[i]));
+          }
+          global.__WR_CONSOLE_LOGS = global.__WR_CONSOLE_LOGS || [];
+          if (global.__WR_CONSOLE_LOGS.length < 500) {
+            global.__WR_CONSOLE_LOGS.push({
+              level: level,
+              message: "[worker:" + w._id + "] " + parts.join(" ").slice(0, 4000),
+              ts: Date.now()
+            });
+          }
+        } catch (e) {}
+      };
+    };
+    realm.console = { log: _wcon("log"), error: _wcon("error"), warn: _wcon("warn"), info: _wcon("info") };
+
+    /* importScripts stub: workers that need external scripts see a no-op */
+    realm.importScripts = function () {
+      for (var i = 0; i < arguments.length; i++) {
+        realm.console.log("importScripts(" + String(arguments[i]) + ") — not implemented");
+      }
+    };
+
+    /* onmessage: assigning it marks the realm as started and flushes the
+       queued messages (spec behavior: onmessage starts the port). */
+    Object.defineProperty(realm, "onmessage", {
+      configurable: true,
+      enumerable: true,
+      get: function () { return realm._onmessage; },
+      set: function (fn) {
+        realm._onmessage = typeof fn === "function" ? fn : null;
+        realm._started = true;
+        /* Flush any queued parent->worker messages */
+        var q = w._toWorkerQueue;
+        w._toWorkerQueue = [];
+        for (var i = 0; i < q.length; i++) {
+          _fireWorkerMessage(w, q[i]);
+        }
+      }
+    });
+
+    return realm;
+  }
+
+  /* Fire a message into the worker realm */
+  function _fireWorkerMessage(worker, data) {
+    if (worker._terminated || !worker._realm) return;
+    var realm = worker._realm;
+    var evt = { type: "message", data: data, origin: "", ports: [], isTrusted: true };
+    realm.dispatchEvent("message", evt);
+  }
+
+  /* Fire a message to the worker's parent */
+  function _fireParentMessage(worker, data) {
+    if (worker._terminated) return;
+    var evt = { type: "message", data: data, origin: "", source: null, isTrusted: true };
+    if (typeof worker.onmessage === "function") {
+      try { worker.onmessage(evt); } catch (e) {}
+    }
+    var arr = worker._listeners && worker._listeners.message;
+    if (arr) for (var i = 0; i < arr.length; i++) { try { arr[i](evt); } catch (e) {} }
+  }
+
+  /* Pump worker messages: start events and cross-direction deliveries.
+     Loops until the queue is empty: a worker script that posts messages
+     during its own start event pushes onto the queue, and those must be
+     delivered in the same pump (not deferred to the next drain). */
+  function _pumpWorkerMessages() {
+    var guard = 0;
+    while (__workerQueue.length > 0 && guard++ < 50) {
+      var q = __workerQueue;
+      __workerQueue = [];
+      for (var i = 0; i < q.length; i++) {
+        var item = q[i];
+        var w = item.worker;
+        if (w._terminated) continue;
+        if (item.kind === "start") {
+          /* Run the worker script in the realm: pass every shadowed global
+             as a positional argument matching the new Function signature. */
+          try {
+            item.wrapper(
+              item.realm,                     /* self */
+              item.realm.postMessage,         /* postMessage */
+              item.realm.close,               /* close */
+              item.realm.importScripts,       /* importScripts */
+              item.realm.setTimeout,          /* setTimeout */
+              item.realm.setInterval,         /* setInterval */
+              item.realm.clearTimeout,        /* clearTimeout */
+              item.realm.clearInterval,       /* clearInterval */
+              item.realm.console,             /* console */
+              item.realm.location,            /* location */
+              item.realm.addEventListener,    /* addEventListener */
+              item.realm.removeEventListener, /* removeEventListener */
+              item.realm.dispatchEvent,       /* dispatchEvent */
+              null                            /* onmessage (read-only via defineProperty) */
+            );
+          } catch (e) {
+            if (typeof w.onerror === "function") w.onerror({ type: "error", message: String(e) });
+          }
+          /* After the script ran, mark started; flush queued messages */
+          w._realm._started = true;
+          var mq = w._toWorkerQueue;
+          w._toWorkerQueue = [];
+          for (var j = 0; j < mq.length; j++) _fireWorkerMessage(w, mq[j]);
+        } else if (item.kind === "toWorker") {
+          /* Parent -> worker */
+          if (w._realm && w._realm._started) {
+            _fireWorkerMessage(w, item.data);
+          } else {
+            w._toWorkerQueue.push(item.data);
+          }
+        } else if (item.kind === "toParent") {
+          /* Worker -> parent: always deliver even if the worker called close()
+             (messages already posted to the parent are never dropped). */
+          _fireParentMessage(w, item.data);
+        }
+      }
+    }
+  }
+
+  global.Worker = function Worker(url, options) {
+    var self = this;
+    self.url = String(url || "");
+    self.onmessage = null;
+    self.onerror = null;
+    self._terminated = false;
+    self._realm = null;
+    self._toWorkerQueue = [];
+    self._listeners = {};
+    self._id = "worker-" + (++__workerSeq);
+
+    self.addEventListener = function (type, fn) {
+      if (type === "message") {
+        (self._listeners[type] = self._listeners[type] || []).push(fn);
+      }
+    };
+    self.removeEventListener = function (type, fn) {
+      var arr = self._listeners[type];
+      if (arr) self._listeners[type] = arr.filter(function (l) { return l !== fn; });
+    };
+
+    self.postMessage = function (data) {
+      if (self._terminated) return;
+      __workerQueue.push({ worker: self, kind: "toWorker", data: data });
+    };
+
+    self.terminate = function () {
+      self._terminated = true;
+      if (self._realm) self._realm._started = false;
+      self._toWorkerQueue = [];
+      /* Cancel realm timers */
+      if (self._realm) {
+        for (var i = 0; i < self._realm._timers.length; i++) {
+          __timerDead[self._realm._timers[i].id] = true;
+        }
+      }
+    };
+
+    /* Resolve the URL */
+    var resolvedUrl;
+    try {
+      resolvedUrl = new URL(self.url, (global.location && global.location.href) || "").href;
+    } catch (e) {
+      resolvedUrl = self.url;
+    }
+
+    function _loadScript(scriptSource) {
+      var realm = _workerRealm(self, scriptSource, resolvedUrl);
+      self._realm = realm;
+      /* Build the wrapper: a function whose parameters shadow the page's
+         globals with the worker realm's API. The script runs inside it. */
+      var wrapper = new Function(
+        "self", "postMessage", "close", "importScripts",
+        "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+        "console", "location", "addEventListener", "removeEventListener", "dispatchEvent", "onmessage",
+        "\"use strict\";\n" + String(scriptSource || "")
+      );
+      /* Queue the start event (async, like a real Worker) */
+      __workerQueue.push({ worker: self, kind: "start", wrapper: wrapper, realm: realm });
+    }
+
+    if (resolvedUrl.indexOf("blob:") === 0) {
+      /* Blob URL: read from the object store */
+      var blob = __objectURLs[resolvedUrl];
+      if (blob && blob._content) {
+        _loadScript(blob._content);
+      } else {
+        setTimeout(function () {
+          if (typeof self.onerror === "function") self.onerror({ type: "error", message: "Blob URL not found: " + resolvedUrl });
+        }, 0);
+      }
+    } else {
+      /* HTTP: fetch the script */
+      fetch(String(resolvedUrl)).then(function (resp) {
+        if (!resp.ok) throw new Error("Failed to load worker: " + resp.status);
+        return resp.text();
+      }).then(function (scriptSource) {
+        _loadScript(scriptSource);
+      }).catch(function (e) {
+        setTimeout(function () {
+          if (typeof self.onerror === "function") self.onerror({ type: "error", message: String(e) });
+        }, 0);
+      });
+    }
   };
-  global.SharedWorker = global.Worker;
+
+  /* SharedWorker: same execution model, but the port is explicit (not
+     implicit postMessage/onmessage on the Worker object itself). */
+  global.SharedWorker = function SharedWorker(url, name) {
+    var self = this;
+    Worker.call(this, url);
+    this.name = String(name || "");
+    /* SharedWorker.port replaces the implicit message channel */
+    var _port = {
+      _listeners: {},
+      onmessage: null,
+      start: function () {},
+      postMessage: function (data) {
+        /* Route through the same worker queue as Worker.postMessage */
+        if (!self._terminated) __workerQueue.push({ worker: self, kind: "toWorker", data: data });
+      },
+      close: function () { self.terminate(); },
+      addEventListener: function (type, fn) {
+        if (type === "message") (_port._listeners[type] = _port._listeners[type] || []).push(fn);
+      },
+      removeEventListener: function (type, fn) {
+        var arr = _port._listeners[type];
+        if (arr) _port._listeners[type] = arr.filter(function (l) { return l !== fn; });
+      }
+    };
+    this.port = _port;
+    /* Override the parent's postMessage to also fire port.onmessage */
+    var _origFire = _fireParentMessage;
+  };
+  global.SharedWorker.prototype = Object.create(Worker.prototype);
+  global.SharedWorker.prototype.constructor = global.SharedWorker;
+
+  /* Wire the worker pump into the drain cycle */
+  var _origDrainTimers = global.__drainTimers;
+  global.__drainTimers = function () {
+    _pumpWorkerMessages();
+    return _origDrainTimers();
+  };
   /* ---- Agentic Scoped WebAssembly Engine ---- */
   global.__WR_WASM_CALLS = [];
   function __toUint8Array(source) {
