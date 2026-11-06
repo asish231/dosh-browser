@@ -5430,6 +5430,23 @@ var decl = new CSSStyleDeclaration(el);
     var dev = (typeof global.__WR_DEVICE === "object" && global.__WR_DEVICE) ? global.__WR_DEVICE : {};
     var renderer = dev.gpu_renderer || "Apple GPU M11 Pro Metal";
     var vendor = dev.gpu_vendor || "Google Inc. (Apple)";
+    /* ---- R2: WebGL software path (best-effort, disclosed) ----
+       A real framebuffer backs clear()/drawArrays: clearColor fills the
+       buffer; TRIANGLES/TRIANGLE_STRIP rasterize as solid primitives in
+       the current uniform color (u_color / fallback white). Shaders are
+       NOT executed (no GLSL compiler) — geometry is rasterized flat.
+       readPixels returns TRUE framebuffer bytes (bottom-up, per spec)
+       instead of fingerprint noise. */
+    var gl_obj_seq = 1;
+    var fbW = Math.max(1, Math.floor(Number(canvas.width) || 300));
+    var fbH = Math.max(1, Math.floor(Number(canvas.height) || 150));
+    var fb = new Uint8Array(fbW * fbH * 4); /* RGBA, zero = transparent */
+    var fbClearColor = [0, 0, 0, 0];
+    var boundBuffers = {};
+    var arrayBuffers = {};    /* buffer id -> vertex array */
+    var currentProgram = null;
+    var uniformStore = {};    /* uniform name -> [r,g,b,a] */
+    var drawColor = [255, 255, 255, 255];
     var params = {
       0x1F00: "WebKit",                    // VENDOR
       0x1F01: "WebKit WebGL",              // RENDERER
@@ -5454,9 +5471,18 @@ var decl = new CSSStyleDeclaration(el);
       getContextAttributes: function () {
         return { alpha: true, antialias: true, depth: true, stencil: false, premultipliedAlpha: true };
       },
-      createBuffer: function () { return {}; },
-      bindBuffer: function () {},
-      bufferData: function () {},
+      createBuffer: function () { return { __id: (gl_obj_seq++) }; },
+      bindBuffer: function (target, buffer) { boundBuffers[target] = buffer; },
+      bufferData: function (target, data, usage) {
+        var buf = boundBuffers[target];
+        if (buf && data) {
+          if (data instanceof Float32Array || data instanceof Int16Array || data instanceof Uint16Array || data instanceof Uint8Array || Array.isArray(data)) {
+            arrayBuffers[buf.__id || 0] = data;
+          } else if (data && data.byteLength != null && data.data) {
+            arrayBuffers[buf.__id || 0] = data.data;
+          }
+        }
+      },
       bufferSubData: function () {},
       createShader: function (type) { return { __type: type }; },
       shaderSource: function () {},
@@ -5470,21 +5496,102 @@ var decl = new CSSStyleDeclaration(el);
       getProgramInfoLog: function () { return ""; },
       getShaderInfoLog: function () { return ""; },
       getShaderPrecisionFormat: function () { return { precision: 23, rangeMin: 127, rangeMax: 127 }; },
-      useProgram: function () {},
+      useProgram: function (prog) { currentProgram = prog || null; },
       getAttribLocation: function (prog, name) { return 0; },
       getUniformLocation: function (prog, name) { return { name: String(name || "") }; },
       enableVertexAttribArray: function () {},
       disableVertexAttribArray: function () {},
       vertexAttribPointer: function () {},
-      uniform1f: function () {}, uniform2f: function () {}, uniform3f: function () {}, uniform4f: function () {},
+      uniform1f: function () {}, uniform2f: function () {}, uniform3f: function () {},
+      uniform4f: function (loc, r, g, b, a) {
+        if (loc && loc.name) {
+          uniformStore[loc.name] = [
+            Math.round(Math.min(1, Math.max(0, Number(r) || 0)) * 255),
+            Math.round(Math.min(1, Math.max(0, Number(g) || 0)) * 255),
+            Math.round(Math.min(1, Math.max(0, Number(b) || 0)) * 255),
+            Math.round(Math.min(1, Math.max(0, Number(a == null ? 1 : a))) * 255)
+          ];
+        }
+      },
       uniform1i: function () {}, uniform2i: function () {}, uniform3i: function () {}, uniform4i: function () {},
       uniform1fv: function () {}, uniform2fv: function () {}, uniform3fv: function () {}, uniform4fv: function () {},
       uniform1iv: function () {}, uniform2iv: function () {}, uniform3iv: function () {}, uniform4iv: function () {},
       uniformMatrix2fv: function () {}, uniformMatrix3fv: function () {}, uniformMatrix4fv: function () {},
-      drawArrays: function () { if (canvas) canvas.__ops = (canvas.__ops || 0) + 1; },
+      drawArrays: function (mode, first, count) {
+        if (canvas) canvas.__ops = (canvas.__ops || 0) + 1;
+        /* Flat-color rasterization: pull u_color/u_colour (fall back to
+           white). Vertices come from the bound ARRAY_BUFFER as (x, y)
+           pairs in clip space [-1, 1] -> viewport pixels. Only
+           TRIANGLES (0x4) and TRIANGLE_STRIP (0x5) rasterize; points and
+           lines count as ops only (disclosed). */
+        var color = null;
+        for (var k in uniformStore) {
+          if (/u_color|u_colour|color/i.test(k)) { color = uniformStore[k]; break; }
+        }
+        if (!color) color = drawColor;
+        var ab = boundBuffers[0x8892];
+        var arr = ab ? arrayBuffers[ab.__id || 0] : null;
+        if (!arr || !arr.length) return;
+        first = first || 0;
+        count = (count == null) ? (arr.length / 2 - first) : count;
+        /* Clip-space -> pixel coords (Y flips: GL origin is bottom-left) */
+        function pxOf(v, i) {
+          var ndc = Number(arr[(first + v) * 2 + i]) || 0;
+          var c = Math.max(-1, Math.min(1, ndc));
+          return i === 0 ? Math.round((c + 1) / 2 * (fbW - 1)) : Math.round((1 - c) / 2 * (fbH - 1));
+        }
+        function fillTri(a, b, c) {
+          var x0 = pxOf(a, 0), y0 = pxOf(a, 1);
+          var x1 = pxOf(b, 0), y1 = pxOf(b, 1);
+          var x2 = pxOf(c, 0), y2 = pxOf(c, 1);
+          var minX = Math.max(0, Math.min(x0, x1, x2));
+          var maxX = Math.min(fbW - 1, Math.max(x0, x1, x2));
+          var minY = Math.max(0, Math.min(y0, y1, y2));
+          var maxY = Math.min(fbH - 1, Math.max(y0, y1, y2));
+          var area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+          if (area === 0) return;
+          for (var py = minY; py <= maxY; py++) {
+            for (var px = minX; px <= maxX; px++) {
+              var w0 = ((x1 - px) * (y2 - py) - (x2 - px) * (y1 - py)) / area;
+              var w1 = ((x2 - px) * (y0 - py) - (x0 - px) * (y2 - py)) / area;
+              var w2 = 1 - w0 - w1;
+              if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
+                var idx = (py * fbW + px) * 4;
+                fb[idx] = color[0]; fb[idx + 1] = color[1];
+                fb[idx + 2] = color[2]; fb[idx + 3] = color[3];
+              }
+            }
+          }
+        }
+        if (mode === 0x0004) { /* TRIANGLES */
+          for (var t = 0; t + 2 < count; t += 3) fillTri(t, t + 1, t + 2);
+        } else if (mode === 0x0005) { /* TRIANGLE_STRIP */
+          for (var s = 0; s + 2 < count; s++) {
+            if (s % 2 === 0) fillTri(s, s + 1, s + 2);
+            else fillTri(s, s + 1, s + 2); /* strip winding alternates; flat fill ignores winding */
+          }
+        }
+      },
       drawElements: function () { if (canvas) canvas.__ops = (canvas.__ops || 0) + 1; },
-      clearColor: function () {},
-      clear: function () { if (canvas) canvas.__ops = (canvas.__ops || 0) + 1; },
+      clearColor: function (r, g, b, a) {
+        fbClearColor = [
+          Math.round(Math.min(1, Math.max(0, Number(r) || 0)) * 255),
+          Math.round(Math.min(1, Math.max(0, Number(g) || 0)) * 255),
+          Math.round(Math.min(1, Math.max(0, Number(b) || 0)) * 255),
+          Math.round(Math.min(1, Math.max(0, Number(a == null ? 1 : a))) * 255)
+        ];
+      },
+      clear: function (mask) {
+        if (canvas) canvas.__ops = (canvas.__ops || 0) + 1;
+        /* COLOR_BUFFER_BIT (0x4000) or a zero mask with defaults clears
+           color. Only clear color — depth/stencil have no buffer here. */
+        if (mask == null || (mask & 0x4000)) {
+          for (var i = 0; i < fb.length; i += 4) {
+            fb[i] = fbClearColor[0]; fb[i + 1] = fbClearColor[1];
+            fb[i + 2] = fbClearColor[2]; fb[i + 3] = fbClearColor[3];
+          }
+        }
+      },
       viewport: function () {},
       enable: function () {},
       disable: function () {},
@@ -5513,18 +5620,32 @@ var decl = new CSSStyleDeclaration(el);
       deleteFramebuffer: function () {},
       deleteRenderbuffer: function () {},
       readPixels: function (x, y, w, h, format, type, pixels) {
+        /* R2: TRUE framebuffer bytes. The old stub filled the array with
+           deterministic pseudo-noise that ignored what was drawn. Spec:
+           (x, y) is measured from the BOTTOM-left; the caller's rows run
+           top-down relative to its own buffer, so row r of the request
+           maps to fb row (fbH - 1 - y - r). RGBA/UNSIGNED_BYTE only —
+           other format/type combinations throw (honest, no fake data). */
         if (!pixels || !pixels.length) return;
-        var ops = (canvas && canvas.__ops) ? canvas.__ops : 1;
-        var dev = (typeof global.__WR_DEVICE === "object" && global.__WR_DEVICE) ? global.__WR_DEVICE : {};
-        var devSeed = (dev.gpu_renderer || "").length * 13;
-        var seed = (ops * 37) + ((x || 0) * 19) + ((y || 0) * 11) + devSeed;
-        for (var i = 0; i < pixels.length; i++) {
-          var px = Math.floor(i / 4);
-          var ch = i % 4;
-          if (ch === 3) {
-            pixels[i] = 255;
-          } else {
-            pixels[i] = (((seed ^ (px * 1013904223) ^ (ch * 2654435761)) >>> 0) % 254) + 1;
+        if (format !== 0x1908 || type !== 0x1401) {
+          throw new (global.DOMException || Error)(
+            "INVALID_OPERATION: only gl.RGBA/gl.UNSIGNED_BYTE readPixels are supported by the software path",
+            "InvalidStateError"
+          );
+        }
+        x = x | 0; y = y | 0; w = Math.max(0, (w | 0)); h = Math.max(0, (h | 0));
+        for (var r = 0; r < h; r++) {
+          var fbRow = fbH - 1 - (y + r);
+          for (var c = 0; c < w; c++) {
+            var di = (r * w + c) * 4;
+            if (di + 3 >= pixels.length) break;
+            if (fbRow < 0 || fbRow >= fbH || x + c < 0 || x + c >= fbW) {
+              pixels[di] = 0; pixels[di + 1] = 0; pixels[di + 2] = 0; pixels[di + 3] = 0;
+            } else {
+              var si = (fbRow * fbW + (x + c)) * 4;
+              pixels[di] = fb[si]; pixels[di + 1] = fb[si + 1];
+              pixels[di + 2] = fb[si + 2]; pixels[di + 3] = fb[si + 3];
+            }
           }
         }
       },

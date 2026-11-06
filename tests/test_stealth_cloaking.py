@@ -211,7 +211,18 @@ def test_webgl_pseudo_rasterizer_and_read_pixels(js_ctx):
         var posAttr = gl.getAttribLocation(prog, "p");
         var uLoc = gl.getUniformLocation(prog, "u_matrix");
         gl.enableVertexAttribArray(posAttr);
+
+        // R2 software path: upload a real fullscreen quad so drawArrays
+        // rasterizes true pixels (the software framebuffer replaces the
+        // old fingerprint pseudo-noise — readPixels now returns what was
+        // actually drawn).
+        var buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+            -1, -1,   1, -1,   -1, 1,   1, 1
+        ]), gl.STATIC_DRAW);
         gl.vertexAttribPointer(posAttr, 2, gl.FLOAT, false, 0, 0);
+        gl.uniform4f(gl.getUniformLocation(prog, "u_color"), 0.2, 0.4, 0.6, 1.0);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
         // Verify readPixels does not throw and returns believable non-zero pixel bytes
