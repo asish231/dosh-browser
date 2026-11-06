@@ -556,6 +556,10 @@ class DoshShell:
             page = await s.act(a["ref"], text=a.get("text", ""), dx=a.get("dx"), dy=a.get("dy"))
             return {"url": _url(page.url), "status": page.status, "view": page.view,
                     "note": "dispatch completed; website outcome must be verified from the document"}
+        if name == "select":
+            page = await s.select_text(a["ref"], start=a.get("start", 0), end=a.get("end"))
+            return {"url": _url(page.url), "status": page.status, "view": page.view,
+                    "note": "text selection drag lane; selectstart/select/selectionchange fired"}
         if name == "net":
             return self.network.query(a.get("after", 0), _limit(a.get("limit", 100)), a.get("pattern", ""))
         if name == "net.capture":
