@@ -11,6 +11,7 @@ import hashlib
 import os
 import tempfile
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 
 @dataclass
@@ -24,6 +25,137 @@ class Download:
     verified: bool = False
     error: str = ""
     scanned: bool = False
+    # M6: per-download malware verdict (clean/suspicious/unknown/error),
+    # the scanner that produced it, and its reasons. No verdict engine
+    # is faked — see webresearch/download.py scan_download().
+    malware_verdict: str = "unknown"
+    malware_scanner: str = ""
+    malware_reasons: list = field(default_factory=list)
+    malware_signature: str = ""
+
+
+# ---- M6: download malware verdict (pluggable scanner hook) ----
+# Honest scope: no signature engine is implemented here. The built-in
+# heuristic checks are structural (magic bytes, extension, size), the
+# registry accepts external scanner callables, and every verdict says
+# which scanner produced it and why. "clean" NEVER means "safe" — it
+# means "no configured scanner flagged it".
+
+@dataclass
+class MalwareVerdict:
+    verdict: str = "unknown"          # clean | suspicious | unknown | error
+    scanner: str = ""                 # which scanner produced it
+    reasons: list = field(default_factory=list)
+    signature_hit: str = ""           # name of the matched signature, if any
+
+
+# Well-known malicious byte patterns used by real scanners as quick
+# triage (EICAR test string, Windows PE exploits in scripts, etc.).
+# These are SIGNATURE-STRINGS, not executable content.
+_EICAR = (
+    rb"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+)
+
+# Executable-magic table: content sniffing independent of the filename.
+_EXE_MAGICS: list[tuple[str, bytes]] = [
+    ("mz-pe", b"MZ"),                 # Windows PE (check EXE header offset)
+    ("elf", b"\x7fELF"),              # Linux ELF
+    ("macho-32", b"\xfe\xed\xfa\xce"),
+    ("macho-64", b"\xfe\xed\xfa\xcf"),
+    ("macho-fat", b"\xca\xfe\xba\xbe"),
+]
+
+# Extensions that browsers flag when arriving over http(s)
+_RISKY_EXTS = {
+    ".exe", ".msi", ".bat", ".cmd", ".com", ".scr", ".pif", ".vbs", ".vbe",
+    ".js", ".jar", ".hta", ".apk", ".deb", ".rpm", ".dmg", ".pkg",
+}
+
+
+def _builtin_heuristic(path: str, *, url: str = "", content_type: str = "", size: int = 0) -> MalwareVerdict:
+    """Structural triage — honest about being heuristics, not signatures."""
+    v = MalwareVerdict(scanner="builtin-heuristic")
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512)
+    except OSError:
+        v.verdict = "error"
+        v.reasons.append("file unreadable")
+        return v
+    # 1. EICAR test file: the industry-standard scanner test pattern.
+    if _EICAR in head:
+        v.verdict = "suspicious"
+        v.signature_hit = "EICAR-Test-File"
+        v.reasons.append("EICAR antivirus test pattern present")
+        return v
+    # 2. Executable content delivered where a browser would not expect it.
+    for name, magic in _EXE_MAGICS:
+        if head.startswith(magic):
+            v.verdict = "suspicious"
+            v.signature_hit = f"executable:{name}"
+            v.reasons.append(f"executable binary content ({name})")
+            return v
+    # 3. Risky extension + executable-ish content type.
+    ext = os.path.splitext(urlparse(url).path)[1].lower() if url else ""
+    if ext in _RISKY_EXTS and ("octet-stream" in (content_type or "").lower() or not content_type):
+        v.verdict = "suspicious"
+        v.reasons.append(f"risky extension '{ext}' with content-type '{content_type or 'none'}'")
+        return v
+    # 4. Nothing flagged: clean means "not flagged", never "safe".
+    v.verdict = "clean"
+    v.reasons.append("no builtin signature/heuristic matched")
+    return v
+
+
+# The pluggable registry. External engines register a callable:
+#   fn(path: str) -> MalwareVerdict (or dict with verdict/scanner/reasons)
+_SCANNERS: list = []
+
+
+def register_scanner(fn) -> None:
+    """Register an external scanner engine. The engine is consulted
+    AFTER the builtin heuristic; the first scanner returning a
+    'suspicious'/'error' verdict wins (most-specific result)."""
+    if callable(fn) and fn not in _SCANNERS:
+        _SCANNERS.append(fn)
+
+
+def clear_scanners() -> None:
+    _SCANNERS.clear()
+
+
+def scan_download(path: str, *, url: str = "", content_type: str = "", size: int = 0) -> MalwareVerdict:
+    """Run every registered scanner + the builtin heuristic and merge
+    into one honest verdict. No scanner configured + heuristic clean =>
+    verdict 'clean' with an explicit reason saying it is heuristic-only."""
+    verdict = _builtin_heuristic(path, url=url, content_type=content_type, size=size)
+    for scanner in _SCANNERS:
+        try:
+            res = scanner(path)
+            if isinstance(res, MalwareVerdict):
+                other = res
+            elif isinstance(res, dict):
+                other = MalwareVerdict(
+                    verdict=str(res.get("verdict", "unknown")),
+                    scanner=str(res.get("scanner", getattr(scanner, "__name__", "external"))),
+                    reasons=list(res.get("reasons", [])),
+                    signature_hit=str(res.get("signature_hit", "")),
+                )
+            else:
+                continue
+        except Exception as exc:
+            verdict.verdict = "error"
+            verdict.reasons.append(f"scanner {getattr(scanner, '__name__', '?')} failed: {type(exc).__name__}: {exc}"[:200])
+            verdict.verdict = "error"
+            return verdict
+        if other.verdict in ("suspicious", "error"):
+            return other
+        if other.verdict == "clean" and not other.reasons:
+            continue
+        if other.verdict == "clean":
+            # keep the more specific scanner name
+            verdict = other
+    return verdict
 
 
 def _expected_digest(expected: str | None) -> tuple[str, bytes] | None:
@@ -92,6 +224,21 @@ async def download(
     rec.path = tmp.name
     rec.bytes = total
     rec.sha256 = hasher.hexdigest()
+    # M6: malware verdict via the pluggable scanner hook. Runs on the
+    # real downloaded bytes; recorded per-download with scanner + reasons.
+    if not rec.error:
+        try:
+            v = scan_download(tmp.name, url=url, content_type=rec.content_type, size=total)
+            rec.malware_verdict = v.verdict
+            rec.malware_scanner = v.scanner
+            rec.malware_reasons = v.reasons
+            rec.malware_signature = v.signature_hit
+            rec.scanned = True
+        except Exception as exc:
+            rec.malware_verdict = "error"
+            rec.malware_scanner = "scan-dispatch"
+            rec.malware_reasons = [f"{type(exc).__name__}: {exc}"[:200]]
+            rec.scanned = False
     want = _expected_digest(expected)
     if want is not None:
         algo, digest = want
