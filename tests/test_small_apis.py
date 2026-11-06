@@ -265,3 +265,55 @@ async def test_check_visibility_options():
 
     # Disconnected element is false
     assert ctx.eval("document.createElement('div').checkVisibility()") is False
+
+
+# ---------------------------------------------------------------------------
+# E4: full Popover semantics — declarative target + light dismiss (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_popover_declarative_target_and_light_dismiss():
+    """E4: declarative popovertarget/popovertargetaction toggles the popover;
+    click-outside light-dismiss closes auto popovers (manual popovers stay)."""
+    page = """<html><body>
+    <button id="trigger" popovertarget="pop">Toggle</button>
+    <button id="elsewhere">Elsewhere</button>
+    <div id="pop" popover="auto"><button id="inside">Inside</button></div>
+    <div id="manual" popover="manual">Manual</div>
+    <script>window.__ready = true;</script>
+    </body></html>"""
+    session = Session(_client({"/": page}), "s_popover_e4")
+    await session.goto(f"{BASE}/")
+    ctx = session.current_tab.ctx
+
+    # Popover starts closed
+    assert ctx.eval("document.getElementById('pop').popoverOpen") is False
+
+    # Click the trigger button: popover opens (declarative popovertarget)
+    ctx.eval("document.getElementById('trigger').click();")
+    assert ctx.eval("document.getElementById('pop').popoverOpen") is True
+
+    # Click elsewhere: light dismiss closes the auto popover
+    ctx.eval("document.getElementById('elsewhere').click();")
+    assert ctx.eval("document.getElementById('pop').popoverOpen") is False
+
+    # Click trigger again: popover opens
+    ctx.eval("document.getElementById('trigger').click();")
+    assert ctx.eval("document.getElementById('pop').popoverOpen") is True
+
+    # Open the manual popover
+    ctx.eval("document.getElementById('manual').showPopover();")
+    assert ctx.eval("document.getElementById('manual').popoverOpen") is True
+
+    # Click elsewhere: auto popover closes, manual popover stays
+    ctx.eval("document.getElementById('elsewhere').click();")
+    assert ctx.eval("document.getElementById('pop').popoverOpen") is False
+    assert ctx.eval("document.getElementById('manual').popoverOpen") is True
+
+    # Click inside the manual popover: it stays open (light dismiss only
+    # fires on clicks outside the popover)
+    ctx.eval("document.getElementById('inside').click();")
+    assert ctx.eval("document.getElementById('manual').popoverOpen") is True
+
+
