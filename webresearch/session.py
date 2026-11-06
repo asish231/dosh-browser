@@ -320,7 +320,7 @@ class Session:
 
     def _broadcast_storage_events(self, js_info: dict | None, event_url: str) -> None:
         """Dispatch `storage` events for localStorage mutations to OTHER
-        same-origin tabs (spec contract).
+        same-origin tabs AND same-origin frame realms (spec contract, S5).
 
         The pass that made the change is the ACTIVE tab's; every other tab
         with a live engine context whose current origin matches receives,
@@ -330,6 +330,13 @@ class Session:
         storageArea. The originating tab gets no event; the receiving store's
         apply is quiet (no re-record) so the change cannot echo back.
         sessionStorage is per-tab and never broadcasts.
+
+        S5: same-origin frame realms also receive the event. Each frame has
+        its own QuickJS context (separate from the parent's), and same-origin
+        frames share the same underlying storage area via `_web_storage`.
+        The broadcast includes the originating tab's frames (they're not the
+        one that made the change) and other tabs' frames. Cross-origin frames
+        never receive the event (per spec).
         """
         changes = (js_info or {}).get("storage_changes") or {}
         local_changes = [c for c in (changes.get("local") or []) if isinstance(c, dict)]
@@ -337,6 +344,7 @@ class Session:
             return
         origin = self._origin_of(event_url)
         src_id = self.active_tab_id
+        # Broadcast to other same-origin tabs
         for tab in self._tabs.values():
             if tab.id == src_id or tab.ctx is None:
                 continue
@@ -366,6 +374,39 @@ class Session:
                     )
                 try:
                     tab.ctx.eval(js)
+                except Exception:
+                    pass
+        # S5: broadcast to same-origin frame realms (including the originating
+        # tab's frames — they're not the one that made the change).
+        for frame in self.frame_documents:
+            if frame.js_info.get("ctx") is None:
+                continue
+            if self._origin_of(frame.url) != origin:
+                continue
+            try:
+                url_js = json.dumps(event_url)
+            except Exception:
+                url_js = '""'
+            for ch in local_changes:
+                key = ch.get("key")
+                if key is None:
+                    js = (
+                        "__applyRemoteStorageChange(null, null, true);"
+                        f"__dispatchStorageEvent(null, null, null, {url_js}); true"
+                    )
+                else:
+                    try:
+                        k_js = json.dumps(str(key))
+                    except Exception:
+                        k_js = '""'
+                    old_js = json.dumps(ch.get("oldValue"))
+                    new_js = json.dumps(ch.get("newValue"))
+                    js = (
+                        f"__applyRemoteStorageChange({k_js}, {new_js}, false);"
+                        f"__dispatchStorageEvent({k_js}, {old_js}, {new_js}, {url_js}); true"
+                    )
+                try:
+                    frame.js_info["ctx"].eval(js)
                 except Exception:
                     pass
 
@@ -648,11 +689,19 @@ class Session:
             return_js_info=True,
             storage_seed=self._storage_seed(url),
             history_length=max(1, len(self.history) + 1),
+            storage_seed_for=self._storage_seed,
         )
         self.frame_documents = frames
         self.captcha_inspection = captcha
         self.current_tab.ctx = js_info.get("ctx") if js_info else None
+        # S4: absorb the parent's drained storage first, then each frame's
+        # drained storage. Order matters: `_absorb_storage` pops keys that
+        # are in the session but not in the drained dict, so the parent's
+        # absorption must not overwrite the frame's writes (which happen
+        # after the parent ran).
         self._absorb_storage(js_info, url)
+        for f in frames:
+            self._absorb_storage(f.js_info, url=f.url)
         self._last_dialogs = list((js_info or {}).get("dialogs") or [])
         self._last_popups = list((js_info or {}).get("popups") or [])
         if self.profile is not None:
@@ -903,7 +952,9 @@ class Session:
             if result.kind == "html":
                 self.current_tab.ctx = js_info.get("ctx") if js_info else None
         frames = (
-            await load_frames(html, result.final_url or form.action, self.client, parent_headers=result.headers)
+            await load_frames(html, result.final_url or form.action, self.client,
+                              parent_headers=result.headers,
+                              storage_seed_for=self._storage_seed)
             if result.kind == "html"
             else []
         )
@@ -923,6 +974,11 @@ class Session:
             frames=frames,
             captcha=captcha.report,
         )
+        # S4: same-origin frame storage sharing — each frame's realm drains
+        # its localStorage writes, which flow back into the session's
+        # shared area keyed by the frame's origin (per-origin).
+        for f in frames:
+            self._absorb_storage(f.js_info, url=f.url)
         self.frame_documents = frames
         self.captcha_inspection = captcha
         pushed = self._push(page, html)
@@ -987,6 +1043,7 @@ class Session:
                     parent_messages=js_info.get("post_messages"),
                     cached=self.frame_documents,
                     parent_ctx=self.current_tab.ctx,
+                    storage_seed_for=self._storage_seed,
                 )
                 if new_html
                 else self.frame_documents
@@ -1268,6 +1325,42 @@ class Session:
             self.html,
             max_chars,
         )
+
+    async def select_text(
+        self,
+        ref: str,
+        start: int = 0,
+        end: int | None = None,
+        *,
+        max_chars: int = 8000,
+    ) -> Page:
+        """E2: drag-select text in a text input, textarea, or contenteditable.
+
+        A distinct lane from element drag-and-drop: models the mousedown →
+        selection → mouseup contract and fires selectstart/select/
+        selectionchange. `start`/`end` are character offsets (end defaults to
+        the end of the text); offsets are clamped and swapped if inverted.
+        """
+        if not self.html:
+            raise ValueError("no current page")
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            raise ValueError("start must be a nonnegative integer")
+        if end is not None and (isinstance(end, bool) or not isinstance(end, int) or end < 0):
+            raise ValueError("end must be a nonnegative integer")
+        surface = self.action_surface(max_actions=100_000)
+        action = next((a for a in surface.actions if a.ref == ref), None)
+        if action is None:
+            raise ValueError(
+                f"no target [{ref}] for text selection. Re-inspect or query the action surface to obtain a valid ref."
+            )
+        payload: dict = {
+            "kind": "text_select",
+            "selector": action.selector or action.target,
+            "start": start,
+        }
+        if end is not None:
+            payload["end"] = end
+        return await self._apply([payload], self.html, max_chars)
 
     def dialogs(self) -> list[dict]:
         """Dialogs (alert/confirm/prompt) fired by the most recent script pass.
@@ -1873,6 +1966,13 @@ resolve a selector directly.
         self.current_tab.ctx = js_info.get("ctx") or self.current_tab.ctx
         self._absorb_storage(js_info)
         self._absorb_history(js_info)
+        # L10/engine honesty: an action the engine refused (occluded_by /
+        # element_not_found / control_disabled / click_refused) is an error,
+        # never a silent success. The refusal text carries which element won
+        # hit-testing so the agent can plan around the overlay.
+        for item in js_info.get("actions_applied") or []:
+            if isinstance(item, dict) and item.get("error"):
+                raise ValueError(f"action refused by engine: {item['error']}")
         # A fresh engine build may be a history restore replaying this entry's
         # document: re-apply the stored scroll position once, before the page
         # snapshot is taken, so IntersectionObserver-driven feeds load the
@@ -1915,6 +2015,7 @@ resolve a selector directly.
                 parent_messages=js_info.get("post_messages"),
                 cached=self.frame_documents,
                 parent_ctx=self.current_tab.ctx,
+                storage_seed_for=self._storage_seed,
             )
             if new_html
             else self.frame_documents
@@ -2013,6 +2114,10 @@ resolve a selector directly.
             frames=frames,
             captcha=captcha.report,
         )
+        # S4: same-origin frame storage sharing — absorb each frame's drained
+        # storage back into the session (per the frame's own origin).
+        for f in frames:
+            self._absorb_storage(f.js_info, url=f.url)
         self.frame_documents = frames
         self.captcha_inspection = captcha
         self._last_deltas = js_info.get("deltas", [])
