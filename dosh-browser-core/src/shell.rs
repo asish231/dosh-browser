@@ -28,6 +28,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("open", "Load url through the normal owned document lifecycle."),
     ("actions", "List controls with explicit pagination coverage."),
     ("act", "Execute an existing browser action ref, with optional text/dx/dy."),
+    ("select", "Drag-select text in a text input/textarea/contenteditable (E2): ref, start, end offsets; fires selectstart/select/selectionchange."),
     ("net", "Query network observations: after, limit, pattern."),
     ("net.capture", "Enable/disable opt-in redacted JSON/form response bodies: enabled."),
     ("net.rule", "Add runtime fetch/XHR block/header/mock rule: action, pattern, options."),
@@ -531,6 +532,17 @@ pub async fn execute_command(
                 "total": total,
                 "offset": offset,
                 "limit": limit,
+            }))
+        }
+        "select" => {
+            let ref_id = args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+            let start = args.get("start").and_then(|v| v.as_i64()).unwrap_or(0);
+            let end = args.get("end").and_then(|v| v.as_i64());
+            let page = session.select_text(ref_id, start, end).await?;
+            Ok(serde_json::json!({
+                "url": page.url,
+                "status": page.status,
+                "note": "text-selection drag lane: mousedown → selection → mouseup; fires selectstart/select/selectionchange; distinct from element DnD"
             }))
         }
         "act" => {
@@ -2121,6 +2133,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_occlusion_gate_refuses_click_under_overlay() {
+        // L10: a click on a control covered by a higher-z overlay must be
+        // refused with the occluder named — never delivered, never silent.
+        // Removing the overlay lets the same ref click through.
+        let client = reqwest::Client::new();
+        let mut session = Session::new(client);
+        let store = ShellStore::new(None).unwrap();
+
+        let html = "<html><head><title>occ</title></head><body>\
+            <button id=\"go\">Go</button>\
+            <div id=\"cover\" style=\"position:fixed;left:0;top:0;width:100%;height:100%;z-index:100;\"></div>\
+            </body></html>";
+        session
+            .goto_html("https://example.com/", html, 4000)
+            .expect("seed document");
+
+        let inv = execute_command("actions", &serde_json::json!({}), &mut session, &store)
+            .await
+            .unwrap();
+        let ref_id = inv["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["text"].as_str() == Some("Go"))
+            .and_then(|a| a["ref_id"].as_str())
+            .expect("Go button in inventory")
+            .to_string();
+
+        let err = execute_command("act", &serde_json::json!({ "ref": ref_id }), &mut session, &store)
+            .await
+            .expect_err("occluded click must be refused, not delivered");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("occluded_by"),
+            "refusal must name the occluder: {msg:?}"
+        );
+
+        // Remove the overlay: the same ref now clicks through.
+        let _ = execute_command(
+            "eval",
+            &serde_json::json!({ "source": "document.getElementById('cover').remove(); 'gone'" }),
+            &mut session,
+            &store,
+        )
+        .await
+        .unwrap();
+        let ok = execute_command("act", &serde_json::json!({ "ref": ref_id }), &mut session, &store)
+            .await
+            .expect("click must land once the overlay is gone");
+        assert!(ok.is_object() || ok.is_string(), "act returns the page: {ok:?}");
+    }
+
+    #[tokio::test]
     async fn test_caps_manifest_live_counts_and_honest_unavailable() {
         // S9: caps is a real per-page "available / unavailable + why" manifest:
         // live-realm counts (post-script document), an unavailable list that
@@ -2188,6 +2253,86 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
         assert_eq!(parsed["counts"]["canvas"], 1);
         let _ = std::fs::remove_file(&dest);
+    }
+
+    #[tokio::test]
+    async fn test_select_text_drag_lane_rust() {
+        // E2 (Rust lane): `select` drags over text in a real text container,
+        // producing a readable selection via the shared engine lane.
+        let client = reqwest::Client::new();
+        let mut session = Session::new(client);
+        let store = ShellStore::new(None).unwrap();
+
+        let html = "<html><head><title>sel</title></head><body>\
+            <input id=\"email\" name=\"email\" value=\"abcdef\">\
+            </body></html>";
+        session
+            .goto_html("https://example.com/", html, 4000)
+            .expect("seed document");
+
+        let inv = execute_command("actions", &serde_json::json!({}), &mut session, &store)
+            .await
+            .unwrap();
+        let ref_id = inv["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["text"].as_str() == Some("email"))
+            .and_then(|a| a["ref_id"].as_str())
+            .expect("email input in inventory")
+            .to_string();
+
+        let _page = execute_command(
+            "select",
+            &serde_json::json!({ "ref": ref_id, "start": 1, "end": 4 }),
+            &mut session,
+            &store,
+        )
+        .await
+        .expect("select must succeed on a text field");
+
+        let check = execute_command(
+            "eval",
+            &serde_json::json!({ "source": "return (function(){var f=document.getElementById('email'); return f.value.substring(f.selectionStart, f.selectionEnd);})()" }),
+            &mut session,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            check["result"].as_str(),
+            Some("bcd"),
+            "selection must span offsets 1..4, got: {check:?}"
+        );
+
+        // A non-text target is an honest refusal, not a silent no-op.
+        let html2 = "<html><head><title>sel2</title></head><body><button id=\"b\">Go</button></body></html>";
+        session
+            .goto_html("https://example.com/two", html2, 4000)
+            .expect("seed document 2");
+        let inv2 = execute_command("actions", &serde_json::json!({}), &mut session, &store)
+            .await
+            .unwrap();
+        let b_ref = inv2["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["text"].as_str() == Some("Go"))
+            .and_then(|a| a["ref_id"].as_str())
+            .expect("button in inventory")
+            .to_string();
+        let refused = execute_command(
+            "select",
+            &serde_json::json!({ "ref": b_ref, "start": 0, "end": 2 }),
+            &mut session,
+            &store,
+        )
+        .await;
+        assert!(refused.is_err(), "selecting a non-text target must error");
+        assert!(
+            refused.unwrap_err().to_string().contains("not_selectable_text"),
+            "refusal must name the reason"
+        );
     }
 
     #[tokio::test]
@@ -2426,8 +2571,8 @@ mod tests {
     async fn test_shell_45_commands_completeness() {
         // 46 original commands + 6 Phase-1 additions (net.stream/ws/cors/
         // timing/replay/decode) + 3 Phase-2 additions (state.snapshot/
-        // state.diff/state.rollback).
-        assert_eq!(COMMANDS.len(), 55);
+        // state.diff/state.rollback) + select (Phase 3 E2).
+        assert_eq!(COMMANDS.len(), 56);
         let client = reqwest::Client::new();
         let mut session = Session::new(client);
         let store = ShellStore::new(None).unwrap();
