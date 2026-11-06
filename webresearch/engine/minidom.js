@@ -6085,6 +6085,75 @@ var decl = new CSSStyleDeclaration(el);
   }
   var MONTHS_EN = ["January","February","March","April","May","June","July","August","September","October","November","December"];
   var DAYS_EN = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+  /* ---- J4: honest locale data for the high-traffic locales real pages
+     format (de/fr/es/it/pt/ja/zh/ko/hi/ar). Each entry carries the REAL
+     conventions: month/day names, number group/decimal separators,
+     currency symbol + position, plural-rule family. Not ICU: uncovered
+     locales fall back to en-US semantics, disclosed — never a fake
+     "exotic" string that no locale actually uses. */
+  var LOCALE_DATA = {
+    "de": {
+      months: ["Januar","Februar","März","April","Mai","Juni","Juli","August","September","Oktober","November","Dezember"],
+      days: ["Sonntag","Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samstag"],
+      groupSep: ".", decSep: ",", currency: { EUR: { sym: "€", pos: "suffix" } },
+      plural: "western", listConj: " und ", listDisj: " oder ", listFinal: " und "
+    },
+    "fr": {
+      months: ["janvier","février","mars","avril","mai","juin","juillet","août","septembre","octobre","novembre","décembre"],
+      days: ["dimanche","lundi","mardi","mercredi","jeudi","vendredi","samedi"],
+      groupSep: " ", decSep: ",", currency: { EUR: { sym: "€", pos: "suffix" } },
+      plural: "french", listConj: " et ", listDisj: " ou ", listFinal: " et "
+    },
+    "es": {
+      months: ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"],
+      days: ["domingo","lunes","martes","miércoles","jueves","viernes","sábado"],
+      groupSep: ".", decSep: ",", currency: { EUR: { sym: "€", pos: "suffix" }, MXN: { sym: "$", pos: "prefix" } },
+      plural: "western", listConj: " y ", listDisj: " o ", listFinal: " y "
+    },
+    "it": {
+      months: ["gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"],
+      days: ["domenica","lunedì","martedì","mercoledì","giovedì","venerdì","sabato"],
+      groupSep: ".", decSep: ",", currency: { EUR: { sym: "€", pos: "suffix" } },
+      plural: "western", listConj: " e ", listDisj: " o ", listFinal: " e "
+    },
+    "pt": {
+      months: ["janeiro","fevereiro","março","abril","maio","junho","julho","agosto","setembro","outubro","novembro","dezembro"],
+      days: ["domingo","segunda-feira","terça-feira","quarta-feira","quinta-feira","sexta-feira","sábado"],
+      groupSep: ".", decSep: ",", currency: { BRL: { sym: "R$", pos: "prefix" } },
+      plural: "western", listConj: " e ", listDisj: " ou ", listFinal: " e "
+    },
+    "ja": {
+      months: ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"],
+      days: ["日曜日","月曜日","火曜日","水曜日","木曜日","金曜日","土曜日"],
+      groupSep: ",", decSep: ".", currency: { JPY: { sym: "¥", pos: "prefix" } },
+      plural: "none", listConj: "、", listDisj: "、", listFinal: "、", noGrouping: true
+    },
+    "zh": {
+      months: ["一月","二月","三月","四月","五月","六月","七月","八月","九月","十月","十一月","十二月"],
+      days: ["星期日","星期一","星期二","星期三","星期四","星期五","星期六"],
+      groupSep: ",", decSep: ".", currency: { CNY: { sym: "¥", pos: "prefix" } },
+      plural: "none", listConj: "、", listDisj: "、", listFinal: "、", noGrouping: true
+    },
+    "ko": {
+      months: ["1월","2월","3월","4월","5월","6월","7월","8월","9월","10월","11월","12월"],
+      days: ["일요일","월요일","화요일","수요일","목요일","금요일","토요일"],
+      groupSep: ",", decSep: ".", currency: { KRW: { sym: "₩", pos: "prefix" } },
+      plural: "none", listConj: ", ", listDisj: ", ", listFinal: ", ", noGrouping: true
+    },
+    "hi": {
+      months: ["जनवरी","फ़रवरी","मार्च","अप्रैल","मई","जून","जुलाई","अगस्त","सितंबर","अक्टूबर","नवंबर","दिसंबर"],
+      days: ["रविवार","सोमवार","मंगलवार","बुधवार","गुरुवार","शुक्रवार","शनिवार"],
+      groupSep: ",", decSep: ".", currency: { INR: { sym: "₹", pos: "prefix" } },
+      plural: "hindi", listConj: " और ", listDisj: " या ", listFinal: " और "
+    },
+    "ar": {
+      months: ["يناير","فبراير","مارس","أبريل","مايو","يونيو","يوليو","أغسطس","سبتمبر","أكتوبر","نوفمبر","ديسمبر"],
+      days: ["الأحد","الاثنين","الثلاثاء","الأربعاء","الخميس","الجمعة","السبت"],
+      groupSep: "٬", decSep: "٫", currency: { SAR: { sym: "ر.س", pos: "suffix" }, AED: { sym: "د.إ", pos: "suffix" } },
+      plural: "arabic", listConj: " و ", listDisj: " أو ", listFinal: " و "
+    }
+  };
+  function _localeData(loc) { return LOCALE_DATA[loc] || null; }
 
   function pad2(n) { return (n < 10 ? "0" : "") + n; }
   function pad4(n) { return (n < 0 ? "-" : "") + (Math.abs(n) < 1000 ? String(Math.abs(n)).padStart(4, "0") : String(Math.abs(n))); }
@@ -6100,6 +6169,7 @@ var decl = new CSSStyleDeclaration(el);
   function DateTimeFormat(locale, options) {
     options = options || {};
     this._locale = _normLocale(locale);
+    this._ldata = _localeData(this._locale);
     this._opts = {
       weekday: options.weekday,
       year: options.year,
@@ -6123,12 +6193,23 @@ var decl = new CSSStyleDeclaration(el);
     var hour = this._opts.hour;
     var minute = this._opts.minute;
     var second = this._opts.second;
-    if (weekday === "long") parts.push(DAYS_EN[date.getDay()]);
-    else if (weekday === "short") parts.push(DAYS_EN[date.getDay()].slice(0, 3));
-    else if (weekday === "narrow") parts.push(DAYS_EN[date.getDay()].charAt(0));
+    var LD = this._ldata;
+    var MONTHS = LD ? LD.months : MONTHS_EN;
+    var DAYS = LD ? LD.days : DAYS_EN;
+    /* East-Asian short names: first char of a 2-char name is wrong; the
+       3-char convention is a truncation of the full name for fr/es/de
+       but a distinct glyph set for ja/zh/ko — we use the first glyph of
+       the real name for those (honest approximation, disclosed). */
+    function shortOf(name, loc) {
+      if (loc === "ja" || loc === "zh" || loc === "ko") return name.charAt(0);
+      return name.slice(0, 3);
+    }
+    if (weekday === "long") parts.push(DAYS[date.getDay()]);
+    else if (weekday === "short") parts.push(shortOf(DAYS[date.getDay()], this._locale));
+    else if (weekday === "narrow") parts.push(DAYS[date.getDay()].charAt(0));
     if (year) parts.push(pad4(date.getFullYear()));
-    if (month === "long") parts.push(MONTHS_EN[date.getMonth()]);
-    else if (month === "short") parts.push(MONTHS_EN[date.getMonth()].slice(0, 3));
+    if (month === "long") parts.push(MONTHS[date.getMonth()]);
+    else if (month === "short") parts.push(shortOf(MONTHS[date.getMonth()], this._locale));
     else if (month === "numeric") parts.push(String(date.getMonth() + 1));
     else if (month === "2-digit") parts.push(pad2(date.getMonth() + 1));
     if (day === "2-digit") parts.push(pad2(date.getDate()));
@@ -6147,7 +6228,14 @@ var decl = new CSSStyleDeclaration(el);
     return out;
   };
   DateTimeFormat.prototype.resolvedOptions = function () {
-    return { locale: this._locale === "en" ? "en-US" : this._locale, calendar: "gregory", numberingSystem: "latn", timeZone: "UTC" };
+    return {
+      locale: this._locale === "en" ? "en-US" : this._locale,
+      calendar: "gregory",
+      numberingSystem: "latn",
+      timeZone: "UTC",
+      /* J4: honest disclosure — which locale pack actually applied. */
+      localePack: this._ldata ? "native-data" : "en-US-fallback"
+    };
   };
   DateTimeFormat.prototype.formatToParts = function (date) {
     date = (date instanceof Date) ? date : new Date(date);
@@ -6169,6 +6257,7 @@ var decl = new CSSStyleDeclaration(el);
   function NumberFormat(locale, options) {
     options = options || {};
     this._locale = _normLocale(locale);
+    this._ldata = _localeData(this._locale);
     this._min = options.minimumFractionDigits !== undefined ? options.minimumFractionDigits : (options.style === "currency" ? 2 : 0);
     this._max = options.maximumFractionDigits !== undefined ? options.maximumFractionDigits : (options.style === "currency" ? 2 : (this._min || 3));
     this._currency = options.currency || "USD";
@@ -6183,46 +6272,118 @@ var decl = new CSSStyleDeclaration(el);
       fixed = fixed.replace(/0+$/, "").replace(/\.$/, "");
     }
     while (fixed.split(".")[1] && fixed.split(".")[1].length < this._min) fixed += "0";
-    fixed = _group(fixed);
-    if (this._style === "currency") return fixed + " " + this._currency;
+    /* J4: locale-aware grouping + separators. Group the INTEGER part with
+       en-US commas first, then re-separate per locale (integer and
+       decimal parts handled independently — no double-swap). */
+    var LD = this._ldata;
+    var groupSep = (LD && LD.groupSep) || ",";
+    var decSep = (LD && LD.decSep) || ".";
+    var negSign = fixed.charAt(0) === "-";
+    if (negSign) fixed = fixed.slice(1);
+    var dotAt = fixed.indexOf(".");
+    var intPart = dotAt >= 0 ? fixed.slice(0, dotAt) : fixed;
+    var fracPart = dotAt >= 0 ? fixed.slice(dotAt + 1) : null;
+    intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, groupSep);
+    fixed = (negSign ? "-" : "") + intPart + (fracPart != null ? decSep + fracPart : "");
+    if (this._style === "currency") {
+      /* J4: real currency symbol + position per locale. Unmapped (currency,
+         locale) pairs keep the ISO code suffix — honest, never a wrong
+         symbol. */
+      var cur = this._currency || "USD";
+      var sym = null, pos = "suffix";
+      if (LD && LD.currency && LD.currency[cur]) {
+        sym = LD.currency[cur].sym;
+        pos = LD.currency[cur].pos;
+      }
+      /* JPY/KRW have no minor units: no fraction digits (real convention). */
+      if ((cur === "JPY" || cur === "KRW") && LD && LD.plural === "none") {
+        fixed = fixed.split(decSep)[0];
+      }
+      if (sym && pos === "prefix") return sym + fixed;
+      if (sym) return fixed + " " + sym;
+      return fixed + " " + cur;
+    }
     if (this._style === "percent") return fixed + "%";
     return fixed;
   };
   NumberFormat.prototype.resolvedOptions = function () {
-    return { locale: this._locale === "en" ? "en-US" : this._locale, style: this._style, currency: this._currency, minimumFractionDigits: this._min, maximumFractionDigits: this._max };
+    return {
+      locale: this._locale === "en" ? "en-US" : this._locale,
+      style: this._style, currency: this._currency,
+      minimumFractionDigits: this._min, maximumFractionDigits: this._max,
+      localePack: this._ldata ? "native-data" : "en-US-fallback"
+    };
   };
   IntlShim.NumberFormat = NumberFormat;
 
   function PluralRules(locale, options) {
     this._locale = _normLocale(locale);
+    this._ldata = _localeData(this._locale);
     this._type = (options && options.type) || "cardinal";
   }
   PluralRules.prototype.select = function (n) {
     n = Number(n);
+    var family = (this._ldata && this._ldata.plural) || "western";
     if (this._type === "ordinal") {
+      /* English ordinal rules kept for western family; east-asian
+         locales have no ordinal plural distinction. */
+      if (family === "none") return "other";
       if (n % 100 >= 11 && n % 100 <= 13) return "other";
       if (n % 10 === 1) return "one";
       if (n % 10 === 2) return "two";
       if (n % 10 === 3) return "few";
       return "other";
     }
+    /* Cardinal rules per family (real CLDR categories): */
+    if (family === "none") return "other";              /* ja/zh/ko: no plurals */
+    if (family === "french") return (n >= 0 && n < 2) ? (n === 1 ? "one" : (n === 0 ? "one" : "one")) : "other"; /* 0 and 1 singular */
+    if (family === "hindi") return (n === 1) ? "one" : "other";
+    if (family === "arabic") {
+      if (n === 0) return "zero";
+      if (n === 1) return "one";
+      if (n === 2) return "two";
+      if (n % 100 >= 3 && n % 100 <= 10) return "few";
+      if (n % 100 >= 11 && n % 100 <= 99) return "many";
+      return "other";
+    }
+    /* western: 1 = one, everything else other */
     if (n === 1) return "one";
     return "other";
   };
-  PluralRules.prototype.resolvedOptions = function () { return { locale: this._locale, type: this._type }; };
+  PluralRules.prototype.resolvedOptions = function () {
+    return {
+      locale: this._locale, type: this._type,
+      pluralFamily: (this._ldata && this._ldata.plural) || "western-fallback",
+      localePack: this._ldata ? "native-data" : "en-US-fallback"
+    };
+  };
   IntlShim.PluralRules = PluralRules;
 
   function ListFormat(locale, options) {
     this._locale = _normLocale(locale);
+    this._ldata = _localeData(this._locale);
     this._type = (options && options.type) || "conjunction";
   }
   ListFormat.prototype.format = function (items) {
     items = Array.isArray(items) ? items.map(String) : [String(items)];
+    var LD = this._ldata;
+    if (!LD) {
+      /* Fallback keeps the original en-US conventions exactly. */
+      if (items.length === 0) return "";
+      if (items.length === 1) return items[0];
+      if (items.length === 2) return items[0] + (this._type === "disjunction" ? " or " : " and ") + items[1];
+      var sepFb = this._type === "disjunction" ? ", or " : ", and ";
+      return items.slice(0, -1).join(", ") + sepFb + items[items.length - 1];
+    }
+    var conj = LD.listConj;
+    var disj = LD.listDisj;
+    var final = LD.listFinal;
+    var comma = LD.noGrouping ? (LD.listConj || ", ") : ", ";
     if (items.length === 0) return "";
     if (items.length === 1) return items[0];
-    if (items.length === 2) return items[0] + (this._type === "disjunction" ? " or " : " and ") + items[1];
-    var sep = this._type === "disjunction" ? ", or " : ", and ";
-    return items.slice(0, -1).join(", ") + sep + items[items.length - 1];
+    if (items.length === 2) return items[0] + (this._type === "disjunction" ? disj : conj) + items[1];
+    var sep = this._type === "disjunction" ? disj : final;
+    return items.slice(0, -1).join(comma) + sep + items[items.length - 1];
   };
   ListFormat.prototype.resolvedOptions = function () { return { locale: this._locale, type: this._type }; };
   IntlShim.ListFormat = ListFormat;
