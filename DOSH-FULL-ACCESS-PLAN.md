@@ -705,16 +705,16 @@ upgrades as real pages need, then the A1/A2/A5 protocol-lane upgrades.
 One hermetic test per implementable item; decisions get recorded
 decisions + divergence-documenting tests. Both suites green before done.
 
-- [ ] **J5** doshgentv8 fork patches fully wired: fuel metering,
+- [x] **J5** doshgentv8 fork patches fully wired: fuel metering,
       host-clock injection, seeded RNG, and checkpoint callback in
       `doshgentv8/core` (policy overlays, byte-level semantics
       unchanged), selectable from the seam; tests in the core crate.
-- [ ] **J1** Native WebAssembly decision: wire V8's native WASM in the
+- [x] **J1** Native WebAssembly decision: wire V8's native WASM in the
       doshgentv8 lane OR keep the documented divergence explicit —
       decide, record the decision + rationale here, and pin the
       divergence with a test (the engine's scoped WASM interpreter
       stays the Python-lane path).
-- [ ] **J2** Proxy-wrapped TypedArray: record the divergence (throws
+- [x] **J2** Proxy-wrapped TypedArray: record the divergence (throws
       honestly instead of faking) + divergence-documenting test.
 - [ ] **J3** WeakRef/FinalizationRegistry: upgrade the shim toward real
       semantics where QuickJS allows (deref after collection where
@@ -734,6 +734,34 @@ decisions + divergence-documenting tests. Both suites green before done.
 - [ ] **Docs** — §2.2/§2.9 rows + AGENTS.md roadmap rows.
 - [ ] **Green** — Python full suite + `cargo test -p dosh-browser-core
       --lib` + `doshgentv8` core-crate tests.
+
+Phase 7 execution evidence (2026-11-06):
+- J5: VERIFIED COMPLETE — all four fork patches are implemented in
+  `doshgentv8/core/src/lib.rs` as public seam APIs on DoshEngine and
+  selectable per session: fuel (set_fuel/fuel_remaining/disable_fuel),
+  host-clock injection (set_virtual_time/advance_virtual_time/
+  virtual_time), seeded RNG (set_random_seed + __setRandomSeed), and
+  the checkpoint callback (checkpoint_parena/rewind_parena via the
+  Parena). 6 dedicated tests pass inside the 29-test core crate suite
+  (test_fuel_metering_trap, test_virtual_host_clock_injection,
+  test_deterministic_seeded_prng, test_parena_checkpoint_and_rewind,
+  test_actor_parena_fork_checkpoint_rewind,
+  test_in_realm_dosh_checkpoint_and_rewind).
+- J1 DECISION (recorded): doshgentv8 runs V8's NATIVE WebAssembly —
+  real WebAssembly.Module/Instance, not the scoped interpreter. The
+  Python/QuickJS lane keeps the scoped interpreter (minidom.js) as its
+  disclosed engine. The two-lane difference is documented as an
+  EXPECTED divergence, not a bug: the QuickJS↔V8 oracle bridge
+  (doshgentv8/test_rust_bridge.py, probe E_wasm) pins it and reports
+  "RESULT: GREEN — all probes match (expected divergences documented)".
+  Rationale: wiring the divergence "away" would mean faking either
+  engine's behavior; the honest contract is per-lane capability with
+  the divergence oracle-tested.
+- J2 DECISION (recorded): Proxy-wrapped TypedArray brand-checks throw
+  honestly under V8 ("WebAssembly.validate(): Argument 0 must be...")
+  instead of the QuickJS lane's validate:false — same oracle test pins
+  it (probe E_wasm covers both facets: native WASM + brand check).
+  Keeping the honest throw is the decision; faking acceptance is not.
 
 ### Phase 8 — Leftover §2 items (execution; started 2026-11-06)
 
