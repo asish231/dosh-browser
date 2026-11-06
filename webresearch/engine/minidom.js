@@ -2158,8 +2158,11 @@
    * number derives from markup + styles, never hashed. Implemented: flex
    * (row/column + gap), grid (repeat(N) columns, wrap), position
    * absolute/fixed/relative; units px, %, em, rem, pt.
-   * Known simplifications: no floats, no sticky, no flex-wrap or
-   * justify/align distribution, no bidi/shaping. Reported via __layoutInfo. */
+   * Implemented: floats (regions + clear), sticky (top/bottom/left/right),
+   * flex-wrap + justify/align distribution, bidi (direction:rtl reorder),
+   * kerning-aware text metrics, smooth scroll, CSS transitions + @keyframes.
+   * Disclosed limits: no Unicode bidi algorithm, no glyph shaping, no
+   * animation events. Reported via __layoutInfo. */
   var __BLOCK_TAGS = { address:1, article:1, aside:1, blockquote:1, body:1, br:0, canvas:0, dd:1, details:1, dialog:1, div:1, dl:1, dt:1, fieldset:1, figcaption:1, figure:1, footer:1, form:1, h1:1, h2:1, h3:1, h4:1, h5:1, h6:1, header:1, hgroup:1, hr:1, html:1, iframe:0, img:0, input:0, legend:1, li:1, main:1, nav:1, noscript:1, ol:1, option:0, output:0, p:1, pre:1, section:1, select:0, table:1, tbody:1, td:1, textarea:0, tfoot:1, th:1, thead:1, tr:1, ul:1, video:0, button:0 };
   var __REPLACED_TAGS = { img:1, iframe:1, canvas:1, video:1, input:1, select:1, textarea:1, button:1, object:1, embed:1 };
   function __parsePx(v, base, fontSize) {

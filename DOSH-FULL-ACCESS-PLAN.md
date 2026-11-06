@@ -83,16 +83,16 @@ shipped behavior, not the gap.
 
 | # | Capability | State |
 |---|---|---|
-| L1 | CSS floats | ❌ |
-| L2 | `position: sticky` | ❌ |
-| L3 | flex-wrap + justify/align distribution | ❌ |
-| L4 | Bidi + text shaping | ❌ |
-| L5 | Real font metrics (shaping-lite) | 🟡 approximate advance table |
-| L6 | Smooth scroll animation | 🟡 stepped-synchronous |
-| L7 | Caret + text selection model | ❌ |
-| L8 | Real rAF frame clock | 🟡 `setTimeout` shim |
-| L9 | CSS transitions / @keyframes timing | ❌ |
-| L10 | Occlusion-gated clicks | 🟡 inspector exists, clicks bypass it |
+| L1 | CSS floats | ✅ |
+| L2 | `position: sticky` | ✅ |
+| L3 | flex-wrap + justify/align distribution | ✅ |
+| L4 | Bidi + text shaping | ✅ (direction:rtl reorder; no Unicode bidi/shaping) |
+| L5 | Real font metrics (shaping-lite) | ✅ proportional advance + kern pairs |
+| L6 | Smooth scroll animation | ✅ rAF frame-clock ease-out |
+| L7 | Caret + text selection model | ✅ |
+| L8 | Real rAF frame clock | ✅ (rAF queue + drain batch) |
+| L9 | CSS transitions / @keyframes timing | ✅ |
+| L10 | Occlusion-gated clicks | ✅ (inspector + gate + honest refusal) |
 
 ### 2.4 Rendering / pixels
 
@@ -504,8 +504,8 @@ clock, then the input-subset gaps, then frame storage.
       parent writes via action pass (full drain + broadcast), same-origin
       frame receives the event and the value is applied; cross-origin frame
       receives nothing.
-- [ ] **Docs** — §2.3/§2.5/§2.6 rows + AGENTS.md tables.
-- [ ] **Green** — both full suites.
+- [x] **Docs** — §2.3 rows (L7/L8/L10 ✅) + AGENTS.md tables.
+- [x] **Green** — both full suites (943 passed/8 skipped; 238 passed/0 failed)
 
 ### Phase 2 — bugs the Phase-2 tests exposed (fixed in-lane, both lanes benefit)
 
@@ -525,3 +525,26 @@ clock, then the input-subset gaps, then frame storage.
   silent no-op. `fork` now materializes the document (same re-load `rewind`
   performs). → `test_session_fork_speculative_execution` now exercises a real
   branch action.
+
+### Phase 4 — Layout/geometry completeness (execution; started 2026-11-06)
+
+AGENTS.md order: **sticky → flex-wrap distribution → floats → bidi**, then
+text-metrics upgrade, smooth-scroll animation, CSS transition/keyframe timing
+engine. One captured-markup regression per item. Both suites green before the
+phase is called done. Status legend: ✅ done+verified · 🟡 partial · [ ] todo.
+
+- [x] **L2** `position: sticky` — sticky already in WIP (top/left/right); verify + regression test.
+- [x] **L3** flex-wrap + justify/align distribution — rewrite WIP two-pass (double layout corrupted `__lines`/overcounted boxes) into single natural pass + subtree translation; regression tests for space-* distributions + align-items.
+- [x] **L1** CSS floats — rewrite naive WIP (floats consumed block cursor; inline text never wrapped) into float regions + line-bounds exclusion; block/replaced/inline siblings wrap; `clear`; regression test incl. captured markup.
+- [x] **L4** Bidi — thread inherited `direction` (html/body → descendants); remove debug prints; honest disclosure (RTL reorder + right-anchored lines; NO Unicode bidi algorithm/shaping); regression test.
+- [x] **L5** Real font metrics (shaping-lite) — Helvetica/Arial AFM advance widths (1000u/em) + common kern pairs; honest `textMetric` in `__layoutInfo`; regression tests (i < W, kern reduces AV).
+- [x] **L6** Smooth scroll animation — rAF-driven smooth scroll (ease-out) for scrollTo/scrollBy/scrollIntoView with `behavior:"smooth"`; `auto`/`instant` stay stepped; regression test with the rAF pump.
+- [x] **L9** CSS transitions / @keyframes — real timing engine on the frame clock: property interpolation (px/unitless/rgb/transform), transition props parsed from the cascade, `@keyframes` harvested; computed values update per pumped frame; regression tests (transition mid/final values; keyframe progress).
+- [x] **Docs** — §2.3 rows + AGENTS.md capability table + roadmap row.
+- [x] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`. (954 passed/8 skipped; 238 passed/0 failed)
+
+Pre-flight note: the Phase-4 WIP branch of work began with an uncommitted
+flex rewrite, naive floats, bidi and sticky adds. An earlier misdiagnosis
+(body margin-shift conditional) broke `scrollWidth` semantics and the
+`test_css_grid_layout_columns_and_gap` expectation; reverted to HEAD behavior
+(8px unconditional shift) and re-verified green before continuing.
