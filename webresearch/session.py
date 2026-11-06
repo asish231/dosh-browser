@@ -1924,7 +1924,7 @@ resolve a selector directly.
                 )
             return await self._apply(
                 [{"kind": "activate", "selector": selector, "stealth": stealth,
-                  "occurrence": action.occurrence}],
+                  "occurrence": action.occurrence, "occlusion_gate": True}],
                 self.html,
                 max_chars,
             )
