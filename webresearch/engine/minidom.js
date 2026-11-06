@@ -8980,6 +8980,48 @@ var decl = new CSSStyleDeclaration(el);
        (query strings redacted, line-capped). */
     var initiatorStack = "";
     try { initiatorStack = (new Error()).stack || ""; } catch (e) { initiatorStack = ""; }
+    /* ---- W2: Service Worker fetch interception ----
+       If an activated SW with a fetch handler controls this URL (within its
+       scope), the SW's respondWith() Response replaces the network response.
+       If the handler never calls respondWith, the fetch falls through to the
+       network below (the real SW spec errors on no-respondWith; fall-through
+       is the disclosed engine choice). */
+    if (global.__wrActiveSW && typeof global.__wrActiveSW.fetchHandler === "function") {
+      var swAbsUrl = urlStr;
+      try { swAbsUrl = new URL(urlStr, (global.location && global.location.href) || "").href; } catch (eAbs) {}
+      var swScopeMatch = String(global.__wrActiveSW.scope || "/");
+      if (swScopeMatch === "/" || swAbsUrl.indexOf(swScopeMatch) === 0) {
+        var swRespondCalled = false;
+        var swResponded = null;
+        var fetchEvent = {
+          type: "fetch",
+          request: {
+            url: swAbsUrl,
+            method: method,
+            headers: customHeaders,
+            body: body,
+            mode: "navigate",
+            destination: ""
+          },
+          respondWith: function (r) {
+            if (swRespondCalled) return;
+            swRespondCalled = true;
+            swResponded = r;
+          },
+          waitUntil: function () { return Promise.resolve(); }
+        };
+        try { global.__wrActiveSW.fetchHandler(fetchEvent); } catch (eSWfetch) {
+          /* Handler error: fall through to the network (disclosed). */
+          swRespondCalled = false;
+        }
+        if (swRespondCalled) {
+          if (swResponded && typeof swResponded.then === "function") {
+            return swResponded.then(function (swResp) { return swResp; });
+          }
+          return Promise.resolve(swResponded);
+        }
+      }
+    }
     var raw = typeof host_fetch === "function" ? host_fetch(String(url), method, body, JSON.stringify(customHeaders), bodyB64, initiatorStack) : "{\"status\":599,\"body\":\"\"}";
     var res = typeof raw === "string" ? JSON.parse(raw) : raw;
     var respHeaders = new Headers();
@@ -9559,11 +9601,19 @@ var decl = new CSSStyleDeclaration(el);
          host-side (sw.py regex + strategy simulation) and navigator.serviceWorker
          does not imply SW JS execution. controller is null: no page is
          controlled by a SW in this engine. */
+      /* ---- W2: Service Worker — REAL execution + fetch interception ----
+         register() fetches the SW script (blob: store or host_fetch), runs
+         it in a ServiceWorkerGlobalScope realm (new Function with shadowed
+         globals), and captures its "fetch" event handler. install and
+         activate listeners fire synchronously at registration (the engine
+         has one event loop pass; disclosed). A page fetch() whose URL is
+         within the SW scope routes through respondWith: the SW's Response
+         replaces the network response. If the SW never calls respondWith,
+         the fetch falls through to the network (real SW spec would error
+         on no-respondWith; fall-through is the disclosed engine choice). */
       serviceWorker: {
         controller: null,
-        ready: Promise.resolve({
-          active: { scope: "/", state: "activated", scriptURL: "", unregister: function () { return Promise.resolve(true); } }
-        }),
+        ready: null,
         register: function (scriptUrl, options) {
           var base = (global.location && global.location.href) || "about:blank";
           var absScript = "";
@@ -9573,21 +9623,151 @@ var decl = new CSSStyleDeclaration(el);
             absScript = String(scriptUrl || "");
           }
           var scope = (options && options.scope) || "/";
-          return Promise.resolve({
+          try {
+            scope = new URL(String(scope), base).href;
+          } catch (eScope) {
+            scope = String(scope || "/");
+          }
+          /* Fetch the SW script source */
+          var scriptSource = null;
+          if (absScript.indexOf("blob:") === 0) {
+            var swBlob = __objectURLs[absScript];
+            if (swBlob && swBlob._content != null) scriptSource = swBlob._content;
+          } else if (typeof host_fetch === "function") {
+            try {
+              var swRaw = host_fetch(absScript, "GET", "", "{}", "", "");
+              var swRes = typeof swRaw === "string" ? JSON.parse(swRaw) : swRaw;
+              if ((swRes.status || 0) >= 200 && (swRes.status || 0) < 300 && swRes.body) {
+                scriptSource = swRes.body;
+              }
+            } catch (eFetch) { scriptSource = null; }
+          }
+          var swObj = {
+            scope: scope,
+            state: scriptSource != null ? "activated" : "redeployable",
+            scriptURL: absScript,
+            onfetch: null,
+            fetchHandler: null,
+            activateHandler: null,
+            installHandler: null,
+            unregister: function () {
+              global.__wrActiveSW = null;
+              var nav = global.navigator;
+              if (nav && nav.serviceWorker) nav.serviceWorker.controller = null;
+              return Promise.resolve(true);
+            }
+          };
+          if (scriptSource == null) {
+            /* Honest failure: the SW script could not be fetched. Registration
+               still resolves (a real browser rejects; we resolve with a
+               non-activated worker so the page can inspect state). */
+            global.__wrActiveSW = null;
+            var failedReg = {
+              scope: scope, installing: null, waiting: null,
+              active: swObj, unregister: swObj.unregister
+            };
+            return Promise.resolve(failedReg);
+          }
+          /* ServiceWorkerGlobalScope realm: shadowed globals via new Function */
+          var swRealm = {
+            _listeners: {},
+            self: null,
+            registration: null,
+            location: { href: absScript },
+            skipWaiting: function () { return Promise.resolve(); },
+            clients: { claim: function () { return Promise.resolve([]); } },
+            caches: {
+              open: function () { return Promise.resolve({ match: function () { return Promise.resolve(undefined); }, put: function () { return Promise.resolve(); } }); },
+              keys: function () { return Promise.resolve([]); }
+            },
+            importScripts: function () {},
+            addEventListener: function (type, fn) {
+              (swRealm._listeners[type] = swRealm._listeners[type] || []).push(fn);
+              if (type === "fetch") swObj.fetchHandler = fn;
+              else if (type === "activate") swObj.activateHandler = fn;
+              else if (type === "install") swObj.installHandler = fn;
+            },
+            removeEventListener: function (type, fn) {
+              var arr = swRealm._listeners[type];
+              if (arr) swRealm._listeners[type] = arr.filter(function (l) { return l !== fn; });
+              if (type === "fetch" && swObj.fetchHandler === fn) swObj.fetchHandler = null;
+              if (type === "activate" && swObj.activateHandler === fn) swObj.activateHandler = null;
+              if (type === "install" && swObj.installHandler === fn) swObj.installHandler = null;
+            },
+            dispatchEvent: function (type, evt) {
+              var arr = swRealm._listeners[type] || [];
+              for (var i = 0; i < arr.length; i++) { try { arr[i](evt); } catch (e) {} }
+            }
+          };
+          swRealm.self = swRealm;
+          var swConsole = global.console || { log: function () {} };
+          var swWrapper = new Function(
+            "self", "addEventListener", "removeEventListener", "dispatchEvent",
+            "skipWaiting", "clients", "caches", "importScripts", "registration",
+            "console", "location", "fetch",
+            "\"use strict\";\n" + String(scriptSource || "")
+          );
+          /* Run the SW script in its realm */
+          try {
+            swWrapper(
+              swRealm, swRealm.addEventListener, swRealm.removeEventListener, swRealm.dispatchEvent,
+              swRealm.skipWaiting, swRealm.clients, swRealm.caches, swRealm.importScripts,
+              { scope: scope },
+              swConsole, swRealm.location, global.fetch
+            );
+          } catch (eSW) {
+            /* Script error: the SW installs but its handler never fires. */
+            swObj.fetchHandler = null;
+            try { swConsole.log("[sw] script error: " + (eSW && eSW.message ? eSW.message : String(eSW))); } catch (eLog) {}
+          }
+          /* Fire install + activate listeners (single event-loop pass —
+             the engine cannot span async SW lifecycle phases; disclosed). */
+          if (swObj.installHandler) {
+            try { swObj.installHandler({ type: "install", waitUntil: function () { return Promise.resolve(); } }); } catch (e) {}
+          }
+          if (swObj.activateHandler) {
+            try { swObj.activateHandler({ type: "activate", waitUntil: function () { return Promise.resolve(); } }); } catch (e) {}
+          }
+          /* Activate: record the interceptor the page fetch() consults */
+          global.__wrActiveSW = {
+            scope: scope,
+            scriptURL: absScript,
+            fetchHandler: swObj.fetchHandler,
+            _sw: swObj
+          };
+          var registration = {
             scope: scope,
             installing: null,
             waiting: null,
-            active: {
-              scope: scope,
-              state: "activated",
-              scriptURL: absScript,
-              unregister: function () { return Promise.resolve(true); }
-            },
-            unregister: function () { return Promise.resolve(true); }
-          });
+            active: swObj,
+            unregister: swObj.unregister
+          };
+          /* ready resolves with the registration once active (already true) */
+          var navSW = global.navigator && global.navigator.serviceWorker;
+          if (navSW) {
+            navSW.controller = swObj;
+            if (!navSW.ready) navSW.ready = Promise.resolve(registration);
+          }
+          return Promise.resolve(registration);
         },
-        getRegistration: function () { return Promise.resolve(undefined); },
-        getRegistrations: function () { return Promise.resolve([]); },
+        getRegistration: function () {
+          return Promise.resolve(global.__wrActiveSW ? {
+            scope: global.__wrActiveSW.scope,
+            installing: null,
+            waiting: null,
+            active: global.__wrActiveSW._sw,
+            unregister: global.__wrActiveSW._sw && global.__wrActiveSW._sw.unregister
+          } : undefined);
+        },
+        getRegistrations: function () {
+          return Promise.resolve(global.__wrActiveSW ? [{
+            scope: global.__wrActiveSW.scope,
+            installing: null,
+            waiting: null,
+            active: global.__wrActiveSW._sw,
+            unregister: global.__wrActiveSW._sw && global.__wrActiveSW._sw.unregister
+          }] : []);
+        },
         addEventListener: function () {},
         removeEventListener: function () {}
       }
