@@ -9958,19 +9958,43 @@ var decl = new CSSStyleDeclaration(el);
           } catch (eScope) {
             scope = String(scope || "/");
           }
-          /* Fetch the SW script source */
+          /* Fetch the SW script source. Real browsers reject an SW script
+             whose MIME type is not JavaScript (text/html, text/plain, ...)
+             and whose body does not compile; a fetch failure rejects the
+             registration too. Never fake a successful registration. */
           var scriptSource = null;
+          var swRejectReason = null;
           if (absScript.indexOf("blob:") === 0) {
             var swBlob = __objectURLs[absScript];
-            if (swBlob && swBlob._content != null) scriptSource = swBlob._content;
+            if (swBlob && swBlob._content != null) {
+              scriptSource = swBlob._content;
+            } else {
+              swRejectReason = "NotFound: blob URL not found: " + absScript;
+            }
           } else if (typeof host_fetch === "function") {
+            var swRaw = null;
             try {
-              var swRaw = host_fetch(absScript, "GET", "", "{}", "", "");
-              var swRes = typeof swRaw === "string" ? JSON.parse(swRaw) : swRaw;
-              if ((swRes.status || 0) >= 200 && (swRes.status || 0) < 300 && swRes.body) {
-                scriptSource = swRes.body;
-              }
-            } catch (eFetch) { scriptSource = null; }
+              swRaw = host_fetch(absScript, "GET", "", "{}", "", "");
+            } catch (eFetch) {
+              swRaw = null;
+            }
+            var swRes = null;
+            try { swRes = typeof swRaw === "string" ? JSON.parse(swRaw) : swRaw; } catch (eParse) { swRes = null; }
+            var swStatus = swRes ? (swRes.status || 0) : 0;
+            var swMime = String((swRes && swRes.content_type) || "").split(";")[0].trim().toLowerCase();
+            if (swStatus < 200 || swStatus >= 300 || !swRes || !swRes.body) {
+              swRejectReason = "NetworkError: fetch of service script failed (status " + swStatus + "): " + absScript;
+            } else if (swMime && swMime !== "application/javascript" && swMime !== "text/javascript" &&
+                       swMime !== "application/ecmascript" && swMime !== "text/ecmascript" &&
+                       swMime !== "application/x-javascript" && swMime !== "module") {
+              /* Chrome: "The MIME type of the script ('text/html') is not
+                 a JavaScript MIME type." */
+              swRejectReason = "TypeError: The MIME type of the script ('" + (swMime || "unknown") + "') is not a JavaScript MIME type: " + absScript;
+            } else {
+              scriptSource = swRes.body;
+            }
+          } else {
+            swRejectReason = "NetworkError: no fetch transport available for: " + absScript;
           }
           var swObj = {
             scope: scope,
@@ -9988,15 +10012,13 @@ var decl = new CSSStyleDeclaration(el);
             }
           };
           if (scriptSource == null) {
-            /* Honest failure: the SW script could not be fetched. Registration
-               still resolves (a real browser rejects; we resolve with a
-               non-activated worker so the page can inspect state). */
+            /* Honest failure: the SW script could not be fetched or has a
+               non-JavaScript MIME type — a real browser REJECTS the
+               registration; so does this engine. */
             global.__wrActiveSW = null;
-            var failedReg = {
-              scope: scope, installing: null, waiting: null,
-              active: swObj, unregister: swObj.unregister
-            };
-            return Promise.resolve(failedReg);
+            var navSW0 = global.navigator && global.navigator.serviceWorker;
+            if (navSW0) navSW0.controller = null;
+            return Promise.reject(new TypeError(String(swRejectReason || ("NetworkError: failed to fetch: " + absScript))));
           }
           /* ServiceWorkerGlobalScope realm: shadowed globals via new Function */
           var swRealm = {
@@ -10031,14 +10053,17 @@ var decl = new CSSStyleDeclaration(el);
           };
           swRealm.self = swRealm;
           var swConsole = global.console || { log: function () {} };
-          var swWrapper = new Function(
-            "self", "addEventListener", "removeEventListener", "dispatchEvent",
-            "skipWaiting", "clients", "caches", "importScripts", "registration",
-            "console", "location", "fetch",
-            "\"use strict\";\n" + String(scriptSource || "")
-          );
-          /* Run the SW script in its realm */
+          /* Compile + run inside one try: a SyntaxError from new Function
+             (invalid script body) must REJECT the registration exactly like
+             a run-time error — not escape register() synchronously. */
+          var swWrapper = null;
           try {
+            swWrapper = new Function(
+              "self", "addEventListener", "removeEventListener", "dispatchEvent",
+              "skipWaiting", "clients", "caches", "importScripts", "registration",
+              "console", "location", "fetch",
+              "\"use strict\";\n" + String(scriptSource || "")
+            );
             swWrapper(
               swRealm, swRealm.addEventListener, swRealm.removeEventListener, swRealm.dispatchEvent,
               swRealm.skipWaiting, swRealm.clients, swRealm.caches, swRealm.importScripts,
@@ -10046,9 +10071,12 @@ var decl = new CSSStyleDeclaration(el);
               swConsole, swRealm.location, global.fetch
             );
           } catch (eSW) {
-            /* Script error: the SW installs but its handler never fires. */
-            swObj.fetchHandler = null;
-            try { swConsole.log("[sw] script error: " + (eSW && eSW.message ? eSW.message : String(eSW))); } catch (eLog) {}
+            /* Compile/run error: a real browser fails installation — the
+               registration REJECTS (the script never becomes active). */
+            global.__wrActiveSW = null;
+            var navSWx = global.navigator && global.navigator.serviceWorker;
+            if (navSWx) navSWx.controller = null;
+            return Promise.reject(new TypeError("SW script error at " + absScript + ": " + (eSW && eSW.message ? eSW.message : String(eSW))));
           }
           /* Fire install + activate listeners (single event-loop pass —
              the engine cannot span async SW lifecycle phases; disclosed). */

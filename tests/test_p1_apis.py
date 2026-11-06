@@ -291,6 +291,12 @@ navigator.geolocation.getCurrentPosition(
 
 @pytest.mark.asyncio
 async def test_service_worker_register_resolves():
+    """W2 made register() real: the script is fetched, MIME-validated, and
+    compiled. This mock serves the 404-HTML page body for /sw.js with
+    content-type text/html — a real browser (and this engine) REJECT the
+    registration with the non-JavaScript-MIME TypeError instead of the old
+    stub's fake success. The rejection message names the absolute script
+    URL, which is what keeps this test's resolution value."""
     page = """<html><body><script>
 window.__sw = '';
 navigator.serviceWorker.register('/sw.js').then(function(r){ window.__sw = 'ok:' + r.scope; })
@@ -303,7 +309,9 @@ navigator.serviceWorker.register('/sw.js').then(function(r){ window.__sw = 'ok:'
     if not got:
         await session.scroll(y=1, max_chars=20_000)
         got = ctx.eval("window.__sw")
-    assert got == "ok:/"
+    assert got.startswith("err:"), f"register must reject an HTML-MIME SW script, got {got!r}"
+    assert "not a JavaScript MIME type" in got, got
+    assert f"{BASE}/sw.js" in got, f"rejection must name the absolute script URL, got {got!r}"
 
 
 @pytest.mark.asyncio

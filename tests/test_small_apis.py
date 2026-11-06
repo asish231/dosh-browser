@@ -50,20 +50,31 @@ async def test_geolocation_watch_position_unique_ids_and_clear():
 
 @pytest.mark.asyncio
 async def test_service_worker_script_url_resolved_absolute():
+    """W2 made register() real: it resolves the script URL ABSOLUTE before
+    fetching. The mock serves HTML for the SW paths, so registration
+    rejects — but the rejection message must name the ABSOLUTE resolved
+    URL for both relative ('sw.js' -> /app/sw.js) and root-absolute
+    ('/root-sw.js') forms, which is what this test verifies."""
     page = """<html><body><script>
     window.__sw_res = {};
     navigator.serviceWorker.register('sw.js').then(function(r) {
-        window.__sw_res.rel = r.active.scriptURL;
+        window.__sw_res.rel = 'ok:' + r.active.scriptURL;
+    }).catch(function(e) {
+        window.__sw_res.rel = 'err:' + (e && e.message ? e.message : String(e));
     });
     navigator.serviceWorker.register('/root-sw.js').then(function(r) {
-        window.__sw_res.root = r.active.scriptURL;
+        window.__sw_res.root = 'ok:' + r.active.scriptURL;
+    }).catch(function(e) {
+        window.__sw_res.root = 'err:' + (e && e.message ? e.message : String(e));
     });
     </script></body></html>"""
     session = Session(_client({"/app/index.html": page}), "s_sw")
     await session.goto(f"{BASE}/app/index.html")
     ctx = session.current_tab.ctx
-    assert ctx.eval("window.__sw_res.rel") == "https://test.local/app/sw.js"
-    assert ctx.eval("window.__sw_res.root") == "https://test.local/root-sw.js"
+    rel = ctx.eval("window.__sw_res.rel")
+    root = ctx.eval("window.__sw_res.root")
+    assert rel.startswith("err:") and "https://test.local/app/sw.js" in rel, f"relative script URL must resolve absolute inside the rejection: {rel!r}"
+    assert root.startswith("err:") and "https://test.local/root-sw.js" in root, f"root script URL must resolve absolute inside the rejection: {root!r}"
 
 
 # ---------------------------------------------------------------------------
