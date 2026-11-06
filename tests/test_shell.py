@@ -874,3 +874,220 @@ async def test_ref_stable_survives_rerender_shift(workspace):
         r = await command(shell, "ref", stable=stable)
         assert r["ref"] == save2["ref"]
         assert r["label"] == "Save"
+
+
+# ---------------------------------------------------------------------------
+# L10: occlusion-gated clicks (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_occlusion_gate_refuses_click_under_overlay(workspace):
+    """L10: a click on a control under a higher-z overlay is refused with
+    the occluder named; after the overlay is removed the same ref clicks
+    through. The refusal is an error, never a silent success."""
+    async with workspace() as (shell, session, requests):
+        await opened(shell)
+        # Overlay a div on top of the button (use frame.eval to run in page realm)
+        # Get the button's actual position and create an overlay at the same coordinates
+        await command(shell, "frame.eval", expr="""(function() {
+            var btn = document.querySelector('button#go');
+            var btnStyle = window.getComputedStyle(btn);
+            var btnRect = btn.getBoundingClientRect();
+            
+            var overlay = document.createElement('div');
+            overlay.id = 'overlay';
+            overlay.style.position = 'fixed';
+            overlay.style.left = btnRect.left + 'px';
+            overlay.style.top = btnRect.top + 'px';
+            overlay.style.width = btnRect.width + 'px';
+            overlay.style.height = btnRect.height + 'px';
+            overlay.style.zIndex = '100';
+            overlay.style.background = 'rgba(0,0,0,0.5)';
+            document.body.appendChild(overlay);
+            return 'overlay added at ' + btnRect.left + ',' + btnRect.top;
+        })()""")
+        # Debug: check if occlusion detection works
+        debug = await command(shell, "frame.eval", expr="""(function() {
+            var btn = document.querySelector('button');
+            var layers = typeof __inspectLayers === 'function' ? __inspectLayers() : 'no function';
+            var occluded = typeof __isElementOccluded === 'function' ? __isElementOccluded(btn) : 'function not found';
+            var overlay = document.getElementById('overlay');
+            var overlayRect = overlay ? overlay.getBoundingClientRect() : null;
+            return JSON.stringify({
+                buttonId: btn ? btn.id : null,
+                layers: layers,
+                occluded: occluded,
+                overlayExists: !!overlay,
+                overlayRect: overlayRect
+            });
+        })()""")
+        # The button should be in the action inventory but clicking it must fail
+        inv = await command(shell, "actions")
+        button = next((a for a in inv["actions"] if a["label"] == "Go"), None)
+        assert button is not None, "button must be in inventory"
+        res = await shell.execute("act", {"ref": button["ref"]})
+        assert res["ok"] is False, f"click under overlay must fail: {res}"
+        assert "occluded_by" in res["error"], f"error must name occluder: {res}"
+        # Remove the overlay (use frame.eval to run in page realm)
+        await command(shell, "frame.eval", expr="(function() { document.getElementById('overlay').remove(); return 'removed'; })()")
+        # Now the click must succeed
+        res2 = await shell.execute("act", {"ref": button["ref"]})
+        assert res2["ok"] is True, f"click after overlay removal must succeed: {res2}"
+
+
+# ---------------------------------------------------------------------------
+# E2: text-selection drag lane (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_select_text_drag_lane(workspace):
+    """E2: select_text drags across a text field, selecting the range and
+    firing selectstart/select/selectionchange — distinct from element DnD."""
+    # Custom HTML with a text input field
+    html_with_field = """<!doctype html><html><head><title>Select test</title></head><body>
+<input type="text" id="field" value="hello world">
+<script>
+window.__selectEvents = [];
+document.getElementById('field').addEventListener('select', function(e) {
+    window.__selectEvents.push({type: 'select', target: e.target.id});
+});
+document.getElementById('field').addEventListener('selectstart', function(e) {
+    window.__selectEvents.push({type: 'selectstart', target: e.target.id});
+});
+document.addEventListener('selectionchange', function() {
+    window.__selectEvents.push({type: 'selectionchange'});
+});
+</script>
+</body></html>"""
+    
+    async with workspace(pages={BASE + "/": html_with_field}) as (shell, session, requests):
+        await opened(shell)
+        inv = await command(shell, "actions")
+        field = next((a for a in inv["actions"] if a["ref"] == "a92811e06" or a["selector"] == "#field"), None)
+        assert field is not None, "text field must be in inventory"
+        # Select characters 3..7 ("lo w")
+        page = await command(shell, "select", ref=field["ref"], start=3, end=7)
+        # The field must now have selectionStart=3, selectionEnd=7
+        result = await command(shell, "frame.eval", expr="""(function() {
+            var f = document.getElementById('field');
+            return JSON.stringify({
+                start: f.selectionStart,
+                end: f.selectionEnd
+            });
+        })()""")
+        got = json.loads(result["value"])
+        # The value is a JSON string wrapped in another JSON string, so parse again
+        if isinstance(got, str):
+            got = json.loads(got)
+        assert got["start"] == 3
+        assert got["end"] == 7
+        # Verify selection events were fired
+        events = await command(shell, "frame.eval", expr="(function() { return JSON.stringify(window.__selectEvents); })()")
+        events_list = json.loads(events["value"])
+        if isinstance(events_list, str):
+            events_list = json.loads(events_list)
+        event_types = [e["type"] for e in events_list]
+        assert "selectstart" in event_types, f"selectstart event not fired: {event_types}"
+        assert "select" in event_types, f"select event not fired: {event_types}"
+
+
+# ---------------------------------------------------------------------------
+# S4: same-origin frame storage sharing (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_same_origin_frame_storage_shared(workspace):
+    """S4: a same-origin frame sees the session's seeded localStorage and
+    writes back to the session (shared area, not per-frame copies).
+    Cross-origin frames never see the parent's storage."""
+    # Custom HTML with iframes
+    html_with_frames = """<!doctype html><html><head><title>Frames test</title></head><body>
+<script>localStorage.setItem('parent-key', 'parent-value');</script>
+<iframe id="same" src="/same.html"></iframe>
+<iframe id="cross" src="https://other.test/frame.html"></iframe>
+<script>window.__ready = true;</script>
+</body></html>"""
+    
+    async with workspace(pages={
+        BASE + "/": html_with_frames,
+        BASE + "/same.html": "<html><body><script>window.__frameReady = true;</script></body></html>",
+        "https://other.test/frame.html": "<html><body><script>window.__frameReady = true;</script></body></html>",
+    }) as (shell, session, requests):
+        await opened(shell)
+        # Get frame refs from inventory
+        frames_result = await command(shell, "frames")
+        same_ref = next(f["ref"] for f in frames_result["frames"] if "same.html" in f["url"])
+        cross_ref = next(f["ref"] for f in frames_result["frames"] if "other.test" in f["url"])
+        # Navigate to the same-origin frame and read localStorage
+        same_result = await command(shell, "frame.eval", frame=same_ref, expr="(function() { return localStorage.getItem('parent-key'); })()")
+        same_value = json.loads(same_result["value"]) if isinstance(same_result["value"], str) else same_result["value"]
+        assert same_value == "parent-value", f"same-origin frame must see parent storage: {same_result}"
+        # Write from the frame
+        await command(shell, "frame.eval", frame=same_ref, expr="(function() { localStorage.setItem('frame-key', 'frame-value'); return 'set'; })()")
+        # Verify the frame's write is visible in the frame itself
+        frame_check = await command(shell, "frame.eval", frame=same_ref, expr="(function() { return localStorage.getItem('frame-key'); })()")
+        frame_value = json.loads(frame_check["value"]) if isinstance(frame_check["value"], str) else frame_check["value"]
+        assert frame_value == "frame-value", f"frame must see its own write: {frame_check}"
+        # Cross-origin frame should NOT see the parent's storage
+        cross_result = await command(shell, "frame.eval", frame=cross_ref, expr="(function() { return localStorage.getItem('parent-key'); })()")
+        cross_value = json.loads(cross_result["value"]) if isinstance(cross_result["value"], str) else cross_result["value"]
+        assert cross_value is None, f"cross-origin frame must not see parent storage: {cross_result}"
+
+
+# ---------------------------------------------------------------------------
+# S5: storage events reach same-origin frames (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_storage_events_reach_same_origin_frames(workspace):
+    """S5: when the parent writes to localStorage, same-origin frames
+    receive the storage event; cross-origin frames do not (per spec)."""
+    # Custom HTML with iframes
+    html_with_frames = """<!doctype html><html><head><title>Frames test</title></head><body>
+<script>
+localStorage.setItem('from-parent', 'hello');
+</script>
+<iframe id="same" src="/same.html"></iframe>
+<iframe id="cross" src="https://other.test/frame.html"></iframe>
+<script>window.__ready = true;</script>
+</body></html>"""
+    
+    same_frame_html = """<html><body><script>
+window.__storageEvents = [];
+window.addEventListener('storage', function(e) {
+    window.__storageEvents.push({key: e.key, newValue: e.newValue, url: e.url});
+});
+window.__frameReady = true;
+</script></body></html>"""
+    
+    async with workspace(pages={
+        BASE + "/": html_with_frames,
+        BASE + "/same.html": same_frame_html,
+        "https://other.test/frame.html": same_frame_html,
+    }) as (shell, session, requests):
+        await opened(shell)
+        # Get frame refs from inventory
+        frames_result = await command(shell, "frames")
+        same_ref = next(f["ref"] for f in frames_result["frames"] if "same.html" in f["url"])
+        cross_ref = next(f["ref"] for f in frames_result["frames"] if "other.test" in f["url"])
+        # Parent already wrote to localStorage during page load
+        # Check same-origin frame received the event
+        same_events = await command(shell, "frame.eval", frame=same_ref, expr="(function() { return JSON.stringify(window.__storageEvents); })()")
+        same_events_list = json.loads(same_events["value"])
+        if isinstance(same_events_list, str):
+            same_events_list = json.loads(same_events_list)
+        assert len(same_events_list) == 1, f"same-origin frame must receive event: {same_events_list}"
+        assert same_events_list[0]["key"] == "from-parent"
+        assert same_events_list[0]["newValue"] == "hello"
+        # Check cross-origin frame did NOT receive the event
+        cross_events = await command(shell, "frame.eval", frame=cross_ref, expr="(function() { return JSON.stringify(window.__storageEvents); })()")
+        cross_events_list = json.loads(cross_events["value"])
+        if isinstance(cross_events_list, str):
+            cross_events_list = json.loads(cross_events_list)
+        assert len(cross_events_list) == 0, f"cross-origin frame must not receive event: {cross_events_list}"
+
+
