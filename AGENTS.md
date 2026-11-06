@@ -157,7 +157,7 @@ Be honest about these rather than working around them silently.
 | File upload | Native end to end: `browser_upload`/`browser_act(files=)` sets `el.files` and fires trusted input/change; multipart submits carry the exact bytes. Binary/video/any files travel as base64 (`content_b64`) so payloads are byte-exact; payload cap ~12 MB raw. |
 | Dialogs (alert/confirm/prompt) | Recorded per script pass, reported in the view and via `browser_respond_dialog`. QuickJS is synchronous, so a dialog cannot block: an agent stages an answer, then re-runs the triggering action. Unanswered dialogs honestly report `answered: default`. |
 | Named keys | `browser_press_key` (enter/tab/escape/backspace/delete/space/arrows/home/end/pageup/pagedown) with real key/code/keyCode. Enter performs implicit form submission, Tab moves focus, arrows change selects, Backspace deletes. |
-| History API | pushState/replaceState create real session entries (same document, new URL); load-time `history.back()` in a `setTimeout` is consumed by goto/submit; back/forward between pushState entries is a LIVE same-document traversal (ctx/JS heap/DOM persist, popstate into the live ctx, no script re-run, per-entry scroll restore honoring `scrollRestoration`); state round-trips through a structured-clone subset codec (undefined keys, Date, NaN/±Infinity, Map/Set/RegExp, cycles preserved; functions/symbols throw DataCloneError). Disclosed: cross-document restore rebuilds the stored document and re-runs its scripts (no-bfcache parity); traversals chain-bounded at depth 4. |
+| History API | pushState/replaceState create real session entries (same document, new URL); load-time `history.back()` in a `setTimeout` is consumed by goto/submit; back/forward between pushState entries is a LIVE same-document traversal (ctx/JS heap/DOM persist, popstate into the live ctx, no script re-run, per-entry scroll restore honoring `scrollRestoration`); state round-trips through a structured-clone codec (undefined keys, Date, NaN/±Infinity, Map/Set/RegExp, class instances WITH preserved prototypes (W5), cycles preserved; functions/symbols/DOM nodes throw DataCloneError). Cross-document restore now restores the PARKED live ctx when one exists (S8 bfcache: heap/DOM/timers survive, no re-run); entries with no parked ctx rebuild + re-run (disclosed fallback). Traversals chain-bounded at depth 4. |
 | window.open / popups | Recorded and loaded as new session tabs (recursion depth-limited); page scripts receive an inert stub window so they do not crash. The agent stays on the opening page and can `browser_tabs` switch. |
 | File downloads | `browser_download` streams to disk with sha256 and optional hash verification (hex or base64); a navigation that lands on an attachment/binary is saved and reported (path/bytes/hash) instead of parsed as a page. No malware verdict engine — that absence is reported, not hidden. |
 | Video downloads | Two real lanes (`video.py`): direct media files stream through the session transport (cookies, sha256, byte cap); pages/HLS/DASH/platform URLs extract via yt-dlp run as `python -m yt_dlp` pinned to this interpreter (`webresearch[video]` extra), with metadata captured via `--print after_move:%(field)j` and the produced file hashed + size-checked post-hoc. Session cookies reach the extractor (Netscape export) for login-gated content. Policy enforced before any network work: DRM subscription services and known piracy mirrors are refused; the denylists are known-entries gates, not guarantees, and the tool contract says so. Absent yt-dlp is reported as a missing capability, never faked; no malware verdict — sha256 provided. Wired: `browser_get_video` (MCP/dispatch/HTTP) and the shell `video` command. |
@@ -231,7 +231,7 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | Fingerprint parity (JA3/JA4, Sec-Fetch, CH-UA, navigator block) | `fetch.py` implementation | ✅ HAVE |
 | Causally-linked network ledger (action→pass→request) | `telemetry.py` ready, causal link missing | `WIRE` + invent `caused_by` |
 | Request rule engine (mock/block/redirect) | Consumed at `runtime.py:611` | `WIRE` |
-| Cookie/site-data partitioning model (third-party isolation) | Not implemented | `INVENT` |
+| Cookie/site-data partitioning model (third-party isolation) | ✅ Double-keyed (top_site, frame_origin) partitioned jars + storage keys (S6) | ✅ DONE (Phase 8) — `tests/test_s6_partitioning.py` |
 
 ### Layer 1 — Document & Runtime
 | Invention | Current State | Status |
@@ -268,11 +268,11 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 |---|---|---|
 | Multi-tab history, live same-doc traversal, stored documents | `session.py` | ✅ HAVE |
 | Dialogs, uploads, downloads, named keys, WS text | `shell.py` commands | ✅ HAVE |
-| IndexedDB store + per-pass drain | `runtime.py` | `HAVE/PARTIAL` |
+| IndexedDB store + per-pass drain | ✅ Full semantics: real indexes, key-ordered cursors, add() ConstraintError, abort() rollback, onupgradeneeded (S10) | ✅ DONE (Phase 8) — `tests/test_s10_indexeddb.py` |
 | localStorage/sessionStorage + cross-tab storage events | `runtime.py` | ✅ HAVE |
 | **Unified SQL state DB** (history+cookies+storage+ledger) with snapshots/diffs/rollbacks | `state_snapshots` + `state.snapshot/diff/rollback` (both lanes) | ✅ HAVE |
-| **Deterministic replay engine** (ledger + snapshots + seeds) | Not implemented | `INVENT` |
-| bfcache parity | Documented rebuild, no live heap | `HAVE-as-disclosed` |
+| **Deterministic replay engine** (ledger + snapshots + seeds) | ✅ Ordered step log + seeded transports + per-step DOM comparison (S7) | ✅ DONE (Phase 8) — `tests/test_s7_deterministic_replay.py` |
+| bfcache parity | ✅ Parked live ctx restores on back/forward (heap/DOM/timers survive, no re-run); rebuild fallback disclosed (S8) | ✅ DONE (Phase 8) — `tests/test_s8_bfcache.py` |
 
 ### Layer 4 — Adversarial Robustness
 | Invention | Current State | Status |

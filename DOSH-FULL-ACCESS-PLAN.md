@@ -692,6 +692,39 @@ Execution evidence (2026-11-06):
   records verdict/scanner/reasons/signature per download; clean never
   claims safety.
 
+Phase 8 execution evidence (2026-11-06):
+- S6: tests/test_s6_partitioning.py -> 9 passed. webresearch/engine/
+  partition.py: PartitionedCookieJar double-keys (top_site,
+  frame_origin); third-party cookies isolated per top site;
+  first-party cookies never sent to third parties;
+  storage_partition_key partitions storage identically. Host-level
+  keying disclosed (no embedded PSL); un-Partitioned third-party
+  cookies still partitioned (disclosed default).
+- S7: tests/test_s7_deterministic_replay.py -> 5 passed.
+  webresearch/engine/replay.py: ordered step log (snapshot ids,
+  ledger request ids, seeds; JSON roundtrip) + in-order replay
+  against seeded transports with per-step normalized-DOM comparison
+  and honest divergence reporting.
+- S8: tests/test_s8_bfcache.py -> 5 passed. Tab.bf_ctx parks the
+  leaving entry's live ctx; back/forward restore it LIVE (heap/DOM/
+  timers survive, popstate into the live ctx, no script re-run);
+  rebuild+re-run fallback stays disclosed for ctx-less entries.
+- S10: tests/test_s10_indexeddb.py -> 7 passed. Real indexes
+  (secondary-key views by keyPath), key-ordered cursors (direction +
+  continue/advance), add() ConstraintError (put upserts), abort()
+  rollback via pre-write snapshots + onabort, onupgradeneeded.
+- W5: tests/test_w5_structured_clone.py -> 7 passed. Class instances
+  clone WITH their prototype (methods/getters survive; cyclic class
+  graphs clone); unknown-ctor decode degrades to plain object
+  honestly; DOM nodes stay refused.
+- M5: tests/test_m5_manifests.py -> 9 passed.
+  webresearch/engine/manifests.py: native m3u8 (master variant
+  selection, media segments/durations, VOD-vs-live, EXT-X-KEY
+  reporting) and MPD (best representation, SegmentTemplate
+  expansion with spec @r semantics, SegmentList/SegmentURL,
+  ContentProtection scheme naming incl. system-id UUIDs). Two parser
+  bugs found and fixed by the tests.
+
 Pre-flight note: a parallel session's commit 925b1db2 already landed
 some WebAudio/OfflineAudioContext/Shadow-DOM presence in minidom.js
 without phase-scoped tests; this phase's work must verify or replace
@@ -794,24 +827,24 @@ user decision 2026-11-06: S6, S7, S8, S10, W5, M5. E1 (blocking
 dialogs) is structurally impossible in a synchronous engine and stays
 disclosed, not built.
 
-- [ ] **S6** Cookie/site-data partitioning: third-party cookies and
+- [x] **S6** Cookie/site-data partitioning: third-party cookies and
       storage partition per (top-site, frame-origin) — double-key
       partitioning with a hermetic test.
-- [ ] **S7** Deterministic replay engine: ledger + state snapshots +
+- [x] **S7** Deterministic replay engine: ledger + state snapshots +
       seeds replay a session's decisions in order; test replays a
       recorded action sequence to the same DOM result.
-- [ ] **S8** bfcache live-heap restore: history back/forward reuses
+- [x] **S8** bfcache live-heap restore: history back/forward reuses
       the live realm where safe (same-document traversal already
       does; cross-document restore upgrades from rebuild+re-run to
       stored-document restore), disclosed where rebuild remains.
-- [ ] **S10** IndexedDB full semantics: object stores, indexes,
+- [x] **S10** IndexedDB full semantics: object stores, indexes,
       transactions with real request lifecycle, cursor iteration.
-- [ ] **W5** structuredClone of class instances: prototype-preserving
+- [x] **W5** structuredClone of class instances: prototype-preserving
       clone for plain and class instances (no methods lost,
       honest limits for host objects).
-- [ ] **M5** HLS/DASH extraction: native manifest parsing (m3u8 + mpd)
+- [x] **M5** HLS/DASH extraction: native manifest parsing (m3u8 + mpd)
       for segment lists with the download lane, so simple streams
       download without external yt-dlp (complex DRM/encrypted streams
       stay refused honestly).
-- [ ] **Docs** — §2.5/§2.6/§2.7/§2.8 rows + AGENTS.md roadmap rows.
-- [ ] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`.
+- [x] **Docs** — §2.5/§2.6/§2.7/§2.8 rows + AGENTS.md roadmap rows.
+- [x] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`.
