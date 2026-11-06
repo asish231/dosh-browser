@@ -586,3 +586,167 @@ def test_window_origin_and_document_base_uri():
     assert got["base"] == "https://erp.aktu.ac.in/login.aspx"
     assert got["domain"] == "erp.aktu.ac.in"
     assert got["host"] == got["domain"]
+
+
+# ---------------------------------------------------------------------------
+# L7: caret + selection model (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def test_field_selection_model_and_selectionchange():
+    """L7: HTMLInputElement.selectionStart/End + selectionchange event."""
+    ctx = _ctx()
+    ctx.eval("""
+    __load({t:"document", c:[{t:"input", a:{type:"text", id:"field"}, c:[]}]}, "https://example.com/");
+    """)
+    result = ctx.eval("""
+    (function() {
+        var field = document.getElementById("field");
+        field.value = "hello";
+        var events = [];
+        document.addEventListener("selectionchange", function() {
+            events.push("selectionchange");
+        });
+        field.focus();
+        field.setSelectionRange(1, 3);
+        return JSON.stringify({
+            start: field.selectionStart,
+            end: field.selectionEnd,
+            events: events
+        });
+    })()
+    """)
+    got = json.loads(str(result))
+    assert got["start"] == 1
+    assert got["end"] == 3
+    assert "selectionchange" in got["events"]
+
+
+def test_typing_lands_at_caret():
+    """L7: typing inserts at the caret position, not at the end."""
+    ctx = _ctx()
+    ctx.eval("""
+    __load({t:"document", c:[{t:"input", a:{type:"text", id:"field"}, c:[]}]}, "https://example.com/");
+    """)
+    result = ctx.eval("""
+    (function() {
+        var field = document.getElementById("field");
+        field.value = "helo";
+        field.setSelectionRange(3, 3);
+        __activateSelector("#field", "l", null, false, 1, false);
+        return JSON.stringify({
+            value: field.value,
+            caret: field.selectionStart
+        });
+    })()
+    """)
+    got = json.loads(str(result))
+    assert got["value"] == "hello"
+    assert got["caret"] == 4
+
+
+def test_backspace_at_caret():
+    """L7: backspace deletes at the caret, not at the end."""
+    ctx = _ctx()
+    ctx.eval("""
+    __load({t:"document", c:[{t:"input", a:{type:"text", id:"field"}, c:[]}]}, "https://example.com/");
+    """)
+    result = ctx.eval("""
+    (function() {
+        var field = document.getElementById("field");
+        field.value = "helloo";
+        field.setSelectionRange(5, 5);
+        __pressKey("#field", "Backspace", false);
+        return JSON.stringify({
+            value: field.value,
+            caret: field.selectionStart
+        });
+    })()
+    """)
+    got = json.loads(str(result))
+    assert got["value"] == "hello"
+    assert got["caret"] == 4
+
+
+def test_contenteditable_caret_and_getselection():
+    """L7: contenteditable uses Selection/Range, not selectionStart/End."""
+    ctx = _ctx()
+    ctx.eval("""
+    __load({t:"document", c:[{t:"div", a:{id:"editor", contenteditable:"true"}, c:[{t:"text", v:"hello"}]}]}, "https://example.com/");
+    """)
+    result = ctx.eval("""
+    (function() {
+        var editor = document.getElementById("editor");
+        var sel = window.getSelection();
+        var range = document.createRange();
+        range.setStart(editor.firstChild, 2);
+        range.setEnd(editor.firstChild, 2);
+        sel.addRange(range);
+        return JSON.stringify({
+            focusNode: sel.focusNode === editor.firstChild,
+            focusOffset: sel.focusOffset,
+            isCollapsed: sel.isCollapsed,
+            toString: sel.toString()
+        });
+    })()
+    """)
+    got = json.loads(str(result))
+    assert got["focusNode"] is True
+    assert got["focusOffset"] == 2
+    assert got["isCollapsed"] is True
+    assert got["toString"] == ""
+
+
+# ---------------------------------------------------------------------------
+# E3: mid-flight fetch abort (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_in_flight_abort_rejects():
+    """E3: fetch() defers resolution by one microtask, allowing abort() to reject."""
+    ctx = _ctx()
+    ctx.eval("""
+    __load({t:"document", c:[]}, "https://example.com/");
+    """)
+    ctx.eval("""
+    globalThis.__testResult = {resolved: null, rejected: null};
+    var controller = new AbortController();
+    var promise = fetch("/data", {signal: controller.signal});
+    controller.abort();
+    promise.then(
+        function() { globalThis.__testResult.resolved = true; },
+        function(e) { globalThis.__testResult.rejected = e.name; }
+    );
+    """)
+    # Pump microtasks to let the promise settle
+    for _ in range(10):
+        ctx.execute_pending_job()
+    result = ctx.eval("JSON.stringify(globalThis.__testResult)")
+    got = json.loads(str(result))
+    assert got["resolved"] is None
+    assert got["rejected"] == "AbortError"
+
+
+def test_fetch_in_flight_abort_wins_over_resolve():
+    """E3: abort() between dispatch and settle wins, even if fetch() would have succeeded."""
+    ctx = _ctx()
+    ctx.eval("""
+    __load({t:"document", c:[]}, "https://example.com/");
+    """)
+    ctx.eval("""
+    globalThis.__aborted = false;
+    var controller = new AbortController();
+    var promise = fetch("/data", {signal: controller.signal});
+    promise.then(
+        function() { globalThis.__aborted = false; },
+        function() { globalThis.__aborted = true; }
+    );
+    controller.abort();
+    """)
+    # Pump microtasks to let the promise settle
+    for _ in range(10):
+        ctx.execute_pending_job()
+    result = ctx.eval("globalThis.__aborted")
+    assert result is True
+
+
