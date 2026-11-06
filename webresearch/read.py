@@ -209,6 +209,7 @@ async def read_live(
     return_js_info: bool = False,
     storage_seed: dict | None = None,
     history_length: int = 1,
+    storage_seed_for: Callable[[str], dict] | None = None,
 ) -> tuple:
     """Fetch (+ QuickJS + frames) → page model and live agent state. Pure from-scratch engine, no Chromium."""
     result = await fetch(url, client=client)
@@ -251,6 +252,7 @@ async def read_live(
             parent_headers=result.headers,
             parent_messages=(js_info.get("post_messages") if js_info else None),
             parent_ctx=(js_info.get("ctx") if js_info else None),
+            storage_seed_for=storage_seed_for,
         )
         if js_info and js_info.get("ctx") and frames:
             parent_ctx = js_info["ctx"]

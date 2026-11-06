@@ -709,6 +709,7 @@ async def load_frames(
     parent_messages: list[dict] | None = None,
     cached: list[FrameDocument] | None = None,
     parent_ctx=None,
+    storage_seed_for: Callable[[str], dict] | None = None,
 ) -> list[FrameDocument]:
     """Fetch a bounded, flat frame tree with parent refs.
 
@@ -846,6 +847,7 @@ async def load_frames(
 
             if document.html and "html" in document.content_type.lower() and js != "never":
                 frame_inbox = _frame_inbox(ref, document.url, url, parent_messages)
+                frame_seed = storage_seed_for(document.url) if storage_seed_for is not None else None
                 document.html, frame_js = await run_scripts(
                     document.html,
                     document.url,
@@ -853,6 +855,7 @@ async def load_frames(
                     force=(js == "always"),
                     headers=frame_headers,
                     messages=frame_inbox,
+                    storage_seed=frame_seed,
                 )
                 document.js_info.update(frame_js)
                 # Ports transferred parent->frame at load: rewire the parent's
@@ -902,6 +905,7 @@ async def load_frames(
                     force=True,
                     messages=inbox,
                     ctx=frame_ctx,
+                    storage_seed=storage_seed_for(doc.url) if storage_seed_for is not None else None,
                 )
                 doc.html = pumped_html or doc.html
                 doc.js_info.setdefault("post_messages", []).extend(
