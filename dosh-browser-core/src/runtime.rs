@@ -928,4 +928,87 @@ mod tests {
         let html = "<html><body><script>var x = 'hello \\\"world\\\" \u{2028} and \u{2029}';</script></body></html>";
         assert!(rt.load_document(html, "https://example.com").is_ok());
     }
+
+    #[test]
+    fn test_runtime_webaudio_and_stealth_emulation() {
+        let client = Client::new();
+        let mut rt = Runtime::new(client, "https://example.com").unwrap();
+        rt.load_document("<html><body></body></html>", "https://example.com").unwrap();
+        let js = r#"
+            (function() {
+                globalThis.__WEBAUDIO_TEST = {};
+                // 1. OfflineAudioContext
+                var actx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 44100, 44100);
+                var osc = actx.createOscillator();
+                var comp = actx.createDynamicsCompressor();
+                osc.connect(comp);
+                comp.connect(actx.destination);
+                osc.start(0);
+                actx.startRendering().then(function(buf) {
+                    var ch = buf.getChannelData(0);
+                    var nonZero = false;
+                    for (var i = 0; i < 200; i++) {
+                        if (ch[i] !== 0) { nonZero = true; break; }
+                    }
+                    globalThis.__WEBAUDIO_TEST.bufLen = ch.length;
+                    globalThis.__WEBAUDIO_TEST.hasNonZero = nonZero;
+                });
+                // 2. RTCPeerConnection
+                var pc = new (window.RTCPeerConnection || window.webkitRTCPeerConnection)();
+                pc.createOffer().then(function(offer) {
+                    globalThis.__WEBAUDIO_TEST.sdpType = offer.type;
+                });
+                // 3. SpeechSynthesis
+                var voices = window.speechSynthesis.getVoices();
+                globalThis.__WEBAUDIO_TEST.audioConstructed = !!actx;
+                globalThis.__WEBAUDIO_TEST.rtcConstructed = !!pc;
+                globalThis.__WEBAUDIO_TEST.voicesCount = voices.length;
+                globalThis.__WEBAUDIO_TEST.cloakedAudio = window.OfflineAudioContext.toString().indexOf('[native code]') !== -1;
+                globalThis.__WEBAUDIO_TEST.cloakedRTC = window.RTCPeerConnection.toString().indexOf('[native code]') !== -1;
+            })()
+        "#;
+        rt.eval(js).unwrap();
+        let _ = rt.drain_timers();
+        let out = rt.eval("JSON.stringify(globalThis.__WEBAUDIO_TEST)").unwrap();
+        let val: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(val["audioConstructed"], true);
+        assert_eq!(val["rtcConstructed"], true);
+        assert!(val["voicesCount"].as_u64().unwrap() >= 1);
+        assert_eq!(val["cloakedAudio"], true);
+        assert_eq!(val["cloakedRTC"], true);
+        assert_eq!(val["sdpType"], "offer");
+        assert_eq!(val["hasNonZero"], true);
+    }
+
+    #[test]
+    fn test_runtime_declarative_shadow_dom() {
+        let client = Client::new();
+        let mut rt = Runtime::new(client, "https://example.com").unwrap();
+        let html = r#"
+            <html><body>
+                <div id="card">
+                    <template shadowrootmode="open">
+                        <span id="shadow-text">Inside Shadow</span>
+                    </template>
+                    <p id="light-text">Inside Light</p>
+                </div>
+            </body></html>
+        "#;
+        rt.load_document(html, "https://example.com").unwrap();
+        let js = r##"
+            (function() {
+                var card = document.getElementById("card");
+                var shadow = card && card.shadowRoot;
+                var shadowChild = shadow && shadow.querySelector("#shadow-text");
+                return JSON.stringify({
+                    hasShadowRoot: !!shadow,
+                    shadowText: shadowChild ? shadowChild.textContent : null
+                });
+            })()
+        "##;
+        let out = rt.eval(js).unwrap();
+        let val: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(val["hasShadowRoot"], true);
+        assert_eq!(val["shadowText"], "Inside Shadow");
+    }
 }

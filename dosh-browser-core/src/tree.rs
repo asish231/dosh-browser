@@ -62,6 +62,13 @@ fn node_to_json(node: &NodeRef) -> Option<Value> {
                 children.push(v);
             }
         }
+        if let Some(ref tc) = elem.template_contents {
+            for child in tc.children() {
+                if let Some(v) = node_to_json(&child) {
+                    children.push(v);
+                }
+            }
+        }
         Some(json!({
             "t": tag,
             "a": attrs,

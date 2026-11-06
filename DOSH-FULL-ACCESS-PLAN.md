@@ -132,10 +132,10 @@ shipped behavior, not the gap.
 
 | # | Capability | State |
 |---|---|---|
-| W1 | Web Workers / SharedWorker real execution | ❌ inert constructors |
-| W2 | Service Worker real execution + interception | 🟡 simulated |
-| W3 | Scoped WASM float/extended opcodes | 🟡 integer subset; floats trap |
-| W4 | MessagePort across realms | 🟡 inert in receiving realm |
+| W1 | Web Workers / SharedWorker real execution | ✅ single-threaded child realm + real message queue (SharedWorker via port) |
+| W2 | Service Worker real execution + interception | ✅ SW script runs in a ServiceWorkerGlobalScope realm; in-scope fetches route through respondWith |
+| W3 | Scoped WASM float/extended opcodes | ✅ f32/f64 consts/arith/compare/memory/conversions at spec opcodes; i64 i32-approximated (disclosed) |
+| W4 | MessagePort across realms | ✅ receiver materializes live proxies; both directions + buffering verified |
 | W5 | structuredClone of class instances | 🟡 subset codec |
 
 ### 2.8 Media / video / audio
@@ -543,6 +543,37 @@ phase is called done. Status legend: ✅ done+verified · 🟡 partial · [ ] to
 - [x] **Docs** — §2.3 rows + AGENTS.md capability table + roadmap row.
 - [x] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`. (954 passed/8 skipped; 238 passed/0 failed)
 
+Execution evidence (2026-11-06):
+- W1: commit 6ad0e6e5 + 3cf9e9ee; `tests/test_minidom_layout_upgrades.py`
+  -k worker → 3 passed (blob execution, parent↔worker echo, SharedWorker
+  port channel). Worker script runs in a DedicatedWorkerGlobalScope via
+  new Function shadowing; messages deliver on the __drainTimers pump,
+  never synchronously; terminate cancels realm timers; close() defers
+  so already-posted messages reach the parent.
+- W2: commit ff73de90; `tests/test_w2_service_worker.py` → 6 passed.
+  register() fetches + runs the SW script in a ServiceWorkerGlobalScope
+  realm; install/activate fire at registration (disclosed single-pass);
+  in-scope fetch() routes through event.respondWith (SW Response with
+  headers replaces the network body); no respondWith → network
+  fall-through (disclosed); out-of-scope never intercepted; unregister
+  clears the interceptor + controller.
+- W3: commit fe90bff1; `tests/test_w3_wasm_float.py` → 12 passed.
+  Repairs the BROKEN float support that shipped in ea7e19b6 (wrong
+  opcode ranges 0x7B-0x96 hijacked real i64 ops: add(1.5,2.5) returned
+  2, add(3.0,4.0) returned 12). Now spec numbers: f32 unary 0x8B-0x91,
+  f32 binary 0x92-0x98, f64 unary 0x99-0x9F, f64 binary 0xA0-0xA6,
+  sign-extend 0xC0-0xC4; type-aware coercion at entry/local.get/set/
+  tee/call/return; i64 ops 0x79-0x8A compute on the i32-approximated
+  lane (disclosed). Post-fix probe: add(1.5,2.5)=4, add(3.0,4.0)=7.
+- W4: verified IMPLEMENTED (not built this phase — the cross-realm port
+  lane already routes in the receiver): `tests/test_port_transfer.py`
+  → 1 passed. The full roundtrip pins the W4 acceptance criteria: the
+  received proxy posts back to the sender (parent-via-port → child-ack),
+  the neutered sender-end is inert (spec), kept-end buffer flushes after
+  wiring (w-buffered-1/2), and receiver-side queue-until-started holds
+  early posts until onmessage attaches (q-early-1). No new code needed;
+  the §2.7 row was stale.
+
 Pre-flight note: the Phase-4 WIP branch of work began with an uncommitted
 flex rewrite, naive floats, bidi and sticky adds. An earlier misdiagnosis
 (body margin-shift conditional) broke `scrollWidth` semantics and the
@@ -556,25 +587,25 @@ W2 Service Worker execution, W3 WASM float/extended opcodes, W4 cross-realm
 MessagePort. Both lanes share minidom.js. One hermetic test per item. Both
 suites green before the phase is called done.
 
-- [ ] **W1** Web Worker emulation: `new Worker(url)` fetches the script (real
+- [x] **W1** Web Worker emulation: `new Worker(url)` fetches the script (real
       URL via host_fetch; blob: from the blob store), runs it in a child realm
       (function scope with worker-only globals: `self`, `postMessage`,
       `onmessage`, `close`, `importScripts`), and wires a real message queue
       pumped by the existing `__drainTimers` pump — parent→worker and
       worker→parent messages deliver between turns, never synchronously.
       `terminate()` stops the pump. `SharedWorker` gets a shared port.
-- [ ] **W2** Service Worker execution: `navigator.serviceWorker.register(url)`
+- [x] **W2** Service Worker execution: `navigator.serviceWorker.register(url)`
       fetches and runs the SW script in a ServiceWorkerGlobalScope realm with
       `fetch` event handlers + `event.respondWith`; page fetches within the SW
       scope route through the SW's respondWith promise.
-- [ ] **W3** WASM float + extended opcodes: f32/f64 types (const 0x43/0x44,
+- [x] **W3** WASM float + extended opcodes: f32/f64 types (const 0x43/0x44,
       comparisons 0x5B–0x66, arithmetic 0x7B–0x8F, min/max/copysign/abs/neg/
       ceil/floor/trunc/nearest/sqrt), f32/f64 memory load/store (0x2A/0x2B/
       0x38/0x39), i64 consts (0x42) where QuickJS supports them, wrap/extend/
       trunc conversions (0xA7–0xAC), sign extensions (0xA0–0xA4, 0xC0–0xC4).
       Fuel metering unchanged.
-- [ ] **W4** Cross-realm MessagePort: transferred ports route in the receiving
+- [x] **W4** Cross-realm MessagePort: transferred ports route in the receiving
       realm — `postMessage` on the received end queues to the sender, the
       buffer is live (not inert).
-- [ ] **Docs** — §2.7 rows + AGENTS.md roadmap rows.
-- [ ] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`.
+- [x] **Docs** — §2.7 rows + AGENTS.md roadmap rows.
+- [x] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`. (954 passed/8 skipped incl. 21 new Phase-5 tests; 238 passed/0 failed)

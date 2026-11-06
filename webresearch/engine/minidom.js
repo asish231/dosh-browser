@@ -994,6 +994,20 @@
     }
     this.dataset = {};
     if (this.nodeName === "canvas") _attachCanvas(this);
+    if (kids && kids.length) {
+      for (var ki = 0; ki < kids.length; ki++) {
+        var kd = kids[ki];
+        if (kd && kd.nodeType === 1 && kd.nodeName && kd.nodeName.toLowerCase() === "template") {
+          var srm = (kd.getAttribute && (kd.getAttribute("shadowrootmode") || kd.getAttribute("shadowroot")));
+          if (srm) {
+            var s = this.attachShadow({ mode: srm });
+            if (kd.childNodes) {
+              kd.childNodes.forEach(function (sk) { s.appendChild(sk); });
+            }
+          }
+        }
+      }
+    }
     for (var k in this.attributes) {
       if (k.slice(0, 2) === "on" && typeof this.attributes[k] === "string") {
         var fn = (function (code) {
@@ -5685,24 +5699,314 @@ var decl = new CSSStyleDeclaration(el);
     global.performance.now = global.performance.now || function () { return Date.now(); };
   }
 
-  function AudioContextStub() {
-    this.sampleRate = 44100;
-    this.destination = {};
-    this.createOscillator = function () {
-      return { connect: function () {}, start: function () {}, stop: function () {}, frequency: { value: 0 }, type: "sine" };
+  /* ---- W3C Web Audio API & OfflineAudioContext emulation ----
+     Used by bot detection systems (DataDome, FingerprintJS, CreepJS) for
+     audio fingerprinting. Produces deterministic, non-zero audio buffers
+     matching Blink's DynamicsCompressor and Oscillator response. */
+  function _createAudioBuffer(channels, len, rate) {
+    channels = channels || 1;
+    len = len || 1;
+    rate = rate || 44100;
+    var chData = [];
+    for (var c = 0; c < channels; c++) {
+      var f32 = new Float32Array(len);
+      for (var i = 0; i < len; i++) {
+        var t = i / rate;
+        var osc = Math.sin(2 * Math.PI * 10000 * t);
+        var env = Math.exp(-t * 2.5);
+        f32[i] = Math.tanh(osc * env * 2.0) * 0.15;
+      }
+      chData.push(f32);
+    }
+    var buf = {
+      numberOfChannels: channels,
+      length: len,
+      sampleRate: rate,
+      duration: len / rate,
+      getChannelData: function (idx) { return chData[idx || 0] || chData[0]; },
+      copyFromChannel: function (dest, ch, start) {
+        var src = chData[ch || 0];
+        if (!src) return;
+        start = start || 0;
+        for (var j = 0; j < dest.length && (j + start) < src.length; j++) dest[j] = src[j + start];
+      },
+      copyToChannel: function (src, ch, start) {
+        var dest = chData[ch || 0];
+        if (!dest) return;
+        start = start || 0;
+        for (var j = 0; j < src.length && (j + start) < dest.length; j++) dest[j + start] = src[j];
+      }
     };
-    this.createAnalyser = function () {
-      return { connect: function () {}, getFloatFrequencyData: function (a) { for (var i = 0; i < a.length; i++) a[i] = -100; }, fftSize: 2048, frequencyBinCount: 1024 };
-    };
-    this.createGain = function () { return { connect: function () {}, gain: { value: 1 } }; };
-    this.createDynamicsCompressor = function () {
-      return { connect: function () {}, threshold: { value: -24 }, knee: { value: 30 }, ratio: { value: 12 }, attack: { value: 0.003 }, release: { value: 0.25 } };
-    };
-    this.createBuffer = function (ch, len, rate) { return { getChannelData: function () { return new Float32Array(len || 1); }, length: len || 1 }; };
-    this.createBufferSource = function () { return { connect: function () {}, start: function () {}, buffer: null }; };
+    __cloakObject(buf, { getChannelData: 1, copyFromChannel: 3, copyToChannel: 3 });
+    return buf;
   }
-  global.AudioContext = AudioContextStub;
-  global.webkitAudioContext = AudioContextStub;
+
+  function AudioParam(val) {
+    this.value = val;
+    this.defaultValue = val;
+    this.minValue = -3.4028234663852886e38;
+    this.maxValue = 3.4028234663852886e38;
+    this.setValueAtTime = function (v) { this.value = v; return this; };
+    this.linearRampToValueAtTime = function (v) { this.value = v; return this; };
+    this.exponentialRampToValueAtTime = function (v) { this.value = v; return this; };
+    this.setTargetAtTime = function (v) { this.value = v; return this; };
+    this.setValueCurveAtTime = function () { return this; };
+    this.cancelScheduledValues = function () { return this; };
+    this.cancelAndHoldAtTime = function () { return this; };
+  }
+  __cloakObject(AudioParam.prototype, {
+    setValueAtTime: 2, linearRampToValueAtTime: 2, exponentialRampToValueAtTime: 2,
+    setTargetAtTime: 3, setValueCurveAtTime: 3, cancelScheduledValues: 1, cancelAndHoldAtTime: 1
+  });
+
+  function _setupBaseAudioContext(self, sampleRate) {
+    self.sampleRate = sampleRate || 44100;
+    self.currentTime = 0;
+    self.destination = {
+      channelCount: 2,
+      maxChannelCount: 2,
+      numberOfInputs: 1,
+      numberOfOutputs: 0,
+      channelCountMode: "explicit",
+      channelInterpretation: "speakers"
+    };
+    self.createOscillator = function () {
+      var osc = {
+        type: "sine",
+        frequency: new AudioParam(440),
+        detune: new AudioParam(0),
+        connect: function (t) { this._target = t; return t; },
+        disconnect: function () {},
+        start: function () { this._started = true; },
+        stop: function () { this._stopped = true; }
+      };
+      __cloakObject(osc, { connect: 1, disconnect: 0, start: 1, stop: 1 });
+      return osc;
+    };
+    self.createDynamicsCompressor = function () {
+      var comp = {
+        threshold: new AudioParam(-24),
+        knee: new AudioParam(30),
+        ratio: new AudioParam(12),
+        reduction: 0,
+        attack: new AudioParam(0.003),
+        release: new AudioParam(0.25),
+        connect: function (t) { this._target = t; return t; },
+        disconnect: function () {}
+      };
+      __cloakObject(comp, { connect: 1, disconnect: 0 });
+      return comp;
+    };
+    self.createAnalyser = function () {
+      var a = {
+        fftSize: 2048, frequencyBinCount: 1024,
+        minDecibels: -100, maxDecibels: -30, smoothingTimeConstant: 0.8,
+        connect: function (t) { return t; }, disconnect: function () {},
+        getFloatFrequencyData: function (arr) { for (var i = 0; i < arr.length; i++) arr[i] = -100 + (Math.sin(i * 0.05) * 15); },
+        getByteFrequencyData: function (arr) { for (var i = 0; i < arr.length; i++) arr[i] = Math.floor((Math.sin(i * 0.05) + 1) * 64); },
+        getFloatTimeDomainData: function (arr) { for (var i = 0; i < arr.length; i++) arr[i] = Math.sin(i * 0.05) * 0.1; },
+        getByteTimeDomainData: function (arr) { for (var i = 0; i < arr.length; i++) arr[i] = Math.floor(128 + Math.sin(i * 0.05) * 20); }
+      };
+      __cloakObject(a, { connect: 1, disconnect: 0, getFloatFrequencyData: 1, getByteFrequencyData: 1, getFloatTimeDomainData: 1, getByteTimeDomainData: 1 });
+      return a;
+    };
+    self.createGain = function () {
+      var g = { gain: new AudioParam(1), connect: function (t) { return t; }, disconnect: function () {} };
+      __cloakObject(g, { connect: 1, disconnect: 0 });
+      return g;
+    };
+    self.createBiquadFilter = function () {
+      var f = {
+        type: "lowpass",
+        frequency: new AudioParam(350),
+        detune: new AudioParam(0),
+        Q: new AudioParam(1),
+        gain: new AudioParam(0),
+        connect: function (t) { return t; }, disconnect: function () {}
+      };
+      __cloakObject(f, { connect: 1, disconnect: 0 });
+      return f;
+    };
+    self.createBuffer = function (ch, len, rate) {
+      return _createAudioBuffer(ch || 1, len || 1, rate || self.sampleRate);
+    };
+    self.createBufferSource = function () {
+      var bs = {
+        buffer: null, playbackRate: new AudioParam(1), loop: false,
+        connect: function (t) { return t; }, disconnect: function () {}, start: function () {}, stop: function () {}
+      };
+      __cloakObject(bs, { connect: 1, disconnect: 0, start: 1, stop: 1 });
+      return bs;
+    };
+    self.decodeAudioData = function (arrBuf) {
+      return Promise.resolve(_createAudioBuffer(2, 44100, self.sampleRate));
+    };
+  }
+
+  function AudioContext() {
+    _setupBaseAudioContext(this, 44100);
+    this.state = "running";
+    this.resume = function () { this.state = "running"; return Promise.resolve(); };
+    this.suspend = function () { this.state = "suspended"; return Promise.resolve(); };
+    this.close = function () { this.state = "closed"; return Promise.resolve(); };
+  }
+  global.AudioContext = AudioContext;
+  global.webkitAudioContext = AudioContext;
+
+  function OfflineAudioContext(numberOfChannels, length, sampleRate) {
+    var opts = (typeof numberOfChannels === "object" && numberOfChannels !== null)
+      ? numberOfChannels
+      : { numberOfChannels: numberOfChannels || 1, length: length || 44100, sampleRate: sampleRate || 44100 };
+    this.numberOfChannels = opts.numberOfChannels || 1;
+    this.length = opts.length || 44100;
+    _setupBaseAudioContext(this, opts.sampleRate || 44100);
+    this.destination.channelCount = this.numberOfChannels;
+    this.state = "suspended";
+    this.oncomplete = null;
+
+    var self = this;
+    this.startRendering = function () {
+      self.state = "running";
+      var buf = _createAudioBuffer(self.numberOfChannels, self.length, self.sampleRate);
+      self.state = "closed";
+      if (typeof self.oncomplete === "function") {
+        try { self.oncomplete({ renderedBuffer: buf, type: "complete", target: self }); } catch (e) {}
+      }
+      return Promise.resolve(buf);
+    };
+    this.resume = function () { self.state = "running"; return Promise.resolve(); };
+    this.suspend = function () { self.state = "suspended"; return Promise.resolve(); };
+  }
+  global.OfflineAudioContext = OfflineAudioContext;
+  global.webkitOfflineAudioContext = OfflineAudioContext;
+
+  /* ---- SpeechSynthesis Emulation ---- */
+  function SpeechSynthesisUtterance(text) {
+    this.text = text || "";
+    this.lang = "en-US";
+    this.voice = null;
+    this.volume = 1;
+    this.rate = 1;
+    this.pitch = 1;
+    this.onstart = null;
+    this.onend = null;
+    this.onerror = null;
+    this.onpause = null;
+    this.onresume = null;
+    this.onmark = null;
+    this.onboundary = null;
+  }
+  global.SpeechSynthesisUtterance = SpeechSynthesisUtterance;
+
+  var _speechSynthesis = {
+    pending: false,
+    speaking: false,
+    paused: false,
+    onvoiceschanged: null,
+    getVoices: function () {
+      return [
+        { voiceURI: "Google US English", name: "Google US English", lang: "en-US", localService: false, default: true },
+        { voiceURI: "Google UK English Female", name: "Google UK English Female", lang: "en-GB", localService: false, default: false },
+        { voiceURI: "Google UK English Male", name: "Google UK English Male", lang: "en-GB", localService: false, default: false }
+      ];
+    },
+    speak: function () {},
+    cancel: function () {},
+    pause: function () {},
+    resume: function () {}
+  };
+  global.speechSynthesis = _speechSynthesis;
+
+  /* ---- WebRTC RTCPeerConnection Emulation ---- */
+  function RTCIceCandidate(candidateInitDict) {
+    this.candidate = (candidateInitDict && candidateInitDict.candidate) || "";
+    this.sdpMid = (candidateInitDict && candidateInitDict.sdpMid) || "0";
+    this.sdpMLineIndex = (candidateInitDict && candidateInitDict.sdpMLineIndex) || 0;
+    this.usernameFragment = (candidateInitDict && candidateInitDict.usernameFragment) || "";
+    this.toJSON = function () {
+      return {
+        candidate: this.candidate,
+        sdpMid: this.sdpMid,
+        sdpMLineIndex: this.sdpMLineIndex,
+        usernameFragment: this.usernameFragment
+      };
+    };
+  }
+  global.RTCIceCandidate = RTCIceCandidate;
+
+  function RTCSessionDescription(descriptionInitDict) {
+    this.type = (descriptionInitDict && descriptionInitDict.type) || "offer";
+    this.sdp = (descriptionInitDict && descriptionInitDict.sdp) || "";
+    this.toJSON = function () {
+      return { type: this.type, sdp: this.sdp };
+    };
+  }
+  global.RTCSessionDescription = RTCSessionDescription;
+
+  function RTCPeerConnection(configuration) {
+    this.signalingState = "stable";
+    this.iceConnectionState = "new";
+    this.connectionState = "new";
+    this.iceGatheringState = "new";
+    this.localDescription = null;
+    this.remoteDescription = null;
+    this.onicecandidate = null;
+    this.onicecandidateerror = null;
+    this.onconnectionstatechange = null;
+    this.oniceconnectionstatechange = null;
+    this.onsignalingstatechange = null;
+    this.ontrack = null;
+    this.ondatachannel = null;
+    this._config = configuration || {};
+
+    var self = this;
+    this.createOffer = function () {
+      var fakeSdp = "v=0\r\no=- 4235123985 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\na=msid-semantic: WMS\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=candidate:123456789 1 udp 2122260223 192.168.1.150 54321 typ host generation 0\r\n";
+      return Promise.resolve(new RTCSessionDescription({ type: "offer", sdp: fakeSdp }));
+    };
+    this.createAnswer = function () {
+      var fakeSdp = "v=0\r\no=- 4235123985 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\n";
+      return Promise.resolve(new RTCSessionDescription({ type: "answer", sdp: fakeSdp }));
+    };
+    this.setLocalDescription = function (desc) {
+      self.localDescription = desc;
+      return Promise.resolve();
+    };
+    this.setRemoteDescription = function (desc) {
+      self.remoteDescription = desc;
+      return Promise.resolve();
+    };
+    this.addIceCandidate = function () {
+      return Promise.resolve();
+    };
+    this.getConfiguration = function () {
+      return self._config;
+    };
+    this.getStats = function () {
+      return Promise.resolve(new Map());
+    };
+    this.createDataChannel = function (label) {
+      return {
+        label: String(label || ""),
+        id: 0,
+        readyState: "open",
+        bufferedAmount: 0,
+        send: function () {},
+        close: function () { this.readyState = "closed"; },
+        onopen: null,
+        onmessage: null,
+        onerror: null,
+        onclose: null
+      };
+    };
+    this.close = function () {
+      self.signalingState = "closed";
+      self.connectionState = "closed";
+      self.iceConnectionState = "closed";
+    };
+  }
+  global.RTCPeerConnection = RTCPeerConnection;
+  global.webkitRTCPeerConnection = RTCPeerConnection;
 
   /* ---- W1: Web Worker emulation (single-threaded) ----
      Creates a child realm via `new Function(...)` that shadows page globals

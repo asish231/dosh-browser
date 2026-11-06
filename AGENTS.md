@@ -240,9 +240,10 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | ESM module graph translator (66-module LinkedIn graph verified) | `engine/modules.py` | ✅ HAVE |
 | Runtime-injected script execution | `runtime.py` | ✅ HAVE |
 | **Scoped WASM interpreter** (opcode subset real challenge modules use + hermetic tests) | `webresearch/engine/wasm.py` + `minidom.js` | ✅ HAVE |
+| **WASM float + extended opcodes (W3)** — f32/f64 consts/arith/compare/memory/conversions at spec opcodes; i64 ops on the i32-approximated lane (disclosed); fuel metering unchanged | `minidom.js` WASM engine | ✅ DONE (Phase 5) — `tests/test_w3_wasm_float.py` |
 | WebSocket binary frames | Counted & skipped | `INVENT` (currently counted & skipped) |
-| Worker substrate decision: real threads vs honest single-thread emulation with real message queues | Inert constructors | `DECIDE + INVENT` |
-| Service worker real execution (SW JS runs, navigation intercepted) | Python simulation | `INVENT` or keep simulation with disclosure |
+| Worker substrate decision: real threads vs honest single-thread emulation with real message queues | ✅ DECIDED + IMPLEMENTED: single-threaded child realms (Worker/SharedWorker) with real message queues pumped by `__drainTimers` (W1) | ✅ DONE (Phase 5) — `tests/test_minidom_layout_upgrades.py` -k worker |
+| Service worker real execution (SW JS runs, navigation intercepted) | ✅ SW script runs in a ServiceWorkerGlobalScope realm; in-scope `fetch()` routes through `event.respondWith` (W2) | ✅ DONE (Phase 5) — `tests/test_w2_service_worker.py` |
 | **Element identity tracker** — stable refs surviving re-renders | `identity.rs` (Rust) / content-identity inventory (Python) | ✅ HAVE |
 
 ### Layer 2 — Layout, Geometry, Text
