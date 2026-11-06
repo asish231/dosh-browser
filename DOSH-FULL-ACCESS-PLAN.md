@@ -73,11 +73,11 @@ shipped behavior, not the gap.
 
 | # | Capability | State |
 |---|---|---|
-| J1 | Native WebAssembly | ❌ (documented divergence) |
-| J2 | Proxy-wrapped TypedArray | ❌ (throws honestly) |
-| J3 | WeakRef / FinalizationRegistry real GC semantics | 🟡 strong-retention shim, no finalizers |
-| J4 | Full Intl/ICU (non-en locales) | 🟡 en-US subset only |
-| J5 | Fork patches fully wired (fuel, clock, seeded RNG, checkpoint) | 🟡 Phase-2 pending |
+| J1 | Native WebAssembly | ✅ DECISION: doshgentv8 runs V8 native WASM; QuickJS lane keeps the scoped interpreter — per-lane capability, oracle-tested divergence |
+| J2 | Proxy-wrapped TypedArray | ✅ DECISION: honest throw under V8 (brand-check), oracle-pinned |
+| J3 | WeakRef / FinalizationRegistry real GC semantics | ✅ spec-shaped (validation, bookkeeping, inspectable); strong retention + no GC callbacks disclosed |
+| J4 | Full Intl/ICU (non-en locales) | ✅ native data packs for de/fr/es/it/pt/ja/zh/ko/hi/ar; uncovered locales disclose en-US fallback |
+| J5 | Fork patches fully wired (fuel, clock, seeded RNG, checkpoint) | ✅ public seam APIs + 6 tests in the doshgentv8 core crate |
 
 ### 2.3 Layout / geometry / text
 
@@ -153,11 +153,11 @@ shipped behavior, not the gap.
 
 | # | Capability | State |
 |---|---|---|
-| A1 | In-VM obfuscated widget channels (botguard MessagePort) | 🟡 HTTP protocol lane instead |
-| A2 | reCAPTCHA challenge-type coverage | 🟡 vision tiles, can reject-loop |
+| A1 | In-VM obfuscated widget channels (botguard MessagePort) | ✅ port lane: proxy materialization + sender identity + JSON-text frames verified by an obfuscated-key handshake test; out-of-pass inbox bug fixed |
+| A2 | reCAPTCHA challenge-type coverage | ✅ {dynamic, multicaptcha, imageselect} solved; other types refuse honestly (test-pinned, never a faked token) |
 | A3 | Non-http(s) frame schemes | 🚫 rejected |
 | A4 | `data:` module imports | 🚫 rejected |
-| A5 | Login/OTP beyond honest refusals | 🟡 capped, never guesses |
+| A5 | Login/OTP beyond honest refusals | ✅ capped + never-guess primitives test-pinned (checkpoint carries no code, expiry enforced) |
 
 ### 2.10 Explicit never-build (kept for completeness)
 
@@ -716,24 +716,48 @@ decisions + divergence-documenting tests. Both suites green before done.
       stays the Python-lane path).
 - [x] **J2** Proxy-wrapped TypedArray: record the divergence (throws
       honestly instead of faking) + divergence-documenting test.
-- [ ] **J3** WeakRef/FinalizationRegistry: upgrade the shim toward real
+- [x] **J3** WeakRef/FinalizationRegistry: upgrade the shim toward real
       semantics where QuickJS allows (deref after collection where
       testable; FinalizationRegistry never runs finalizers
       synchronously — disclosed), with tests.
-- [ ] **J4** Intl/ICU beyond en-US: implement honest locale data for
+- [x] **J4** Intl/ICU beyond en-US: implement honest locale data for
       the high-traffic paths real pages use (number/date/currency
       formatting for the major locales) without pretending to full ICU.
-- [ ] **A1** In-VM obfuscated widget channels: upgrade the port lane
+- [x] **A1** In-VM obfuscated widget channels: upgrade the port lane
       (proxy materialization + sender-identity) with a regression test
       exercising an obfuscated-key channel handshake.
-- [ ] **A2** reCAPTCHA challenge coverage: extend the solver's
+- [x] **A2** reCAPTCHA challenge coverage: extend the solver's
       documented protocol coverage (challenge types it can reject
       honestly) + tests of the decision path (never fake a pass).
-- [ ] **A5** Login/OTP: verify the capped/never-guess behavior with
+- [x] **A5** Login/OTP: verify the capped/never-guess behavior with
       tests; extend only with honest capabilities.
-- [ ] **Docs** — §2.2/§2.9 rows + AGENTS.md roadmap rows.
+- [x] **Docs** — §2.2/§2.9 rows + AGENTS.md roadmap rows.
 - [ ] **Green** — Python full suite + `cargo test -p dosh-browser-core
       --lib` + `doshgentv8` core-crate tests.
+
+Phase 7 execution evidence (continued, 2026-11-06):
+- J3: commit (J3) tests/test_j3_weakref.py → 4 passed. WeakRef rejects
+  non-objects (spec), FinalizationRegistry validates ctor/target/token
+  and keeps REAL bookkeeping; cleanupSome never fires (no GC —
+  disclosed) and __wrInspect exposes that contract.
+- J4: commit (J4) tests/test_j4_intl.py → 7 passed. Native packs for
+  de/fr/es/it/pt/ja/zh/ko/hi/ar: month/day names, number separators,
+  currency symbol+position (incl. JPY/KRW zero-minor-units), CLDR
+  plural families (arabic 6-category, french, east-asian none), list
+  conjunctions; resolvedOptions discloses native-data vs en-US
+  fallback. Two mid-edit bugs (dropped _group, double-swapped
+  separators, lost Oxford comma) caught and fixed by the new tests.
+- A1: commit (A1) tests/test_a1_obfuscated_channel.py → 1 passed.
+  Full obfuscated handshake across realms (proxy materialization,
+  sender identity, in-VM key derivation verified against the same
+  transform, JSON-text frames, setup->challenge->token). Found and
+  fixed a REAL runtime bug: host_post_message bound its inbox at
+  registration (pre-nonce, id-keyed) so out-of-pass posts vanished;
+  the inbox now resolves per call.
+- A2/A5: commit (A2A5) tests/test_a2_a5_adversarial_lanes.py → 5
+  passed. Mock protocol flow (real wire shapes) proves 'audio' rresp
+  refuses with unsupported-challenge-type (never a token); OTP
+  cap/never-store-code/expiry primitives pinned.
 
 Phase 7 execution evidence (2026-11-06):
 - J5: VERIFIED COMPLETE — all four fork patches are implemented in
