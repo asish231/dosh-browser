@@ -7660,7 +7660,7 @@ var decl = new CSSStyleDeclaration(el);
     this.abort = function (reason) {
       if (signal.aborted) return;
       signal.aborted = true;
-      signal.reason = reason !== undefined ? reason : new Error("This operation was aborted");
+      signal.reason = reason !== undefined ? reason : new global.DOMException("This operation was aborted", "AbortError");
       signal._emit("abort", { type: "abort" });
     };
   };
@@ -7707,7 +7707,7 @@ var decl = new CSSStyleDeclaration(el);
     // (spec); in-flight abort is a no-op here because host_fetch is
     // synchronous — disclosed approximation, not a fake.
     if (opts.signal && opts.signal.aborted) {
-      return Promise.reject(opts.signal.reason || new Error("This operation was aborted"));
+      return Promise.reject(opts.signal.reason || new global.DOMException("This operation was aborted", "AbortError"));
     }
     var urlStr = String(url);
     if (urlStr.indexOf("blob:") === 0) {
@@ -7781,7 +7781,7 @@ var decl = new CSSStyleDeclaration(el);
         if (settled) return;
         settled = true;
         signal.removeEventListener("abort", onAbort);
-        reject(signal.reason || new Error("This operation was aborted"));
+        reject(signal.reason || new global.DOMException("This operation was aborted", "AbortError"));
       }
       signal.addEventListener("abort", onAbort);
       Promise.resolve().then(function () {
