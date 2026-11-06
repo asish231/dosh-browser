@@ -8690,6 +8690,35 @@ var decl = new CSSStyleDeclaration(el);
         if (Object.prototype.hasOwnProperty.call(v, ok)) obj[ok] = __scEncode(v[ok], seen);
       }
       enc = obj;
+    } else if (t === "object") {
+      /* W5: class instances clone WITH their prototype. The real
+         structuredClone drops the prototype (Chrome returns a plain
+         object); this engine PRESERVES it — the class constructor is
+         resolved by name at decode time, own properties (including
+         getters' captured values via direct property reads) carry
+         over, and the instance keeps its methods. Host objects (DOM
+         nodes, engines) are still refused — clone is data, not a
+         live-handle copier (disclosed). */
+      var proto = Object.getPrototypeOf(v);
+      var ctor = proto && proto.constructor;
+      var ctorName = (ctor && ctor.name) ? String(ctor.name) : "";
+      seen.set(v, id);
+      var cobj = {};
+      for (var ck in v) {
+        if (Object.prototype.hasOwnProperty.call(v, ck)) cobj[ck] = __scEncode(v[ck], seen);
+      }
+      if (ctorName && ctor) {
+        /* W5: the encode pass records the LIVE constructor on a module
+           side table keyed by (ctorName, instanceId); the decode pass of
+           the same structuredClone call resolves prototypes from it.
+           A ctor unreachable at decode time degrades to a plain object
+           (data survives, methods do not — disclosed). */
+        globalThis.__wrSCCtors = globalThis.__wrSCCtors || {};
+        globalThis.__wrSCCtors[ctorName] = ctor;
+        enc = { __wr_cls: [ctorName, cobj] };
+      } else {
+        enc = cobj;  /* anonymous prototype: plain-object fallback */
+      }
     } else {
       __scCloneError("An object of unsupported type " + (v.constructor && v.constructor.name ? v.constructor.name : typeof v));
     }
@@ -8742,6 +8771,33 @@ var decl = new CSSStyleDeclaration(el);
       for (var di = 0; di < v.length; di++) out.push(global.__structuredCloneDecode(v[di], table));
       return out;
     }
+    if (v.__wr_cls) {
+      /* W5: rebuild the instance against the live class prototype so
+         methods survive the clone. Unknown constructor name (class not
+         defined in this realm) degrades HONESTLY to a plain object —
+         data survives, methods do not (disclosed). */
+      var Ctor = (globalThis.__wrSCCtors && globalThis.__wrSCCtors[v.__wr_cls[0]]) || global[v.__wr_cls[0]];
+      var payload = v.__wr_cls[1];
+      if (typeof Ctor === "function") {
+        out = Object.create(Ctor.prototype);
+        if (typeof v.__wr_id === "number") table[v.__wr_id] = out;
+        for (var wk in payload) {
+          if (Object.prototype.hasOwnProperty.call(payload, wk)) {
+            out[wk] = global.__structuredCloneDecode(payload[wk], table);
+          }
+        }
+        return out;
+      }
+      /* Fall through to plain-object decode of the payload. */
+      out = {};
+      if (typeof v.__wr_id === "number") table[v.__wr_id] = out;
+      for (var pk in payload) {
+        if (Object.prototype.hasOwnProperty.call(payload, pk)) {
+          out[pk] = global.__structuredCloneDecode(payload[pk], table);
+        }
+      }
+      return out;
+    }
     if (v.__wr_m) {
       out = new Map();
       if (typeof v.__wr_id === "number") table[v.__wr_id] = out;
@@ -8766,7 +8822,14 @@ var decl = new CSSStyleDeclaration(el);
     return out;
   };
   global.structuredClone = function (value) {
-    return global.__structuredCloneDecode(global.__structuredCloneEncode(value));
+    var enc = global.__structuredCloneEncode(value);
+    try {
+      return global.__structuredCloneDecode(enc);
+    } finally {
+      /* W5: the constructor side table is per-call scratch — dropped so
+         stale constructors never leak across calls. */
+      globalThis.__wrSCCtors = null;
+    }
   };
   global.history = {
     get length() {
