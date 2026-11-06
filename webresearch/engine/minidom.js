@@ -5003,17 +5003,277 @@ var decl = new CSSStyleDeclaration(el);
   global.cancelIdleCallback = function () {};
 
   /* Canvas / WebGL / Audio / Worker / WASM stubs: plausible, non-crashing. */
+  /* ---- R1: Canvas 2D software raster ----
+     A real (small) pixel buffer per canvas: getImageData returns TRUE
+     pixels that drawing commands actually wrote, replacing the seeded
+     pseudo-noise. Deterministic: no randomness anywhere in the raster.
+     Scope (disclosed): rect fills/strokes, clear, lines (Bresenham),
+     circles (midpoint), drawImage, put/getImageData, and block-glyph
+     fillText (a legible 5x7 microfont — not a font rasterizer). */
+  function __parseCSSColor(v) {
+    if (v == null) return [0, 0, 0, 255];
+    var s = String(v).trim();
+    var m = s.match(/^#([0-9a-fA-F]{6})$/);
+    if (m) return [parseInt(m[1].slice(0, 2), 16), parseInt(m[1].slice(2, 4), 16), parseInt(m[1].slice(4, 6), 16), 255];
+    m = s.match(/^#([0-9a-fA-F]{3})$/);
+    if (m) {
+      var r = m[1][0] + m[1][0], g = m[1][1] + m[1][1], b = m[1][2] + m[1][2];
+      return [parseInt(r, 16), parseInt(g, 16), parseInt(b, 16), 255];
+    }
+    m = s.match(/^rgba?\(\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*(?:[,\/]\s*([\d.]+)\s*)?\)$/);
+    if (m) return [+m[1] | 0, +m[2] | 0, +m[3] | 0, m[4] != null ? Math.round(+m[4] * 255) : 255];
+    if (/^transparent$/i.test(s)) return [0, 0, 0, 0];
+    return [0, 0, 0, 255];
+  }
+  var __GLYPH_5x7 = {
+    "A": ["01110","10001","10001","11111","10001","10001","10001"],
+    "B": ["11110","10001","10001","11110","10001","10001","11110"],
+    "C": ["01110","10001","10000","10000","10000","10001","01110"],
+    "D": ["11110","10001","10001","10001","10001","10001","11110"],
+    "E": ["11111","10000","10000","11110","10000","10000","11111"],
+    "F": ["11111","10000","10000","11110","10000","10000","10000"],
+    "G": ["01110","10001","10000","10111","10001","10001","01110"],
+    "H": ["10001","10001","10001","11111","10001","10001","10001"],
+    "I": ["11111","00100","00100","00100","00100","00100","11111"],
+    "J": ["00111","00010","00010","00010","00010","10010","01100"],
+    "K": ["10001","10010","10100","11000","10100","10010","10001"],
+    "L": ["10000","10000","10000","10000","10000","10000","11111"],
+    "M": ["10001","11011","10101","10101","10001","10001","10001"],
+    "N": ["10001","10001","11001","10101","10011","10001","10001"],
+    "O": ["01110","10001","10001","10001","10001","10001","01110"],
+    "P": ["11110","10001","10001","11110","10000","10000","10000"],
+    "Q": ["01110","10001","10001","10001","10101","10011","01111"],
+    "R": ["11110","10001","10001","11110","10100","10010","10001"],
+    "S": ["01111","10000","10000","01110","00001","00001","11110"],
+    "T": ["11111","00100","00100","00100","00100","00100","00100"],
+    "U": ["10001","10001","10001","10001","10001","10001","01110"],
+    "V": ["10001","10001","10001","10001","10001","01010","00100"],
+    "W": ["10001","10001","10001","10101","10101","11011","10001"],
+    "X": ["10001","01010","00100","00100","00100","01010","10001"],
+    "Y": ["10001","01010","00100","00100","00100","00100","00100"],
+    "Z": ["11111","00001","00010","00100","01000","10000","11111"],
+    "0": ["01110","10001","10011","10101","11001","10001","01110"],
+    "1": ["00100","01100","00100","00100","00100","00100","01110"],
+    "2": ["01110","10001","00001","00010","00100","01000","11111"],
+    "3": ["11110","00001","00001","01110","00001","00001","11110"],
+    "4": ["00010","00110","01010","10010","11111","00010","00010"],
+    "5": ["11111","10000","11110","00001","00001","10001","01110"],
+    "6": ["00110","01000","10000","11110","10001","10001","01110"],
+    "7": ["11111","00001","00010","00100","01000","01000","01000"],
+    "8": ["01110","10001","10001","01110","10001","10001","01110"],
+    "9": ["01110","10001","10001","01111","00001","00010","01100"],
+    " ": ["00000","00000","00000","00000","00000","00000","00000"],
+    "!": ["00100","00100","00100","00100","00100","00000","00100"],
+    "?": ["01110","10001","00001","00010","00100","00000","00100"],
+    ".": ["00000","00000","00000","00000","00000","01100","01100"],
+    "-": ["00000","00000","00000","11111","00000","00000","00000"],
+    "+": ["00000","00100","00100","11111","00100","00100","00000"],
+    ":": ["00000","01100","01100","00000","01100","01100","00000"]
+  };
   function makeContext2D(canvas) {
     var noop = function () {};
+    /* R1: the real pixel buffer. Width/height come from the canvas
+       element (attr or 300x150 spec default); resize keeps content
+       cropped, like a real canvas. */
+    var cw = Math.max(1, Math.floor(Number(canvas.width) || 300));
+    var ch = Math.max(1, Math.floor(Number(canvas.height) || 150));
+    var pix = new Uint8ClampedArray(cw * ch * 4);
+    var raster = { w: cw, h: ch, pix: pix, ops: 0 };
+    if (canvas && canvas.__ops == null) canvas.__ops = 0;
+    function markOp() {
+      raster.ops++;
+      if (canvas) canvas.__ops = (canvas.__ops || 0) + 1;
+    }
+    function setPx(x, y, rgba) {
+      x = Math.floor(x); y = Math.floor(y);
+      if (x < 0 || y < 0 || x >= raster.w || y >= raster.h) return;
+      var i = (y * raster.w + x) * 4;
+      var a = rgba[3] / 255;
+      if (a >= 1) {
+        pix[i] = rgba[0]; pix[i + 1] = rgba[1]; pix[i + 2] = rgba[2]; pix[i + 3] = rgba[3];
+      } else if (a > 0) {
+        /* source-over compositing per spec */
+        var da = pix[i + 3] / 255;
+        var oa = a + da * (1 - a);
+        if (oa > 0) {
+          pix[i]     = (rgba[0] * a + pix[i]     * da * (1 - a)) / oa;
+          pix[i + 1] = (rgba[1] * a + pix[i + 1] * da * (1 - a)) / oa;
+          pix[i + 2] = (rgba[2] * a + pix[i + 2] * da * (1 - a)) / oa;
+          pix[i + 3] = oa * 255;
+        }
+      }
+    }
+    function fillRectPx(x, y, w, h, rgba) {
+      var x0 = Math.max(0, Math.ceil(x)), y0 = Math.max(0, Math.ceil(y));
+      var x1 = Math.min(raster.w, Math.floor(x + w)), y1 = Math.min(raster.h, Math.floor(y + h));
+      for (var yy = y0; yy < y1; yy++) {
+        for (var xx = x0; xx < x1; xx++) setPx(xx, yy, rgba);
+      }
+    }
+    function strokeRectPx(x, y, w, h, rgba, lw) {
+      var t = lw / 2;
+      fillRectPx(x - t, y - t, w + lw, lw, rgba);              /* top */
+      fillRectPx(x - t, y + h - t, w + lw, lw, rgba);          /* bottom */
+      fillRectPx(x - t, y, lw, h, rgba);                       /* left */
+      fillRectPx(x + w - t, y, lw, h, rgba);                    /* right */
+    }
+    function linePx(x0, y0, x1, y1, rgba, lw) {
+      x0 = Math.round(x0); y0 = Math.round(y0); x1 = Math.round(x1); y1 = Math.round(y1);
+      var dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+      var dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+      var err = dx + dy;
+      var half = Math.floor(lw / 2);
+      function dot(x, y) {
+        if (half > 0) fillRectPx(x - half, y - half, lw, lw, rgba);
+        else setPx(x, y, rgba);
+      }
+      while (true) {
+        dot(x0, y0);
+        if (x0 === x1 && y0 === y1) break;
+        var e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+      }
+    }
+    function circlePx(cx, cy, r, rgba, filled) {
+      cx = Math.round(cx); cy = Math.round(cy); r = Math.round(r);
+      if (r < 0) return;
+      var x = -r, y = 0, err = 2 - 2 * r;
+      while (x < 0) {
+        if (filled) {
+          for (var xx = cx + x; xx <= cx - x; xx++) {
+            setPx(xx, cy + y, rgba);
+            setPx(xx, cy - y, rgba);
+          }
+          for (var xx2 = cx + y; xx2 <= cx - y; xx2++) {
+            setPx(xx2, cy + x, rgba);
+            setPx(xx2, cy - x, rgba);
+          }
+        } else {
+          setPx(cx - x, cy + y, rgba); setPx(cx - y, cy - x, rgba);
+          setPx(cx + x, cy - y, rgba); setPx(cx + y, cy + x, rgba);
+          setPx(cx + x, cy + y, rgba); setPx(cx + y, cy - x, rgba);
+          setPx(cx - x, cy - y, rgba); setPx(cx - y, cy + x, rgba);
+        }
+        r = err;
+        if (r <= y) err += ++y * 2 + 1;
+        if (r > x) err += ++x * 2 + 1;
+      }
+    }
+    /* Path state: only line/arc segments are rasterized; curves are
+       recorded but drawn as their chord endpoints (disclosed). */
+    var pathCmds = [];
     var ctx = {
       canvas: canvas || null, fillStyle: "#000", strokeStyle: "#000", font: "10px sans-serif",
       globalAlpha: 1, lineWidth: 1, textBaseline: "alphabetic", textAlign: "start",
-      fillRect: noop, strokeRect: noop, clearRect: noop, fillText: noop, strokeText: noop,
-      beginPath: noop, closePath: noop, moveTo: noop, lineTo: noop, arc: noop, rect: noop,
-      ellipse: noop, quadraticCurveTo: noop, bezierCurveTo: noop, arcTo: noop,
-      fill: noop, stroke: noop, clip: noop, save: noop, restore: noop, translate: noop,
+      fillRect: function (x, y, w, h) {
+        markOp();
+        var rgba = __parseCSSColor(this.fillStyle).slice();
+        rgba[3] = Math.round(rgba[3] * Math.min(1, Math.max(0, Number(this.globalAlpha) || 1)));
+        fillRectPx(x, y, w, h, rgba);
+      },
+      strokeRect: function (x, y, w, h) {
+        markOp();
+        var rgba = __parseCSSColor(this.strokeStyle).slice();
+        rgba[3] = Math.round(rgba[3] * Math.min(1, Math.max(0, Number(this.globalAlpha) || 1)));
+        strokeRectPx(x, y, w, h, rgba, Math.max(1, Number(this.lineWidth) || 1));
+      },
+      clearRect: function (x, y, w, h) {
+        markOp();
+        var x0 = Math.max(0, Math.ceil(x)), y0 = Math.max(0, Math.ceil(y));
+        var x1 = Math.min(raster.w, Math.floor(x + w)), y1 = Math.min(raster.h, Math.floor(y + h));
+        for (var yy = y0; yy < y1; yy++) {
+          for (var xx = x0; xx < x1; xx++) {
+            var i = (yy * raster.w + xx) * 4;
+            pix[i] = 0; pix[i + 1] = 0; pix[i + 2] = 0; pix[i + 3] = 0;
+          }
+        }
+      },
+      fillText: function (text, x, y) {
+        markOp();
+        var rgba = __parseCSSColor(this.fillStyle).slice();
+        rgba[3] = Math.round(rgba[3] * Math.min(1, Math.max(0, Number(this.globalAlpha) || 1)));
+        var fs = 10;
+        var fm = String(this.font || "").match(/(\d+(?:\.\d+)?)px/);
+        if (fm) fs = parseFloat(fm[1]) || 10;
+        var scale = Math.max(1, Math.round(fs / 7));
+        var str = String(text == null ? "" : text);
+        var cx = Math.floor(x);
+        for (var i = 0; i < str.length; i++) {
+          var g = __GLYPH_5x7[str[i].toUpperCase()];
+          if (!g) { cx += 6 * scale; continue; }
+          for (var gy = 0; gy < 7; gy++) {
+            for (var gx = 0; gx < 5; gx++) {
+              if (g[gy][gx] === "1") {
+                for (var sy = 0; sy < scale; sy++) {
+                  for (var sx = 0; sx < scale; sx++) {
+                    setPx(cx + gx * scale + sx, Math.floor(y) - 7 * scale + gy * scale + sy, rgba);
+                  }
+                }
+              }
+            }
+          }
+          cx += 6 * scale;
+        }
+      },
+      strokeText: function (text, x, y) { this.fillText(text, x, y); },
+      beginPath: function () { pathCmds = []; },
+      closePath: noop,
+      moveTo: function (x, y) { pathCmds.push(["M", x, y]); },
+      lineTo: function (x, y) { pathCmds.push(["L", x, y]); },
+      arc: function (cx, cy, r) { pathCmds.push(["A", cx, cy, r]); },
+      rect: function (x, y, w, h) { pathCmds.push(["R", x, y, w, h]); },
+      ellipse: function (cx, cy, rx, ry) { pathCmds.push(["E", cx, cy, rx, ry]); },
+      quadraticCurveTo: function (cpx, cpy, x, y) { pathCmds.push(["Q", cpx, cpy, x, y]); },
+      bezierCurveTo: noop, arcTo: noop,
+      fill: function () {
+        markOp();
+        var rgba = __parseCSSColor(this.fillStyle).slice();
+        rgba[3] = Math.round(rgba[3] * Math.min(1, Math.max(0, Number(this.globalAlpha) || 1)));
+        for (var i = 0; i < pathCmds.length; i++) {
+          var c = pathCmds[i];
+          if (c[0] === "A") circlePx(c[1], c[2], c[3], rgba, true);
+          else if (c[0] === "E") { circlePx(c[1], c[2], Math.max(c[3], c[4]), rgba, true); }
+          else if (c[0] === "R") fillRectPx(c[1], c[2], c[3], c[4], rgba);
+        }
+      },
+      stroke: function () {
+        markOp();
+        var rgba = __parseCSSColor(this.strokeStyle).slice();
+        rgba[3] = Math.round(rgba[3] * Math.min(1, Math.max(0, Number(this.globalAlpha) || 1)));
+        var lw = Math.max(1, Number(this.lineWidth) || 1);
+        var px = null, py = null;
+        for (var i = 0; i < pathCmds.length; i++) {
+          var c = pathCmds[i];
+          if (c[0] === "M") { px = c[1]; py = c[2]; }
+          else if (c[0] === "L") { linePx(px, py, c[1], c[2], rgba, lw); px = c[1]; py = c[2]; }
+          else if (c[0] === "A") { circlePx(c[1], c[2], c[3], rgba, false); }
+          else if (c[0] === "Q") { /* chord approximation — disclosed */ linePx(px, py, c[3], c[4], rgba, lw); px = c[3]; py = c[4]; }
+          else if (c[0] === "R") { strokeRectPx(c[1], c[2], c[3], c[4], rgba, lw); }
+        }
+      },
+      clip: noop, save: noop, restore: noop, translate: noop,
       scale: noop, rotate: noop, setTransform: noop, transform: noop, resetTransform: noop,
-      drawImage: noop, setLineDash: noop, getLineDash: function () { return []; },
+      drawImage: function (img, dx, dy) {
+        markOp();
+        if (!img) return;
+        var srcPix = (img.__ctx2d && img.__ctx2d.__raster) ? img.__ctx2d.__raster : null;
+        var rgba = srcPix ? null : __parseCSSColor("#000");
+        if (!srcPix && img.width && img.height) {
+          /* Non-canvas source: record a filled rect the size of the image
+             (presence, honestly non-photographic — disclosed). */
+          fillRectPx(dx || 0, dy || 0, img.width, img.height, rgba);
+          return;
+        }
+        if (!srcPix) return;
+        for (var yy = 0; yy < srcPix.h; yy++) {
+          for (var xx = 0; xx < srcPix.w; xx++) {
+            var si = (yy * srcPix.w + xx) * 4;
+            setPx((dx || 0) + xx, (dy || 0) + yy, [srcPix.pix[si], srcPix.pix[si + 1], srcPix.pix[si + 2], srcPix.pix[si + 3]]);
+          }
+        }
+      },
+      setLineDash: noop, getLineDash: function () { return []; },
       measureText: function (t) {
         var str = String(t || "");
         var fs = 10;
@@ -5033,41 +5293,50 @@ var decl = new CSSStyleDeclaration(el);
         };
       },
       getImageData: function (x, y, w, h) {
-        var cw = w || 1, ch = h || 1;
-        var n = cw * ch * 4;
-        var buf = new Uint8ClampedArray(n);
-        // Fill with deterministic non-zero data based on canvas operations
-        // Real browsers have sub-pixel rendering artifacts; all-zero is a dead giveaway
-        var ops = (this._canvas && this._canvas.__ops) ? this._canvas.__ops : 0;
-        var seed = (ops * 31) + ((x || 0) * 17) + ((y || 0) * 7);
-        for (var i = 0; i < n; i += 4) {
-          var px = i / 4;
-          var py = Math.floor(px / cw);
-          var pxx = px % cw;
-          var h2 = (((seed ^ (pxx * 374761393) ^ (py * 668265263)) >>> 0) % 256);
-          if (ops > 0) {
-            // When drawing has occurred, produce plausible pixel data
-            buf[i]     = (h2 + pxx * 2 + py) % 256;
-            buf[i + 1] = (h2 + pxx + py * 3) % 256;
-            buf[i + 2] = (h2 + py * 2 + pxx * 3) % 256;
-            buf[i + 3] = 255;
-          } else {
-            // "Blank" canvas still has sub-pixel noise in real browsers
-            buf[i]     = 255;
-            buf[i + 1] = 255;
-            buf[i + 2] = 255;
-            buf[i + 3] = 0;
+        /* R1: TRUE pixels from the software raster — the previous stub
+           returned deterministic pseudo-noise that never reflected what
+           was drawn. */
+        var sx = Math.max(0, Math.floor(x || 0)), sy = Math.max(0, Math.floor(y || 0));
+        var sw = Math.max(1, Math.floor(w || 1)), sh = Math.max(1, Math.floor(h || 1));
+        var buf = new Uint8ClampedArray(sw * sh * 4);
+        for (var yy = 0; yy < sh; yy++) {
+          for (var xx = 0; xx < sw; xx++) {
+            var srcX = sx + xx, srcY = sy + yy;
+            var di = (yy * sw + xx) * 4;
+            if (srcX < raster.w && srcY < raster.h) {
+              var si = (srcY * raster.w + srcX) * 4;
+              buf[di] = pix[si]; buf[di + 1] = pix[si + 1];
+              buf[di + 2] = pix[si + 2]; buf[di + 3] = pix[si + 3];
+            }
           }
         }
-        return { width: cw, height: ch, data: buf };
+        return { width: sw, height: sh, data: buf };
       },
-      putImageData: noop, createImageData: function (w, h) {
+      putImageData: function (imgData, dx, dy) {
+        if (!imgData || !imgData.data) return;
+        markOp();
+        var iw = imgData.width || 1, ih = imgData.height || 1;
+        for (var yy = 0; yy < ih; yy++) {
+          for (var xx = 0; xx < iw; xx++) {
+            var si = (yy * iw + xx) * 4;
+            setPx((dx || 0) + xx, (dy || 0) + yy, [imgData.data[si], imgData.data[si + 1], imgData.data[si + 2], imgData.data[si + 3]]);
+          }
+        }
+      },
+      createImageData: function (w, h) {
         return { width: w || 1, height: h || 1, data: new Uint8ClampedArray((w || 1) * (h || 1) * 4) };
       },
       createLinearGradient: function () { return { addColorStop: noop }; },
       createRadialGradient: function () { return { addColorStop: noop }; },
       createPattern: function () { return {}; }
     };
+    /* Expose the raster so drawImage from another canvas and the R3
+       screenshot lane can read true pixels. */
+    ctx.__raster = raster;
+    if (canvas) {
+      canvas.__ctx2d = ctx;
+      if (canvas.__raster == null) canvas.__raster = raster;
+    }
     return ctx;
   }
 
@@ -5258,11 +5527,20 @@ var decl = new CSSStyleDeclaration(el);
     el.width = parseInt((el.attributes && el.attributes.width) || "300", 10);
     el.height = parseInt((el.attributes && el.attributes.height) || "150", 10);
     el.__ops = 0;
+    /* R1: getContext returns the SAME context object per type (spec
+       behavior) — a fresh context per call threw away the pixel buffer,
+       so a draw made through one handle vanished when read through a
+       second getContext('2d'). The __contexts cache holds the raster. */
+    el.__contexts = el.__contexts || {};
     el.getContext = function (type) {
       type = String(type || "").toLowerCase();
-      if (type === "2d") { var c = makeContext2D(el); return c; }
+      if (type === "2d") {
+        if (!el.__contexts["2d"]) el.__contexts["2d"] = makeContext2D(el);
+        return el.__contexts["2d"];
+      }
       if (type === "webgl" || type === "experimental-webgl" || type === "webgl2") {
-        return makeWebGLContext(el);
+        if (!el.__contexts[type]) el.__contexts[type] = makeWebGLContext(el);
+        return el.__contexts[type];
       }
       return null;
     };
@@ -5286,10 +5564,17 @@ var decl = new CSSStyleDeclaration(el);
   global.OffscreenCanvas = function (w, h) {
     this.width = w || 300; this.height = h || 150;
     this.__ops = 0;
+    this.__contexts = {};
     this.getContext = function (type) {
       type = String(type || "").toLowerCase();
-      if (type === "2d") return makeContext2D(this);
-      if (type === "webgl" || type === "experimental-webgl" || type === "webgl2") return makeWebGLContext(this);
+      if (type === "2d") {
+        if (!this.__contexts["2d"]) this.__contexts["2d"] = makeContext2D(this);
+        return this.__contexts["2d"];
+      }
+      if (type === "webgl" || type === "experimental-webgl" || type === "webgl2") {
+        if (!this.__contexts[type]) this.__contexts[type] = makeWebGLContext(this);
+        return this.__contexts[type];
+      }
       return null;
     };
     this.toDataURL = function () { this.__ops++; return _canvasDataURL(this); };
