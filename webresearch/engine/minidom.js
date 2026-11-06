@@ -11714,6 +11714,86 @@ var decl = new CSSStyleDeclaration(el);
     if (/serif/.test(f) && f.indexOf("sans") < 0) return "serif";
     return "sans-serif";
   }
+  /* ---- R3: encode the 2d raster as a real PNG (no zlib dependency:
+     deflate stored blocks + adler32 + crc32, deterministic). ---- */
+  function __crc32(buf) {
+    var table = [];
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      table[n] = c >>> 0;
+    }
+    var crc = 0xFFFFFFFF;
+    for (var i = 0; i < buf.length; i++) crc = (table[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8)) >>> 0;
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+  function __adler32(buf) {
+    var a = 1, b = 0;
+    for (var i = 0; i < buf.length; i++) {
+      a = (a + buf[i]) % 65521;
+      b = (b + a) % 65521;
+    }
+    return ((b << 16) | a) >>> 0;
+  }
+  function __pngChunk(type, payload) {
+    var out = [];
+    var len = payload.length;
+    out.push((len >>> 24) & 0xFF, (len >>> 16) & 0xFF, (len >>> 8) & 0xFF, len & 0xFF);
+    var crcInput = [];
+    for (var t = 0; t < type.length; t++) { out.push(type.charCodeAt(t)); crcInput.push(type.charCodeAt(t)); }
+    for (var p = 0; p < payload.length; p++) { out.push(payload[p]); crcInput.push(payload[p]); }
+    var crc = __crc32(new Uint8Array(crcInput));
+    out.push((crc >>> 24) & 0xFF, (crc >>> 16) & 0xFF, (crc >>> 8) & 0xFF, crc & 0xFF);
+    return out;
+  }
+  function __rasterToPngDataURL(raster) {
+    if (!raster || !raster.pix) return null;
+    var w = raster.w, h = raster.h;
+    /* IHDR: w, h, bit depth 8, color type 6 (RGBA), no interlace */
+    var ihdr = [ (w >>> 24) & 0xFF, (w >>> 16) & 0xFF, (w >>> 8) & 0xFF, w & 0xFF,
+                 (h >>> 24) & 0xFF, (h >>> 16) & 0xFF, (h >>> 8) & 0xFF, h & 0xFF,
+                 8, 6, 0, 0, 0 ];
+    /* Raw scanlines: each row prefixed by filter byte 0 */
+    var raw = [];
+    for (var y = 0; y < h; y++) {
+      raw.push(0);
+      for (var x = 0; x < w; x++) {
+        var i = (y * w + x) * 4;
+        raw.push(raster.pix[i], raster.pix[i + 1], raster.pix[i + 2], raster.pix[i + 3]);
+      }
+    }
+    /* zlib stream: 0x78 0x01 header + stored blocks + adler32 */
+    var z = [0x78, 0x01];
+    var BLOCK = 65535;
+    var pos = 0;
+    while (true) {
+      var remaining = raw.length - pos;
+      var take = Math.min(BLOCK, remaining);
+      var last = (pos + take >= raw.length) ? 1 : 0;
+      z.push(last);
+      z.push(take & 0xFF, (take >>> 8) & 0xFF);
+      z.push((~take) & 0xFF, ((~take) >>> 8) & 0xFF);
+      for (var b = 0; b < take; b++) z.push(raw[pos + b]);
+      pos += take;
+      if (last) break;
+    }
+    var ad = __adler32(new Uint8Array(raw));
+    z.push((ad >>> 24) & 0xFF, (ad >>> 16) & 0xFF, (ad >>> 8) & 0xFF, ad & 0xFF);
+    var png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    png = png.concat(__pngChunk("IHDR", ihdr));
+    png = png.concat(__pngChunk("IDAT", z));
+    png = png.concat(__pngChunk("IEND", []));
+    /* base64 */
+    var b64 = "";
+    var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (var q = 0; q < png.length; q += 3) {
+      var b0 = png[q], b1 = q + 1 < png.length ? png[q + 1] : 0, b2 = q + 2 < png.length ? png[q + 2] : 0;
+      b64 += chars[b0 >> 2] + chars[((b0 & 3) << 4) | (b1 >> 4)]
+           + (q + 1 < png.length ? chars[((b1 & 15) << 2) | (b2 >> 6)] : "=")
+           + (q + 2 < png.length ? chars[b2 & 63] : "=");
+    }
+    return "data:image/png;base64," + b64;
+  }
   global.__screenshotSVG = function () {
     var doc = global.document; if (!doc) return '<svg xmlns="http://www.w3.org/2000/svg"/>';
     /* The painter consumes __box/__lines/__scrollExtent, which only exist
@@ -11770,6 +11850,28 @@ var decl = new CSSStyleDeclaration(el);
           var src = node.getAttribute && node.getAttribute("src");
           if (src) out.push('<image href="' + __escXml(__absUrl(src)) + '" x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" preserveAspectRatio="xMidYMid slice"/>');
           else out.push('<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" fill="#e8e8e8"/>');
+        } else if (tag === "canvas") {
+          /* R3: a canvas with a 2d raster paints its TRUE pixels as an
+             embedded PNG (deflate stored blocks — deterministic). A blank
+             canvas paints the neutral grid placeholder instead of faked
+             content; the 'approximate' disclosure stays for everything
+             that is not a canvas raster. */
+          var raster = node.__raster;
+          var hasContent = false;
+          if (raster && raster.pix) {
+            for (var ci = 3; ci < raster.pix.length; ci += 4) {
+              if (raster.pix[ci] !== 0) { hasContent = true; break; }
+            }
+          }
+          if (hasContent) {
+            var pngUrl = __rasterToPngDataURL(raster);
+            if (pngUrl) {
+              out.push('<image href="' + pngUrl + '" x="' + x + '" y="' + y + '" width="' + Math.min(w, raster.w) + '" height="' + Math.min(h, raster.h) + '" preserveAspectRatio="none"/>');
+            }
+          } else {
+            out.push('<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" fill="#f8f9fa" stroke="#dadce0" stroke-width="1"/>');
+            out.push('<text x="' + (x + w / 2) + '" y="' + (y + h / 2 + 4) + '" text-anchor="middle" font-size="11" font-family="monospace" fill="#5f6368">canvas</text>');
+          }
         } else if (tag === "input" || tag === "select" || tag === "textarea") {
           var type = String((node.getAttribute && node.getAttribute("type")) || "text").toLowerCase();
           /* type=hidden paints nothing, ever: hidden field values are page
