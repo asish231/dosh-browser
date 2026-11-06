@@ -696,3 +696,70 @@ Pre-flight note: a parallel session's commit 925b1db2 already landed
 some WebAudio/OfflineAudioContext/Shadow-DOM presence in minidom.js
 without phase-scoped tests; this phase's work must verify or replace
 those additions rather than assume them.
+
+### Phase 7 — Engine semantics & adversarial (execution; started 2026-11-06)
+
+Order per §3: J5 fork patches first (they gate the engine-lane items),
+then the J1/J2 decisions (record, never fake), then J3/J4 QuickJS-lane
+upgrades as real pages need, then the A1/A2/A5 protocol-lane upgrades.
+One hermetic test per implementable item; decisions get recorded
+decisions + divergence-documenting tests. Both suites green before done.
+
+- [ ] **J5** doshgentv8 fork patches fully wired: fuel metering,
+      host-clock injection, seeded RNG, and checkpoint callback in
+      `doshgentv8/core` (policy overlays, byte-level semantics
+      unchanged), selectable from the seam; tests in the core crate.
+- [ ] **J1** Native WebAssembly decision: wire V8's native WASM in the
+      doshgentv8 lane OR keep the documented divergence explicit —
+      decide, record the decision + rationale here, and pin the
+      divergence with a test (the engine's scoped WASM interpreter
+      stays the Python-lane path).
+- [ ] **J2** Proxy-wrapped TypedArray: record the divergence (throws
+      honestly instead of faking) + divergence-documenting test.
+- [ ] **J3** WeakRef/FinalizationRegistry: upgrade the shim toward real
+      semantics where QuickJS allows (deref after collection where
+      testable; FinalizationRegistry never runs finalizers
+      synchronously — disclosed), with tests.
+- [ ] **J4** Intl/ICU beyond en-US: implement honest locale data for
+      the high-traffic paths real pages use (number/date/currency
+      formatting for the major locales) without pretending to full ICU.
+- [ ] **A1** In-VM obfuscated widget channels: upgrade the port lane
+      (proxy materialization + sender-identity) with a regression test
+      exercising an obfuscated-key channel handshake.
+- [ ] **A2** reCAPTCHA challenge coverage: extend the solver's
+      documented protocol coverage (challenge types it can reject
+      honestly) + tests of the decision path (never fake a pass).
+- [ ] **A5** Login/OTP: verify the capped/never-guess behavior with
+      tests; extend only with honest capabilities.
+- [ ] **Docs** — §2.2/§2.9 rows + AGENTS.md roadmap rows.
+- [ ] **Green** — Python full suite + `cargo test -p dosh-browser-core
+      --lib` + `doshgentv8` core-crate tests.
+
+### Phase 8 — Leftover §2 items (execution; started 2026-11-06)
+
+The items owned by no earlier phase, promoted to a formal phase per
+user decision 2026-11-06: S6, S7, S8, S10, W5, M5. E1 (blocking
+dialogs) is structurally impossible in a synchronous engine and stays
+disclosed, not built.
+
+- [ ] **S6** Cookie/site-data partitioning: third-party cookies and
+      storage partition per (top-site, frame-origin) — double-key
+      partitioning with a hermetic test.
+- [ ] **S7** Deterministic replay engine: ledger + state snapshots +
+      seeds replay a session's decisions in order; test replays a
+      recorded action sequence to the same DOM result.
+- [ ] **S8** bfcache live-heap restore: history back/forward reuses
+      the live realm where safe (same-document traversal already
+      does; cross-document restore upgrades from rebuild+re-run to
+      stored-document restore), disclosed where rebuild remains.
+- [ ] **S10** IndexedDB full semantics: object stores, indexes,
+      transactions with real request lifecycle, cursor iteration.
+- [ ] **W5** structuredClone of class instances: prototype-preserving
+      clone for plain and class instances (no methods lost,
+      honest limits for host objects).
+- [ ] **M5** HLS/DASH extraction: native manifest parsing (m3u8 + mpd)
+      for segment lists with the download lane, so simple streams
+      download without external yt-dlp (complex DRM/encrypted streams
+      stay refused honestly).
+- [ ] **Docs** — §2.5/§2.6/§2.7/§2.8 rows + AGENTS.md roadmap rows.
+- [ ] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`.
