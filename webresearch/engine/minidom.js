@@ -182,6 +182,24 @@
     if (g.MutationObserver) __makeNative(g.MutationObserver, "MutationObserver", 1);
     if (g.IntersectionObserver) __makeNative(g.IntersectionObserver, "IntersectionObserver", 1);
     if (g.ResizeObserver) __makeNative(g.ResizeObserver, "ResizeObserver", 1);
+    if (g.AudioContext) __makeNative(g.AudioContext, "AudioContext", 0);
+    if (g.webkitAudioContext) __makeNative(g.webkitAudioContext, "webkitAudioContext", 0);
+    if (g.OfflineAudioContext) __makeNative(g.OfflineAudioContext, "OfflineAudioContext", 1);
+    if (g.webkitOfflineAudioContext) __makeNative(g.webkitOfflineAudioContext, "webkitOfflineAudioContext", 1);
+    if (g.RTCPeerConnection) __makeNative(g.RTCPeerConnection, "RTCPeerConnection", 0);
+    if (g.webkitRTCPeerConnection) __makeNative(g.webkitRTCPeerConnection, "webkitRTCPeerConnection", 0);
+    if (g.RTCIceCandidate) __makeNative(g.RTCIceCandidate, "RTCIceCandidate", 1);
+    if (g.RTCSessionDescription) __makeNative(g.RTCSessionDescription, "RTCSessionDescription", 1);
+    if (g.SpeechSynthesisUtterance) __makeNative(g.SpeechSynthesisUtterance, "SpeechSynthesisUtterance", 0);
+    if (g.speechSynthesis) {
+      __cloakObject(g.speechSynthesis, {
+        getVoices: 0,
+        speak: 1,
+        cancel: 0,
+        pause: 0,
+        resume: 0
+      });
+    }
   }
 
   function Node(type, name, attrs, kids) {
@@ -5829,6 +5847,16 @@ var decl = new CSSStyleDeclaration(el);
     }
     var arr = worker._listeners && worker._listeners.message;
     if (arr) for (var i = 0; i < arr.length; i++) { try { arr[i](evt); } catch (e) {} }
+    /* W1: SharedWorker exposes its channel through `port`, not the Worker's
+       own onmessage — a consumer doing sw.port.onmessage = ... must hear
+       worker→parent traffic. */
+    if (worker.port) {
+      if (typeof worker.port.onmessage === "function") {
+        try { worker.port.onmessage(evt); } catch (e) {}
+      }
+      var parr = worker.port._listeners && worker.port._listeners.message;
+      if (parr) for (var j = 0; j < parr.length; j++) { try { parr[j](evt); } catch (e) {} }
+    }
   }
 
   /* Pump worker messages: start events and cross-direction deliveries.
@@ -5999,8 +6027,6 @@ var decl = new CSSStyleDeclaration(el);
       }
     };
     this.port = _port;
-    /* Override the parent's postMessage to also fire port.onmessage */
-    var _origFire = _fireParentMessage;
   };
   global.SharedWorker.prototype = Object.create(Worker.prototype);
   global.SharedWorker.prototype.constructor = global.SharedWorker;

@@ -450,3 +450,23 @@ def test_worker_parent_to_worker_message():
         })()
     """))
     assert "echo: ping" in result, f"Expected 'echo: ping', got {result}"
+
+
+def test_shared_worker_port_channel():
+    """W1: SharedWorker consumers hear replies through sw.port.onmessage."""
+    ctx = _ctx("<html><body></body></html>")
+    result = json.loads(ctx.eval("""
+        (function() {
+            var workerCode = 'self.onmessage = function(e) { postMessage("ack:" + e.data); };';
+            var blob = new Blob([workerCode], {type: "application/javascript"});
+            var url = URL.createObjectURL(blob);
+            var sw = new SharedWorker(url);
+            var heard = [];
+            sw.port.onmessage = function(e) { heard.push(e.data); };
+            __advanceTimerClock(1);
+            sw.port.postMessage("ping");
+            __advanceTimerClock(1);
+            return JSON.stringify(heard);
+        })()
+    """))
+    assert result == ["ack:ping"], f"sw.port.onmessage must hear the worker reply, got {result}"
