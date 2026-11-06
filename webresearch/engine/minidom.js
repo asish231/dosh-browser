@@ -2205,6 +2205,53 @@
     walk(doc);
     return rules;
   }
+  /* L9: Parse @keyframes from <style> blocks. Each keyframe block
+     becomes a list of { offset: N/100, props: {...} } entries.
+     Stored per document at doc.__keyframes = { name: [{offset, props}, ...] } */
+  function __collectKeyframes(doc) {
+    var kf = {};
+    function walk(n) {
+      if (!n || !n.childNodes) return;
+      if (n.nodeType === 1 && n.nodeName === "style") {
+        var css = "";
+        n.childNodes.forEach(function (c) { if (c.nodeType === 3) css += __nodeText(c); });
+        css = css.replace(/\/\*[\s\S]*?\*\//g, "");
+        /* Match @keyframes NAME { ... } with nested braces: the body is
+           either non-brace chars or a complete { ... } group. */
+        var kfRe = /@keyframes\s+([a-zA-Z_][a-zA-Z0-9_-]*)\s*\{((?:[^{}]|\{[^{}]*\})*)\}/g;
+        var m;
+        while ((m = kfRe.exec(css)) !== null) {
+          var name = m[1];
+          var body = m[2];
+          var entries = [];
+          var stepRe = /(?:^|[\s;])(from|to|\d+%)\s*\{([^}]*)\}/g;
+          var sm;
+          while ((sm = stepRe.exec(body)) !== null) {
+            var offsetStr = sm[1].trim().toLowerCase();
+            var offsets = [];
+            if (offsetStr === "from") offsets = [0];
+            else if (offsetStr === "to") offsets = [100];
+            else offsets = [parseFloat(offsetStr) || 0];
+            var props = {};
+            sm[2].split(";").forEach(function(d) {
+              var eq = d.indexOf(":");
+              if (eq > 0) {
+                var k = d.slice(0, eq).trim();
+                var v = d.slice(eq + 1).trim();
+                if (k && v) props[k] = v;
+              }
+            });
+            offsets.forEach(function(off) { entries.push({ offset: off / 100, props: props }); });
+          }
+          entries.sort(function(a, b) { return a.offset - b.offset; });
+          if (entries.length > 0) kf[name] = entries;
+        }
+      }
+      n.childNodes.forEach(walk);
+    }
+    walk(doc);
+    return kf;
+  }
   function __matchesSel(el, sel) {
     sel = sel.trim().toLowerCase();
     if (!sel || sel === "*") return true;
@@ -2246,6 +2293,13 @@
     if (key === "flex-direction") return "flexDirection";
     if (key === "justify-content") return "justifyContent";
     if (key === "align-items") return "alignItems";
+    if (key === "animation-name") return "animationName";
+    if (key === "animation-duration") return "animationDuration";
+    if (key === "animation-timing-function") return "animationTimingFunction";
+    if (key === "animation-delay") return "animationDelay";
+    if (key === "animation-iteration-count") return "animationIterationCount";
+    if (key === "animation-direction") return "animationDirection";
+    if (key === "animation-fill-mode") return "animationFillMode";
     /* Declaration keys arrive kebab-case from every real source (stylesheet
        text, the style ATTRIBUTE, computed inline declarations); the cascade
        template is a JS-property (camelCase) table. Without this mapping the
@@ -2288,6 +2342,15 @@
       fontVariant: null,
       fontStretch: null,
       fontSizeAdjust: null,
+      animation: null,
+      animationName: null,
+      animationDuration: null,
+      animationTimingFunction: null,
+      animationDelay: null,
+      animationIterationCount: null,
+      animationDirection: null,
+      animationFillMode: null,
+      transition: null,
       textAlign: null,
       textAlignLast: null,
       lineHeight: null,
@@ -3048,6 +3111,20 @@ var pos = (st.position || "").toLowerCase();
     }
     var root = doc.documentElement || doc;
     var bodyMargin = 8;
+    /* L9: collect @keyframes and register animations before layout so
+       animated property values are available to the layout pass. */
+    try {
+      var kf = __collectKeyframes(doc);
+      if (Object.keys(kf).length > 0) {
+        doc.__keyframes = kf;
+        (function reg(n) {
+          if (!n || n.nodeType !== 1) return;
+          var cs2 = __computedStyle(n, kf.__rules || __collectStyleRules(doc), 16);
+          __registerAnimations(doc, n, cs2);
+          (n.childNodes || []).forEach(function (c) { if (c.nodeType === 1) reg(c); });
+        })(root);
+      }
+    } catch (e) {}
     layoutBlock(root, 0, 0, vw, 16);
     if (root.nodeName === "html") {
       (function shift(n, dx, dy) {
@@ -4593,6 +4670,176 @@ var pos = (st.position || "").toLowerCase();
   ResizeObserver.prototype.disconnect = function () {};
   global.ResizeObserver = ResizeObserver;
 
+  /* L9: CSS animation / transition timing engine.
+     Runs on the frame clock: each __advanceClock tick advances active
+     animations. An element with animation: NAME DURATION gets its
+     animated properties interpolated between keyframes and exposed via
+     getComputedStyle as the interpolated value.
+
+     Honest scope: interpolation is linear between keyframe offsets for
+     numeric/color properties; animation-iteration-count >1 / infinite
+     loops; animation-fill-mode forwards holds the last keyframe. No
+     transition shorthand yet (transition property support is the next
+     step); no animation events (animationstart/end are not dispatched). */
+  function __parseAnimationShorthand(st) {
+    var sh = st.animation;
+    if (!sh) {
+      if (st.animationName) return {
+        name: st.animationName,
+        duration: st.animationDuration || "0s",
+        timing: st.animationTimingFunction || "ease",
+        delay: st.animationDelay || "0s",
+        iterations: st.animationIterationCount || "1",
+        direction: st.animationDirection || "normal",
+        fill: st.animationFillMode || "none"
+      };
+      return null;
+    }
+    var parts = String(sh).trim().split(/\s+/);
+    var name = null, duration = "0s", timing = "ease", delay = "0s", iterations = "1", direction = "normal", fill = "none";
+    parts.forEach(function (p) {
+      if (/^\d+(\.\d+)?(s|ms)$/.test(p)) {
+        if (duration === "0s") duration = p;
+        else if (delay === "0s") delay = p;
+      } else if (/^(linear|ease|ease-in|ease-out|ease-in-out|step-start|step-end)$/.test(p)) {
+        timing = p;
+      } else if (/^\d+$/.test(p) || p === "infinite") {
+        iterations = p;
+      } else if (/^(normal|reverse|alternate|alternate-reverse)$/.test(p)) {
+        direction = p;
+      } else if (/^(none|forwards|backwards|both)$/.test(p)) {
+        fill = p;
+      } else {
+        name = p;
+      }
+    });
+    return { name: name, duration: duration, timing: timing, delay: delay, iterations: iterations, direction: direction, fill: fill };
+  }
+  function __parseTime(s) {
+    s = String(s || "0s").trim();
+    if (/ms$/.test(s)) return parseFloat(s) || 0;
+    if (/s$/.test(s)) return (parseFloat(s) || 0) * 1000;
+    return parseFloat(s) || 0;
+  }
+  /* Interpolate between two CSS values. Handles numbers with units
+     (px, em, %, deg) and rgb()/rgba()/hex colors. */
+  function __lerpCSS(a, b, t) {
+    if (a == null || b == null) return b;
+    a = String(a).trim(); b = String(b).trim();
+    var ma = a.match(/^(-?[\d.]+)(px|em|%|deg|rem|pt)?$/i);
+    var mb = b.match(/^(-?[\d.]+)(px|em|%|deg|rem|pt)?$/i);
+    if (ma && mb) {
+      var va = parseFloat(ma[1]), vb = parseFloat(mb[1]);
+      var unit = ma[2] || mb[2] || "";
+      return String(va + (vb - va) * t) + (unit || "");
+    }
+    /* Color interpolation: hex -> rgb lerp */
+    function hexToRgb(h) {
+      var m = /^#([0-9a-f]{6})$/i.exec(h);
+      if (!m) return null;
+      return [parseInt(m[1].slice(0,2),16), parseInt(m[1].slice(2,4),16), parseInt(m[1].slice(4,6),16)];
+    }
+    var ca = a.toLowerCase().startsWith("#") ? hexToRgb(a) : null;
+    var cb = b.toLowerCase().startsWith("#") ? hexToRgb(b) : null;
+    if (!ca) {
+      var ra = a.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+      if (ra) ca = [parseInt(ra[1]), parseInt(ra[2]), parseInt(ra[3])];
+    }
+    if (!cb) {
+      var rb = b.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+      if (rb) cb = [parseInt(rb[1]), parseInt(rb[2]), parseInt(rb[3])];
+    }
+    if (ca && cb) {
+      var r = Math.round(ca[0] + (cb[0] - ca[0]) * t);
+      var g = Math.round(ca[1] + (cb[1] - ca[1]) * t);
+      var bl = Math.round(ca[2] + (cb[2] - ca[2]) * t);
+      return "rgb(" + r + ", " + g + ", " + bl + ")";
+    }
+    /* Non-interpolable: jump at midpoint */
+    return t < 0.5 ? a : b;
+  }
+  function __ease(t, timing) {
+    timing = String(timing || "ease").toLowerCase();
+    if (timing === "linear") return t;
+    if (timing === "ease-in") return t * t;
+    if (timing === "ease-out") return 1 - (1 - t) * (1 - t);
+    if (timing === "ease-in-out") return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+    if (timing === "step-start") return 1;
+    if (timing === "step-end") return 0;
+    /* ease (default): cubic-bezier(0.25,0.1,0.25,1) approx */
+    return 1 - Math.pow(1 - t, 3);
+  }
+  /* Advance all active animations on the document by dt ms. Called from
+     __advanceClock. */
+  function __advanceAnimations(doc, dt) {
+    if (!doc || !doc.__activeAnimations) return;
+    var still = [];
+    doc.__activeAnimations.forEach(function (anim) {
+      anim.elapsed += dt;
+      var delay = __parseTime(anim.spec.delay);
+      if (anim.elapsed < delay) { still.push(anim); return; }
+      var dur = __parseTime(anim.spec.duration);
+      if (dur <= 0) { still.push(anim); return; }
+      var progress = (anim.elapsed - delay) / dur;
+      var maxIter = (anim.spec.iterations === "infinite") ? Infinity : parseInt(anim.spec.iterations) || 1;
+      var iter = Math.floor(progress);
+      if (iter >= maxIter) {
+        /* Finished: apply fill mode */
+        if (anim.spec.fill === "forwards" || anim.spec.fill === "both") {
+          var last = anim.keyframes[anim.keyframes.length - 1];
+          for (var k in last.props) anim.el.__animProps[k] = last.props[k];
+        } else {
+          anim.el.__animProps = null;
+        }
+        return; /* not pushed to still */
+      }
+      var frac = progress - iter;
+      if (anim.spec.direction === "reverse") frac = 1 - frac;
+      else if (anim.spec.direction === "alternate") frac = (iter % 2 === 1) ? 1 - frac : frac;
+      else if (anim.spec.direction === "alternate-reverse") frac = (iter % 2 === 0) ? 1 - frac : frac;
+      /* Find surrounding keyframes */
+      var kf = anim.keyframes;
+      var i0 = 0, i1 = kf.length - 1;
+      for (var i = 0; i < kf.length; i++) {
+        if (kf[i].offset <= frac) i0 = i;
+        if (kf[i].offset >= frac) { i1 = i; break; }
+      }
+      var span = kf[i1].offset - kf[i0].offset;
+      var t = span > 0 ? (frac - kf[i0].offset) / span : 1;
+      t = __ease(Math.max(0, Math.min(1, t)), anim.spec.timing);
+      var props0 = kf[i0].props, props1 = kf[i1].props;
+      if (!anim.el.__animProps) anim.el.__animProps = {};
+      for (var k2 in props1) {
+        var v0 = props0[k2] != null ? props0[k2] : props1[k2];
+        var v1 = props1[k2];
+        anim.el.__animProps[k2] = __lerpCSS(v0, v1, t);
+      }
+      still.push(anim);
+    });
+    doc.__activeAnimations = still;
+  }
+  /* Register animations for elements with animation: NAME DURATION. Called
+     during layout passes (cheap no-op when no keyframes defined). */
+  function __registerAnimations(doc, el, cs) {
+    if (!doc.__keyframes || Object.keys(doc.__keyframes).length === 0) return;
+    var spec = __parseAnimationShorthand(cs);
+    if (!spec || !spec.name || !doc.__keyframes[spec.name]) {
+      /* clear stale */
+      if (el.__animProps) el.__animProps = null;
+      return;
+    }
+    /* Check if already registered with the same spec */
+    if (el.__animSpec === spec.name + "|" + spec.duration) return;
+    el.__animSpec = spec.name + "|" + spec.duration;
+    el.__animProps = {};
+    doc.__activeAnimations = doc.__activeAnimations || [];
+    doc.__activeAnimations.push({
+      el: el, keyframes: doc.__keyframes[spec.name], spec: spec, elapsed: 0
+    });
+    /* Apply initial values from the delay/first keyframe so getComputedStyle
+       returns the correct value even before any __advanceClock call. */
+    __advanceAnimations(doc, 0);
+  }
   global.getComputedStyle = function (el) {
     if (!el) {
       return { getPropertyValue: function () { return ""; }, length: 0 };
@@ -4623,6 +4870,12 @@ var decl = new CSSStyleDeclaration(el);
           var v = cs[pk];
           if (v == null || v === "") continue;
           decl[pk] = String(v);
+        }
+        /* L9: overlay animated property values from active keyframe animation */
+        if (el.__animProps) {
+          for (var ak in el.__animProps) {
+            if (el.__animProps[ak] != null) decl[ak] = String(el.__animProps[ak]);
+          }
         }
       } finally {
         decl.__parsing = false;
@@ -8750,6 +9003,11 @@ var decl = new CSSStyleDeclaration(el);
     var _clockOffset = 0;
     global.__advanceClock = function (ms) {
       _clockOffset += Math.max(0, Number(ms) || 0);
+      /* L9: advance CSS animations/transitions on the same clock tick */
+      try {
+        var doc = global.document;
+        if (doc) __advanceAnimations(doc, Math.max(0, Number(ms) || 0));
+      } catch (e) {}
       return _clockOffset;
     };
     global.__getClockOffset = function () { return _clockOffset; };

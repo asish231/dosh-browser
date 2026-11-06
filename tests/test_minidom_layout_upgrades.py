@@ -302,3 +302,77 @@ def test_smooth_scroll_reports_intermediate_positions():
     assert len(positions) >= 2, f"Expected intermediate positions, got {positions}"
     assert positions[0] < 1000, f"First intermediate should be < 1000, got {positions[0]}"
     assert positions[-1] == 1000, f"Last should be target 1000, got {positions[-1]}"
+
+
+def test_css_keyframes_animation_interpolation():
+    """L9: @keyframes animation interpolates opacity between keyframes."""
+    html = """<!doctype html><html><head><style>
+        @keyframes fade {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        #box { animation: fade 1s linear; }
+    </style></head><body>
+        <div id="box">Hello</div>
+    </body></html>"""
+    ctx = _ctx(html)
+    # Trigger layout to register the animation
+    ctx.eval("document.getElementById('box').getBoundingClientRect();")
+    # At start (elapsed=0), opacity should be 0 (from keyframe)
+    op0 = ctx.eval("getComputedStyle(document.getElementById('box')).opacity")
+    # Advance the clock by 500ms (halfway)
+    ctx.eval("__advanceClock(500);")
+    op_mid = ctx.eval("getComputedStyle(document.getElementById('box')).opacity")
+    # Advance past the end
+    ctx.eval("__advanceClock(600);")
+    op_end = ctx.eval("getComputedStyle(document.getElementById('box')).opacity")
+    assert op0 in ("0", "0.0", ""), f"start opacity should be ~0, got {op0}"
+    mid = float(op_mid) if op_mid else 0.0
+    assert 0.0 < mid < 1.0, f"mid opacity should be between 0 and 1, got {mid}"
+    # After animation ends (1s duration, no fill-forwards), opacity reverts to
+    # the cascade value (1 from the default) or stays at end
+    end = float(op_end) if op_end else 1.0
+    assert end >= mid, f"end opacity should be >= mid, got {end}"
+
+
+def test_css_keyframes_fill_forwards():
+    """L9: animation-fill-mode: forwards holds the last keyframe value."""
+    html = """<!doctype html><html><head><style>
+        @keyframes slide {
+            from { left: 0px; }
+            to { left: 100px; }
+        }
+        #mover { position: absolute; animation: slide 0.5s linear forwards; }
+    </style></head><body>
+        <div id="mover">M</div>
+    </body></html>"""
+    ctx = _ctx(html)
+    ctx.eval("document.getElementById('mover').getBoundingClientRect();")
+    # Advance past animation end
+    ctx.eval("__advanceClock(600); 600;")
+    left_end = ctx.eval("getComputedStyle(document.getElementById('mover')).left")
+    assert left_end == "100px", f"fill-forwards should hold 100px, got {left_end}"
+
+
+def test_css_keyframes_parsed_from_stylesheet():
+    """L9: @keyframes blocks are parsed into document.__keyframes."""
+    html = """<!doctype html><html><head><style>
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        #p { animation: pulse 2s; }
+    </style></head><body>
+        <div id="p">P</div>
+    </body></html>"""
+    ctx = _ctx(html)
+    ctx.eval("document.getElementById('p').getBoundingClientRect();")
+    kf = json.loads(ctx.eval("""
+        (function() {
+            var k = document.__keyframes || {};
+            return JSON.stringify({ names: Object.keys(k), pulseSteps: (k.pulse || []).map(function(e) { return e.offset; }) });
+        })()
+    """))
+    assert "pulse" in kf["names"], f"pulse should be parsed, got {kf['names']}"
+    assert kf["pulseSteps"] == [0, 0.5, 1.0], f"steps should be 0/0.5/1, got {kf['pulseSteps']}"
