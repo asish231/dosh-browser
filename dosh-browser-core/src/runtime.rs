@@ -461,7 +461,8 @@ impl Runtime {
         }
         let tree = tree::html_to_tree(html);
         let payload = serde_json::to_string(&tree).map_err(|e| e.to_string())?;
-        self.engine.eval(&format!("__load({payload}, {}); true", json!(url)))?;
+        let escaped = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+        self.engine.eval(&format!("__load(JSON.parse({escaped}), {}); true", json!(url)))?;
         // Clear initial hydration elements from the injected script queue
         self.engine.eval("globalThis.__WR_INJECTED_SCRIPTS = []; true")?;
         let mut parena = doshgentv8_core::parena::Parena::new();
@@ -918,5 +919,13 @@ mod tests {
         assert!(non_zero, "readPixels must return non-zero pseudo-rasterized pixel values");
         assert_eq!(val["a"], 255, "readPixels alpha must be fully opaque");
         assert_eq!(val["cloaked"], true, "readPixels must be cloaked as native code");
+    }
+
+    #[test]
+    fn test_runtime_load_tricky_html_entities() {
+        let client = Client::new();
+        let mut rt = Runtime::new(client, "https://example.com").unwrap();
+        let html = "<html><body><script>var x = 'hello \\\"world\\\" \u{2028} and \u{2029}';</script></body></html>";
+        assert!(rt.load_document(html, "https://example.com").is_ok());
     }
 }

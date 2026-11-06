@@ -548,3 +548,33 @@ flex rewrite, naive floats, bidi and sticky adds. An earlier misdiagnosis
 (body margin-shift conditional) broke `scrollWidth` semantics and the
 `test_css_grid_layout_columns_and_gap` expectation; reverted to HEAD behavior
 (8px unconditional shift) and re-verified green before continuing.
+
+### Phase 5 — Workers / WASM substrate (execution; started 2026-11-06)
+
+Order per §3: W1 Worker emulation first (message queue + child realm), then
+W2 Service Worker execution, W3 WASM float/extended opcodes, W4 cross-realm
+MessagePort. Both lanes share minidom.js. One hermetic test per item. Both
+suites green before the phase is called done.
+
+- [ ] **W1** Web Worker emulation: `new Worker(url)` fetches the script (real
+      URL via host_fetch; blob: from the blob store), runs it in a child realm
+      (function scope with worker-only globals: `self`, `postMessage`,
+      `onmessage`, `close`, `importScripts`), and wires a real message queue
+      pumped by the existing `__drainTimers` pump — parent→worker and
+      worker→parent messages deliver between turns, never synchronously.
+      `terminate()` stops the pump. `SharedWorker` gets a shared port.
+- [ ] **W2** Service Worker execution: `navigator.serviceWorker.register(url)`
+      fetches and runs the SW script in a ServiceWorkerGlobalScope realm with
+      `fetch` event handlers + `event.respondWith`; page fetches within the SW
+      scope route through the SW's respondWith promise.
+- [ ] **W3** WASM float + extended opcodes: f32/f64 types (const 0x43/0x44,
+      comparisons 0x5B–0x66, arithmetic 0x7B–0x8F, min/max/copysign/abs/neg/
+      ceil/floor/trunc/nearest/sqrt), f32/f64 memory load/store (0x2A/0x2B/
+      0x38/0x39), i64 consts (0x42) where QuickJS supports them, wrap/extend/
+      trunc conversions (0xA7–0xAC), sign extensions (0xA0–0xA4, 0xC0–0xC4).
+      Fuel metering unchanged.
+- [ ] **W4** Cross-realm MessagePort: transferred ports route in the receiving
+      realm — `postMessage` on the received end queues to the sender, the
+      buffer is live (not inert).
+- [ ] **Docs** — §2.7 rows + AGENTS.md roadmap rows.
+- [ ] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`.
