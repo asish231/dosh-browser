@@ -311,6 +311,27 @@ impl Session {
         HashMap::new()
     }
 
+    /// Inject federated session cookies into both the live HTTP/2 jar and resident JS runtime.
+    pub fn set_cookie(&mut self, cookie_str: &str, url: &str) -> Result<(), String> {
+        if let Ok(parsed) = url::Url::parse(url) {
+            self.network.set_cookie(cookie_str, &parsed);
+            let tab_id = self.current_tab().id.clone();
+            if let Some(rt) = self.runtimes.get(&tab_id) {
+                if let Ok(mut map) = rt.seam.0.cookies.lock() {
+                    for part in cookie_str.split(';') {
+                        let trimmed = part.trim();
+                        if let Some((k, v)) = trimmed.split_once('=') {
+                            map.insert(k.trim().to_string(), v.trim().to_string());
+                        }
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            Err(format!("invalid URL: {url}"))
+        }
+    }
+
     pub fn switch_tab(&mut self, tab_id: &str) -> Result<(), String> {
         if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
             self.current_tab_idx = idx;

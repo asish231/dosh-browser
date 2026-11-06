@@ -168,6 +168,9 @@ pub fn build_acd(
             chrome_skipped += 1;
             continue;
         }
+        if crate::actions::is_inline_hidden(node) {
+            continue;
+        }
         let tag = tag_name(node);
         
         if budget_hit { continue; }
@@ -228,6 +231,7 @@ pub fn build_acd(
                 for node in sel_iter {
                     let n = node.as_node();
                     if inside_chrome(n, Some(&root)) { continue; }
+                    if crate::actions::is_inline_hidden(n) { continue; }
                     region_nodes.push(n.clone());
                 }
             }

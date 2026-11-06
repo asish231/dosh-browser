@@ -933,6 +933,30 @@ pub async fn execute_command(
                 "note": "live session cookie jar; values are never echoed (lengths only with values=true; real values require values=raw + the audited reveal gate)"
             }))
         }
+        "cookies.set" | "auth.import" => {
+            let target_url = args.get("url")
+                .or_else(|| args.get("domain"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| &session.current_tab().url);
+            let cookie_str = args.get("cookie")
+                .or_else(|| args.get("cookies"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if target_url.is_empty() || cookie_str.is_empty() {
+                return Err("url (or domain) and cookie (or cookies) are required".into());
+            }
+            let full_url = if !target_url.starts_with("http://") && !target_url.starts_with("https://") {
+                format!("https://{target_url}")
+            } else {
+                target_url.to_string()
+            };
+            session.set_cookie(cookie_str, &full_url)?;
+            Ok(serde_json::json!({
+                "imported": true,
+                "url": full_url,
+                "note": "federated session cookies injected into live HTTP/2 jar and JS runtime"
+            }))
+        }
         "snapshot" => {
             let tab = session.current_tab();
             let actions = crate::actions::extract_actions(&tab.html, &tab.url, 100);
@@ -2617,5 +2641,27 @@ mod tests {
         // 10. gate
         let gt = execute_command("gate", &serde_json::json!({"gate": "eval", "allowed": false}), &mut session, &store).await.unwrap();
         assert_eq!(gt["eval_allowed"], false);
+    }
+
+    #[tokio::test]
+    async fn test_auth_import_federated_cookie() {
+        let client = reqwest::Client::new();
+        let mut session = Session::new(client);
+        let store = ShellStore::new(None).unwrap();
+
+        let _ = session.goto_html("<html><body><h1>Test</h1></body></html>", "https://example.com/app", 4000);
+        let res = execute_command(
+            "auth.import",
+            &serde_json::json!({
+                "url": "https://example.com/app",
+                "cookie": "sid=xyz123abc; Path=/; Domain=example.com"
+            }),
+            &mut session,
+            &store,
+        ).await.unwrap();
+
+        assert_eq!(res["imported"], true);
+        assert!(session.current_cookies().contains_key("sid"));
+        assert_eq!(session.current_cookies().get("sid").unwrap(), "xyz123abc");
     }
 }

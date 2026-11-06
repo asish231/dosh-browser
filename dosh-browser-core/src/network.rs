@@ -132,6 +132,7 @@ impl std::error::Error for NetworkError {}
 pub struct NetworkEngine {
     pub config: NetworkConfig,
     client: Client,
+    pub cookie_jar: Arc<reqwest::cookie::Jar>,
     /// Retry client with `danger_accept_invalid_certs(true)`, used only for
     /// requests to hosts listed in `WEBRESEARCH_TLS_PROCEED_HOSTS` (an explicit
     /// operator decision; recorded in the network ledger as proceeded-unverified).
@@ -155,8 +156,9 @@ impl Default for NetworkEngine {
 impl NetworkEngine {
     /// Initialize a new NetworkEngine with the given configuration.
     pub fn new(config: NetworkConfig) -> Self {
+        let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
         let client = Client::builder()
-            .cookie_store(true)
+            .cookie_provider(Arc::clone(&cookie_jar))
             .build()
             .unwrap_or_else(|_| Client::new());
 
@@ -165,7 +167,7 @@ impl NetworkEngine {
         // delegated to tls_policy::decision_for_host at dispatch time.
         let insecure_client = if std::env::var("WEBRESEARCH_TLS_PROCEED_HOSTS").is_ok() {
             Client::builder()
-                .cookie_store(true)
+                .cookie_provider(Arc::clone(&cookie_jar))
                 .danger_accept_invalid_certs(true)
                 .build()
                 .ok()
@@ -190,6 +192,7 @@ impl NetworkEngine {
         Self {
             config,
             client,
+            cookie_jar,
             insecure_client,
             ip_filter,
             rate_limiter,
@@ -200,6 +203,11 @@ impl NetworkEngine {
             trackers,
             ledger,
         }
+    }
+
+    /// Inject raw cookie header string for a URL into the live HTTP/2 cookie jar.
+    pub fn set_cookie(&self, cookie_str: &str, url: &Url) {
+        self.cookie_jar.add_cookie_str(cookie_str, url);
     }
 
     /// Primary entry point: process a request through the full network pipeline.
