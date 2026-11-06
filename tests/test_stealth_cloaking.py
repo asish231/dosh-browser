@@ -191,3 +191,58 @@ def test_navigator_agentic_pruned_stubs_and_cloaking(js_ctx):
     assert data["xr_val"] == "undefined"
 
 
+def test_webgl_pseudo_rasterizer_and_read_pixels(js_ctx):
+    res = js_ctx.eval("""
+        var canvas = document.createElement("canvas");
+        var gl = canvas.getContext("webgl");
+
+        // Verify standard constants exist
+        var hasConsts = gl.VERTEX_SHADER === 0x8B31 && gl.RGBA === 0x1908 && gl.UNSIGNED_BYTE === 0x1401;
+
+        // Verify shader/program pipeline stubs
+        var vs = gl.createShader(gl.VERTEX_SHADER);
+        gl.shaderSource(vs, "attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }");
+        gl.compileShader(vs);
+        var prog = gl.createProgram();
+        gl.attachShader(prog, vs);
+        gl.linkProgram(prog);
+        gl.useProgram(prog);
+
+        var posAttr = gl.getAttribLocation(prog, "p");
+        var uLoc = gl.getUniformLocation(prog, "u_matrix");
+        gl.enableVertexAttribArray(posAttr);
+        gl.vertexAttribPointer(posAttr, 2, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        // Verify readPixels does not throw and returns believable non-zero pixel bytes
+        var pixels = new Uint8Array(4);
+        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+
+        var nonZero = pixels[0] > 0 || pixels[1] > 0 || pixels[2] > 0;
+        var alphaOpaque = pixels[3] === 255;
+
+        // Verify cloaking
+        var readPixelsNative = gl.readPixels.toString().indexOf("[native code]") !== -1;
+        var getAttribNative = gl.getAttribLocation.toString().indexOf("[native code]") !== -1;
+
+        JSON.stringify({
+            hasConsts: hasConsts,
+            posAttr: posAttr,
+            uLocExists: uLoc != null,
+            pixels: Array.from(pixels),
+            nonZero: nonZero,
+            alphaOpaque: alphaOpaque,
+            readPixelsNative: readPixelsNative,
+            getAttribNative: getAttribNative
+        });
+    """)
+    data = json.loads(res)
+    assert data["hasConsts"] is True
+    assert data["uLocExists"] is True
+    assert data["nonZero"] is True
+    assert data["alphaOpaque"] is True
+    assert data["readPixelsNative"] is True
+    assert data["getAttribNative"] is True
+
+
+

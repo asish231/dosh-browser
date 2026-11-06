@@ -437,16 +437,8 @@ impl Runtime {
         engine.eval(&format!("globalThis.__WR_UA = {}; true", json!(ua)))?;
         engine.eval(&format!("globalThis.__WR_CTX_KEY = {}; true", json!(ctx_key)))?;
 
-        let device = json!({
-            "platform": "Darwin",
-            "cpu_brand": "Apple M-Series",
-            "cpu_count": 8,
-            "machine_model": "MacBookPro",
-            "gpu_renderer": "ANGLE (Apple, Metal)",
-            "gpu_vendor": "Google Inc. (Apple)",
-            "is_virtual": false,
-            "is_real_device": true,
-        });
+        let dev_prof = crate::device::detect_device_profile();
+        let device = json!(dev_prof);
         engine.eval(&format!("globalThis.__WR_DEVICE = {}; true", device))?;
 
         // 3. Boot minidom.js
@@ -887,5 +879,44 @@ mod tests {
         });
         let mutated = rt.apply_action(&action).unwrap();
         assert!(mutated.contains("data-clicked") || rt.eval("document.body.getAttribute('data-clicked')").unwrap() == "true");
+    }
+
+    #[test]
+    fn test_runtime_webgl_readpixels_emulation() {
+        let client = Client::new();
+        let mut rt = Runtime::new(client, "https://example.com").unwrap();
+        rt.load_document("<html><body><canvas id='c'></canvas></body></html>", "https://example.com").unwrap();
+        let js = r#"
+            (function() {
+                var c = document.getElementById('c');
+                var gl = c.getContext('webgl');
+                if (!gl) return JSON.stringify({ ok: false, error: 'no webgl' });
+                var prog = gl.createProgram();
+                var vs = gl.createShader(gl.VERTEX_SHADER);
+                gl.shaderSource(vs, 'attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }');
+                gl.compileShader(vs);
+                gl.attachShader(prog, vs);
+                gl.linkProgram(prog);
+                gl.useProgram(prog);
+                gl.drawArrays(gl.TRIANGLES, 0, 3);
+                var px = new Uint8Array(4);
+                gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+                return JSON.stringify({
+                    ok: true,
+                    r: px[0],
+                    g: px[1],
+                    b: px[2],
+                    a: px[3],
+                    cloaked: gl.readPixels.toString().indexOf('[native code]') !== -1
+                });
+            })()
+        "#;
+        let out = rt.eval(js).unwrap();
+        let val: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(val["ok"], true);
+        let non_zero = val["r"].as_u64().unwrap() > 0 || val["g"].as_u64().unwrap() > 0 || val["b"].as_u64().unwrap() > 0;
+        assert!(non_zero, "readPixels must return non-zero pseudo-rasterized pixel values");
+        assert_eq!(val["a"], 255, "readPixels alpha must be fully opaque");
+        assert_eq!(val["cloaked"], true, "readPixels must be cloaked as native code");
     }
 }

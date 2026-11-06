@@ -5081,21 +5081,143 @@ var decl = new CSSStyleDeclaration(el);
       getContextAttributes: function () {
         return { alpha: true, antialias: true, depth: true, stencil: false, premultipliedAlpha: true };
       },
-      createBuffer: function () { return {}; }, bindBuffer: function () {},
-      createShader: function () { return {}; }, shaderSource: function () {}, compileShader: function () {},
-      createProgram: function () { return {}; }, attachShader: function () {}, linkProgram: function () {},
-      getProgramParameter: function () { return true; }, getShaderParameter: function () { return true; },
-      useProgram: function () {}, drawArrays: function () {}, drawElements: function () {},
-      clearColor: function () {}, clear: function () {}, viewport: function () {},
-      enable: function () {}, disable: function () {}, getError: function () { return 0; },
-      isContextLost: function () { return false; }
+      createBuffer: function () { return {}; },
+      bindBuffer: function () {},
+      bufferData: function () {},
+      bufferSubData: function () {},
+      createShader: function (type) { return { __type: type }; },
+      shaderSource: function () {},
+      compileShader: function () {},
+      createProgram: function () { return {}; },
+      attachShader: function () {},
+      detachShader: function () {},
+      linkProgram: function () {},
+      getProgramParameter: function () { return true; },
+      getShaderParameter: function () { return true; },
+      getProgramInfoLog: function () { return ""; },
+      getShaderInfoLog: function () { return ""; },
+      getShaderPrecisionFormat: function () { return { precision: 23, rangeMin: 127, rangeMax: 127 }; },
+      useProgram: function () {},
+      getAttribLocation: function (prog, name) { return 0; },
+      getUniformLocation: function (prog, name) { return { name: String(name || "") }; },
+      enableVertexAttribArray: function () {},
+      disableVertexAttribArray: function () {},
+      vertexAttribPointer: function () {},
+      uniform1f: function () {}, uniform2f: function () {}, uniform3f: function () {}, uniform4f: function () {},
+      uniform1i: function () {}, uniform2i: function () {}, uniform3i: function () {}, uniform4i: function () {},
+      uniform1fv: function () {}, uniform2fv: function () {}, uniform3fv: function () {}, uniform4fv: function () {},
+      uniform1iv: function () {}, uniform2iv: function () {}, uniform3iv: function () {}, uniform4iv: function () {},
+      uniformMatrix2fv: function () {}, uniformMatrix3fv: function () {}, uniformMatrix4fv: function () {},
+      drawArrays: function () { if (canvas) canvas.__ops = (canvas.__ops || 0) + 1; },
+      drawElements: function () { if (canvas) canvas.__ops = (canvas.__ops || 0) + 1; },
+      clearColor: function () {},
+      clear: function () { if (canvas) canvas.__ops = (canvas.__ops || 0) + 1; },
+      viewport: function () {},
+      enable: function () {},
+      disable: function () {},
+      getError: function () { return 0; },
+      isContextLost: function () { return false; },
+      createTexture: function () { return {}; },
+      bindTexture: function () {},
+      texImage2D: function () {},
+      texSubImage2D: function () {},
+      texParameteri: function () {},
+      texParameterf: function () {},
+      generateMipmap: function () {},
+      pixelStorei: function () {},
+      createFramebuffer: function () { return {}; },
+      bindFramebuffer: function () {},
+      createRenderbuffer: function () { return {}; },
+      bindRenderbuffer: function () {},
+      renderbufferStorage: function () {},
+      framebufferRenderbuffer: function () {},
+      framebufferTexture2D: function () {},
+      checkFramebufferStatus: function () { return 0x8CD5; },
+      deleteBuffer: function () {},
+      deleteShader: function () {},
+      deleteProgram: function () {},
+      deleteTexture: function () {},
+      deleteFramebuffer: function () {},
+      deleteRenderbuffer: function () {},
+      readPixels: function (x, y, w, h, format, type, pixels) {
+        if (!pixels || !pixels.length) return;
+        var ops = (canvas && canvas.__ops) ? canvas.__ops : 1;
+        var dev = (typeof global.__WR_DEVICE === "object" && global.__WR_DEVICE) ? global.__WR_DEVICE : {};
+        var devSeed = (dev.gpu_renderer || "").length * 13;
+        var seed = (ops * 37) + ((x || 0) * 19) + ((y || 0) * 11) + devSeed;
+        for (var i = 0; i < pixels.length; i++) {
+          var px = Math.floor(i / 4);
+          var ch = i % 4;
+          if (ch === 3) {
+            pixels[i] = 255;
+          } else {
+            pixels[i] = (((seed ^ (px * 1013904223) ^ (ch * 2654435761)) >>> 0) % 254) + 1;
+          }
+        }
+      },
+      // Standard WebGL Enums
+      VERTEX_SHADER: 0x8B31,
+      FRAGMENT_SHADER: 0x8B30,
+      ARRAY_BUFFER: 0x8892,
+      ELEMENT_ARRAY_BUFFER: 0x8893,
+      STATIC_DRAW: 0x88E4,
+      DYNAMIC_DRAW: 0x88E8,
+      FLOAT: 0x1406,
+      UNSIGNED_BYTE: 0x1401,
+      RGBA: 0x1908,
+      RGB: 0x1907,
+      COLOR_BUFFER_BIT: 0x00004000,
+      DEPTH_BUFFER_BIT: 0x00000100,
+      TRIANGLES: 0x0004,
+      TRIANGLE_STRIP: 0x0005,
+      TEXTURE_2D: 0x0DE1,
+      TEXTURE_WRAP_S: 0x2802,
+      TEXTURE_WRAP_T: 0x2803,
+      TEXTURE_MAG_FILTER: 0x2800,
+      TEXTURE_MIN_FILTER: 0x2801,
+      LINEAR: 0x2601,
+      NEAREST: 0x2600,
+      FRAMEBUFFER: 0x8D40,
+      RENDERBUFFER: 0x8D41,
+      FRAMEBUFFER_COMPLETE: 0x8CD5
     };
     __cloakObject(ctxObj, {
       getParameter: 1,
       getSupportedExtensions: 0,
       getExtension: 1,
       getContextAttributes: 0,
-      isContextLost: 0
+      isContextLost: 0,
+      createBuffer: 0,
+      bindBuffer: 2,
+      bufferData: 3,
+      createShader: 1,
+      shaderSource: 2,
+      compileShader: 1,
+      createProgram: 0,
+      attachShader: 2,
+      linkProgram: 1,
+      getProgramParameter: 2,
+      getShaderParameter: 2,
+      useProgram: 1,
+      getAttribLocation: 2,
+      getUniformLocation: 2,
+      enableVertexAttribArray: 1,
+      disableVertexAttribArray: 1,
+      vertexAttribPointer: 6,
+      uniform1f: 2, uniform1i: 2, uniform4f: 5,
+      drawArrays: 3,
+      drawElements: 4,
+      clearColor: 4,
+      clear: 1,
+      viewport: 4,
+      enable: 1,
+      disable: 1,
+      getError: 0,
+      createTexture: 0,
+      bindTexture: 2,
+      texImage2D: 9,
+      texParameteri: 3,
+      readPixels: 7
     });
     return ctxObj;
   }
@@ -6301,6 +6423,173 @@ var decl = new CSSStyleDeclaration(el);
       } else if (op === 0x78) {
         var b = (stack.pop() || 0) & 0x1F; var a = (stack.pop() || 0) >>> 0;
         stack.push((((a >>> b) | (a << (32 - b)))) | 0);
+      }
+      /* ---- W3: f32/f64 memory load/store ---- */
+      else if (op === 0x2A) { /* f32.load */
+        var rAl = __readU32Leb(code, pc); pc = rAl[1];
+        var rOff = __readU32Leb(code, pc); var memOff = rOff[0]; pc = rOff[1];
+        var base = stack.pop() || 0;
+        if (dv) stack.push(dv.getFloat32(base + memOff, true)); else stack.push(0);
+      } else if (op === 0x2B) { /* f64.load */
+        var rAl = __readU32Leb(code, pc); pc = rAl[1];
+        var rOff = __readU32Leb(code, pc); var memOff = rOff[0]; pc = rOff[1];
+        var base = stack.pop() || 0;
+        if (dv) stack.push(dv.getFloat64(base + memOff, true)); else stack.push(0);
+      } else if (op === 0x38) { /* f32.store */
+        var rAl = __readU32Leb(code, pc); pc = rAl[1];
+        var rOff = __readU32Leb(code, pc); var memOff = rOff[0]; pc = rOff[1];
+        var val = stack.pop() || 0; var base = stack.pop() || 0;
+        if (dv) dv.setFloat32(base + memOff, val, true);
+      } else if (op === 0x39) { /* f64.store */
+        var rAl = __readU32Leb(code, pc); pc = rAl[1];
+        var rOff = __readU32Leb(code, pc); var memOff = rOff[0]; pc = rOff[1];
+        var val = stack.pop() || 0; var base = stack.pop() || 0;
+        if (dv) dv.setFloat64(base + memOff, val, true);
+      }
+      /* ---- W3: f32/f64 constants ---- */
+      else if (op === 0x43) { /* f32.const — 4-byte IEEE754 LE */
+        if (pc + 4 > code.length) throw new Error("unexpected end of f32.const");
+        var f32buf = new DataView(code.buffer, code.byteOffset + pc, 4);
+        pc += 4;
+        stack.push(f32buf.getFloat32(0, true));
+      } else if (op === 0x44) { /* f64.const — 8-byte IEEE754 LE */
+        if (pc + 8 > code.length) throw new Error("unexpected end of f64.const");
+        var f64buf = new DataView(code.buffer, code.byteOffset + pc, 8);
+        pc += 8;
+        stack.push(f64buf.getFloat64(0, true));
+      } else if (op === 0x42) { /* i64.const — signed LEB128 */
+        var rI64 = __readI32Leb(code, pc); pc = rI64[1];
+        stack.push(rI64[0]);
+      }
+      /* ---- W3: f32 comparisons (0x5B–0x60) ---- */
+      else if (op >= 0x5B && op <= 0x60) {
+        var b = +stack.pop(); var a = +stack.pop();
+        var r5B = 0;
+        if (op === 0x5B) r5B = (a === b) ? 1 : 0;          /* f32.eq */
+        else if (op === 0x5C) r5B = (a !== b) ? 1 : 0;     /* f32.ne */
+        else if (op === 0x5D) r5B = (a < b) ? 1 : 0;       /* f32.lt */
+        else if (op === 0x5E) r5B = (a > b) ? 1 : 0;       /* f32.gt */
+        else if (op === 0x5F) r5B = (a <= b) ? 1 : 0;      /* f32.le */
+        else if (op === 0x60) r5B = (a >= b) ? 1 : 0;      /* f32.ge */
+        stack.push(r5B);
+      }
+      /* ---- W3: f64 comparisons (0x61–0x66) ---- */
+      else if (op >= 0x61 && op <= 0x66) {
+        var b = +stack.pop(); var a = +stack.pop();
+        var r61 = 0;
+        if (op === 0x61) r61 = (a === b) ? 1 : 0;          /* f64.eq */
+        else if (op === 0x62) r61 = (a !== b) ? 1 : 0;     /* f64.ne */
+        else if (op === 0x63) r61 = (a < b) ? 1 : 0;       /* f64.lt */
+        else if (op === 0x64) r61 = (a > b) ? 1 : 0;       /* f64.gt */
+        else if (op === 0x65) r61 = (a <= b) ? 1 : 0;      /* f64.le */
+        else if (op === 0x66) r61 = (a >= b) ? 1 : 0;      /* f64.ge */
+        stack.push(r61);
+      }
+      /* ---- W3: f32 unary arithmetic (0x7B–0x81) ---- */
+      else if (op >= 0x7B && op <= 0x81) {
+        var a = +stack.pop();
+        var r7B = 0;
+        if (op === 0x7B) r7B = -a;                          /* f32.neg */
+        else if (op === 0x7C) r7B = Math.abs(a);            /* f32.abs */
+        else if (op === 0x7D) r7B = Math.ceil(a);           /* f32.ceil */
+        else if (op === 0x7E) r7B = Math.floor(a);          /* f32.floor */
+        else if (op === 0x7F) r7B = Math.trunc(a);          /* f32.trunc */
+        else if (op === 0x80) r7B = Math.round(a);          /* f32.nearest */
+        else if (op === 0x81) r7B = Math.sqrt(a);           /* f32.sqrt */
+        stack.push(Math.fround(r7B));
+      }
+      /* ---- W3: f32 binary arithmetic (0x82–0x88) ---- */
+      else if (op >= 0x82 && op <= 0x88) {
+        var b = +stack.pop(); var a = +stack.pop();
+        var r82 = 0;
+        if (op === 0x82) r82 = a + b;                       /* f32.add */
+        else if (op === 0x83) r82 = a - b;                  /* f32.sub */
+        else if (op === 0x84) r82 = a * b;                  /* f32.mul */
+        else if (op === 0x85) r82 = a / b;                  /* f32.div */
+        else if (op === 0x86) r82 = Math.min(a, b);         /* f32.min */
+        else if (op === 0x87) r82 = Math.max(a, b);         /* f32.max */
+        else if (op === 0x88) r82 = Math.abs(a) * Math.sign(b); /* f32.copysign */
+        stack.push(Math.fround(r82));
+      }
+      /* ---- W3: f64 unary arithmetic (0x89–0x8F) ---- */
+      else if (op >= 0x89 && op <= 0x8F) {
+        var a = +stack.pop();
+        var r89 = 0;
+        if (op === 0x89) r89 = -a;                          /* f64.neg */
+        else if (op === 0x8A) r89 = Math.abs(a);            /* f64.abs */
+        else if (op === 0x8B) r89 = Math.ceil(a);           /* f64.ceil */
+        else if (op === 0x8C) r89 = Math.floor(a);          /* f64.floor */
+        else if (op === 0x8D) r89 = Math.trunc(a);          /* f64.trunc */
+        else if (op === 0x8E) r89 = Math.round(a);          /* f64.nearest */
+        else if (op === 0x8F) r89 = Math.sqrt(a);           /* f64.sqrt */
+        stack.push(r89);
+      }
+      /* ---- W3: f64 binary arithmetic (0x90–0x96) ---- */
+      else if (op >= 0x90 && op <= 0x96) {
+        var b = +stack.pop(); var a = +stack.pop();
+        var r90 = 0;
+        if (op === 0x90) r90 = a + b;                       /* f64.add */
+        else if (op === 0x91) r90 = a - b;                  /* f64.sub */
+        else if (op === 0x92) r90 = a * b;                  /* f64.mul */
+        else if (op === 0x93) r90 = a / b;                  /* f64.div */
+        else if (op === 0x94) r90 = Math.min(a, b);         /* f64.min */
+        else if (op === 0x95) r90 = Math.max(a, b);         /* f64.max */
+        else if (op === 0x96) r90 = Math.abs(a) * Math.sign(b); /* f64.copysign */
+        stack.push(r90);
+      }
+      /* ---- W3: conversions (0xA7–0xBF) ---- */
+      else if (op >= 0xA7 && op <= 0xBF) {
+        var cvVal = 0;
+        if (op === 0xA7) { cvVal = (stack.pop() | 0); }              /* i32.wrap_i64 */
+        else if (op === 0xA8) { cvVal = Math.trunc(+stack.pop()) | 0; } /* i32.trunc_f32_s */
+        else if (op === 0xA9) { cvVal = Math.trunc(+stack.pop()) >>> 0; } /* i32.trunc_f32_u */
+        else if (op === 0xAA) { cvVal = Math.trunc(+stack.pop()) | 0; } /* i32.trunc_f64_s */
+        else if (op === 0xAB) { cvVal = Math.trunc(+stack.pop()) >>> 0; } /* i32.trunc_f64_u */
+        else if (op === 0xAC) { cvVal = (stack.pop() | 0); }         /* i64.extend_i32_s */
+        else if (op === 0xAD) { cvVal = (stack.pop() | 0) >>> 0; }   /* i64.extend_i32_u */
+        else if (op === 0xAE) { cvVal = Math.trunc(+stack.pop()); }  /* i64.trunc_f32_s */
+        else if (op === 0xAF) { cvVal = Math.trunc(+stack.pop()); }  /* i64.trunc_f32_u */
+        else if (op === 0xB0) { cvVal = Math.trunc(+stack.pop()); }  /* i64.trunc_f64_s */
+        else if (op === 0xB1) { cvVal = Math.trunc(+stack.pop()); }  /* i64.trunc_f64_u */
+        else if (op === 0xB2) { cvVal = Math.fround(+(stack.pop() | 0)); } /* f32.convert_i32_s */
+        else if (op === 0xB3) { cvVal = Math.fround((stack.pop() | 0) >>> 0); } /* f32.convert_i32_u */
+        else if (op === 0xB4) { cvVal = Math.fround(+(stack.pop() | 0)); } /* f32.convert_i64_s */
+        else if (op === 0xB5) { cvVal = Math.fround((stack.pop() | 0) >>> 0); } /* f32.convert_i64_u */
+        else if (op === 0xB6) { cvVal = Math.fround(+stack.pop()); }  /* f32.demote_f64 */
+        else if (op === 0xB7) { cvVal = +(stack.pop() | 0); }         /* f64.convert_i32_s */
+        else if (op === 0xB8) { cvVal = +((stack.pop() | 0) >>> 0); } /* f64.convert_i32_u */
+        else if (op === 0xB9) { cvVal = +(stack.pop() | 0); }         /* f64.convert_i64_s */
+        else if (op === 0xBA) { cvVal = +((stack.pop() | 0) >>> 0); } /* f64.convert_i64_u */
+        else if (op === 0xBB) { cvVal = +stack.pop(); }               /* f64.promote_f32 */
+        else if (op === 0xBC) { /* i32.reinterpret_f32 */
+          var ri32f32 = new DataView(new ArrayBuffer(4));
+          ri32f32.setFloat32(0, +stack.pop(), true);
+          cvVal = ri32f32.getInt32(0, true);
+        } else if (op === 0xBD) { /* i64.reinterpret_f64 */
+          var ri64f64 = new DataView(new ArrayBuffer(8));
+          ri64f64.setFloat64(0, +stack.pop(), true);
+          cvVal = ri64f64.getInt32(0, true); /* low 32 bits (i64 approximated as i32 in this engine) */
+        } else if (op === 0xBE) { /* f32.reinterpret_i32 */
+          var rf32i32 = new DataView(new ArrayBuffer(4));
+          rf32i32.setInt32(0, stack.pop() | 0, true);
+          cvVal = rf32i32.getFloat32(0, true);
+        } else if (op === 0xBF) { /* f64.reinterpret_i64 */
+          var rf64i64 = new DataView(new ArrayBuffer(8));
+          rf64i64.setInt32(0, stack.pop() | 0, true);
+          cvVal = rf64i64.getFloat64(0, true);
+        }
+        stack.push(cvVal);
+      }
+      /* ---- W3: sign extensions (0xA0–0xA4, 0xC0–0xC4) ---- */
+      else if (op >= 0xA0 && op <= 0xA4) {
+        var v = stack.pop() || 0;
+        var rA0 = 0;
+        if (op === 0xA0) rA0 = ((v & 0xFF) << 24) >> 24;   /* i32.extend8_s */
+        else if (op === 0xA1) rA0 = ((v & 0xFFFF) << 16) >> 16; /* i32.extend16_s */
+        else if (op === 0xA2) rA0 = ((v & 0xFF) << 24) >> 24;   /* i64.extend8_s (i32 the engine) */
+        else if (op === 0xA3) rA0 = ((v & 0xFFFF) << 16) >> 16; /* i64.extend16_s */
+        else if (op === 0xA4) rA0 = v | 0;                     /* i64.extend32_s */
+        stack.push(rA0 | 0);
       }
     }
     if (sig.results.length > 0 && stack.length > 0) return stack[stack.length - 1] | 0;
