@@ -9397,10 +9397,46 @@ var decl = new CSSStyleDeclaration(el);
       if (!dbData || !dbData.stores[name]) {
         throw new Error("NotFoundError: The specified object store was not found: " + name);
       }
+      if (this.__aborted) {
+        throw new Error("InvalidStateError: transaction aborted");
+      }
+      /* S10: snapshot the store pre-write state so abort() can roll back. */
+      this.__snapshot(name, dbData.stores[name]);
       return new IDBObjectStore(name, dbData.stores[name], this);
     };
-    IDBTransaction.prototype.abort = function () {};
+    IDBTransaction.prototype.abort = function () {
+      /* S10: real abort semantics — writes made through THIS transaction
+      roll back (the store snapshots taken at first objectStore() access
+      are restored), abort fires onabort, and further use errors. */
+      var self = this;
+      self.__aborted = true;
+      Object.keys(self.__snapshots || {}).forEach(function (storeName) {
+        var snap = self.__snapshots[storeName];
+        var dbData = idbDatabases[self.db.name];
+        if (dbData && dbData.stores[storeName]) {
+          dbData.stores[storeName] = snap;
+        }
+      });
+      Promise.resolve().then(function () {
+        if (typeof self.onabort === "function") {
+          try { self.onabort({ type: "abort", target: self }); } catch (e) {}
+        }
+      });
+    };
     IDBTransaction.prototype.commit = function () {};
+    IDBTransaction.prototype.__snapshot = function (storeName, storeData) {
+      this.__snapshots = this.__snapshots || {};
+      if (!this.__snapshots[storeName]) {
+        this.__snapshots[storeName] = {
+          records: JSON.parse(JSON.stringify(storeData.records || {})),
+          keys: (storeData.keys || []).slice(),
+          autoId: storeData.autoId || 1,
+          keyPath: storeData.keyPath,
+          autoIncrement: storeData.autoIncrement,
+          indices: JSON.parse(JSON.stringify(storeData.indices || {}))
+        };
+      }
+    };
 
     function IDBObjectStore(name, storeData, tx) {
       this.name = name;
@@ -9436,6 +9472,30 @@ var decl = new CSSStyleDeclaration(el);
       return req;
     };
     IDBObjectStore.prototype.add = function (val, key) {
+      /* S10: spec — add() REJECTS an existing key (ConstraintError);
+      put() upserts. The old stub silently upserted both. */
+      var data = this._data;
+      var k = key;
+      if (k === undefined && data.keyPath && typeof val === "object" && val !== null) {
+        k = val[data.keyPath];
+      }
+      if (k === undefined && data.autoIncrement) {
+        k = data.autoId++;
+      }
+      var kStr = String(k !== undefined ? k : data.autoId);
+      if (Object.prototype.hasOwnProperty.call(data.records, kStr)) {
+        var req = new IDBRequest();
+        req.source = this;
+        req.transaction = this.transaction;
+        var err = new Error("ConstraintError: A record with this key already exists: " + kStr);
+        err.name = "ConstraintError";
+        Promise.resolve().then(function () {
+          req.readyState = "done";
+          req.error = err;
+          req.dispatchEvent({ type: "error" });
+        });
+        return req;
+      }
       return this.put(val, key);
     };
     IDBObjectStore.prototype.get = function (key) {
@@ -9500,6 +9560,63 @@ var decl = new CSSStyleDeclaration(el);
       });
       return req;
     };
+    IDBObjectStore.prototype.openCursor = function (range, direction) {
+      /* S10: real cursor iteration — success fires per record with a
+      cursor {key, value, primaryKey, advance/continue}; done fires
+      with result undefined. Direction is honored for traversal order
+      ('next', 'prev', 'nextunique', 'prevunique'). */
+      var req = new IDBRequest();
+      req.source = this;
+      req.transaction = this.transaction;
+      var data = this._data;
+      var dir = String(direction || "next");
+      /* S10: cursors iterate in KEY ORDER (spec), not insertion order.
+         Keys are stored stringified; sort numerically when both sides
+         are numeric, lexically otherwise. */
+      var keys = data.keys.slice().sort(function (a, b) {
+        var na = Number(a), nb = Number(b);
+        if (!isNaN(na) && !isNaN(nb)) return na - nb;
+        return String(a) < String(b) ? -1 : (String(a) > String(b) ? 1 : 0);
+      });
+      if (dir === "prev" || dir === "prevunique") keys = keys.reverse();
+      if (dir === "nextunique" || dir === "prevunique") {
+        var seen = {};
+        keys = keys.filter(function (k) {
+          var rec = data.records[k];
+          var kk = (rec && typeof rec === "object" && data.keyPath) ? rec[data.keyPath] : k;
+          if (seen[String(kk)]) return false;
+          seen[String(kk)] = true;
+          return true;
+        });
+      }
+      var pos = 0;
+      function fireNext() {
+        Promise.resolve().then(function () {
+          if (pos >= keys.length) {
+            req.readyState = "done";
+            req.result = undefined;
+            req.dispatchEvent({ type: "success" });
+            return;
+          }
+          var k = keys[pos];
+          var rec = data.records[k];
+          var copy = (typeof rec === "object" && rec !== null) ? JSON.parse(JSON.stringify(rec)) : rec;
+          var cursor = {
+            key: (data.keyPath && copy && typeof copy === "object" && data.keyPath in copy) ? copy[data.keyPath] : k,
+            primaryKey: k,
+            value: copy,
+            direction: dir,
+            continue: function () { pos++; fireNext(); },
+            advance: function (n) { pos += Math.max(1, Number(n) || 1); fireNext(); }
+          };
+          req.readyState = "done";
+          req.result = cursor;
+          req.dispatchEvent({ type: "success" });
+        });
+      }
+      fireNext();
+      return req;
+    };
     IDBObjectStore.prototype.count = function () {
       var req = new IDBRequest();
       req.source = this;
@@ -9513,21 +9630,94 @@ var decl = new CSSStyleDeclaration(el);
       return req;
     };
     IDBObjectStore.prototype.createIndex = function (name, keyPath, options) {
+      /* S10: an index is a real secondary-key view over the store's
+      records: entries map index-key -> primary-key list. */
       this._data.indices[name] = { name: name, keyPath: keyPath, options: options || {} };
       return this.index(name);
     };
     IDBObjectStore.prototype.index = function (name) {
+      /* S10: index operations honor the index's keyPath — get(k) returns
+      the record whose INDEXED value equals k; getAll()/count() filter by
+      the index. The old stub returned the whole store for everything. */
       var self = this;
+      var meta = self._data.indices[name];
+      if (!meta) {
+        throw new Error("NotFoundError: The specified index was not found: " + name);
+      }
+      function indexedKeys() {
+        var hits = [];
+        var data = self._data;
+        for (var i = 0; i < data.keys.length; i++) {
+          var k = data.keys[i];
+          var rec = data.records[k];
+          var v = rec;
+          if (meta.keyPath && typeof meta.keyPath === "string" && rec && typeof rec === "object") {
+            v = rec[meta.keyPath];
+          } else if (meta.keyPath && Array.isArray(meta.keyPath) && rec && typeof rec === "object") {
+            v = [];
+            for (var kp = 0; kp < meta.keyPath.length; kp++) v.push(rec[meta.keyPath[kp]]);
+          }
+          hits.push({ primaryKey: k, indexValue: v });
+        }
+        return hits;
+      }
+      function keysWithValue(k) {
+        return indexedKeys().filter(function (h) { return String(h.indexValue) === String(k); });
+      }
       return {
         name: name,
-        get: function (k) { return self.get(k); },
-        getAll: function () { return self.getAll(); },
-        count: function () { return self.count(); }
+        keyPath: meta.keyPath,
+        get: function (k) {
+          var req = new IDBRequest();
+          req.source = self;
+          req.transaction = self.transaction;
+          var hits = keysWithValue(k);
+          var rec = hits.length ? self._data.records[hits[0].primaryKey] : undefined;
+          var copy = (typeof rec === "object" && rec !== null) ? JSON.parse(JSON.stringify(rec)) : rec;
+          Promise.resolve().then(function () {
+            req.readyState = "done";
+            req.result = copy;
+            req.dispatchEvent({ type: "success" });
+          });
+          return req;
+        },
+        getAll: function (k) {
+          var req = new IDBRequest();
+          req.source = self;
+          req.transaction = self.transaction;
+          var hits = (k === undefined) ? indexedKeys() : keysWithValue(k);
+          var res = [];
+          for (var i = 0; i < hits.length; i++) {
+            var rec = self._data.records[hits[i].primaryKey];
+            res.push((typeof rec === "object" && rec !== null) ? JSON.parse(JSON.stringify(rec)) : rec);
+          }
+          Promise.resolve().then(function () {
+            req.readyState = "done";
+            req.result = res;
+            req.dispatchEvent({ type: "success" });
+          });
+          return req;
+        },
+        count: function (k) {
+          var req = new IDBRequest();
+          req.source = self;
+          req.transaction = self.transaction;
+          var n = ((k === undefined) ? indexedKeys() : keysWithValue(k)).length;
+          Promise.resolve().then(function () {
+            req.readyState = "done";
+            req.result = n;
+            req.dispatchEvent({ type: "success" });
+          });
+          return req;
+        }
       };
     };
 
     var IDBFactory = {
       open: function (name, version) {
+        /* S10 note: onupgradeneeded fires below when the version bumps
+        (or the DB is new), carrying oldVersion/newVersion — a real
+        versionchange pass, not a silent version overwrite. */
         var req = new IDBOpenDBRequest();
         var existing = idbDatabases[name];
         var oldVer = existing ? existing.version : 0;
