@@ -342,6 +342,15 @@ impl Session {
             .await
             .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error + Send + Sync>)?;
 
+        self.process_fetch_result(result, max_chars)
+    }
+
+    /// Turn a FetchResult into an executed, ACD-projected Page and update the session tab.
+    pub fn process_fetch_result(
+        &mut self,
+        result: crate::fetch::FetchResult,
+        max_chars: usize,
+    ) -> Result<Page, Box<dyn std::error::Error + Send + Sync>> {
         let mut html = result.body.clone();
         let mut js_errors = Vec::new();
         let mut runtime_title = String::new();
@@ -437,6 +446,99 @@ impl Session {
         let tab = self.current_tab_mut();
         let pushed = tab.push(page.clone(), Some(html), Some(result.headers), false, None);
         Ok(pushed)
+    }
+
+    /// Check and dispatch any navigation or form submission effects triggered by an action.
+    pub async fn dispatch_action_effects(
+        &mut self,
+        rt: &mut crate::runtime::Runtime,
+        current_url: &str,
+    ) -> Result<Option<Page>, String> {
+        // 1. Check client-side navigation
+        let nav = rt.eval("globalThis.__WR_NAVIGATED || ''").unwrap_or_default();
+        if !nav.is_empty() {
+            let _ = rt.eval("globalThis.__WR_NAVIGATED = ''; true");
+            let target_url = if let Ok(base) = url::Url::parse(current_url) {
+                base.join(&nav).map(|u| u.to_string()).unwrap_or(nav)
+            } else {
+                nav
+            };
+            let page = self.goto(&target_url, 8000).await.map_err(|e| e.to_string())?;
+            return Ok(Some(page));
+        }
+
+        // 2. Check form submission
+        let form_sub = rt.eval("JSON.stringify(globalThis.__WR_FORM_SUBMIT || null)").unwrap_or_default();
+        if form_sub != "null" && !form_sub.is_empty() {
+            let _ = rt.eval("globalThis.__WR_FORM_SUBMIT = null; true");
+            if let Ok(fs) = serde_json::from_str::<serde_json::Value>(&form_sub) {
+                let action = fs["action"].as_str().unwrap_or("");
+                let method = fs["method"].as_str().unwrap_or("POST").to_uppercase();
+                let target_url = if let Ok(base) = url::Url::parse(current_url) {
+                    base.join(action).map(|u| u.to_string()).unwrap_or_else(|_| current_url.to_string())
+                } else {
+                    current_url.to_string()
+                };
+
+                let fields = fs["fields"].as_object();
+                if method == "GET" {
+                    let qs = {
+                        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+                        if let Some(fmap) = fields {
+                            for (k, v) in fmap {
+                                if let Some(arr) = v.as_array() {
+                                    for item in arr {
+                                        serializer.append_pair(k, item.as_str().unwrap_or(""));
+                                    }
+                                } else {
+                                    serializer.append_pair(k, v.as_str().unwrap_or(""));
+                                }
+                            }
+                        }
+                        serializer.finish()
+                    };
+                    let full_url = if qs.is_empty() {
+                        target_url
+                    } else if target_url.contains('?') {
+                        format!("{}&{}", target_url, qs)
+                    } else {
+                        format!("{}?{}", target_url, qs)
+                    };
+                    let page = self.goto(&full_url, 8000).await.map_err(|e| e.to_string())?;
+                    return Ok(Some(page));
+                } else {
+                    let encoded_body = {
+                        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+                        if let Some(fmap) = fields {
+                            for (k, v) in fmap {
+                                if let Some(arr) = v.as_array() {
+                                    for item in arr {
+                                        serializer.append_pair(k, item.as_str().unwrap_or(""));
+                                    }
+                                } else {
+                                    serializer.append_pair(k, v.as_str().unwrap_or(""));
+                                }
+                            }
+                        }
+                        serializer.finish()
+                    };
+                    let mut req = crate::network::NetworkRequest::new(&target_url);
+                    req.method = "POST".to_string();
+                    req.body = Some(encoded_body);
+                    let mut h = std::collections::HashMap::new();
+                    h.insert("content-type".to_string(), "application/x-www-form-urlencoded".to_string());
+                    req.headers = h;
+                    if let Ok(parsed) = url::Url::parse(current_url) {
+                        req.client_origin = Some(parsed.origin().ascii_serialization());
+                    }
+                    let result = self.network.fetch(req).await.map_err(|e| e.to_string())?;
+                    let page = self.process_fetch_result(result, 8000).map_err(|e| e.to_string())?;
+                    return Ok(Some(page));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Load HTML content directly into session: executes page scripts via V8 runtime,
@@ -619,6 +721,10 @@ impl Session {
         let mutated = rt.serialize()?;
         Self::check_action_error(&mut rt)?;
 
+        if let Some(page) = self.dispatch_action_effects(&mut rt, &url).await? {
+            return Ok(page);
+        }
+
         self.update_page_after_action(&url, &mutated, 8000)
     }
 
@@ -700,6 +806,10 @@ impl Session {
         rt.apply_action(&action_payload)?;
         let mutated = rt.serialize()?;
         Self::check_action_error(&mut rt)?;
+
+        if let Some(page) = self.dispatch_action_effects(&mut rt, &url).await? {
+            return Ok(page);
+        }
 
         self.update_page_after_action(&url, &mutated, 8000)
     }

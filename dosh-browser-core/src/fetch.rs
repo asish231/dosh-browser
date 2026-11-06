@@ -48,6 +48,7 @@ pub fn navigate_headers(_url: &str) -> HeaderMap {
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         ),
     );
+    h.insert("upgrade-insecure-requests", HeaderValue::from_static("1"));
     h.insert("sec-fetch-dest", HeaderValue::from_static("document"));
     h.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
     h.insert("sec-fetch-site", HeaderValue::from_static("none"));
@@ -58,6 +59,8 @@ pub fn navigate_headers(_url: &str) -> HeaderMap {
     );
     h.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
     h.insert("sec-ch-ua-platform", HeaderValue::from_static("\"macOS\""));
+    h.insert("accept-language", HeaderValue::from_static("en-US,en;q=0.9"));
+    h.insert("priority", HeaderValue::from_static("u=0, i"));
     h.insert(
         "Accept",
         HeaderValue::from_static(

@@ -107,11 +107,23 @@ fn _css_path(node: &NodeRef) -> String {
             .take(2)
             .map(|c| format!(".{}", _escape_ident(c)))
             .collect();
-        if classes.is_empty() {
-            parts.push(if tag.is_empty() { "*".to_string() } else { tag });
+        let mut segment = if classes.is_empty() {
+            if tag.is_empty() { "*".to_string() } else { tag }
         } else {
-            parts.push(format!("{}{}", if tag.is_empty() { "*" } else { &tag }, classes.join("")));
+            format!("{}{}", if tag.is_empty() { "*" } else { &tag }, classes.join(""))
+        };
+        if hops == 0 {
+            if let Some(name) = attr(&cur, "name") {
+                if !name.is_empty() && !name.contains('"') && !name.contains('\'') && !name.contains(']') {
+                    segment.push_str(&format!("[name={name}]"));
+                }
+            } else if let Some(input_type) = attr(&cur, "type") {
+                if !input_type.is_empty() && !input_type.contains('"') && !input_type.contains('\'') && !input_type.contains(']') {
+                    segment.push_str(&format!("[type={input_type}]"));
+                }
+            }
         }
+        parts.push(segment);
         cursor = cur.parent();
         hops += 1;
     }

@@ -9,7 +9,7 @@ description = "Pure-Rust dosh-browser product — consumes doshgentv8-core"
 doshgentv8-core = { path = "../doshgentv8/core" }
 
 # HTTP & transport (replaces curl_cffi / httpx)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "stream", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "stream", "json", "http2", "brotli", "gzip"] }
 http = "1.2"
 url = "2.5"
 encoding_rs = "0.8"
