@@ -550,7 +550,8 @@ Execution evidence (2026-11-06):
   new Function shadowing; messages deliver on the __drainTimers pump,
   never synchronously; terminate cancels realm timers; close() defers
   so already-posted messages reach the parent.
-- W2: commit ff73de90; `tests/test_w2_service_worker.py` → 6 passed.
+- W2: commits ff73de90 + 9cdf0532; `tests/test_w2_service_worker.py`
+  → 6 passed.
   register() fetches + runs the SW script in a ServiceWorkerGlobalScope
   realm; install/activate fire at registration (disclosed single-pass);
   in-scope fetch() routes through event.respondWith (SW Response with
@@ -608,4 +609,4 @@ suites green before the phase is called done.
       realm — `postMessage` on the received end queues to the sender, the
       buffer is live (not inert).
 - [x] **Docs** — §2.7 rows + AGENTS.md roadmap rows.
-- [x] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`. (954 passed/8 skipped incl. 21 new Phase-5 tests; 238 passed/0 failed)
+- [x] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`. (Python 976 passed/8 skipped incl. 21 new Phase-5 tests; Rust 243 passed/0 failed)
