@@ -844,4 +844,4 @@ disclosed, not built.
       download without external yt-dlp (complex DRM/encrypted streams
       stay refused honestly).
 - [x] **Docs** — §2.5/§2.6/§2.7/§2.8 rows + AGENTS.md roadmap rows.
-- [x] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`.
+- [x] **Green** — Python full suite + `cargo test -p dosh-browser-core --lib`. (Python 1082 passed/8 skipped at Phase-8 HEAD — all 42 Phase-8 tests included plus Phases 1-7; Rust 243 passed/0 failed)
