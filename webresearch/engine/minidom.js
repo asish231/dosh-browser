@@ -6326,14 +6326,65 @@ var decl = new CSSStyleDeclaration(el);
     return JSON.parse(JSON.stringify(value));
   };
 
-  /* ---- WeakRef / FinalizationRegistry (safe shims: strong retention,
-         no callbacks — semantically a conservative over-approximation) ---- */
-  global.WeakRef = function (target) { this._target = target; };
+  /* ---- J3: WeakRef / FinalizationRegistry — spec-shaped, honestly
+         disclosed. QuickJS has no real weak references exposed to JS,
+         so deref() keeps STRONG retention (conservative: never observes
+         a collection that did not happen). Upgrades over the old shell:
+         deref() throws TypeError on non-object targets (spec), WeakRef
+         constructor rejects non-objects, FinalizationRegistry carries
+         REAL bookkeeping (register/unregisterToken/holds), and
+         cleanupSome never fires callbacks (no GC integration —
+         disclosed), but tracking is inspectable so agents can see the
+         registry state honestly. */
+  global.WeakRef = function (target) {
+    if (target == null || (typeof target !== "object" && typeof target !== "function")) {
+      throw new TypeError("WeakRef: target must be an object or a non-registered symbol");
+    }
+    this._target = target;
+  };
+  __cloakObject(global.WeakRef.prototype, { deref: 0 });
   global.WeakRef.prototype.deref = function () { return this._target; };
-  global.FinalizationRegistry = function () {
-    this.register = function () {};
-    this.unregister = function () { return false; };
-    this.cleanupSome = function () {};
+  global.FinalizationRegistry = function (cleanupCallback) {
+    if (typeof cleanupCallback !== "function") {
+      throw new TypeError("FinalizationRegistry: cleanupCallback must be a function");
+    }
+    var held = []; /* { target, heldValue, unregisterToken } — real bookkeeping */
+    var unregistered = []; /* heldValues whose unregisterToken was hit */
+    this.register = function (target, heldValue, unregisterToken) {
+      if (target == null || (typeof target !== "object" && typeof target !== "function")) {
+        throw new TypeError("FinalizationRegistry.register: target must be an object");
+      }
+      if (unregisterToken != null && (typeof unregisterToken !== "object" && typeof unregisterToken !== "function")) {
+        throw new TypeError("FinalizationRegistry.register: unregisterToken must be an object");
+      }
+      var entry = { target: target, heldValue: heldValue, unregisterToken: unregisterToken || null };
+      held.push(entry);
+      return entry;
+    };
+    this.unregister = function (unregisterToken) {
+      if (unregisterToken == null || (typeof unregisterToken !== "object" && typeof unregisterToken !== "function")) {
+        throw new TypeError("FinalizationRegistry.unregister: unregisterToken must be an object");
+      }
+      var before = held.length;
+      held = held.filter(function (e) { return e.unregisterToken !== unregisterToken; });
+      var removed = before - held.length;
+      if (removed > 0) unregistered.push(unregisterToken);
+      return removed > 0;
+    };
+    this.cleanupSome = function () {
+      /* No GC integration: callbacks never fire (disclosed). Kept as a
+         no-op so feature-detection code paths work. */
+    };
+    /* Honest introspection for the agent surface: the registry's real
+       state, without pretending GC ran. */
+    this.__wrInspect = function () {
+      return JSON.stringify({
+        registered: held.length,
+        unregistered: unregistered.length,
+        cleanupWillFire: false,
+        reason: "no GC integration in this engine; callbacks never fire (disclosed)"
+      });
+    };
   };
 
   /* ---- PerformanceObserver (records nothing; supported types listed so
