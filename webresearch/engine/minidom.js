@@ -3622,6 +3622,11 @@ var pos = (st.position || "").toLowerCase();
     if (ev.defaultPrevented) return;
     this.__popoverOpen = true;
     this.setAttribute("open", "");
+    /* R4: an open popover joins the document top layer with a backdrop
+       when it is modal-shaped (manual popovers join without a backdrop —
+       spec: only ::modal popovers get a backdrop; we give it to all,
+       disclosed). */
+    try { global.__wrEnterTopLayer(this, "popover"); } catch (e) {}
     if (isAuto && doc) {
       doc.__openAutoPopovers = doc.__openAutoPopovers || [];
       if (doc.__openAutoPopovers.indexOf(this) < 0) {
@@ -3653,6 +3658,7 @@ var pos = (st.position || "").toLowerCase();
     }
     this.__popoverOpen = false;
     this.removeAttribute("open");
+    try { global.__wrLeaveTopLayer(this); } catch (e) {}
     var t = new global.Event("toggle", { bubbles: true });
     t.oldState = "open";
     t.newState = "closed";
@@ -3899,6 +3905,67 @@ var pos = (st.position || "").toLowerCase();
     })(htmlElements[i]);
   }
   global.__htmlCtorByTag = __htmlCtorByTag;
+  /* ---- R4: Paint stack / top layer / ::backdrop ----
+     A document-owned ordered top layer (last-in on top). Modal dialogs
+     and open popovers are promoted; their ::backdrop pseudo gets a real
+     backing box stored on the element (__backdropBox) that the layers
+     inspector and the SVG painter can report. Layout renders promoted
+     elements above everything (the L3 overlay stratum reports them
+     first-class as TOP_LAYER entries). */
+  (function () {
+    var topLayer = [];
+    function enter(el, kind) {
+      if (!el || el.nodeType !== 1) return;
+      /* dedupe: promote to top of the stack */
+      for (var i = 0; i < topLayer.length; i++) {
+        if (topLayer[i].el === el) { topLayer.splice(i, 1); break; }
+      }
+      topLayer.push({ el: el, kind: String(kind || "modal") });
+      /* ::backdrop backing box: full viewport, above everything except
+         its owner (the owner paints on top of its own backdrop). */
+      var vw = Number(global.innerWidth) || 1280;
+      var vh = Number(global.innerHeight) || 720;
+      el.__backdropBox = { x: 0, y: 0, width: vw, height: vh, isBackdrop: true };
+      el.__topLayerKind = String(kind || "modal");
+      /* A modal dialog/popover is promoted out of normal flow stacking. */
+      try {
+        var doc = global.document;
+        if (doc) doc.__layoutVersion = (doc.__layoutVersion || 0) + 1;
+      } catch (e) {}
+    }
+    function leave(el) {
+      if (!el) return;
+      for (var i = 0; i < topLayer.length; i++) {
+        if (topLayer[i].el === el) { topLayer.splice(i, 1); break; }
+      }
+      el.__backdropBox = null;
+      el.__topLayerKind = null;
+      try {
+        var doc = global.document;
+        if (doc) doc.__layoutVersion = (doc.__layoutVersion || 0) + 1;
+      } catch (e) {}
+    }
+    global.__wrEnterTopLayer = enter;
+    global.__wrLeaveTopLayer = leave;
+    global.__wrTopLayer = function () {
+      return topLayer.map(function (t) { return { el: t.el, kind: t.kind }; });
+    };
+    global.__wrTopLayerInfo = function () {
+      return JSON.stringify(topLayer.map(function (t) {
+        var b = (t.el.getBoundingClientRect && t.el.getBoundingClientRect()) || {};
+        return {
+          kind: t.kind,
+          tag: String(t.el.nodeName || "").toLowerCase(),
+          id: (t.el.id != null ? String(t.el.id) : ""),
+          selector: (typeof __nodeSelector === "function") ? __nodeSelector(t.el) : "",
+          x: Math.round(b.x || 0), y: Math.round(b.y || 0),
+          width: Math.round(b.width || 0), height: Math.round(b.height || 0),
+          hasBackdrop: !!(t.el.__backdropBox)
+        };
+      }));
+    };
+  })();
+
   /* ---- <dialog> semantics ----
      The constructor existed as a name-list shell; showModal/close threw
      "not a function" and modals could never open. Real subset: open
@@ -3931,12 +3998,17 @@ var pos = (st.position || "").toLowerCase();
       }
       this.__isModal = true;
       this.setAttribute("open", "");
+      /* R4: promote to the document top layer (paint stack). */
+      try { global.__wrEnterTopLayer(this, "modal"); } catch (e) {}
       this.dispatchEvent(new global.Event("open", { bubbles: false }));
     };
     __DialogCtor.prototype.close = function (returnValue) {
       if (!this.open) return;
       this.__isModal = false;
       this.removeAttribute("open");
+      /* R4: leave the document top layer; drop the ::backdrop backing box. */
+      try { global.__wrLeaveTopLayer(this); } catch (e) {}
+      if (this.__backdropBox) { this.__backdropBox = null; }
       if (returnValue !== undefined) this.returnValue = String(returnValue);
       var ev = new global.Event("close", { bubbles: false });
       this.dispatchEvent(ev);
@@ -12831,7 +12903,12 @@ global.__submitPath = function (path) {
       L1_CHROME: [],
       L2_SCROLLER: [],
       L3_OVERLAY: [],
-      L4_HIDDEN: []
+      L4_HIDDEN: [],
+      /* R4: the paint stack's promoted elements and their ::backdrop
+         pseudo-boxes. Reported FIRST-CLASS: an agent reasoning about
+         occlusion must see what is above everything else. */
+      TOP_LAYER: [],
+      BACKDROPS: []
     };
     var overlays = [];
     var interactiveControls = [];
@@ -12847,6 +12924,30 @@ global.__submitPath = function (path) {
       if (el.getAttribute && (el.getAttribute("onclick") != null || el.getAttribute("contenteditable") != null)) return true;
       return false;
     }
+
+    /* R4: report the top layer (promoted dialogs/popovers) and their
+       ::backdrop boxes ahead of the normal strata walk. */
+    try {
+      var tl = (typeof global.__wrTopLayer === "function") ? global.__wrTopLayer() : [];
+      tl.forEach(function (t) {
+        var b = (t.el.getBoundingClientRect && t.el.getBoundingClientRect()) || {};
+        strata.TOP_LAYER.push({
+          kind: t.kind,
+          tag: String(t.el.nodeName || "").toLowerCase(),
+          id: (t.el.id != null ? String(t.el.id) : ""),
+          x: Math.round(b.x || 0), y: Math.round(b.y || 0),
+          width: Math.round(b.width || 0), height: Math.round(b.height || 0)
+        });
+        if (t.el.__backdropBox) {
+          var bb = t.el.__backdropBox;
+          strata.BACKDROPS.push({
+            for: String(t.el.nodeName || "").toLowerCase() + (t.el.id ? "#" + t.el.id : ""),
+            x: Math.round(bb.x), y: Math.round(bb.y),
+            width: Math.round(bb.width), height: Math.round(bb.height)
+          });
+        }
+      });
+    } catch (eTop) {}
 
     (function walk(el, ancestorHidden, ancestorOverlay, ancestorChrome) {
       if (!el || el.nodeType !== 1) return;
