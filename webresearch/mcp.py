@@ -435,13 +435,105 @@ def estimate_tokens(text: str) -> int:
 
 
 class McpServer:
-    """Stdio JSON-RPC 2.0 Model Context Protocol Server."""
+    """Stdio JSON-RPC 2.0 Model Context Protocol Server.
 
-    def __init__(self) -> None:
+    When the Loom daemon is running (socket at ~/.dosh/loom.sock), connects to it
+    and forwards tool calls through the daemon. This allows the MCP process to
+    die/restart while the browser session lives in the daemon.
+
+    Falls back to in-process session management when the daemon is not available.
+    """
+
+    def __init__(self, loom_socket_path: str | None = None) -> None:
         self.browser = Browser()
         self.session: Session | None = None
         self.total_tokens_burned: int = 0
         self.total_tool_calls: int = 0
+        # Loom daemon client (used when daemon is running)
+        self._loom_client = None
+        self._loom_socket_path = loom_socket_path
+
+    async def _ensure_loom_client(self):
+        """Initialize Loom client if daemon is running."""
+        if self._loom_client is None:
+            from webresearch.mcp_daemon_client import LoomClient
+            self._loom_client = LoomClient(self._loom_socket_path)
+            connected = await self._loom_client.connect()
+            if not connected:
+                self._loom_client = None  # daemon not available
+
+    async def _get_session(self) -> Session:
+        """Get session via Loom daemon (if running) or in-process fallback."""
+        await self._ensure_loom_client()
+        if self._loom_client is not None:
+            # Daemon is running — session is managed by daemon
+            return None  # session methods will use _loom_client.call_tool
+        if self.session is None:
+            profile_name = os.environ.get("WR_PROFILE", "default")
+            self.session = await self.browser.create(profile=profile_name)
+            # Opt-in persistent session: if WR_SESSION_DB is set, the shell's
+            # store is backed by that SQLite file. Restore the most recent
+            # checkpoint so DOM/storage/cookies/history survive a process
+            # restart (the live VM realm is honestly NOT restored — see the
+            # checkpoint/restore contract in shell.py).
+            store = self.session.shell.store
+            if store.persistent:
+                try:
+                    rows = store.list_checkpoints()
+                except Exception:
+                    rows = []
+                if rows:
+                    try:
+                        await self.session.shell.execute("restore", {"id": rows[0]["id"]})
+                    except Exception:
+                        pass
+        return self.session
+
+    async def _maybe_checkpoint(self, session: Session) -> None:
+        """Auto-checkpoint after a navigation when persistence is opted in."""
+        store = session.shell.store
+        if not store.persistent:
+            return
+        try:
+            await session.shell.execute("checkpoint", {})
+        except Exception:
+            pass
+
+    async def _handle_via_loom(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Handle a tool call by routing through the Loom daemon."""
+        # Map MCP tool names to shell commands
+        command_map = {
+            "browser_shell": lambda: self._loom_client.call_tool(args["command"], args.get("arguments", {})),
+            "browser_search": lambda: self._loom_client.call_tool("search", {"query": args.get("query", ""), "engine": args.get("engine", "auto")}),
+            "browser_images": lambda: self._loom_client.call_tool("search_images", {"query": args.get("query", ""), "engine": args.get("engine", "auto"), "max_hits": int(args.get("max_hits", 8))}),
+            "browser_navigate": lambda: self._loom_client.call_tool("open", {"url": args.get("url", ""), "js": args.get("js", "auto"), "max_chars": int(args.get("max_chars", 8000))}),
+            "browser_click": lambda: self._loom_client.call_tool("act", {"ref": args.get("ref", "")}),
+            "browser_type": lambda: self._loom_client.call_tool("act", {"ref": args.get("ref", ""), "text": args.get("text", "")}),
+            "browser_query": lambda: self._loom_client.call_tool("query", {"term": args.get("term", ""), "limit": int(args.get("limit", 40))}),
+            "browser_slice": lambda: self._loom_client.call_tool("read", {"offset": int(args.get("offset", 0)), "limit": int(args.get("limit", 50))}),
+            "browser_read": lambda: self._loom_client.call_tool("read", {"offset": int(args.get("offset", 0)), "limit": int(args.get("limit", 50)), "max_chars": int(args.get("max_chars", 8000))}),
+            "browser_actions": lambda: self._loom_client.call_tool("actions", {"offset": int(args.get("offset", 0)), "limit": int(args.get("limit", 100))}),
+            "browser_status": lambda: self._loom_client.call_tool("status", {}),
+            "browser_history": lambda: self._loom_client.call_tool("history", {}),
+            "browser_cookies": lambda: self._loom_client.call_tool("cookies", {}),
+            "browser_checkpoint": lambda: self._loom_client.call_tool("checkpoint", {"id": args.get("id")}),
+            "browser_restore": lambda: self._loom_client.call_tool("restore", {"id": args.get("id", "")}),
+            "browser_tabs": lambda: self._loom_client.call_tool("tabs", {"id": args.get("id")} if "id" in args else {}),
+            "browser_wait": lambda: self._loom_client.call_tool("wait", args),
+        }
+
+        handler = command_map.get(name)
+        if handler is None:
+            return self._format_result(json.dumps({"ok": False, "error": f"unknown tool: {name}"}))
+
+        try:
+            result = await handler()
+            formatted = self._format_result(json.dumps(result, ensure_ascii=False))
+            if not result.get("ok", True):
+                formatted["isError"] = True
+            return formatted
+        except Exception as e:
+            return self._format_result(json.dumps({"ok": False, "error": str(e)}))
 
     def _format_result(self, text: str) -> dict[str, Any]:
         self.total_tool_calls += 1
@@ -465,13 +557,11 @@ class McpServer:
             },
         }
 
-    async def _get_session(self) -> Session:
-        if self.session is None:
-            profile_name = os.environ.get("WR_PROFILE", "default")
-            self.session = await self.browser.create(profile=profile_name)
-        return self.session
-
     async def handle_call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        # If Loom daemon is available, route through it
+        if self._loom_client is not None:
+            return await self._handle_via_loom(name, args)
+
         session = await self._get_session()
 
         if name == "browser_shell":
@@ -500,6 +590,7 @@ class McpServer:
             js = args.get("js", "auto")
             max_chars = int(args.get("max_chars", 8000))
             page = await session.goto(url, js=js, max_chars=max_chars)
+            await self._maybe_checkpoint(session)
             return self._format_result(page.view)
 
         elif name == "browser_click":
