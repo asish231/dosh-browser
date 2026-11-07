@@ -11,7 +11,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -138,19 +138,93 @@ pub(crate) struct HostBridge {
     pub network_allowed: Arc<AtomicBool>,
     pub parena: Arc<Mutex<Option<parena::Parena>>>,
     pub checkpoints: Arc<Mutex<HashMap<u64, parena::Checkpoint>>>,
+    /// Heap-pressure escalation epoch for the CURRENT eval (Stage-1 ladder).
+    /// 0 = calm; 1 = near-limit callback fired once (GC was granted headroom);
+    /// >=2 = genuine exhaustion — the next callback terminates execution.
+    pub pressure_epoch: Arc<AtomicU8>,
+    /// Hard ceiling the ladder will never grant beyond. Computed at isolate
+    /// construction from the configured memory_limit (0 = uncapped policy:
+    /// per-epoch bump only, max PRESSURE_MAX_EPOCHS).
+    pub hard_limit: usize,
+    /// Host bytes last reported to V8's external-memory pacer (Stage 0).
+    pub last_external: AtomicUsize,
 }
 
+/// Max escalation epochs under the uncapped policy (memory_limit == 0).
+const PRESSURE_MAX_EPOCHS: u8 = 3;
+/// Headroom granted per epoch: +25% of the current limit.
+const PRESSURE_BUMP_FRAC: usize = 4;
+/// When a memory_limit IS configured, the hard ceiling is
+/// limit + max(64 MiB, limit/2) — bounded, generous enough for one full GC.
+fn pressure_hard_limit(memory_limit: usize) -> usize {
+    if memory_limit == 0 {
+        0
+    } else {
+        memory_limit + (64 * 1024 * 1024).max(memory_limit / 2)
+    }
+}
+
+/// Stage-1 pressure-graded near-heap-limit response.
+///
+/// V8's contract for this callback: it fires when the heap approaches the
+/// limit, and the RETURN VALUE is the new limit — returning a higher limit
+/// lets the GC that triggered the callback complete and reclaim, instead of
+/// crashing. The old implementation unconditionally terminated execution on
+/// the FIRST callback (a hard kill with +16 MiB of irrelevant headroom):
+/// collectable garbage was indistinguishable from genuine exhaustion.
+///
+/// The ladder:
+///   epoch 0 → 1 : grant +25% headroom (bounded by hard_limit) so GC finishes.
+///                Collectable loads survive; the flag stays false.
+///   epoch ≥ 1  : genuine growth against the ceiling — set the oom flag and
+///                terminate (the raised limit is only the unwinding lifeboat).
+///
+/// Epochs are reset per eval (see eval_raw), so one page's pressure never
+/// poisons the next.
+/// V8 contract for this callback: the RETURN VALUE is the new limit, and
+/// "if the callback returns a value that is not higher than the current
+/// limit, the OOM handler is called" — a process-fatal abort (SIGTRAP), NOT
+/// our honest error. So EVERY branch here must return a raised limit; the
+/// oom flag + terminate_execution are what actually stop the runaway, while
+/// the raised limit is the lifeboat that lets V8 unwind out of the GC.
 unsafe extern "C" fn near_heap_limit_callback(
     data: *mut std::ffi::c_void,
     current_heap_limit: usize,
     _initial_heap_limit: usize,
 ) -> usize {
-    if !data.is_null() {
-        let bridge = &*(data as *mut HostBridge);
+    if data.is_null() {
+        return current_heap_limit;
+    }
+    let bridge = &*(data as *mut HostBridge);
+    let bump = (current_heap_limit / PRESSURE_BUMP_FRAC).max(16 * 1024 * 1024);
+    let epoch = bridge.pressure_epoch.fetch_add(1, Ordering::SeqCst);
+    if epoch >= 1 {
+        // Second (or later) callback in the same eval: the headroom we
+        // granted was consumed without reclaim — genuine exhaustion. Flag
+        // the OOM and terminate the JS loop, but STILL raise the limit so
+        // V8 can finish this GC and unwind (returning an unchanged limit is
+        // a process-fatal abort). Execution is already being terminated, so
+        // this bump is an unwinding lifeboat, not a growth permit.
         bridge.oom.store(true, Ordering::SeqCst);
         bridge.interrupt_handle.terminate_execution();
+        return current_heap_limit + bump;
     }
-    current_heap_limit + 16 * 1024 * 1024
+    // First callback: bounded headroom so the GC that fired completes.
+    let ceiling = bridge.hard_limit;
+    if ceiling > 0 {
+        if current_heap_limit + bump >= ceiling {
+            // Even one more full GC pass cannot fit under the ceiling.
+            bridge.oom.store(true, Ordering::SeqCst);
+            bridge.interrupt_handle.terminate_execution();
+            return current_heap_limit + bump;
+        }
+    } else if epoch + 1 >= PRESSURE_MAX_EPOCHS {
+        // Uncapped policy: refuse to grow forever.
+        bridge.oom.store(true, Ordering::SeqCst);
+        bridge.interrupt_handle.terminate_execution();
+        return current_heap_limit + bump;
+    }
+    current_heap_limit + bump
 }
 
 // The bridge pointer is installed for the duration of each eval/pump on the
@@ -728,6 +802,8 @@ pub struct DoshEngine {
     wall_limit: f64,
     memory_limit: usize,
     oom: Arc<AtomicBool>,
+    pressure_epoch: Arc<AtomicU8>,
+    last_external: Arc<AtomicUsize>,
     eval_count: usize,
     fuel: Arc<AtomicU64>,
     fuel_enabled: Arc<AtomicBool>,
@@ -772,6 +848,8 @@ impl DoshEngine {
         let mut isolate = v8::Isolate::new(params);
         let interrupt_handle = isolate.thread_safe_handle();
         let oom = Arc::new(AtomicBool::new(false));
+        let pressure_epoch = Arc::new(AtomicU8::new(0));
+        let last_external = Arc::new(AtomicUsize::new(0));
 
         let fuel = Arc::new(AtomicU64::new(0));
         let fuel_enabled = Arc::new(AtomicBool::new(false));
@@ -795,6 +873,9 @@ impl DoshEngine {
             network_allowed: network_allowed.clone(),
             parena: parena.clone(),
             checkpoints: checkpoints.clone(),
+            pressure_epoch: pressure_epoch.clone(),
+            hard_limit: pressure_hard_limit(memory_limit),
+            last_external: AtomicUsize::new(0),
         }));
 
         isolate.add_near_heap_limit_callback(near_heap_limit_callback, bridge as *mut std::ffi::c_void);
@@ -840,6 +921,8 @@ impl DoshEngine {
             wall_limit: 0.0,
             memory_limit,
             oom,
+            pressure_epoch,
+            last_external,
             eval_count: 0,
             fuel,
             fuel_enabled,
@@ -876,6 +959,8 @@ impl DoshEngine {
         let mut isolate = v8::Isolate::new(params);
         let interrupt_handle = isolate.thread_safe_handle();
         let oom = Arc::new(AtomicBool::new(false));
+        let pressure_epoch = Arc::new(AtomicU8::new(0));
+        let last_external = Arc::new(AtomicUsize::new(0));
 
         let fuel = Arc::new(AtomicU64::new(0));
         let fuel_enabled = Arc::new(AtomicBool::new(false));
@@ -899,6 +984,9 @@ impl DoshEngine {
             network_allowed: network_allowed.clone(),
             parena: parena.clone(),
             checkpoints: checkpoints.clone(),
+            pressure_epoch: pressure_epoch.clone(),
+            hard_limit: pressure_hard_limit(memory_limit),
+            last_external: AtomicUsize::new(0),
         }));
 
         isolate.add_near_heap_limit_callback(near_heap_limit_callback, bridge as *mut std::ffi::c_void);
@@ -936,6 +1024,8 @@ impl DoshEngine {
             wall_limit: 0.0,
             memory_limit,
             oom,
+            pressure_epoch,
+            last_external,
             eval_count: 0,
             fuel,
             fuel_enabled,
@@ -981,6 +1071,9 @@ impl DoshEngine {
     pub fn eval_raw(&mut self, code: &str) -> Result<JsValue, String> {
         let _guard = ReentrancyGuard::enter(&self.is_evaluating)?;
         self.isolate.cancel_terminate_execution();
+        // Stage 1: each eval starts with a calm pressure ladder. One page's
+        // near-limit event must not poison the next eval on this isolate.
+        self.pressure_epoch.store(0, Ordering::SeqCst);
 
         // Process-wide watchdog deadline, only armed when a limit is set.
         let _watchdog = if self.wall_limit > 0.0 {
@@ -997,6 +1090,12 @@ impl DoshEngine {
             self.isolate.enter();
         }
         let out = self.eval_inner_raw(code);
+        // Stage 0: after the eval, report host-side page-arena bytes to V8's
+        // external-memory pacer (host_parse_html and friends grew the Parena
+        // during this eval). V8's GC then reacts to DOM growth it previously
+        // could not see. Negative deltas (arena dropped/reset) are fine — the
+        // API is explicitly delta-based.
+        self.report_external_parena();
         unsafe {
             self.isolate.exit();
         }
@@ -1004,6 +1103,42 @@ impl DoshEngine {
 
         self.eval_count += 1;
         out
+    }
+
+    /// Bytes the Parena currently holds outside the V8 cage.
+    fn parena_bytes(&self) -> usize {
+        self.parena
+            .lock()
+            .map(|guard| {
+                guard
+                    .as_ref()
+                    .map(|a| a.external_bytes())
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Stage 0: report the Parena's external-bytes delta to V8. The isolate
+    /// must be entered (called from inside eval_raw only).
+    fn report_external_parena(&mut self) {
+        let now = self.parena_bytes();
+        let last = self.last_external.load(Ordering::SeqCst);
+        if now == last {
+            return;
+        }
+        self.isolate
+            .adjust_amount_of_external_allocated_memory(now as i64 - last as i64);
+        self.last_external.store(now, Ordering::SeqCst);
+    }
+
+    /// Current pressure-epoch of the ladder (0 = calm, >=2 = exhaustion hit).
+    pub fn pressure_epoch(&self) -> u8 {
+        self.pressure_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Host bytes currently reported to V8's external-memory pacer.
+    pub fn external_reported(&self) -> usize {
+        self.last_external.load(Ordering::SeqCst)
     }
 
     fn eval_inner_raw(&mut self, code: &str) -> Result<JsValue, String> {
@@ -1799,6 +1934,98 @@ mod tests {
         engine.set_time_limit(0.0);
         let recovery = engine.eval("10 + 20").unwrap();
         assert_eq!(recovery, "30");
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 1: pressure-graded near-heap-limit ladder
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_collectable_waves_survive_pressure() {
+        // 24 MiB heap, then ~64 MiB of SHORT-LIVED garbage: the live set stays
+        // tiny, so this load is collectable. The old callback terminated on
+        // the FIRST near-limit hit, so garbage-heavy hydration died with
+        // "out of memory" (the build.nvidia.com failure class). The ladder
+        // must let V8's GC complete instead: this eval succeeds.
+        // Timing-sensitive by nature (GC pacing), so a wall budget bounds it.
+        let mut engine = DoshEngine::new_with_limit(Arc::new(DummySeam), 24 * 1024 * 1024).unwrap();
+        engine.set_time_limit(20.0);
+        let res = engine.eval(
+            "var t = 0;\n\
+             for (var i = 0; i < 64000; i++) { var s = 'x'.repeat(1024); t += s.length; }\n\
+             t",
+        );
+        assert!(
+            res.is_ok(),
+            "collectable load must survive the pressure ladder, got: {:?}",
+            res.err()
+        );
+        assert_eq!(res.unwrap(), "65536000"); // 64,000 x 1024 chars of collectable text
+        // Ladder never reached genuine exhaustion.
+        assert!(engine.pressure_epoch() < 2, "epoch: {}", engine.pressure_epoch());
+    }
+
+    #[test]
+    fn test_genuine_growth_terminates_with_oom() {
+        // 16 MiB heap, retained growth: every allocation stays live, so the
+        // ladder's headroom is consumed without reclaim. The eval must die
+        // with an honest "out of memory" (epoch >= 2), bounded by the hard
+        // ceiling (limit + max(64 MiB, limit/2)) — not hang, not crash.
+        let mut engine = DoshEngine::new_with_limit(Arc::new(DummySeam), 16 * 1024 * 1024).unwrap();
+        engine.set_time_limit(30.0);
+        let res = engine.eval(
+            "var a = [];\n\
+             for (;;) a.push('x'.repeat(65536));\n\
+             a.length",
+        );
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "out of memory");
+        assert!(engine.pressure_epoch() >= 2, "epoch: {}", engine.pressure_epoch());
+    }
+
+    #[test]
+    fn test_pressure_epoch_resets_per_eval() {
+        // One eval genuinely exhausts the heap. The NEXT eval on the same
+        // isolate must start from a calm ladder — a poisoned epoch from page
+        // A must not kill page B (the same regression class the facade's
+        // engine-swap disarming had).
+        let mut engine = DoshEngine::new_with_limit(Arc::new(DummySeam), 16 * 1024 * 1024).unwrap();
+        engine.set_time_limit(30.0);
+        let res = engine.eval("var a = []; for (;;) a.push('y'.repeat(65536)); a.length");
+        assert_eq!(res.unwrap_err(), "out of memory");
+        assert!(engine.pressure_epoch() >= 2);
+
+        // Recovery: fresh eval, calm ladder, works.
+        engine.set_time_limit(10.0);
+        let ok = engine.eval("7 * 6");
+        assert_eq!(ok.unwrap(), "42");
+        assert_eq!(engine.pressure_epoch(), 0, "epoch must reset per eval");
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 0: external-memory reporting (Parena -> V8 pacer)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_external_reporting_after_parena() {
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        assert_eq!(engine.external_reported(), 0, "nothing reported before a Parena exists");
+
+        let mut arena = parena::Parena::default();
+        let big_text = "x".repeat(200_000);
+        arena.add_node(parena::TagId::Div, 0, &[("id", "root")], &big_text);
+        let expected = arena.external_bytes();
+        assert!(expected > 0, "arena must hold the big text");
+        engine.set_parena(arena);
+
+        // Any eval reports the host-side arena delta to V8's pacer.
+        let ok = engine.eval("1 + 1");
+        assert_eq!(ok.unwrap(), "2");
+        assert_eq!(
+            engine.external_reported(),
+            expected,
+            "arena bytes must be reported after the eval"
+        );
     }
 
     #[test]

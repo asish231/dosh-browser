@@ -257,6 +257,23 @@ impl Parena {
         self.tags.is_empty()
     }
 
+    /// Host-resident bytes this arena currently holds OUTSIDE the V8 cage.
+    /// Reported to V8's external-memory pacer so its GC reacts to DOM/host
+    /// growth it otherwise cannot see (doshgentv8/core/src/lib.rs Stage 0).
+    /// Capacity-based: an arena that grew and shrank keeps its high-water
+    /// reservation, and that reservation is the real RAM cost.
+    pub fn external_bytes(&self) -> usize {
+        self.text_arena.capacity()
+            + self.attr_data.capacity()
+            + self.tags.capacity() * std::mem::size_of::<u16>()
+            + self.parents.capacity() * std::mem::size_of::<u32>()
+            + self.attr_offsets.capacity() * std::mem::size_of::<u32>()
+            + self.attr_lens.capacity() * std::mem::size_of::<u32>()
+            + self.text_offsets.capacity() * std::mem::size_of::<u32>()
+            + self.text_lens.capacity() * std::mem::size_of::<u32>()
+            + self.actions.capacity() * std::mem::size_of::<PackedAction>()
+    }
+
     /// Add a node to the arena, returning its node ID (0-indexed).
     pub fn add_node(
         &mut self,
