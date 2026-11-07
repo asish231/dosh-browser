@@ -86,3 +86,43 @@ gate:  eval/network/wasm allowed, secret_reveal: false
 - tests/test_engine.py, test_loom.py, test_cli_thin_client.py, test_mcp_thin_client.py, test_mcp_session_persist.py — **37 passed**
 - tests/test_shell_commands_tier.py, test_shell_spine.py, test_shell_audit_upgrades.py, test_mcp_layer_fixes.py — **67 passed**
 - Legacy unit-test files that import the `quickjs` package directly (minidom-internals tests) were not migrated — that remains the repo's deferred Phase-2 parity work
+
+## Post-pipeline verification (2026-11-08, Stages 0-5 core in the binary)
+
+Rebuilt `dosh` (nm: 39 pipeline symbols present) and re-ran the failure sites
+plus a real-page pressure probe:
+
+| Site | Lane | Result |
+|---|---|---|
+| build.nvidia.com | Rust `dosh read` | **0.3s** (original 73s/timeout failure — fixed, stays fixed) |
+| nvidia.com/en-us/about-nvidia/ | Rust `dosh read` | **0.3s** |
+| huggingface.co | Rust `dosh read` | **0.4s** |
+| cnn.com | Rust `dosh read` | **>60s timeout** — expected: CPU deadline on the read path is deferred work (plan §Future D) |
+
+### Real-page ladder proof (Python lane, V8 facade, huggingface.co)
+
+Heap cap `WR_JS_MEMORY_LIMIT_MB` swept 512→12 MB: page loads at EVERY cap,
+same title (~26-27s; the Python lane's own slowness — the Rust lane does it
+in 0.5s).
+
+Decisive probe at 16 MB via `webresearch shell` + new `heap` command:
+- `granted_bytes: 27262976` (26 MB) ≠ the 16 MB initial — **the near-heap
+  callback FIRED on this real page** and the ladder granted GC headroom
+  (V8's internal working limit ~10 MB + our 16 MB minimum bump); the page
+  completed. The pre-pipeline callback hard-killed JS at exactly this moment.
+- `pressure_epoch: 0` in the `heap` eval — correct: epochs reset per eval;
+  the granted-limit footprint is what persists as evidence of the save.
+- `shrink_fires: 3` on the light httpbin page (live set far under the granted
+  budget) — the Stage-2 envelope's shrink pass demonstrably runs on real
+  pages too.
+
+### Honest limitations seen on this run
+
+- Python-shell `open` on build.nvidia.com still hangs (>120s): pre-existing
+  shell-path issue (hung with QuickJS as well); the Rust lane is the path
+  that handles ultra-heavy pages.
+- `parena` stats are (0,0,0) on Python-lane page loads — the Python engine
+  does not build a Parena on navigation (it is the Rust DoshActor lane's
+  structure), so the Stage-3 spill currently applies to Rust-lane
+  arena-backed paths, not Python minidom pages yet.
+- `ab_pool` all-zero unless `WR_AB_POOL=1` (opt-in by design).
