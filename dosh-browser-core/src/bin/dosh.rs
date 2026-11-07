@@ -150,6 +150,9 @@ async fn main() {
         eprintln!("  ask <prompt>              Let an agent research and answer using browser tools");
         eprintln!("  assist <goal> [--url U]   In-session DevTools walkthrough -> unified command");
         eprintln!("  shell [-c <command>]      Agent browser terminal (46 commands)");
+        eprintln!("  attach [session_id]       Attach to a Dosh Loom daemon session (persistent)");
+        eprintln!("  sessions                  List live sessions in the Dosh Loom daemon");
+        eprintln!("  journal [--session ID]    Show the Dosh Loom event journal");
         eprintln!("  server / serve [--port N] Run REST HTTP API & tool invoke endpoints");
         eprintln!("  mcp                       Run Model Context Protocol server over stdio");
         eprintln!("  product / status          Show official lane and engine status");
@@ -325,6 +328,71 @@ async fn main() {
                         Ok(val) => println!("{}", serde_json::to_string(&val).unwrap_or_default()),
                         Err(e) => eprintln!("Error: {}", e),
                     }
+                }
+            }
+        }
+        "attach" => {
+            let session_id = args.get(2).map(|s| s.as_str());
+            match dosh_browser_core::daemon_client::Session::attach(None, session_id) {
+                Ok(mut sess) => {
+                    println!("{{\"ok\":true,\"session_id\":\"{}\"}}", sess.session_id);
+                    // Interactive: relay shell commands over the persistent connection.
+                    use std::io::BufRead;
+                    let stdin = std::io::stdin();
+                    for line in stdin.lock().lines() {
+                        let Ok(l) = line else { break };
+                        let trimmed = l.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if trimmed == "exit" || trimmed == "quit" || trimmed == "detach" {
+                            let _ = sess.detach();
+                            break;
+                        }
+                        let (exec_cmd, shell_args) = parse_shell_line(trimmed);
+                        match sess.command(exec_cmd, Some(shell_args)) {
+                            Ok(resp) => println!("{}", serde_json::to_string(&resp).unwrap_or_default()),
+                            Err(e) => eprintln!("Error: {}", e),
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        "sessions" => {
+            let client = dosh_browser_core::daemon_client::DaemonClient::new(None);
+            match client.list() {
+                Ok(resp) => println!("{}", serde_json::to_string(&resp).unwrap_or_default()),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        "journal" => {
+            // Journal lives in the SQLite file the daemon writes; read it with rusqlite.
+            let db = std::env::var("WR_LOOM_DB").unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_default();
+                format!("{}/.dosh/loom.db", home)
+            });
+            let session_filter = args.iter().position(|a| a == "--session")
+                .and_then(|idx| args.get(idx + 1).map(|s| s.clone()));
+            match dosh_browser_core::daemon_client::read_journal(&db, session_filter.as_deref()) {
+                Ok(rows) => {
+                    if rows.is_empty() {
+                        println!("No journal entries found.");
+                    } else {
+                        for r in rows {
+                            println!("{}", r);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
                 }
             }
         }
