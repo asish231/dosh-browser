@@ -71,6 +71,7 @@ COMMANDS = {
     "gate": "Configure capability gates: gate=secret_reveal, allowed=bool (audited).",
     "wait": "Wait for url substring, action ref, page text, or network idle. Timeout via timeout_ms (ms, preferred) or timeout (s); rejects unknown args.",
     "caps": "Per-page capability manifest: live counts plus known engine gaps; export=path writes it to disk.",
+    "heap": "Engine memory pressure: heap envelope (floor/ceil/granted), pressure epoch, shrink passes, Parena active/passive split, and pooled ArrayBuffer stats.",
     "screenshot": "Save the engine's approximate SVG layout diagram: dest_dir, frame.",
     "frame.eval": "Run a bounded probe expression in the live page/frame realm: frame, expr.",
     "ref": "Re-resolve a stable id (from an action's stable field) to the current page's ref.",
@@ -1119,6 +1120,59 @@ class DoshShell:
             raise ValueError(
                 f"unknown gate '{gate_name}'; supported: secret_reveal (the audited N8 gate)"
             )
+        if name == "heap":
+            # Unknown-argument rejection, same policy as `wait`: a wrong kwarg
+            # must be refused loudly, not silently dropped.
+            _HEAP_KEYS = set()
+            unknown = sorted(k for k in a if k not in _HEAP_KEYS)
+            if unknown:
+                raise ValueError(f"heap takes no arguments; got {unknown}")
+            # Stage-5 pressure observability. Everything is optional-by-probe:
+            # the mini-racer fallback lacks most bindings, so the command
+            # reports what the live context can honestly answer.
+            ctx = getattr(getattr(s, "current_tab", None), "ctx", None)
+            out: dict[str, Any] = {"engine": js_engine(), "available": {}}
+            notes: list[str] = []
+            if ctx is None:
+                notes.append("no live JS context on the active tab; page not opened or realm closed")
+            else:
+                if hasattr(ctx, "heap_band"):
+                    floor, ceil, granted = ctx.heap_band()
+                    out["available"]["heap_band"] = {
+                        "floor_bytes": floor, "ceil_bytes": ceil, "granted_bytes": granted}
+                else:
+                    notes.append("heap_band not exposed by this engine build")
+                if hasattr(ctx, "pressure_epoch"):
+                    out["available"]["pressure_epoch"] = ctx.pressure_epoch()
+                else:
+                    notes.append("pressure_epoch not exposed by this engine build")
+                if hasattr(ctx, "external_reported"):
+                    out["available"]["external_reported_bytes"] = ctx.external_reported()
+                else:
+                    notes.append("external reporting not exposed by this engine build")
+                if hasattr(ctx, "shrink_fires"):
+                    out["available"]["shrink_fires"] = ctx.shrink_fires()
+                else:
+                    notes.append("shrink pass not exposed by this engine build")
+                if hasattr(ctx, "parena_stats"):
+                    ram, spill, text = ctx.parena_stats()
+                    out["available"]["parena"] = {
+                        "ram_bytes": ram, "spill_bytes": spill, "text_bytes": text}
+                else:
+                    notes.append("parena residency not exposed by this engine build")
+            try:
+                import doshgentv8_rust as _d8r
+                if hasattr(_d8r, "ab_pool_stats_py"):
+                    live, peak, allocs, budget = _d8r.ab_pool_stats_py()
+                    out["available"]["ab_pool"] = {
+                        "live_bytes": live, "peak_bytes": peak,
+                        "allocs": allocs, "budget_bytes": budget}
+            except ImportError:
+                notes.append("pooled ArrayBuffer stats unavailable (facade not built)")
+            out["notes"] = notes
+            out["note"] = ("pressure_epoch >= 2 means genuine exhaustion was hit this eval; "
+                           "spill_bytes > 0 means the cold Parena tail is offloaded to disk")
+            return out
         if name == "caps":
             counts, source, probe_note = self._caps_counts(a.get("frame", ""))
             unavailable = []

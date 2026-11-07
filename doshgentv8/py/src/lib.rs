@@ -151,6 +151,25 @@ impl DoshContext {
         self.engine.pressure_epoch()
     }
 
+    /// Stage-5: measured heap envelope — (floor_bytes, ceil_bytes,
+    /// granted_bytes). Lets hosts size sessions and budget pressure.
+    fn heap_band(&mut self) -> (u64, u64, u64) {
+        let (f, c, g) = self.engine.heap_band();
+        (f as u64, c as u64, g as u64)
+    }
+
+    /// Stage-5: times the shrink pass asked V8 for a low-memory GC.
+    fn shrink_fires(&mut self) -> u32 {
+        self.engine.shrink_fires()
+    }
+
+    /// Stage-5: Parena residency — (ram_bytes, spill_bytes, text_bytes).
+    /// The active/passive split of the page arena, observable per context.
+    fn parena_stats(&mut self) -> (u64, u64, u64) {
+        let (r, s, t) = self.engine.parena_stats();
+        (r as u64, s as u64, t as u64)
+    }
+
     /// Host bytes currently reported to V8's external-memory pacer.
     fn external_reported(&mut self) -> usize {
         self.engine.external_reported()
@@ -230,8 +249,18 @@ impl DoshContext {
     }
 }
 
+/// Stage-5: process-global pooled ArrayBuffer allocator stats —
+/// (live_bytes, peak_bytes, allocs, budget_bytes). Requires WR_AB_POOL=1
+/// (or the Rust-side switch) at isolate creation; stats exist regardless.
+#[pyfunction]
+fn ab_pool_stats_py() -> (u64, u64, u64, u64) {
+    let s = doshgentv8_core::ab_pool::ab_pool_stats();
+    (s.live as u64, s.peak as u64, s.allocs, s.budget as u64)
+}
+
 #[pymodule]
 fn doshgentv8_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DoshContext>()?;
+    m.add_function(wrap_pyfunction!(ab_pool_stats_py, m)?)?;
     Ok(())
 }

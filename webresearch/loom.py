@@ -155,18 +155,38 @@ class SessionRegistry:
         return result
 
     async def list_sessions(self) -> list[dict[str, Any]]:
-        """List all live sessions with metadata."""
+        """List all live sessions with metadata (+ engine pressure)."""
         async with self._lock:
-            return [
-                {
+            rows = []
+            for e in self._sessions.values():
+                row = {
                     "session_id": e.session_id,
                     "url": e.session.url or "",
                     "title": e.session.page.title if e.session.page else "",
                     "attached_clients": e.attached_clients,
                     "idle_seconds": int(time.monotonic() - e.last_attach),
                 }
-                for e in self._sessions.values()
-            ]
+                # Stage-5: expose the live context's pressure so eviction
+                # policy (and agents) can see which sessions run hot. All
+                # probes are optional — a closed realm simply reports none.
+                ctx = getattr(getattr(e.session, "current_tab", None), "ctx", None)
+                pressure = {}
+                if ctx is not None:
+                    if hasattr(ctx, "pressure_epoch"):
+                        pressure["epoch"] = ctx.pressure_epoch()
+                    if hasattr(ctx, "heap_band"):
+                        floor, ceil, granted = ctx.heap_band()
+                        pressure["heap_granted_bytes"] = granted
+                        pressure["heap_ceil_bytes"] = ceil
+                    if hasattr(ctx, "external_reported"):
+                        pressure["external_bytes"] = ctx.external_reported()
+                    if hasattr(ctx, "parena_stats"):
+                        _ram, spill, _text = ctx.parena_stats()
+                        pressure["parena_spill_bytes"] = spill
+                if pressure:
+                    row["pressure"] = pressure
+                rows.append(row)
+            return rows
 
     async def _restore_locked(self, session_id: str) -> dict[str, Any] | None:
         """Restore a session from its SQLite checkpoint."""
