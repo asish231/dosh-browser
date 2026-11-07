@@ -19,6 +19,7 @@ pub mod actor;
 pub mod parena;
 pub mod protocol;
 pub mod session;
+pub mod ab_pool;
 pub mod watchdog;
 
 pub use actor::{DoshActor, DoshActorHandle};
@@ -146,6 +147,10 @@ pub(crate) struct HostBridge {
     /// construction from the configured memory_limit (0 = uncapped policy:
     /// per-epoch bump only, max PRESSURE_MAX_EPOCHS).
     pub hard_limit: usize,
+    /// Last limit granted by the ladder callback (Stage-2 envelope tracking).
+    /// Initialized to the configured memory_limit; the callback stores every
+    /// raise so the shrink pass can compare live heap vs granted budget.
+    pub current_limit: Arc<AtomicUsize>,
     /// Host bytes last reported to V8's external-memory pacer (Stage 0).
     pub last_external: AtomicUsize,
 }
@@ -154,6 +159,40 @@ pub(crate) struct HostBridge {
 const PRESSURE_MAX_EPOCHS: u8 = 3;
 /// Headroom granted per epoch: +25% of the current limit.
 const PRESSURE_BUMP_FRAC: usize = 4;
+/// Shrink pass (Stage 2): when the live heap stays under this fraction of the
+/// granted limit for SHRINK_STREAK_N consecutive job-pump drains, ask V8 for a
+/// low-memory GC so it releases pages back (Go-pacer inspired: measure the
+/// live set, size the budget from it).
+const SHRINK_LIVE_FRAC: usize = 5; // under 1/5 (20%) of granted budget
+const SHRINK_STREAK_N: u8 = 2;
+
+/// Stage-2 env knob: envelope floor in MiB (below this granted budget we never
+/// ask V8 to release pages). WR_JS_HEAP_FLOOR_MB, default 32; 0 = no floor.
+fn env_heap_floor_mb() -> usize {
+    std::env::var("WR_JS_HEAP_FLOOR_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(32)
+}
+
+/// Stage-2 env knob: envelope ceiling in MiB — clamps the ladder's bumps.
+/// WR_JS_HEAP_CEIL_MB, default 512.
+///
+/// Stage-3 env knob lives with it: resident text-arena watermark in MiB
+/// before the cold tail spills to disk. WR_PARENA_SPILL_MB, default 64;
+/// 0 disables the auto-spill (explicit spill_parena_tail still works).
+fn env_parena_spill_mb() -> usize {
+    std::env::var("WR_PARENA_SPILL_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64)
+}
+fn env_heap_ceil_mb() -> usize {
+    std::env::var("WR_JS_HEAP_CEIL_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512)
+}
 /// When a memory_limit IS configured, the hard ceiling is
 /// limit + max(64 MiB, limit/2) — bounded, generous enough for one full GC.
 fn pressure_hard_limit(memory_limit: usize) -> usize {
@@ -161,6 +200,24 @@ fn pressure_hard_limit(memory_limit: usize) -> usize {
         0
     } else {
         memory_limit + (64 * 1024 * 1024).max(memory_limit / 2)
+    }
+}
+
+/// Stage-2 measured heap envelope for one isolate.
+/// Returns (floor_bytes, ceil_bytes, hard_limit, initial_granted).
+/// - With a configured memory_limit: hard = max(limit, min(pressure_hard_limit(limit), ceil))
+///   (the ladder may grow the heap past the configured limit, but never past the band).
+/// - Uncapped (limit 0): hard = ceil — the envelope IS the policy; the
+///   epoch backstop remains as a safety net if the ceiling is 0.
+fn heap_band(memory_limit: usize) -> (usize, usize, usize, usize) {
+    let floor = env_heap_floor_mb().saturating_mul(1024 * 1024);
+    let ceil = env_heap_ceil_mb().max(1).saturating_mul(1024 * 1024);
+    if memory_limit > 0 {
+        let base = pressure_hard_limit(memory_limit);
+        let hard = memory_limit.max(base.min(ceil));
+        (floor, ceil, hard, memory_limit)
+    } else {
+        (floor, ceil, ceil, 0)
     }
 }
 
@@ -207,24 +264,30 @@ unsafe extern "C" fn near_heap_limit_callback(
         // this bump is an unwinding lifeboat, not a growth permit.
         bridge.oom.store(true, Ordering::SeqCst);
         bridge.interrupt_handle.terminate_execution();
-        return current_heap_limit + bump;
+        let new_limit = current_heap_limit + bump;
+        bridge.current_limit.store(new_limit, Ordering::SeqCst);
+        return new_limit;
     }
     // First callback: bounded headroom so the GC that fired completes.
     let ceiling = bridge.hard_limit;
+    let new_limit = current_heap_limit + bump;
     if ceiling > 0 {
-        if current_heap_limit + bump >= ceiling {
+        if new_limit >= ceiling {
             // Even one more full GC pass cannot fit under the ceiling.
             bridge.oom.store(true, Ordering::SeqCst);
             bridge.interrupt_handle.terminate_execution();
-            return current_heap_limit + bump;
+            bridge.current_limit.store(new_limit, Ordering::SeqCst);
+            return new_limit;
         }
     } else if epoch + 1 >= PRESSURE_MAX_EPOCHS {
         // Uncapped policy: refuse to grow forever.
         bridge.oom.store(true, Ordering::SeqCst);
         bridge.interrupt_handle.terminate_execution();
-        return current_heap_limit + bump;
+        bridge.current_limit.store(new_limit, Ordering::SeqCst);
+        return new_limit;
     }
-    current_heap_limit + bump
+    bridge.current_limit.store(new_limit, Ordering::SeqCst);
+    new_limit
 }
 
 // The bridge pointer is installed for the duration of each eval/pump on the
@@ -804,6 +867,19 @@ pub struct DoshEngine {
     oom: Arc<AtomicBool>,
     pressure_epoch: Arc<AtomicU8>,
     last_external: Arc<AtomicUsize>,
+    /// Stage-2 measured heap envelope. floor: below this granted budget we
+    /// never ask V8 to release pages. ceil: mirrored into the bridge's
+    /// hard_limit (single source of truth for the ladder). shrink_streak:
+    /// consecutive job-pump drains that saw the live heap under 40% of the
+    /// granted limit; two in a row trigger a low-memory GC.
+    heap_floor: usize,
+    heap_ceil: usize,
+    shrink_streak: u8,
+    /// Times the shrink pass asked V8 for a low-memory GC (Stage 2).
+    /// Observable so the pass is testable without depending on V8's
+    /// asynchronous page-release behavior.
+    shrink_fires: u32,
+    current_limit: Arc<AtomicUsize>,
     eval_count: usize,
     fuel: Arc<AtomicU64>,
     fuel_enabled: Arc<AtomicBool>,
@@ -845,11 +921,17 @@ impl DoshEngine {
         if memory_limit > 0 {
             params = params.heap_limits(0, memory_limit);
         }
+        // Stage 4: opt-in pooled ArrayBuffer allocator (host accounting).
+        if ab_pool::ab_pool_enabled() {
+            params = params.array_buffer_allocator(ab_pool::make_pooled_allocator());
+        }
         let mut isolate = v8::Isolate::new(params);
         let interrupt_handle = isolate.thread_safe_handle();
         let oom = Arc::new(AtomicBool::new(false));
         let pressure_epoch = Arc::new(AtomicU8::new(0));
         let last_external = Arc::new(AtomicUsize::new(0));
+        let (heap_floor, _heap_ceil, heap_hard, _initial) = heap_band(memory_limit);
+        let current_limit = Arc::new(AtomicUsize::new(memory_limit));
 
         let fuel = Arc::new(AtomicU64::new(0));
         let fuel_enabled = Arc::new(AtomicBool::new(false));
@@ -874,7 +956,8 @@ impl DoshEngine {
             parena: parena.clone(),
             checkpoints: checkpoints.clone(),
             pressure_epoch: pressure_epoch.clone(),
-            hard_limit: pressure_hard_limit(memory_limit),
+            hard_limit: heap_hard,
+            current_limit: current_limit.clone(),
             last_external: AtomicUsize::new(0),
         }));
 
@@ -923,6 +1006,11 @@ impl DoshEngine {
             oom,
             pressure_epoch,
             last_external,
+            heap_floor,
+            heap_ceil: _heap_ceil,
+            shrink_streak: 0,
+            shrink_fires: 0,
+            current_limit,
             eval_count: 0,
             fuel,
             fuel_enabled,
@@ -956,11 +1044,17 @@ impl DoshEngine {
         if memory_limit > 0 {
             params = params.heap_limits(0, memory_limit);
         }
+        // Stage 4: opt-in pooled ArrayBuffer allocator (host accounting).
+        if ab_pool::ab_pool_enabled() {
+            params = params.array_buffer_allocator(ab_pool::make_pooled_allocator());
+        }
         let mut isolate = v8::Isolate::new(params);
         let interrupt_handle = isolate.thread_safe_handle();
         let oom = Arc::new(AtomicBool::new(false));
         let pressure_epoch = Arc::new(AtomicU8::new(0));
         let last_external = Arc::new(AtomicUsize::new(0));
+        let (heap_floor, _heap_ceil, heap_hard, _initial) = heap_band(memory_limit);
+        let current_limit = Arc::new(AtomicUsize::new(memory_limit));
 
         let fuel = Arc::new(AtomicU64::new(0));
         let fuel_enabled = Arc::new(AtomicBool::new(false));
@@ -985,7 +1079,8 @@ impl DoshEngine {
             parena: parena.clone(),
             checkpoints: checkpoints.clone(),
             pressure_epoch: pressure_epoch.clone(),
-            hard_limit: pressure_hard_limit(memory_limit),
+            hard_limit: heap_hard,
+            current_limit: current_limit.clone(),
             last_external: AtomicUsize::new(0),
         }));
 
@@ -1026,6 +1121,11 @@ impl DoshEngine {
             oom,
             pressure_epoch,
             last_external,
+            heap_floor,
+            heap_ceil: _heap_ceil,
+            shrink_streak: 0,
+            shrink_fires: 0,
+            current_limit,
             eval_count: 0,
             fuel,
             fuel_enabled,
@@ -1096,6 +1196,22 @@ impl DoshEngine {
         // could not see. Negative deltas (arena dropped/reset) are fine — the
         // API is explicitly delta-based.
         self.report_external_parena();
+        // Stage 3: past the watermark, spill the arena's cold text tail to
+        // disk (RAM release), then report the drop to the pacer. The
+        // isolate is entered here, matching report_external_parena.
+        let spill_wm = env_parena_spill_mb().saturating_mul(1024 * 1024);
+        if spill_wm > 0 && self.parena_bytes() > spill_wm {
+            let spilled = match self.parena.lock() {
+                Ok(mut guard) => match guard.as_mut() {
+                    Some(arena) => arena.spill_tail(spill_wm),
+                    None => false,
+                },
+                Err(_) => false,
+            };
+            if spilled {
+                self.report_external_parena();
+            }
+        }
         unsafe {
             self.isolate.exit();
         }
@@ -1116,6 +1232,21 @@ impl DoshEngine {
                     .unwrap_or(0)
             })
             .unwrap_or(0)
+    }
+
+    /// Stage-5 observability: (ram_bytes, spill_bytes, logical_text_bytes)
+    /// for the attached Parena. RAM is the resident cost (post-spill);
+    /// spill is the offloaded cold tail; text_len is the logical total.
+    pub fn parena_stats(&self) -> (usize, usize, usize) {
+        self.parena
+            .lock()
+            .map(|guard| {
+                match guard.as_ref() {
+                    Some(a) => (a.external_bytes(), a.spill_bytes(), a.text_len()),
+                    None => (0, 0, 0),
+                }
+            })
+            .unwrap_or((0, 0, 0))
     }
 
     /// Stage 0: report the Parena's external-bytes delta to V8. The isolate
@@ -1139,6 +1270,32 @@ impl DoshEngine {
     /// Host bytes currently reported to V8's external-memory pacer.
     pub fn external_reported(&self) -> usize {
         self.last_external.load(Ordering::SeqCst)
+    }
+
+    /// Stage-3: spill the arena's cold text tail to disk at an explicit
+    /// watermark (bytes). Returns true when a spill happened. The RAM drop
+    /// is reported to V8's external-memory pacer so its GC sees the release.
+    pub fn spill_parena_tail(&mut self, watermark_bytes: usize) -> bool {
+        let spilled = {
+            let mut guard = match self.parena.lock() {
+                Ok(g) => g,
+                Err(_) => return false,
+            };
+            match guard.as_mut() {
+                Some(arena) => arena.spill_tail(watermark_bytes),
+                None => false,
+            }
+        };
+        if spilled {
+            unsafe {
+                self.isolate.enter();
+            }
+            self.report_external_parena();
+            unsafe {
+                self.isolate.exit();
+            }
+        }
+        spilled
     }
 
     fn eval_inner_raw(&mut self, code: &str) -> Result<JsValue, String> {
@@ -1230,11 +1387,63 @@ impl DoshEngine {
             self.isolate.enter();
         }
         self.isolate.perform_microtask_checkpoint();
+        // Stage-2 shrink pass: measure the live heap against the granted
+        // budget (Go-pacer style). If the live set stays under 20% of the
+        // granted limit for SHRINK_STREAK_N consecutive drains — and the
+        // granted budget is above the floor — ask V8 for a low-memory GC so
+        // it releases pages back to the OS instead of squatting on the
+        // high-water mark (Goose's reserve-big/commit-lazy, via V8's own
+        // machinery). V8 lowers its limit itself after such a GC.
+        let granted = self.current_limit.load(Ordering::SeqCst);
+        if granted > self.heap_floor {
+            let used = self.isolate.get_heap_statistics().used_heap_size();
+            if used.saturating_mul(SHRINK_LIVE_FRAC) < granted {
+                self.shrink_streak = self.shrink_streak.saturating_add(1);
+                if self.shrink_streak >= SHRINK_STREAK_N {
+                    self.isolate.low_memory_notification();
+                    self.shrink_fires += 1;
+                    self.shrink_streak = 0;
+                }
+            } else {
+                self.shrink_streak = 0;
+            }
+        }
         unsafe {
             self.isolate.exit();
         }
         HOST_BRIDGE.with(|b| b.set(std::ptr::null_mut()));
         false
+    }
+
+    /// Stage-2: times the shrink pass asked V8 for a low-memory GC.
+    pub fn shrink_fires(&self) -> u32 {
+        self.shrink_fires
+    }
+
+    /// Stage-2: (floor_bytes, ceil_bytes, granted_limit) for this engine.
+    pub fn heap_band(&self) -> (usize, usize, usize) {
+        (
+            self.heap_floor,
+            self.heap_ceil,
+            self.current_limit.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Stage-2: override the envelope at runtime (MiB). The ceiling clamps
+    /// future ladder bumps; the floor gates the shrink pass.
+    pub fn set_heap_band(&mut self, floor_mb: usize, ceil_mb: usize) {
+        self.heap_floor = floor_mb.saturating_mul(1024 * 1024);
+        self.heap_ceil = ceil_mb.max(1).saturating_mul(1024 * 1024);
+        // Keep the bridge's hard limit consistent with the new ceiling.
+        let granted = self.current_limit.load(Ordering::SeqCst);
+        let hard = if granted > 0 {
+            granted.max(pressure_hard_limit(granted).min(self.heap_ceil))
+        } else {
+            self.heap_ceil
+        };
+        if let Some(bridge) = unsafe { self.bridge.as_mut() } {
+            bridge.hard_limit = hard;
+        }
     }
 
     /// Wall-clock budget per subsequent eval, in seconds. 0 disables.
@@ -2026,6 +2235,228 @@ mod tests {
             expected,
             "arena bytes must be reported after the eval"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 2: measured heap envelope (band, shrink pass, ceiling clamp)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_heap_band_surface_and_setter() {
+        let mut engine = DoshEngine::new_with_limit(Arc::new(DummySeam), 64 * 1024 * 1024).unwrap();
+        let (floor, _ceil, granted) = engine.heap_band();
+        assert_eq!(granted, 64 * 1024 * 1024, "granted = configured limit");
+        assert!(floor > 0, "default floor must exist");
+
+        // Runtime override: floor/ceil move together; granted stays.
+        engine.set_heap_band(8, 256);
+        let (floor2, ceil2, granted2) = engine.heap_band();
+        assert_eq!(floor2, 8 * 1024 * 1024);
+        assert_eq!(ceil2, 256 * 1024 * 1024);
+        assert_eq!(granted2, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_shrink_pass_fires_on_low_live_set() {
+        // Waves of garbage, then everything dropped: the live set ends far
+        // under 20% of the granted budget, so consecutive job-pump drains
+        // must trip the shrink pass (low-memory GC request to V8).
+        let mut engine = DoshEngine::new_with_limit(Arc::new(DummySeam), 64 * 1024 * 1024).unwrap();
+        engine.set_time_limit(20.0);
+        engine
+            .eval("var keep = []; for (var i = 0; i < 2000; i++) keep.push('x'.repeat(1024)); keep.length")
+            .unwrap();
+        // Drop the live set and pump past the streak threshold.
+        engine.eval("keep = null; 1").unwrap();
+        let before = engine.shrink_fires();
+        engine.pump_jobs();
+        engine.pump_jobs();
+        engine.pump_jobs();
+        assert!(
+            engine.shrink_fires() > before,
+            "shrink pass must fire when the live set is far below the granted budget (fires: {} -> {})",
+            before,
+            engine.shrink_fires()
+        );
+    }
+
+    #[test]
+    fn test_shrink_pass_gated_by_floor() {
+        // Floor ABOVE the granted budget: the shrink pass must never fire —
+        // small heaps are allowed to stay small without churning GCs.
+        let mut engine = DoshEngine::new_with_limit(Arc::new(DummySeam), 64 * 1024 * 1024).unwrap();
+        engine.set_time_limit(20.0);
+        engine.set_heap_band(256, 512); // floor 256 MiB > granted 64 MiB
+        engine.eval("var k = []; for (var i = 0; i < 1000; i++) k.push('x'.repeat(1024)); k = null; 1").unwrap();
+        for _ in 0..6 {
+            engine.pump_jobs();
+        }
+        assert_eq!(engine.shrink_fires(), 0, "floor must gate the shrink pass");
+    }
+
+    #[test]
+    fn test_ceiling_clamps_ladder() {
+        // A tight ceiling must clamp the ladder's growth: genuine retained
+        // growth dies at the ceiling with an honest "out of memory" rather
+        // than growing past the envelope.
+        let mut engine = DoshEngine::new_with_limit(Arc::new(DummySeam), 16 * 1024 * 1024).unwrap();
+        engine.set_time_limit(30.0);
+        engine.set_heap_band(8, 32); // ceiling 32 MiB (vs 80 MiB unclamped)
+        let res = engine.eval("var a = []; for (;;) a.push('z'.repeat(65536)); a.length");
+        assert_eq!(res.unwrap_err(), "out of memory");
+        assert!(engine.pressure_epoch() >= 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 3: Parena spill tier (cold tail to disk, hot prefix in RAM)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_spill_moves_cold_tail_and_reads_stay_correct() {
+        let mut arena = parena::Parena::default();
+        let texts = ["a".repeat(50_000), "b".repeat(50_000), "c".repeat(50_000)];
+        for t in &texts {
+            arena.add_node(parena::TagId::Div, 0, &[], t);
+        }
+        let total = arena.text_len();
+        assert_eq!(total, 150_000);
+
+        // Spill with a 64 KiB watermark: the cold tail goes to disk.
+        assert!(arena.spill_tail(64 * 1024), "spill must happen past the watermark");
+        assert!(arena.spill_bytes() > 0, "cold tail must live on disk");
+        assert_eq!(arena.text_len(), total, "logical text length is unchanged");
+        assert!(
+            arena.text_arena.len() <= 64 * 1024,
+            "hot prefix must be at most the watermark, got {}",
+            arena.text_arena.len()
+        );
+
+        // Every node's text must read back IDENTICAL through the tier —
+        // hot reads, spilled reads and boundary-crossing reads included.
+        for (i, t) in texts.iter().enumerate() {
+            assert_eq!(&arena.get_text(i as u32), t, "node {} text corrupted by spill", i);
+        }
+    }
+
+    #[test]
+    fn test_spill_append_and_write_semantics() {
+        let mut arena = parena::Parena::default();
+        arena.add_node(parena::TagId::Div, 0, &[], &"x".repeat(100_000));
+        assert!(arena.spill_tail(16 * 1024));
+
+        // Append after spill: goes to the spill file; reads stay correct.
+        let appended = "y".repeat(20_000);
+        let n1 = arena.add_node(parena::TagId::P, 0, &[], &appended);
+        assert_eq!(&arena.get_text(n1), &appended);
+        assert!(arena.spill_bytes() > 20_000, "append must land in the spill");
+        assert_eq!(arena.text_len(), 120_000);
+
+        // Write to a spilled node: un-spills (re-resident), stays correct.
+        let mutated = "z".repeat(30_000);
+        assert!(arena.set_text(0, &mutated), "set_text must succeed");
+        assert!(arena.spill.is_none(), "a text write must un-spill the arena");
+        assert_eq!(&arena.get_text(0), &mutated);
+        assert_eq!(arena.text_arena.len(), arena.text_len(), "fully resident after un-spill");
+    }
+
+    #[test]
+    fn test_fork_of_spilled_arena_is_complete() {
+        let mut arena = parena::Parena::default();
+        let texts = ["h".repeat(40_000), "i".repeat(40_000), "j".repeat(40_000)];
+        for t in &texts {
+            arena.add_node(parena::TagId::Span, 0, &[], t);
+        }
+        assert!(arena.spill_tail(32 * 1024));
+
+        // Fork must materialize the FULL logical text — a partial clone of
+        // the hot prefix would silently lose every spilled node.
+        let forked = arena.fork();
+        assert!(forked.spill.is_none(), "fork is re-resident by construction");
+        assert_eq!(forked.text_len(), 120_000);
+        for (i, t) in texts.iter().enumerate() {
+            assert_eq!(&forked.get_text(i as u32), t, "forked node {} corrupted", i);
+        }
+        // The source arena is untouched.
+        for (i, t) in texts.iter().enumerate() {
+            assert_eq!(&arena.get_text(i as u32), t);
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_restore_across_spill() {
+        let mut arena = parena::Parena::default();
+        arena.add_node(parena::TagId::Div, 0, &[], "original text one");
+        let cp = arena.checkpoint();
+        assert!(arena.spill_tail(8)); // tiny watermark: everything spills
+        assert!(arena.spill.is_some());
+
+        // Mutate after spilling (this un-spills), then restore.
+        assert!(arena.set_text(0, "CHANGED"));
+        assert_ne!(&arena.get_text(0), "original text one");
+        arena.rewind(&cp).unwrap();
+        assert_eq!(&arena.get_text(0), "original text one", "restore must rewind the text");
+    }
+
+    #[test]
+    fn test_engine_spill_reports_external_drop() {
+        // Engine-level: spilling releases RAM and the pacer sees the drop.
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        let mut arena = parena::Parena::default();
+        arena.add_node(parena::TagId::Div, 0, &[], &"k".repeat(200_000));
+        engine.set_parena(arena);
+
+        // First eval reports the arena's resident bytes.
+        engine.eval("1 + 1").unwrap();
+        let before = engine.external_reported();
+        assert!(before >= 200_000, "arena RAM must be reported, got {}", before);
+
+        // Explicit spill at a 64 KiB watermark.
+        assert!(engine.spill_parena_tail(64 * 1024));
+        let after = engine.external_reported();
+        assert!(
+            after < before,
+            "spill must release RAM and report the drop: {} -> {}",
+            before,
+            after
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 4: pooled ArrayBuffer allocator (opt-in host accounting)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_pooled_allocator_accounts_array_buffers() {
+        // Shared global pool: serialize with the ab_pool unit tests that
+        // toggle the switch (parallel #[test] runs race otherwise).
+        let _g = ab_pool::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Opt-in pool, then a big ArrayBuffer allocation: the pool must see
+        // the backing store (live grows during the eval, peak tracks it).
+        ab_pool::set_ab_pool_enabled(true);
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+        let before = ab_pool::ab_pool_stats();
+        engine
+            .eval("var ab = new ArrayBuffer(50 * 1024 * 1024); ab.byteLength")
+            .unwrap();
+        let after = ab_pool::ab_pool_stats();
+        assert!(
+            after.allocs > before.allocs,
+            "the allocation must be counted (allocs {} -> {})",
+            before.allocs,
+            after.allocs
+        );
+        // Peak is a MAX, not a sum: the 50 MiB backing store must APPEAR in
+        // it, and it must never decrease (a parallel test may have already
+        // pushed peak above zero through the shared pool).
+        assert!(
+            after.peak >= 50 * 1024 * 1024,
+            "peak must track the 50 MiB backing store (peak {} -> {})",
+            before.peak,
+            after.peak
+        );
+        assert!(after.peak >= before.peak, "peak must never decrease");
+        // Leave the switch in its default-off state for other tests.
+        ab_pool::set_ab_pool_enabled(false);
     }
 
     #[test]
