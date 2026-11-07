@@ -314,6 +314,72 @@ async def test_wait_validation_is_honest(workspace):
         assert "net_idle_ms must be" in err
 
 
+@pytest.mark.asyncio
+async def test_wait_rejects_unknown_kwargs(workspace):
+    """A wrong param name (e.g. net_idle vs net_idle_ms) must be rejected, not
+    silently dropped onto the default deadline."""
+    async with workspace() as (shell, session, _):
+        await opened(shell)
+        err = await fail(shell, "wait", text="x", timeout_ms=3000, net_idle=False)
+        assert "unknown argument" in err
+        assert "net_idle" in err
+
+
+@pytest.mark.asyncio
+async def test_wait_timeout_ms_is_honored_not_default(workspace):
+    """timeout_ms (milliseconds) must bound the wait. Previously it was silently
+    ignored and the call fell back to the 15s default."""
+    import time as _t
+    async with workspace() as (shell, session, _):
+        await opened(shell)
+        t0 = _t.monotonic()
+        result = await command(shell, "wait", text="WILL_NEVER_APPEAR",
+                               timeout_ms=200, interval=0.05)
+        dt = _t.monotonic() - t0
+        assert result["met"] is False
+        assert result["elapsed_ms"] < 1000  # bounded, nowhere near the 15s default
+        assert dt < 1.5
+        assert "timeout" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_wait_timeout_ms_and_timeout_mutually_exclusive(workspace):
+    async with workspace() as (shell, session, _):
+        await opened(shell)
+        err = await fail(shell, "wait", text="x", timeout=1, timeout_ms=500)
+        assert "not both" in err
+
+
+@pytest.mark.asyncio
+async def test_wait_timeout_ms_validation(workspace):
+    async with workspace() as (shell, session, _):
+        await opened(shell)
+        err = await fail(shell, "wait", text="x", timeout_ms=10)
+        assert "timeout_ms must be" in err
+
+
+@pytest.mark.asyncio
+async def test_wait_ref_check_does_not_rebuild_inventory_per_tick(workspace, monkeypatch):
+    """Waiting for a ref must not rebuild the full inventory on every poll tick
+    when no network activity changes (the old per-tick 1M-entry rebuild)."""
+    async with workspace() as (shell, session, _):
+        await opened(shell)
+        inventory = await command(shell, "actions", limit=10)
+        ref = inventory["actions"][0]["ref"]
+        calls = {"n": 0}
+        real = shell._inventory
+
+        def counting(offset, limit):
+            calls["n"] += 1
+            return real(offset, limit)
+
+        monkeypatch.setattr(shell, "_inventory", counting)
+        result = await command(shell, "wait", ref=ref, timeout_ms=500, interval=0.05)
+        assert result["met"] is True
+        # ref present at open + no network change -> inventory built at most once
+        assert calls["n"] <= 1, calls
+
+
 # ---------------------------------------------------------------- caps
 
 

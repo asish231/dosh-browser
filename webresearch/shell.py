@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import tempfile
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-from quickjs import Context
+from quickjs import Context  # banned for page runtime; legacy tests import it directly
 from webresearch.config import js_engine
 
 from webresearch.telemetry import (
@@ -68,7 +69,7 @@ COMMANDS = {
     "history": "List history entries, or traverse with move (delta) or goto (absolute index).",
     "cookies": "Inspect session cookie names, domains, paths; values are never echoed.",
     "gate": "Configure capability gates: gate=secret_reveal, allowed=bool (audited).",
-    "wait": "Wait for url substring, action ref, page text, or network idle: timeout-bounded.",
+    "wait": "Wait for url substring, action ref, page text, or network idle. Timeout via timeout_ms (ms, preferred) or timeout (s); rejects unknown args.",
     "caps": "Per-page capability manifest: live counts plus known engine gaps; export=path writes it to disk.",
     "screenshot": "Save the engine's approximate SVG layout diagram: dest_dir, frame.",
     "frame.eval": "Run a bounded probe expression in the live page/frame realm: frame, expr.",
@@ -396,7 +397,11 @@ class DoshShell:
         if getattr(session.client, "_dosh_runtime_observer", None) is not None:
             raise ValueError("this session already has a shell observer")
         self.session = session
-        self.store = ShellStore(database)
+        # Opt-in persistent workspace: an explicit database path wins; otherwise
+        # fall back to WR_SESSION_DB env (used by the MCP stdio server so session
+        # checkpoints survive process restarts). Default stays in-memory.
+        path = database if database is not None else (os.environ.get("WR_SESSION_DB") or None)
+        self.store = ShellStore(path)
         self.network = NetworkLedger(session.client)
         self.network.attach()
         self.logs: deque = deque(maxlen=1000)
@@ -773,6 +778,17 @@ class DoshShell:
                     s._web_storage.update(json.loads(chk["storage"]))
                 except Exception:
                     pass
+            # Reapply the saved cookie jar so logged-in sessions survive a
+            # process restart (the high-value retention case). The checkpoint
+            # stores cookies as a list of {name,value}; _restore_cookie_map
+            # wants a name->value dict.
+            if chk.get("cookies"):
+                try:
+                    pairs = json.loads(chk["cookies"])
+                    cookie_map = {p["name"]: p["value"] for p in pairs} if isinstance(pairs, list) else dict(pairs)
+                    _restore_cookie_map(s, cookie_map)
+                except Exception:
+                    pass
             return {"restored": cid, "url": chk["url"], "title": chk["title"], "note": "session rehydrated from checkpoint"}
         if name == "state.snapshot":
             tab = getattr(s, "current_tab", None)
@@ -1012,12 +1028,32 @@ class DoshShell:
             return {"cookies": rows[:limit], "total": len(rows), "returned": min(len(rows), limit),
                     "note": "cookie values are never echoed; names/domains/paths only (real values need values=raw + the audited reveal gate)"}
         if name == "wait":
+            # Unknown-argument rejection: a wrong param name (e.g. timeout_ms vs
+            # timeout) used to be silently dropped, so callers hit the default
+            # deadline with no warning. Reject explicitly.
+            _WAIT_KEYS = {"url", "ref", "text", "net_idle_ms", "timeout", "timeout_ms", "interval"}
+            unknown = sorted(k for k in a if k not in _WAIT_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"wait: unknown argument(s) {unknown}; accepted: {sorted(_WAIT_KEYS)}"
+                )
             given = {k for k in ("url", "ref", "text", "net_idle_ms") if k in a}
             if not given:
                 raise ValueError("wait needs at least one of: url, ref, text, net_idle_ms")
-            timeout = a.get("timeout", 15)
-            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0.1 <= timeout <= 60:
-                raise ValueError("timeout must be 0.1-60 seconds")
+            # Unified timeout: accept timeout_ms (milliseconds, preferred) or
+            # timeout (seconds, back-compat). Never both. ms is the canonical
+            # unit across the rest of the surface (net_idle_ms, datadome, etc.).
+            if "timeout" in a and "timeout_ms" in a:
+                raise ValueError("wait: pass either timeout (seconds) or timeout_ms (milliseconds), not both")
+            if "timeout_ms" in a:
+                tms = a["timeout_ms"]
+                if isinstance(tms, bool) or not isinstance(tms, (int, float)) or not 100 <= tms <= 60_000:
+                    raise ValueError("timeout_ms must be 100-60000 milliseconds")
+                timeout = float(tms) / 1000.0
+            else:
+                timeout = a.get("timeout", 15)
+                if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0.1 <= timeout <= 60:
+                    raise ValueError("timeout must be 0.1-60 seconds")
             interval = a.get("interval", 0.25)
             if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not 0.05 <= interval <= 2:
                 raise ValueError("interval must be 0.05-2 seconds")
@@ -1031,6 +1067,25 @@ class DoshShell:
             deadline = start + float(timeout)
             last_net = self.network.query(limit=1)["total_observed"]
             last_change = start
+            # Cache the action-ref set and refresh only when network activity
+            # changes. Previously the full inventory (capped at 1,000,000) was
+            # rebuilt on every poll tick while waiting for a ref. Most
+            # ref-appearance waits follow a navigation/fetch, so this preserves
+            # the common-case semantics at a fraction of the cost. A pure
+            # JS-timer DOM mutation with no network is not detected here — use
+            # the `watch` mutation stream for that case.
+            ref_set = None
+            ref_set_net = None
+
+            def _ref_present(net_now):
+                nonlocal ref_set, ref_set_net
+                if not ref_need:
+                    return True
+                if ref_set is None or ref_set_net != net_now:
+                    ref_set = {x["ref"] for x in self._inventory(0, 1_000_000)["actions"]}
+                    ref_set_net = net_now
+                return ref_need in ref_set
+
             while True:
                 await asyncio.sleep(interval)
                 now = time.monotonic()
@@ -1038,9 +1093,7 @@ class DoshShell:
                 if cur_net != last_net:
                     last_net, last_change = cur_net, now
                 ok_url = (not url_need) or (url_need in (s.url or ""))
-                ok_ref = (not ref_need) or ref_need in {
-                    x["ref"] for x in self._inventory(0, 1_000_000)["actions"]
-                }
+                ok_ref = _ref_present(last_net)
                 view = s.page.view if (s.page and s.page.view) else ""
                 ok_text = (not text_need) or (text_need in view) or (text_need in (s.html or ""))
                 ok_idle = (not idle_ms) or ((now - last_change) * 1000 >= idle_ms)
@@ -1329,15 +1382,18 @@ class DoshShell:
                               "actions": actions, "allow_actions": allow_actions})
         if len(payload.encode()) > 2_000_000:
             raise ValueError("script projection exceeds 2 MB; narrow the document before scripting")
-        engine = js_engine()
-        if engine == "doshgentv8":
-            try:
-                from doshgentv8 import DoshContext
-                vm = DoshContext()
-            except ImportError:
-                vm = Context()
-        else:
-            vm = Context()
+        engine = js_engine()  # raises ValueError on WR_JS_ENGINE=quickjs (banned)
+        if engine != "doshgentv8":
+            raise RuntimeError(f"unknown engine '{engine}'; only doshgentv8 is built")
+        try:
+            from doshgentv8 import DoshContext
+        except ImportError as e:
+            raise RuntimeError(
+                "doshgentv8 (V8 facade) is not importable and QuickJS is "
+                "banned on this build — no fallback exists. Build the facade: "
+                "cd doshgentv8/py && cargo build --release."
+            ) from e
+        vm = DoshContext()
         vm.set_memory_limit(16 * 1024 * 1024)
         vm.set_max_stack_size(256 * 1024)
         vm.set_time_limit(0.25)
