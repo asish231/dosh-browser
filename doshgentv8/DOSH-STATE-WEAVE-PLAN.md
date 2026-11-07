@@ -223,6 +223,12 @@ Recorded as `patches/0014-dosh-control-realm-top-level-return-and-action-gate.pa
 
 Two items from an external review were verified real and folded in:
 
+> **Architectural work explicitly deferred (out of single-session scope):**
+> - **Ref stability + idempotency (#3)**: `action.start(ref, expected_epoch, idempotency_key)` design exists in `DOSH-SESSION-FINDINGS-EXACT.md` §8 (priority #1) but is NOT shipped. The current `ref` system is fragile (refs don't survive across calls — see `tests/test_quickjs_deadline.py` for the host-callable contract). A future vertical slice will force the correct architecture.
+> - **One semantic registry across adapters (#7)**: multiple authorities for the same state (shell, OpenAI tools, MCP, REST, dispatch) is the "largest architectural slop" (`DOSH-SESSION-FINDINGS-EXACT.md` §6). The canonical browser control/evidence plane is the planned fix, not yet built.
+> - **Rust watchdog armed by default**: `watchdog.rs` is implemented + tested (`test_watchdog_execution_timeout` PASS), but `wall_limit: 0.0` default disarms it. An env-knob `DOSH_WATCHDOG_LIMIT_SECS` was added to arm it opt-in. Full arming by default is deferred to avoid breaking the 243 Rust tests that assume unlimited eval.
+
+
 1. **`--single-threaded` agent-mode flag** — exists (`base/src/flags/flag-definitions.h`, with
    implications disabling concurrent Sparkplug/WASM tasks). Added to the agent-mode flag set
    (Phase A/C) for short-lived isolates: collapses the ~6–10 background worker threads per
