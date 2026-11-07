@@ -64,6 +64,11 @@ impl HostSeam for SharedPyHost {
 struct DoshContext {
     engine: DoshEngine,
     host: Arc<SharedPyHost>,
+    /// Wall-clock budget last set via set_time_limit. Tracked here because
+    /// set_memory_limit may swap in a fresh engine (heap limits are fixed at
+    /// isolate creation); without re-applying, the swap silently disarmed the
+    /// watchdog. 0.0 = disabled.
+    wall_limit: f64,
 }
 
 #[pymethods]
@@ -76,7 +81,7 @@ impl DoshContext {
         })));
         let engine = DoshEngine::new_with_limit(host.clone(), memory_limit.unwrap_or(0))
             .map_err(PyRuntimeError::new_err)?;
-        Ok(Self { engine, host })
+        Ok(Self { engine, host, wall_limit: 0.0 })
     }
 
     /// Evaluate JS; returns typed Python value (quickjs parity).
@@ -118,6 +123,11 @@ impl DoshContext {
                         let _ = new_engine.add_host(name);
                     }
                 }
+                // Preserve the armed wall-clock budget across the engine
+                // swap: the fresh engine defaults to wall_limit=0 (watchdog
+                // disarmed), which previously silently cancelled a
+                // set_time_limit issued before this call.
+                new_engine.set_time_limit(self.wall_limit);
                 self.engine = new_engine;
                 return;
             }
@@ -127,12 +137,24 @@ impl DoshContext {
 
     /// Wall-clock budget per eval, in seconds. 0 disables.
     fn set_time_limit(&mut self, seconds: f64) {
+        self.wall_limit = seconds;
         self.engine.set_time_limit(seconds);
     }
 
     /// Accepted for quickjs.Context parity. V8 manages its own stack guards,
     /// so there is no separate host-set stack limit to configure.
     fn set_max_stack_size(&mut self, _bytes: u64) {}
+
+    /// Heap-pressure epoch of the current eval (0 = calm, >=2 = exhaustion hit).
+    /// Lets the Python lane observe GC pressure for eviction decisions.
+    fn pressure_epoch(&mut self) -> u8 {
+        self.engine.pressure_epoch()
+    }
+
+    /// Host bytes currently reported to V8's external-memory pacer.
+    fn external_reported(&mut self) -> usize {
+        self.engine.external_reported()
+    }
 
     /// Explicit close / dispose hook for parity.
     fn close(&mut self) {}

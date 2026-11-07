@@ -16,15 +16,56 @@ from quickjs import Context
 from webresearch.config import js_engine
 
 
+def _arm_untrusted_limits(ctx):
+    """Arm memory/stack caps and the wall-clock watchdog on every page-arena
+    Context. QuickJS is banned on this build; this path is doshgentv8 (V8).
+
+    The Rust bridge's set_time_limit drives the process-wide watchdog
+    (doshgentv8/core/src/watchdog.rs) and — unlike the banned _quickjs C
+    extension — is host-callable safe: "Can not call into Python with a time
+    limit set" never happens here, and host errors are catchable in JS.
+    Memory/stack limits are armed alongside, tunable via
+    WR_JS_MEMORY_LIMIT_MB / WR_JS_STACK_LIMIT_MB.
+    """
+    from webresearch.config import js_memory_limit_mb, js_stack_limit_mb, js_time_limit_ms
+    # Order matters on this bridge: set_memory_limit may swap in a fresh
+    # engine when no evals have run (heap limits are fixed at isolate
+    # creation), so arm the wall-clock watchdog LAST to guarantee it stays
+    # armed. The facade now also preserves wall_limit across the swap.
+    try:
+        ctx.set_memory_limit(js_memory_limit_mb() * 1024 * 1024)
+    except Exception:
+        pass
+    try:
+        ctx.set_max_stack_size(js_stack_limit_mb() * 1024 * 1024)
+    except Exception:
+        pass
+    try:
+        ctx.set_time_limit(js_time_limit_ms() / 1000.0)
+    except Exception:
+        pass
+
+
 def _create_context():
-    engine = js_engine()
-    if engine == "doshgentv8":
-        try:
-            from doshgentv8 import DoshContext
-            return DoshContext()
-        except ImportError:
-            return Context()
-    return Context()
+    """Create a doshgentv8 (V8) context. QuickJS is banned on this build:
+    there is deliberately NO QuickJS fallback. If the facade is missing the
+    error says exactly what to do instead of silently downgrading engines.
+    """
+    engine = js_engine()  # raises ValueError on WR_JS_ENGINE=quickjs
+    if engine != "doshgentv8":
+        raise RuntimeError(f"unknown engine '{engine}'; only doshgentv8 is built")
+    try:
+        from doshgentv8 import DoshContext
+    except ImportError as e:
+        raise RuntimeError(
+            "doshgentv8 (V8 facade) is not importable and QuickJS is banned "
+            "on this build — no fallback exists. Build the facade: "
+            "cd doshgentv8/py && cargo build --release, then ensure "
+            "doshgentv8/doshgentv8_rust.so is on the path."
+        ) from e
+    ctx = DoshContext()
+    _arm_untrusted_limits(ctx)
+    return ctx
 
 from webresearch import device as device_mod
 from webresearch.engine.modules import (
