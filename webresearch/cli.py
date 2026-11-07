@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
 from webresearch.fetch import make_client
@@ -19,6 +20,14 @@ def main(argv: list[str] | None = None) -> None:
     serve = sub.add_parser("serve", help="HTTP API + OpenAPI at /docs")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=4747)
+    serve.add_argument("--daemon", action="store_true",
+                       help="Run as Dosh Loom session daemon (Unix socket, persistent sessions)")
+    serve.add_argument("--socket-path", default=None,
+                       help="Unix socket path for daemon mode (default: ~/.dosh/loom.sock)")
+    serve.add_argument("--max-live", type=int, default=8,
+                       help="Max live sessions in daemon mode (default: 8)")
+    serve.add_argument("--ttl", type=float, default=1800.0,
+                       help="Session TTL in seconds for daemon mode (default: 1800)")
 
     read_cmd = sub.add_parser("read", help="Open a URL as an LLM page model")
     read_cmd.add_argument("url")
@@ -79,6 +88,15 @@ def main(argv: list[str] | None = None) -> None:
     p_clear = p_sub.add_parser("clear", help="Clear cookies in profile")
     p_clear.add_argument("--name", default="default", help="Profile name")
 
+    # Phase 3: CLI thin-client commands for Dosh Loom daemon
+    attach_cmd = sub.add_parser("attach", help="Attach to a specific session in the Dosh Loom daemon")
+    attach_cmd.add_argument("session_id", help="Session ID to attach to")
+    
+    sub.add_parser("sessions", help="List all live and evicted sessions in the Dosh Loom daemon")
+    
+    journal_cmd = sub.add_parser("journal", help="View event journal entries")
+    journal_cmd.add_argument("--session", help="Filter by session ID")
+
     args = parser.parse_args(argv)
 
     if args.cmd == "shell":
@@ -121,7 +139,82 @@ def main(argv: list[str] | None = None) -> None:
             print(f"Cleared cookies in profile '{args.name}'")
             return
 
+    # Phase 3: CLI thin-client commands for Dosh Loom daemon
+    if args.cmd == "attach":
+        import json
+        import socket
+        SOCKET_PATH = os.path.expanduser('~/.dosh/loom.sock')
+        if not os.path.exists(SOCKET_PATH):
+            print("Dosh Loom daemon is not running.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(SOCKET_PATH)
+                s.sendall(json.dumps({'op': 'attach', 'session_id': args.session_id}).encode() + b'\n')
+                response = s.recv(4096).decode().strip()
+                print(response)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.cmd == "sessions":
+        import json
+        import socket
+        SOCKET_PATH = os.path.expanduser('~/.dosh/loom.sock')
+        if not os.path.exists(SOCKET_PATH):
+            print("Dosh Loom daemon is not running.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(SOCKET_PATH)
+                s.sendall(json.dumps({'op': 'list'}).encode() + b'\n')
+                response = s.recv(4096).decode().strip()
+                print(response)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.cmd == "journal":
+        from webresearch.loom_journal import get_journal_entries, get_all_journal_entries
+        if args.session:
+            entries = get_journal_entries(args.session)
+        else:
+            entries = get_all_journal_entries()
+        
+        if not entries:
+            print("No journal entries found.")
+            return
+        
+        for entry in entries:
+            if args.session:
+                # timestamp, kind, payload
+                print(f"[{entry[0]}] {entry[1]}: {entry[2]}")
+            else:
+                # session_id, timestamp, kind, payload
+                print(f"[{entry[0]}] [{entry[1]}] {entry[2]}: {entry[3]}")
+        return
+
     if args.cmd == "serve":
+        if args.daemon:
+            import uvicorn
+            from webresearch.loom import LoomDaemon
+            
+            SOCKET_PATH = args.socket_path or os.path.expanduser('~/.dosh/loom.sock')
+            daemon = LoomDaemon(
+                socket_path=SOCKET_PATH,
+                max_live=args.max_live,
+                ttl_seconds=args.ttl,
+            )
+            print(f"Dosh Loom daemon on {SOCKET_PATH}", file=sys.stderr)
+            try:
+                asyncio.run(daemon.serve_forever())
+            except KeyboardInterrupt:
+                print("shutting down", file=sys.stderr)
+                asyncio.run(daemon.stop())
+            return
+
         import uvicorn
 
         uvicorn.run("webresearch.server:app", host=args.host, port=args.port, reload=False)
