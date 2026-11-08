@@ -1004,6 +1004,17 @@ async def run_scripts(
                             info.setdefault("blocked_csp_style", 0)
                             info["blocked_csp_style"] += 1
         payload = json.dumps(tree, ensure_ascii=False)
+        # Stage-3 integration: project the parsed tree into the engine's
+        # Parena (initial-document snapshot) so spill/checkpoint/fork and
+        # external-memory reporting apply to Python-lane pages too.
+        # Probe-optional + best-effort: a facade without the binding (or a
+        # projection failure) must never break page loading.
+        if hasattr(ctx, "load_parena"):
+            try:
+                info["parena_nodes"] = ctx.load_parena(payload)
+            except Exception as exc:
+                info["parena_nodes"] = 0
+                info["parena_error"] = str(exc)[:200]
         ctx.eval(f"__load({payload}, {json.dumps(url)})")
     
         # Inject frame content into iframe elements
