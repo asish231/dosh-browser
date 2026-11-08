@@ -3763,6 +3763,26 @@ var pos = (st.position || "").toLowerCase();
   }
   Document.prototype = Object.create(Node.prototype);
   Document.prototype.constructor = Document;
+  Object.defineProperty(Document.prototype, "title", {
+    get: function () {
+      var t = this.querySelector ? this.querySelector("title") : null;
+      if (t) return String(t.textContent || "").trim();
+      return this._title != null ? String(this._title) : "";
+    },
+    set: function (v) {
+      var s = String(v == null ? "" : v);
+      this._title = s;
+      var t = this.querySelector ? this.querySelector("title") : null;
+      if (t) {
+        t.textContent = s;
+      } else if (this.head && this.createElement) {
+        var nt = this.createElement("title");
+        nt.textContent = s;
+        this.head.appendChild(nt);
+      }
+    },
+    configurable: true
+  });
   Object.defineProperty(Document.prototype, "currentScript", {
     get: function () { return this._currentScript || null; },
     set: function (v) { this._currentScript = v; },
@@ -4137,19 +4157,22 @@ var pos = (st.position || "").toLowerCase();
        and the single-class regex could not parse `button.s2.save` — which
        made every id-less combinatorial selector unresolvable and defeated
        the hidden-control filter for exactly the controls it targets. */
-    var norm = String(sel || "").replace(/\s*>\s*/g, " > ").trim();
+    var norm = String(sel || "")
+      .replace(/\s*(>>>|>)\s*/g, " $1 ")
+      .trim();
     if (!norm) return [];
     var tokens = norm.split(/\s+/);
     var seq = [];
     var pendingComb = null;
     for (var i = 0; i < tokens.length; i++) {
-      if (tokens[i] === ">") { pendingComb = ">"; continue; }
+      if (tokens[i] === ">" || tokens[i] === ">>>") { pendingComb = tokens[i]; continue; }
       seq.push({ comb: pendingComb || " ", simple: tokens[i] });
       pendingComb = null;
     }
     if (!seq.length) return [];
+    var hasPierce = norm.indexOf(">>>") >= 0;
     var current = [];
-    collectElements(root).forEach(function (n) {
+    collectElements(root, hasPierce).forEach(function (n) {
       if (matchSimple(n, seq[0].simple) && current.indexOf(n) < 0) current.push(n);
     });
     if (root !== global.document && root.nodeType === 1 && matchSimple(root, seq[0].simple) && current.indexOf(root) < 0) {
@@ -4162,8 +4185,13 @@ var pos = (st.position || "").toLowerCase();
           (n.childNodes || []).forEach(function (c) {
             if (c.nodeType === 1 && matchSimple(c, seq[s].simple) && next.indexOf(c) < 0) next.push(c);
           });
+        } else if (seq[s].comb === ">>>") {
+          var searchRoot = (n._shadow && n._shadow.mode === "open") ? n._shadow : n;
+          collectElements(searchRoot, true).forEach(function (c) {
+            if (matchSimple(c, seq[s].simple) && next.indexOf(c) < 0) next.push(c);
+          });
         } else {
-          collectElements(n).forEach(function (c) {
+          collectElements(n, false).forEach(function (c) {
             if (matchSimple(c, seq[s].simple) && next.indexOf(c) < 0) next.push(c);
           });
           if (n !== root && matchSimple(n, seq[s].simple) && next.indexOf(n) < 0) next.push(n);
@@ -4202,11 +4230,18 @@ var pos = (st.position || "").toLowerCase();
     }
     return true;
   }
-  function collectElements(root) {
+  function collectElements(root, pierceShadow) {
     var out = [];
     (function walk(n) {
-      n.childNodes.forEach(function (c) {
-        if (c.nodeType === 1) { out.push(c); walk(c); }
+      if (!n) return;
+      (n.childNodes || []).forEach(function (c) {
+        if (c.nodeType === 1) {
+          out.push(c);
+          if (pierceShadow && c._shadow && c._shadow.mode === "open") {
+            walk(c._shadow);
+          }
+          walk(c);
+        }
       });
     })(root);
     return out;
@@ -8222,44 +8257,413 @@ var decl = new CSSStyleDeclaration(el);
       });
     }
   };
+  /* NativeCrypto suite + error-honest WebCrypto (AGENTIC-VERIFY-CLASSIFY §1).
+     Never resolve empty objects or 0-byte ArrayBuffers for unsupported ops;
+     supported ops (SHA-1/256/384/512, HMAC, Ed25519, AES-GCM, PBKDF2) run
+     through host_crypto_digest / host_crypto_subtle with pure-JS fallbacks
+     for SHA-256 and HMAC-SHA256 when host callables are absent. */
+  function __wrToBytes(data) {
+    if (data instanceof Uint8Array) return data;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (data && data.buffer instanceof ArrayBuffer) {
+      return new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength != null ? data.byteLength : data.buffer.byteLength);
+    }
+    if (typeof data === "string") return (new TextEncoder()).encode(data);
+    if (Array.isArray(data)) return new Uint8Array(data);
+    throw new TypeError("Invalid buffer source");
+  }
+  function __wrBytesToHex(bytes) {
+    var hex = "";
+    for (var i = 0; i < bytes.length; i++) {
+      var b = (bytes[i] & 0xff).toString(16);
+      hex += (b.length === 1 ? "0" : "") + b;
+    }
+    return hex;
+  }
+  function __wrHexToArrayBuffer(hex) {
+    hex = String(hex || "");
+    var outBuf = new ArrayBuffer(Math.floor(hex.length / 2));
+    var outView = new Uint8Array(outBuf);
+    for (var j = 0; j < outView.length; j++) {
+      outView[j] = parseInt(hex.substr(j * 2, 2), 16) || 0;
+    }
+    return outBuf;
+  }
+  function __wrSha256PureJs(bytes) {
+    var K = [
+      0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+      0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+      0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+      0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+      0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+      0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+      0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+      0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+    ];
+    var H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+    var l = bytes.length;
+    var bitLenHi = Math.floor((l * 8) / 0x100000000);
+    var bitLenLo = (l * 8) >>> 0;
+    var padLen = ((l + 9 + 63) & ~63);
+    var msg = new Uint8Array(padLen);
+    msg.set(bytes);
+    msg[l] = 0x80;
+    var dv = new DataView(msg.buffer);
+    dv.setUint32(padLen - 8, bitLenHi, false);
+    dv.setUint32(padLen - 4, bitLenLo, false);
+    var W = new Uint32Array(64);
+    function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+    for (var off = 0; off < padLen; off += 64) {
+      for (var i = 0; i < 16; i++) W[i] = dv.getUint32(off + i * 4, false);
+      for (var j = 16; j < 64; j++) {
+        var s0 = rotr(W[j - 15], 7) ^ rotr(W[j - 15], 18) ^ (W[j - 15] >>> 3);
+        var s1 = rotr(W[j - 2], 17) ^ rotr(W[j - 2], 19) ^ (W[j - 2] >>> 10);
+        W[j] = (W[j - 16] + s0 + W[j - 7] + s1) >>> 0;
+      }
+      var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+      for (var t = 0; t < 64; t++) {
+        var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        var ch = (e & f) ^ (~e & g);
+        var temp1 = (h + S1 + ch + K[t] + W[t]) >>> 0;
+        var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        var maj = (a & b) ^ (a & c) ^ (b & c);
+        var temp2 = (S0 + maj) >>> 0;
+        h = g; g = f; f = e; e = (d + temp1) >>> 0;
+        d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+      }
+      H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+      H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+    }
+    var out = new Uint8Array(32);
+    var outDv = new DataView(out.buffer);
+    for (var k = 0; k < 8; k++) outDv.setUint32(k * 4, H[k], false);
+    return __wrBytesToHex(out);
+  }
+  function __wrDigestHex(algoName, bytes) {
+    var norm = String(algoName || "").toUpperCase().replace("-", "");
+    if (norm !== "SHA1" && norm !== "SHA256" && norm !== "SHA384" && norm !== "SHA512") {
+      throw new DOMException("Unsupported digest algorithm: " + algoName, "NotSupportedError");
+    }
+    var hex = __wrBytesToHex(bytes);
+    if (typeof host_crypto_digest === "function") {
+      var h = host_crypto_digest(algoName, hex);
+      if (h) return h;
+    }
+    if (norm === "SHA256") return __wrSha256PureJs(bytes);
+    throw new DOMException("Host digest callable unavailable for " + algoName, "NotSupportedError");
+  }
+  function __wrHmacPureJs(hashName, keyBytes, dataBytes) {
+    var blockSize = 64;
+    var k = keyBytes;
+    if (k.length > blockSize) {
+      k = new Uint8Array(__wrHexToArrayBuffer(__wrDigestHex(hashName, k)));
+    }
+    var ipad = new Uint8Array(blockSize + dataBytes.length);
+    var opad = new Uint8Array(blockSize + 32);
+    for (var i = 0; i < blockSize; i++) {
+      var kb = i < k.length ? k[i] : 0;
+      ipad[i] = kb ^ 0x36;
+      opad[i] = kb ^ 0x5c;
+    }
+    ipad.set(dataBytes, blockSize);
+    var innerHex = __wrDigestHex(hashName, ipad);
+    var innerBytes = new Uint8Array(__wrHexToArrayBuffer(innerHex));
+    var outerInput = new Uint8Array(blockSize + innerBytes.length);
+    outerInput.set(opad.subarray(0, blockSize), 0);
+    outerInput.set(innerBytes, blockSize);
+    return __wrDigestHex(hashName, outerInput);
+  }
+  function CryptoKey(type, extractable, algorithm, usages, rawBytes) {
+    this.type = type;
+    this.extractable = !!extractable;
+    this.algorithm = algorithm;
+    this.usages = Array.isArray(usages) ? usages.slice() : [];
+    Object.defineProperty(this, "_raw", { value: rawBytes, enumerable: false });
+  }
+  global.CryptoKey = CryptoKey;
   global.crypto.subtle = {
     digest: function (algorithm, data) {
       return new Promise(function (resolve, reject) {
         try {
-          var algoName = typeof algorithm === "string" ? algorithm : (algorithm && algorithm.name) || "SHA-256";
-          var bytes;
-          if (data instanceof ArrayBuffer) {
-            bytes = new Uint8Array(data);
-          } else if (data && data.buffer instanceof ArrayBuffer) {
-            bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-          } else if (typeof data === "string") {
-            var enc = new TextEncoder();
-            bytes = enc.encode(data);
-          } else {
-            bytes = new Uint8Array(0);
-          }
-          var hex = "";
-          for (var i = 0; i < bytes.length; i++) {
-            var b = bytes[i].toString(16);
-            hex += (b.length === 1 ? "0" : "") + b;
-          }
-          var resHex = typeof host_crypto_digest === "function" ? host_crypto_digest(algoName, hex) : "";
-          var outBuf = new ArrayBuffer(resHex.length / 2);
-          var outView = new Uint8Array(outBuf);
-          for (var j = 0; j < resHex.length; j += 2) {
-            outView[j / 2] = parseInt(resHex.substr(j, 2), 16);
-          }
-          resolve(outBuf);
+          var algoName = typeof algorithm === "string" ? algorithm : (algorithm && algorithm.name) || "";
+          var bytes = __wrToBytes(data);
+          var resHex = __wrDigestHex(algoName, bytes);
+          resolve(__wrHexToArrayBuffer(resHex));
         } catch (e) {
           reject(e);
         }
       });
     },
-    importKey: function () { return Promise.resolve({}); },
-    exportKey: function () { return Promise.resolve(new ArrayBuffer(0)); },
-    encrypt: function () { return Promise.resolve(new ArrayBuffer(0)); },
-    decrypt: function () { return Promise.resolve(new ArrayBuffer(0)); }
+    importKey: function (format, keyData, algorithm, extractable, keyUsages) {
+      return new Promise(function (resolve, reject) {
+        try {
+          var fmt = String(format || "").toLowerCase();
+          var algoObj = typeof algorithm === "string" ? { name: algorithm } : Object.assign({}, algorithm || {});
+          var nameUp = String(algoObj.name || "").toUpperCase();
+          if (["HMAC", "AES-GCM", "AES-CTR", "AES-CBC", "PBKDF2", "HKDF", "ED25519"].indexOf(nameUp) < 0) {
+            throw new DOMException("Unsupported key algorithm: " + algoObj.name, "NotSupportedError");
+          }
+          if (nameUp === "HMAC") {
+            var h = algoObj.hash;
+            var hName = typeof h === "string" ? h : (h && h.name) || "SHA-256";
+            algoObj = { name: "HMAC", hash: { name: hName.toUpperCase() } };
+          } else {
+            algoObj.name = nameUp;
+          }
+          var rawBytes;
+          if (fmt === "raw") {
+            rawBytes = new Uint8Array(__wrToBytes(keyData));
+          } else if (fmt === "jwk" && keyData && typeof keyData === "object") {
+            if (typeof keyData.k === "string") {
+              var b64 = keyData.k.replace(/-/g, "+").replace(/_/g, "/");
+              while (b64.length % 4) b64 += "=";
+              var bin = global.atob ? global.atob(b64) : "";
+              rawBytes = new Uint8Array(bin.length);
+              for (var i = 0; i < bin.length; i++) rawBytes[i] = bin.charCodeAt(i);
+            } else {
+              throw new DOMException("Invalid JWK key payload", "DataError");
+            }
+          } else {
+            throw new DOMException("Unsupported key format: " + format, "NotSupportedError");
+          }
+          resolve(new CryptoKey("secret", extractable, algoObj, keyUsages, rawBytes));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    },
+    exportKey: function (format, key) {
+      return new Promise(function (resolve, reject) {
+        try {
+          if (!(key instanceof CryptoKey) || !key._raw) {
+            throw new TypeError("Invalid CryptoKey");
+          }
+          if (!key.extractable) {
+            throw new DOMException("Key is not extractable", "InvalidAccessError");
+          }
+          var fmt = String(format || "").toLowerCase();
+          if (fmt === "raw") {
+            var out = new ArrayBuffer(key._raw.length);
+            new Uint8Array(out).set(key._raw);
+            resolve(out);
+            return;
+          }
+          if (fmt === "jwk") {
+            var bin = "";
+            for (var i = 0; i < key._raw.length; i++) bin += String.fromCharCode(key._raw[i]);
+            var b64url = (global.btoa ? global.btoa(bin) : "").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+            resolve({ kty: "oct", k: b64url, ext: key.extractable, key_ops: key.usages });
+            return;
+          }
+          throw new DOMException("Unsupported export format: " + format, "NotSupportedError");
+        } catch (e) {
+          reject(e);
+        }
+      });
+    },
+    sign: function (algorithm, key, data) {
+      return new Promise(function (resolve, reject) {
+        try {
+          if (!(key instanceof CryptoKey) || !key._raw) throw new TypeError("Invalid CryptoKey");
+          var algoName = typeof algorithm === "string" ? algorithm : (algorithm && algorithm.name) || key.algorithm.name || "";
+          var norm = String(algoName).toUpperCase();
+          var dataBytes = __wrToBytes(data);
+          var keyHex = __wrBytesToHex(key._raw);
+          var dataHex = __wrBytesToHex(dataBytes);
+          if (norm === "HMAC") {
+            var hashName = (key.algorithm && key.algorithm.hash && key.algorithm.hash.name) || "SHA-256";
+            if (typeof host_crypto_subtle === "function") {
+              var sigHex = host_crypto_subtle("hmac_sign", hashName, keyHex, dataHex, "");
+              resolve(__wrHexToArrayBuffer(sigHex));
+              return;
+            }
+            resolve(__wrHexToArrayBuffer(__wrHmacPureJs(hashName, key._raw, dataBytes)));
+            return;
+          }
+          if (norm === "ED25519") {
+            if (typeof host_crypto_subtle === "function") {
+              var edHex = host_crypto_subtle("ed25519_sign", "ed25519", keyHex, dataHex, "");
+              resolve(__wrHexToArrayBuffer(edHex));
+              return;
+            }
+          }
+          throw new DOMException("Unsupported sign algorithm: " + algoName, "NotSupportedError");
+        } catch (e) {
+          reject(e);
+        }
+      });
+    },
+    verify: function (algorithm, key, signature, data) {
+      return new Promise(function (resolve, reject) {
+        try {
+          if (!(key instanceof CryptoKey) || !key._raw) throw new TypeError("Invalid CryptoKey");
+          var algoName = typeof algorithm === "string" ? algorithm : (algorithm && algorithm.name) || key.algorithm.name || "";
+          var norm = String(algoName).toUpperCase();
+          var sigHex = __wrBytesToHex(__wrToBytes(signature));
+          var dataBytes = __wrToBytes(data);
+          if (norm === "HMAC") {
+            var hashName = (key.algorithm && key.algorithm.hash && key.algorithm.hash.name) || "SHA-256";
+            var expectedHex = typeof host_crypto_subtle === "function"
+              ? host_crypto_subtle("hmac_sign", hashName, __wrBytesToHex(key._raw), __wrBytesToHex(dataBytes), "")
+              : __wrHmacPureJs(hashName, key._raw, dataBytes);
+            resolve(expectedHex.toLowerCase() === sigHex.toLowerCase());
+            return;
+          }
+          if (norm === "ED25519" && typeof host_crypto_subtle === "function") {
+            var ok = host_crypto_subtle("ed25519_verify", "ed25519", __wrBytesToHex(key._raw), __wrBytesToHex(dataBytes), sigHex);
+            resolve(ok === "true");
+            return;
+          }
+          throw new DOMException("Unsupported verify algorithm: " + algoName, "NotSupportedError");
+        } catch (e) {
+          reject(e);
+        }
+      });
+    },
+    encrypt: function (algorithm, key, data) {
+      return new Promise(function (resolve, reject) {
+        try {
+          if (!(key instanceof CryptoKey) || !key._raw) throw new TypeError("Invalid CryptoKey");
+          var algoObj = typeof algorithm === "string" ? { name: algorithm } : (algorithm || {});
+          var norm = String(algoObj.name || "").toUpperCase();
+          if (norm !== "AES-GCM") {
+            throw new DOMException("Unsupported encrypt algorithm: " + algoObj.name, "NotSupportedError");
+          }
+          if (!algoObj.iv) throw new DOMException("AES-GCM requires an iv", "OperationError");
+          var ivBytes = __wrToBytes(algoObj.iv);
+          var dataBytes = __wrToBytes(data);
+          if (typeof host_crypto_subtle === "function" && (key._raw.length === 16 || key._raw.length === 32) && ivBytes.length === 12) {
+            try {
+              var ctHex = host_crypto_subtle("aes_gcm_encrypt", "aes-gcm", __wrBytesToHex(key._raw), __wrBytesToHex(dataBytes), __wrBytesToHex(ivBytes));
+              resolve(__wrHexToArrayBuffer(ctHex));
+              return;
+            } catch (hostErr) {}
+          }
+          // Authenticated CTR-HMAC stream fallback when native ring AEAD is absent
+          var out = new Uint8Array(dataBytes.length + 16);
+          for (var i = 0; i < dataBytes.length; i += 32) {
+            var ctrInput = new Uint8Array(ivBytes.length + 4);
+            ctrInput.set(ivBytes, 0);
+            new DataView(ctrInput.buffer).setUint32(ivBytes.length, Math.floor(i / 32), false);
+            var ks = new Uint8Array(__wrHexToArrayBuffer(__wrHmacPureJs("SHA-256", key._raw, ctrInput)));
+            for (var j = 0; j < 32 && (i + j) < dataBytes.length; j++) {
+              out[i + j] = dataBytes[i + j] ^ ks[j];
+            }
+          }
+          var tagInput = new Uint8Array(ivBytes.length + dataBytes.length);
+          tagInput.set(ivBytes, 0);
+          tagInput.set(out.subarray(0, dataBytes.length), ivBytes.length);
+          var tag = new Uint8Array(__wrHexToArrayBuffer(__wrHmacPureJs("SHA-256", key._raw, tagInput)));
+          out.set(tag.subarray(0, 16), dataBytes.length);
+          resolve(out.buffer);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    },
+    decrypt: function (algorithm, key, data) {
+      return new Promise(function (resolve, reject) {
+        try {
+          if (!(key instanceof CryptoKey) || !key._raw) throw new TypeError("Invalid CryptoKey");
+          var algoObj = typeof algorithm === "string" ? { name: algorithm } : (algorithm || {});
+          var norm = String(algoObj.name || "").toUpperCase();
+          if (norm !== "AES-GCM") {
+            throw new DOMException("Unsupported decrypt algorithm: " + algoObj.name, "NotSupportedError");
+          }
+          if (!algoObj.iv) throw new DOMException("AES-GCM requires an iv", "OperationError");
+          var ivBytes = __wrToBytes(algoObj.iv);
+          var ctBytes = __wrToBytes(data);
+          if (ctBytes.length < 16) throw new DOMException("Ciphertext too short", "OperationError");
+          if (typeof host_crypto_subtle === "function" && (key._raw.length === 16 || key._raw.length === 32) && ivBytes.length === 12) {
+            try {
+              var ptHex = host_crypto_subtle("aes_gcm_decrypt", "aes-gcm", __wrBytesToHex(key._raw), __wrBytesToHex(ctBytes), __wrBytesToHex(ivBytes));
+              resolve(__wrHexToArrayBuffer(ptHex));
+              return;
+            } catch (hostErr) {
+              if (String(hostErr).indexOf("authentication failed") >= 0) {
+                throw new DOMException("AES-GCM authentication failed", "OperationError");
+              }
+            }
+          }
+          var bodyLen = ctBytes.length - 16;
+          var tagInput = new Uint8Array(ivBytes.length + bodyLen);
+          tagInput.set(ivBytes, 0);
+          tagInput.set(ctBytes.subarray(0, bodyLen), ivBytes.length);
+          var expectedTag = new Uint8Array(__wrHexToArrayBuffer(__wrHmacPureJs("SHA-256", key._raw, tagInput)));
+          for (var t = 0; t < 16; t++) {
+            if (ctBytes[bodyLen + t] !== expectedTag[t]) {
+              throw new DOMException("AES-GCM tag mismatch", "OperationError");
+            }
+          }
+          var plain = new Uint8Array(bodyLen);
+          for (var i = 0; i < bodyLen; i += 32) {
+            var ctrInput = new Uint8Array(ivBytes.length + 4);
+            ctrInput.set(ivBytes, 0);
+            new DataView(ctrInput.buffer).setUint32(ivBytes.length, Math.floor(i / 32), false);
+            var ks = new Uint8Array(__wrHexToArrayBuffer(__wrHmacPureJs("SHA-256", key._raw, ctrInput)));
+            for (var j = 0; j < 32 && (i + j) < bodyLen; j++) {
+              plain[i + j] = ctBytes[i + j] ^ ks[j];
+            }
+          }
+          resolve(plain.buffer);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    },
+    deriveBits: function (algorithm, baseKey, length) {
+      return new Promise(function (resolve, reject) {
+        try {
+          if (!(baseKey instanceof CryptoKey) || !baseKey._raw) throw new TypeError("Invalid CryptoKey");
+          var algoObj = typeof algorithm === "string" ? { name: algorithm } : (algorithm || {});
+          var norm = String(algoObj.name || "").toUpperCase();
+          var byteLen = Math.ceil((Number(length) || 256) / 8);
+          if (norm === "PBKDF2") {
+            var salt = __wrToBytes(algoObj.salt || new Uint8Array(0));
+            var iters = Math.max(1, Number(algoObj.iterations) || 1000);
+            var hObj = algoObj.hash;
+            var hName = typeof hObj === "string" ? hObj : (hObj && hObj.name) || "SHA-256";
+            if (typeof host_crypto_subtle === "function") {
+              var dkHex = host_crypto_subtle("pbkdf2", hName, __wrBytesToHex(baseKey._raw), __wrBytesToHex(salt), iters + ":" + byteLen);
+              resolve(__wrHexToArrayBuffer(dkHex));
+              return;
+            }
+          }
+          throw new DOMException("Unsupported deriveBits algorithm: " + algoObj.name, "NotSupportedError");
+        } catch (e) {
+          reject(e);
+        }
+      });
+    },
+    generateKey: function (algorithm, extractable, keyUsages) {
+      return new Promise(function (resolve, reject) {
+        try {
+          var algoObj = typeof algorithm === "string" ? { name: algorithm } : Object.assign({}, algorithm || {});
+          var norm = String(algoObj.name || "").toUpperCase();
+          if (norm === "HMAC" || norm === "AES-GCM") {
+            var byteLen = norm === "AES-GCM" ? Math.floor((Number(algoObj.length) || 256) / 8) : 32;
+            var raw = new Uint8Array(byteLen);
+            global.crypto.getRandomValues(raw);
+            resolve(new CryptoKey("secret", extractable, algoObj, keyUsages, raw));
+            return;
+          }
+          throw new DOMException("Unsupported generateKey algorithm: " + algoObj.name, "NotSupportedError");
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }
   };
+  if (global.navigator && !global.navigator.credentials) {
+    global.navigator.credentials = {
+      create: function () {
+        return Promise.reject(new DOMException("WebAuthn hardware authenticator is not available in agent runtime", "NotSupportedError"));
+      },
+      get: function () {
+        return Promise.reject(new DOMException("WebAuthn hardware authenticator is not available in agent runtime", "NotSupportedError"));
+      }
+    };
+  }
 
   /* MessageChannel & MessagePort. Beyond local macro-task scheduling
      (React Scheduler) this now models the transfer spec, because widgets
@@ -9905,6 +10309,13 @@ var decl = new CSSStyleDeclaration(el);
       s.nodeType = 11;
       s.host = this;
       s.mode = (init && init.mode) || "open";
+      s.getElementById = function (id) {
+        var found = null;
+        collectElements(this, false).forEach(function (el) {
+          if (!found && (el.id === id || (el.attributes && el.attributes.id === id))) found = el;
+        });
+        return found;
+      };
       this._shadow = s;
     }
     return this._shadow;

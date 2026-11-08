@@ -541,6 +541,48 @@ async def run_scripts(
 
     ctx.add_callable("host_crypto_digest", host_crypto_digest)
 
+    def host_crypto_subtle(op: str, algo: str, key_hex: str, data_hex: str, extra_str: str = "") -> str:
+        import hashlib
+        import hmac as _hmac
+
+        norm = (algo or "").lower().replace("-", "")
+        key_bytes = bytes.fromhex(key_hex) if key_hex else b""
+        data_bytes = bytes.fromhex(data_hex) if data_hex else b""
+        if op == "hmac_sign":
+            h_fn = {
+                "sha1": hashlib.sha1,
+                "hmacsha1": hashlib.sha1,
+                "sha256": hashlib.sha256,
+                "hmacsha256": hashlib.sha256,
+                "sha384": hashlib.sha384,
+                "hmacsha384": hashlib.sha384,
+                "sha512": hashlib.sha512,
+                "hmacsha512": hashlib.sha512,
+            }.get(norm)
+            if h_fn is None:
+                raise ValueError(f"NotSupportedError: unsupported HMAC hash '{algo}'")
+            return _hmac.new(key_bytes, data_bytes, h_fn).hexdigest()
+        if op == "hmac_verify":
+            sig_hex = host_crypto_subtle("hmac_sign", algo, key_hex, data_hex, "")
+            ok = _hmac.compare_digest(sig_hex.lower(), (extra_str or "").lower())
+            return "true" if ok else "false"
+        if op == "pbkdf2":
+            parts = (extra_str or "1000:32").split(":")
+            iters = max(1, int(parts[0]) if parts and parts[0].isdigit() else 1000)
+            out_len = max(1, min(512, int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 32))
+            h_name = "sha256"
+            if "384" in norm:
+                h_name = "sha384"
+            elif "512" in norm:
+                h_name = "sha512"
+            elif "1" in norm:
+                h_name = "sha1"
+            dk = hashlib.pbkdf2_hmac(h_name, key_bytes, data_bytes, iters, dklen=out_len)
+            return dk.hex()
+        raise ValueError(f"NotSupportedError: unsupported subtle operation '{op}'")
+
+    ctx.add_callable("host_crypto_subtle", host_crypto_subtle)
+
     # Dynamic import() bridge: __wr_import (minidom) calls this to load
     # lazily-discovered ES modules (como/webpack chunks). Resolves the
     # specifier (absolute URL, CDN-rooted path, or page-relative), fetches,

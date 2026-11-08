@@ -4,21 +4,17 @@ One source of truth for WHICH implementation is official and which is
 experimental, so every surface (CLI, MCP, server, docs) answers the
 question the same way instead of by inference.
 
-Current status (2026-11-04):
-- PYTHON (webresearch/) is the OFFICIAL product: full agent browser —
-  script execution, captcha solver, login/OTP, frame messaging, video
-  lane, unified network pipeline (SSRF IpFilter, SingleFlight, RateLimiter,
-  Robots, CORS, WebBotAuth, SQLite Cache), 35 shell commands; 874-test suite green.
-- RUST (dosh-browser-core/) is EXPERIMENTAL: the pipeline is ported and
-  unit-tested (fetch → parse → project → session → shell → server,
-  169/169 tests) with the doshgentv8 V8 core, ACD 2.0, champion INT8 neural
-  interactivity model, unified network pipeline (SSRF IpFilter, SingleFlight,
-  RateLimiter, Robots, CORS, WebBotAuth, RFC 9111 SQLite Cache), but page script
-  execution is not yet wired into goto(), and the adversarial/agent layers (captcha, login,
-  frames, ws, ESM, MCP, telemetry) are not ported. It is not behind any agent surface.
-- The V8 engine core (doshgentv8/) is proven against the QuickJS oracle
-  (bridge GREEN: 27.5ms boot, 38µs host calls, native WASM) and will
-  become selectable via WR_JS_ENGINE once Phase 2 seam parity passes.
+Current status (2026-11-08):
+- RUST (dosh-browser-core/) is the PRIMARY product: pure-Rust standalone
+  browser binary (dosh) and core crate with the doshgentv8 V8 engine,
+  ACD 2.0, champion INT8 neural interactivity model, unified network
+  pipeline, 60 shell commands, REST server, and MCP server. Zero Python
+  runtime dependency.
+- PYTHON (webresearch/) is the OPTIONAL companion SDK: full agent browser
+  support (PyO3 native bindings via doshgentv8_rust, reCAPTCHA v2 solver,
+  login/OTP, frame messaging, video lane, MCP/HTTP/CLI surfaces).
+- JS ENGINE: QuickJS is BANNED (2026-11-07). The doshgentv8 V8 lane is the
+  only engine on this build; `WR_JS_ENGINE=quickjs` refuses loudly.
 """
 
 from __future__ import annotations
@@ -153,11 +149,10 @@ def js_engine_status() -> dict:
                     for name, meta in JS_ENGINES.items()},
         "note": (
             f"'{active}' is active. " +
-            ("The experimental V8 lane was requested via WR_JS_ENGINE and is "
-             "in use; it is proven at the bridge level but not yet validated "
-             "by the full test suite (Phase 2 pending)."
-             if active == "doshgentv8" else
-             "The official QuickJS engine is in use.")
+            ("The doshgentv8 V8 lane is the only engine on this build "
+             "(QuickJS banned 2026-11-07: its time limit breaks host callables "
+             "and cannot bound CPU loops)."
+             )
         ),
     }
 

@@ -4,8 +4,8 @@ of truth (webresearch/config.py) and surfaces honestly everywhere.
 Pins the policy the project runs on:
 - RUST (dosh-browser-core/) is the primary product.
 - PYTHON (webresearch/) is the optional companion SDK.
-- QuickJS is the default JS engine for Python companion flows; the V8 lane is
-  proven against the QuickJS oracle, selectable via WR_JS_ENGINE.
+- QuickJS is BANNED on this build (2026-11-07): the doshgentv8 V8 lane is
+  the only JS engine; an explicit WR_JS_ENGINE=quickjs is refused loudly.
 """
 
 import pytest
@@ -48,20 +48,21 @@ def test_unknown_lane_is_honest():
     assert "python" in got["error"] and "rust" in got["error"]
 
 
-def test_quickjs_is_the_official_engine():
-    assert JS_ENGINE_DEFAULT == "quickjs"
-    assert JS_ENGINES["quickjs"]["status"] == "official"
+def test_quickjs_is_banned_and_doshgentv8_is_official():
+    assert JS_ENGINE_DEFAULT == "doshgentv8"
+    assert JS_ENGINES["quickjs"]["status"] == "banned"
+    assert JS_ENGINES["doshgentv8"]["status"] == "official"
 
 
-def test_v8_lane_is_experimental_until_phase_2():
-    v8 = JS_ENGINES["doshgentv8"]
-    assert v8["status"] == "experimental"
-    assert "Phase 2" in v8["summary"]
+def test_explicit_quickjs_selection_is_refused(monkeypatch):
+    monkeypatch.setenv("WR_JS_ENGINE", "quickjs")
+    with pytest.raises(ValueError, match="QuickJS is banned"):
+        js_engine()
 
 
-def test_js_engine_defaults_to_quickjs(monkeypatch):
+def test_js_engine_defaults_to_doshgentv8(monkeypatch):
     monkeypatch.delenv("WR_JS_ENGINE", raising=False)
-    assert js_engine() == "quickjs"
+    assert js_engine() == "doshgentv8"
 
 
 def test_js_engine_selects_v8_when_configured(monkeypatch):
@@ -69,16 +70,17 @@ def test_js_engine_selects_v8_when_configured(monkeypatch):
     assert js_engine() == "doshgentv8"
     status = js_engine_status()
     assert status["active"] == "doshgentv8"
-    assert "experimental" in status["note"]
-    assert "not yet validated" in status["note"]
+    assert "only engine" in status["note"]
+    assert "banned" in status["note"]
 
 
-def test_unknown_engine_falls_back_to_official(monkeypatch):
+def test_unknown_engine_falls_back_to_doshgentv8(monkeypatch):
     monkeypatch.setenv("WR_JS_ENGINE", "turbojs")
-    assert js_engine() == "quickjs"
+    assert js_engine() == "doshgentv8"
     status = js_engine_status()
     assert status["requested"] == "turbojs"
-    assert status["active"] == "quickjs"
+    assert status["active"] == "doshgentv8"
+    assert "banned" in status["note"]
 
 
 def test_project_status_answers_the_official_question():
@@ -124,7 +126,8 @@ async def test_shell_product_command_reports_official_lane():
                 await shell.execute("open", {"url": "https://cfg.test/"})
                 r2 = await shell.execute("status", {})
                 assert r2["result"]["product"]["official_lane"] == "rust"
-                assert r2["result"]["product"]["active_js_engine"] == "quickjs"
+                # Post-2026-11-07 QuickJS ban: doshgentv8 is the ONLY JS lane.
+                assert r2["result"]["product"]["active_js_engine"] == "doshgentv8"
             finally:
                 shell.close()
                 await session.close()

@@ -290,5 +290,66 @@ class SelectorContractTests(unittest.TestCase):
         self.assertEqual(len(root.css(BLOCK_SEL)), 1)
 
 
+class AcdV2AndDataDomeNativeTests(unittest.TestCase):
+    def test_acd_v2_references_frames_and_json_ld_schemas(self):
+        html = """<html><body><main>
+            <p>Main article body.</p>
+            <ol class="mw-references references">
+                <li>Ref [1]: Agent Browser Design</li>
+            </ol>
+            <iframe srcdoc="<p>Nested frame widget text</p>"></iframe>
+            <script type="application/ld+json">
+            [
+                {"@type": "Recipe", "name": "Cardamom Tea", "recipeIngredient": ["Tea", "Milk"], "recipeInstructions": "Simmer 5m."},
+                {"@type": "JobPosting", "title": "Rust Compiler Engineer", "hiringOrganization": {"name": "Dosh"}, "description": "Work on V8."},
+                {"@type": "BreadcrumbList", "itemListElement": [{"name": "Docs"}, {"name": "ACD"}]}
+            ]
+            </script>
+        </main></body></html>"""
+        acd_default = build_acd(url="https://en.wikipedia.org/wiki/T", title="T", html=html)
+        texts_def = [b.text for b in acd_default.blocks if b.text]
+        self.assertFalse(any("Ref [1]: Agent Browser Design" in t for t in texts_def))
+        self.assertTrue(any("[frame-1] Nested frame widget text" in t for t in texts_def), texts_def)
+        self.assertTrue(any("Recipe: Cardamom Tea" in t for t in texts_def), texts_def)
+        self.assertTrue(any("Job: Rust Compiler Engineer at Dosh" in t for t in texts_def), texts_def)
+        self.assertTrue(any("Breadcrumbs: Docs > ACD" in t for t in texts_def), texts_def)
+
+        acd_refs = build_acd(url="https://en.wikipedia.org/wiki/T", title="T", html=html, include_references=True)
+        texts_refs = [b.text for b in acd_refs.blocks if b.text]
+        self.assertTrue(any("Ref [1]: Agent Browser Design" in t for t in texts_refs), texts_refs)
+
+    def test_datadome_native_protocol_extraction_and_verdicts(self):
+        import asyncio
+        from webresearch.engine import datadome
+
+        interstitial_fe = """<html><body class="dd-response-page--captcha">
+            <script>var dd = {'cid':'AHrlqAAAAAMA','hsh':'A5829B','t':'fe','s':46694,'e':'9a8b','host':'geo.captcha-delivery.com'};</script>
+            <iframe src="https://geo.captcha-delivery.com/captcha/?initialCid=AHrlqAAAAAMA"></iframe>
+        </body></html>"""
+        det = datadome.detect(interstitial_fe, referer="https://booking.com/")
+        self.assertTrue(det.present)
+        self.assertEqual(det.kind, "captcha")
+        self.assertEqual(det.variant, "fe")
+        self.assertEqual(det.request_id, "AHrlqAAAAAMA")
+        self.assertTrue(det.solvable)
+        self.assertIn("https://geo.captcha-delivery.com/captcha/?", det.challenge_url)
+
+        interstitial_bv = """<html><body class="dd-response-page--hard-block">
+            <script>var dd = {'cid':'BLOCKED123','hsh':'A5829B','t':'bv','s':46694,'host':'geo.captcha-delivery.com'};</script>
+        </body></html>"""
+        det_bv = datadome.detect(interstitial_bv)
+        self.assertTrue(det_bv.present)
+        self.assertFalse(det_bv.solvable)
+
+        class DummySession:
+            html = interstitial_bv
+            url = "https://booking.com/"
+            frames = []
+
+        res = asyncio.run(datadome.solve(DummySession()))
+        self.assertFalse(res["ok"])
+        self.assertTrue(res.get("needs_new_ip"))
+
+
 if __name__ == "__main__":
     unittest.main()

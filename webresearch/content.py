@@ -302,10 +302,16 @@ def _same_node(a: Node | None, b: Node | None) -> bool:
 # those against the chrome tokens vetoed every article on the site. Once the
 # walk reaches either of them it has already left the content root.
 NEVER_CHROME_TAGS = {"html", "body"}
+REFERENCE_CLASS_TOKENS = {"reference", "references", "mw-references-wrap", "mw-references", "reflist"}
 
 
-def inside_chrome(node: Node, stop: Node | None = None) -> bool:
+def inside_chrome(node: Node, stop: Node | None = None, *, include_references: bool = False) -> bool:
     """True if node sits in nav/aside/toc/infobox/ads, stopping at the article root."""
+    skip_classes = (
+        SKIP_CLASS_TOKENS - REFERENCE_CLASS_TOKENS
+        if include_references
+        else SKIP_CLASS_TOKENS
+    )
     current: Node | None = node
     while current is not None and not _same_node(current, stop):
         tag = (current.tag or "").lower()
@@ -320,7 +326,7 @@ def inside_chrome(node: Node, stop: Node | None = None) -> bool:
         nid = (attrs.get("id") or "").lower()
         if nid in SKIP_IDS or any(sub in SKIP_IDS for sub in nid.replace("_", "-").split("-") if sub):
             return True
-        if _class_tokens(current) & SKIP_CLASS_TOKENS:
+        if _class_tokens(current) & skip_classes:
             return True
         current = current.parent
     return False

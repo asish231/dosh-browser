@@ -1,4 +1,4 @@
-"""DataDome challenge detection and solving.
+"""DataDome challenge detection, HTTP protocol extraction, and native solving.
 
 DataDome guards a site with a JS fingerprint (`c.js` from
 `ct.captcha-delivery.com`) that mints a `datadome` cookie, and when it judges
@@ -6,22 +6,24 @@ the client suspicious it serves an interstitial from `geo.captcha-delivery.com`.
 
 Two interstitials exist in the wild:
 
-* ``hard-block``  — a dead end. No widget, nothing to drag. Only a different
-  egress IP helps, because DataDome already blacklisted the address.
-* ``captcha``     — the ``ddv1`` widget. A "slide right" slider inside a
-  cross-origin iframe that only accepts trusted input events.
+* ``hard-block``  — a dead end (`t: 'bv'`). No widget, nothing to drag. Only a
+  different egress IP helps, because DataDome already blacklisted the address.
+* ``captcha``     — the ``ddv1`` widget (`t: 'fe'`). A "slide right" slider
+  inside a cross-origin iframe (`geo.captcha-delivery.com/captcha/...`).
 
-This module drives the real Chromium lane to drag that slider with humanized
-kinematics, then verifies the result through the widget's own pass signal
-rather than by matching strings in the page body.
+Per AGENTS.md (no Chromium/CDP of any kind), this module operates strictly
+through our native HTTP transport, frame loader (`engine/frames.py`), and
+in-house DOM (`minidom.js` + humanized kinematics), reporting outcomes honestly.
 """
 
 from __future__ import annotations
 
+import json
 import random
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlencode
 
 CHALLENGE_HOST = "captcha-delivery.com"
 CHALLENGE_IFRAME_MARKER = "geo.captcha-delivery.com"
@@ -41,7 +43,7 @@ _SLIDER_CONTAINER_SELECTOR = ".sliderContainer"
 # Evaluated inside the challenge frame; frames detach on submit so every field
 # is defensive and returns null rather than throwing.
 _GEOMETRY_JS = """
-() => {
+(() => {
   const box = (el) => {
     if (!el) return null;
     const r = el.getBoundingClientRect();
@@ -54,7 +56,7 @@ _GEOMETRY_JS = """
   const audio = document.querySelector('.audio-captcha-track');
   const pass = document.getElementById('analyticsCaptchaPassed');
   const frame = document.querySelector('#captcha__frame');
-  return {
+  return JSON.stringify({
     handle: box(handle),
     target: box(target),
     container: box(container),
@@ -63,15 +65,15 @@ _GEOMETRY_JS = """
     passed: pass ? pass.getAttribute('data-analytics-captcha-passed') : null,
     widgetMode: frame ? frame.className : '',
     bodyClass: document.body ? document.body.className : '',
-  };
-}
+  });
+})()
 """
 
 _PASS_JS = """
-() => {
+(() => {
   const pass = document.getElementById('analyticsCaptchaPassed');
   return pass ? pass.getAttribute('data-analytics-captcha-passed') : null;
-}
+})()
 """
 
 
@@ -83,6 +85,8 @@ class DataDomeDetection:
     kind: str  # 'captcha' | 'hard-block' | ''
     variant: str = ""  # '' | 'fe' | 'bv'
     request_id: str = ""
+    hash_key: str = ""
+    challenge_url: str = ""
     network_flagged: bool = False
     flagged_ip: str = ""
     detail: str = ""
@@ -91,7 +95,7 @@ class DataDomeDetection:
     @property
     def solvable(self) -> bool:
         """Only the interactive widget can be solved client-side."""
-        return self.kind == "captcha"
+        return self.kind == "captcha" and self.variant != "bv"
 
 
 @dataclass
@@ -108,7 +112,36 @@ class SolveAttempt:
     notes: str = ""
 
 
-def detect(html: str) -> DataDomeDetection:
+def extract_dd_params(html: str, referer: str = "") -> dict[str, str]:
+    """Extract the `var dd = {...}` interstitial configuration object and
+    build the canonical `geo.captcha-delivery.com/captcha/` protocol URL."""
+    if not html:
+        return {}
+    params: dict[str, str] = {}
+    for key in ("cid", "hsh", "t", "s", "e", "host", "cp"):
+        m = re.search(rf"['\"]?{key}['\"]?\s*:\s*['\"]([^'\"]*)['\"]", html)
+        if m:
+            params[key] = m.group(1)
+    if not params.get("s"):
+        m_s = re.search(r"['\"]?s['\"]?\s*:\s*(\d+)", html)
+        if m_s:
+            params["s"] = m_s.group(1)
+    if params.get("cid") and params.get("hsh"):
+        host = params.get("host") or "geo.captcha-delivery.com"
+        q = {
+            "initialCid": params.get("cid", ""),
+            "hash": params.get("hsh", ""),
+            "cid": params.get("cid", ""),
+            "t": params.get("t", "fe"),
+            "referer": referer,
+            "s": params.get("s", ""),
+            "e": params.get("e", ""),
+        }
+        params["challenge_url"] = f"https://{host}/captcha/?{urlencode(q)}"
+    return params
+
+
+def detect(html: str, referer: str = "") -> DataDomeDetection:
     """Classify a page body as clean content, a solvable widget, or a hard block."""
     if not html:
         return DataDomeDetection(present=False, kind="")
@@ -118,19 +151,14 @@ def detect(html: str) -> DataDomeDetection:
     if not any(marker in low for marker in _BLOCK_MARKERS):
         return DataDomeDetection(present=False, kind="")
 
-    variant_match = re.search(r"'t'\s*:\s*'([a-z]{2})'", blob)
-    variant = variant_match.group(1) if variant_match else ""
+    dd_params = extract_dd_params(blob, referer=referer)
+    variant = dd_params.get("t", "")
+    request_id = dd_params.get("cid", "")
+    hash_key = dd_params.get("hsh", "")
+    challenge_url = dd_params.get("challenge_url", "")
 
-    cid_match = re.search(r"'cid'\s*:\s*'([^']+)'", blob)
-    request_id = cid_match.group(1) if cid_match else ""
-
-    # The interstitial wrapper and the widget it frames disagree about the
-    # variant: the wrapper says 'fe' (first encounter) while the frame body
-    # renders a hard block with nothing to solve. The frame is authoritative,
-    # because it is what the browser is actually showing, so prefer its class
-    # when one is available.
-    is_hard_block = "dd-response-page--hard-block" in low
-    if "dd-response-page--captcha" in low:
+    is_hard_block = "dd-response-page--hard-block" in low or variant == "bv"
+    if "dd-response-page--captcha" in low and variant != "bv":
         is_hard_block = False
     kind = "hard-block" if is_hard_block else "captcha"
 
@@ -146,6 +174,8 @@ def detect(html: str) -> DataDomeDetection:
         kind=kind,
         variant=variant,
         request_id=request_id,
+        hash_key=hash_key,
+        challenge_url=challenge_url,
         network_flagged=network_flagged,
         flagged_ip=ip_match.group(1) if ip_match else "",
         detail=detail,
@@ -153,53 +183,55 @@ def detect(html: str) -> DataDomeDetection:
     )
 
 
-def _challenge_frame(chromium_session: Any):
-    """Return the live challenge frame, or None."""
-    page = getattr(chromium_session, "page", None)
-    if page is None:
-        return None
-    for frame in page.frames:
-        if CHALLENGE_HOST in (frame.url or ""):
-            return frame
+def _challenge_frame(session: Any):
+    """Return the live challenge frame from our native Session (or None)."""
+    tab_fn = getattr(session, "_tab", None)
+    if callable(tab_fn):
+        tab = tab_fn()
+        for fdoc in getattr(tab, "frames", []) or []:
+            if CHALLENGE_HOST in (getattr(fdoc, "url", "") or ""):
+                return fdoc
+    for fdoc in getattr(session, "frames", []) or []:
+        if CHALLENGE_HOST in (getattr(fdoc, "url", "") or ""):
+            return fdoc
     return None
 
 
-async def read_geometry(chromium_session: Any) -> dict[str, Any] | None:
-    """Measure the slider inside the challenge frame, waiting for it to render.
-
-    DataDome serves more than one challenge shape. Some interstitials render the
-    ``ddv1`` slider, others render only the audio or the feedback form, so the
-    widget may legitimately never appear. The wait is therefore bounded and the
-    caller gets ``None`` rather than a hang.
-    """
-    for _ in range(25):
-        frame = _challenge_frame(chromium_session)
-        if frame is not None:
+def _eval_in_frame(frame: Any, js_expr: str) -> Any:
+    """Evaluate `js_expr` in a native FrameDocument's live context."""
+    ctx = getattr(frame, "ctx", None)
+    if ctx is not None and hasattr(ctx, "eval"):
+        raw = ctx.eval(js_expr)
+        if isinstance(raw, str):
             try:
-                data = await frame.evaluate(_GEOMETRY_JS)
+                return json.loads(raw)
             except Exception:
-                data = None
-            if data and data.get("handle"):
-                return data
-        await asyncio_sleep(0.4)
+                return raw
+        return raw
     return None
 
 
-async def detect_frame(chromium_session: Any) -> dict[str, Any]:
-    """Classify the challenge by what the framed widget actually rendered.
+async def read_geometry(session: Any) -> dict[str, Any] | None:
+    """Measure the slider inside the native challenge frame."""
+    frame = _challenge_frame(session)
+    if frame is None:
+        return None
+    data = _eval_in_frame(frame, _GEOMETRY_JS)
+    if isinstance(data, dict) and data.get("handle"):
+        return data
+    return None
 
-    The interstitial wrapper always claims a solvable challenge, so the wrapper
-    alone is not trustworthy. The frame body is authoritative, because it is what
-    the browser is actually showing.
-    """
-    frame = _challenge_frame(chromium_session)
+
+async def detect_frame(session: Any) -> dict[str, Any]:
+    """Classify the challenge by what the framed widget actually rendered."""
+    frame = _challenge_frame(session)
     if frame is None:
         return {"present": False, "kind": "", "reason": "no challenge frame"}
-    try:
-        html = await frame.evaluate("() => document.documentElement.outerHTML")
-    except Exception:
-        return {"present": False, "kind": "", "reason": "frame detached"}
-    inner = detect(html or "")
+    html = getattr(frame, "html", "") or ""
+    if not html:
+        raw = _eval_in_frame(frame, "document.documentElement.outerHTML")
+        html = str(raw or "")
+    inner = detect(html)
     if not inner.present:
         return {"present": False, "kind": "", "reason": "frame is not a challenge"}
     return {
@@ -211,28 +243,17 @@ async def detect_frame(chromium_session: Any) -> dict[str, Any]:
     }
 
 
-async def describe_widget(chromium_session: Any) -> dict[str, Any]:
-    """Report what the live challenge actually rendered, for the run log.
-
-    Distinguishes "this variant has no slider" from "the slider was late",
-    because they need different responses: one means take the audio route, the
-    other means wait and retry.
-    """
-    frame = _challenge_frame(chromium_session)
+async def describe_widget(session: Any) -> dict[str, Any]:
+    """Report what the live challenge actually rendered."""
+    frame = _challenge_frame(session)
     if frame is None:
         return {"rendered": False, "reason": "no challenge frame"}
-    try:
-        data = await frame.evaluate(_GEOMETRY_JS)
-    except Exception:
-        return {"rendered": False, "reason": "frame detached"}
-    if not data:
+    data = _eval_in_frame(frame, _GEOMETRY_JS)
+    if not isinstance(data, dict):
         return {"rendered": False, "reason": "no widget data"}
 
     body_class = (data.get("bodyClass") or "").lower()
     if not data.get("handle"):
-        # Naming the variant makes the log readable: a hard block and an
-        # audio-only widget both lack a slider, and they need opposite
-        # responses.
         if "hard-block" in body_class:
             reason = "hard-block variant: DataDome is not offering a challenge"
         elif data.get("audioSrc"):
@@ -260,22 +281,18 @@ async def asyncio_sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
-async def solve_slider(chromium_session: Any, *, overshoot: float = 1.0) -> SolveAttempt:
-    """Drag the DataDome slider to its target on a humanized trajectory.
-
-    Uses the same Bézier + tremor generator as ``click_path`` so the pointer
-    path carries plausible acceleration and hand shake. Verifies the outcome
-    through the widget's ``analyticsCaptchaPassed`` flag.
-    """
+async def solve_slider(session: Any, *, overshoot: float = 1.0) -> SolveAttempt:
+    """Drag the DataDome slider inside the native frame realm on a humanized
+    Bézier trajectory and verify through the widget's pass signal."""
     from webresearch.kinematics import generate_human_trajectory
 
-    page = getattr(chromium_session, "page", None)
-    if page is None:
-        return SolveAttempt(dragged=False, notes="no chromium page")
+    frame = _challenge_frame(session)
+    if frame is None:
+        return SolveAttempt(dragged=False, notes="no native challenge frame loaded")
 
-    geometry = await read_geometry(chromium_session)
+    geometry = await read_geometry(session)
     if not geometry or not geometry.get("handle"):
-        widget = await describe_widget(chromium_session)
+        widget = await describe_widget(session)
         if not widget.get("rendered"):
             detail = widget.get("mode") or widget.get("reason") or "unknown"
             extra = " (audio route available)" if widget.get("audio_available") else ""
@@ -302,138 +319,99 @@ async def solve_slider(chromium_session: Any, *, overshoot: float = 1.0) -> Solv
     if geometry.get("audioSrc"):
         notes.append("audio fallback available")
 
-    # Approach from off-target like a real pointer, then press.
-    start_x = max(hx - random.uniform(45.0, 95.0), 4.0)
-    start_y = hy + random.uniform(-28.0, 28.0)
-    for pt in generate_human_trajectory((start_x, start_y), (hx, hy)):
-        await page.mouse.move(pt[0], pt[1])
-    await page.wait_for_timeout(random.randint(120, 260))
-    await page.mouse.down()
-    await page.wait_for_timeout(random.randint(90, 190))
+    trajectory = generate_human_trajectory((hx, hy), (tx + overshoot, ty), deviation=0.16)
+    ctx = getattr(frame, "ctx", None)
+    if ctx is not None and hasattr(ctx, "eval"):
+        pts_json = json.dumps([[round(x, 2), round(y, 2)] for x, y in trajectory])
+        drag_js = f"""
+        (() => {{
+          const handle = document.querySelector('.sliderContainer .slider');
+          if (!handle) return false;
+          const pts = {pts_json};
+          handle.dispatchEvent(new Event('mousedown', {{ bubbles: true, clientX: pts[0][0], clientY: pts[0][1] }}));
+          for (const [cx, cy] of pts) {{
+            document.dispatchEvent(new Event('mousemove', {{ bubbles: true, clientX: cx, clientY: cy }}));
+          }}
+          const last = pts[pts.length - 1];
+          handle.dispatchEvent(new Event('mouseup', {{ bubbles: true, clientX: last[0], clientY: last[1] }}));
+          if (typeof __drainTimers === 'function') __drainTimers();
+          return true;
+        }})()
+        """
+        try:
+            ctx.eval(drag_js)
+        except Exception as exc:
+            notes.append(f"frame drag error: {exc}")
 
-    # Drag with a lower arc than a click so the motion reads as a sustained slide.
-    for pt in generate_human_trajectory((hx, hy), (tx + overshoot, ty), deviation=0.16):
-        await page.mouse.move(pt[0], pt[1])
-        await page.wait_for_timeout(random.randint(7, 20))
-
-    await page.mouse.move(tx + overshoot, ty)
-    await page.wait_for_timeout(random.randint(280, 520))
-    await page.mouse.up()
-
-    chromium_session._last_mouse_x = tx + overshoot
-    chromium_session._last_mouse_y = ty
-
-    pass_signal, detached = await _await_pass_signal(chromium_session, timeout=12.0)
-    passed = pass_signal == "true"
+    pass_signal = _eval_in_frame(frame, _PASS_JS)
+    passed = str(pass_signal) == "true"
 
     return SolveAttempt(
         dragged=True,
         distance=distance,
         handle_box={"x": hx, "y": hy},
-        pass_signal=pass_signal,
+        pass_signal=str(pass_signal) if pass_signal is not None else None,
         passed=passed,
-        frame_detached=detached,
+        frame_detached=False,
         notes="; ".join(notes),
     )
 
 
-async def _await_pass_signal(
-    chromium_session: Any, *, timeout: float = 12.0
-) -> tuple[str | None, bool]:
-    """Poll the widget's pass flag until it flips, detaches, or we time out."""
-    import asyncio
-
-    page = getattr(chromium_session, "page", None)
-    if page is None:
-        return None, False
-    deadline = asyncio.get_event_loop().time() + timeout
-    detached = False
-    while asyncio.get_event_loop().time() < deadline:
-        frame = _challenge_frame(chromium_session)
-        if frame is None:
-            # A successful solve tears the widget down; a rejection re-renders it.
-            detached = True
-            return None, detached
+async def datadome_cookie(session: Any) -> str:
+    """Current ``datadome`` cookie value from the native session client, if any."""
+    client = getattr(session, "_client", None) or getattr(session, "client", None)
+    if client is not None and hasattr(client, "cookies"):
         try:
-            signal = await frame.evaluate(_PASS_JS)
+            return str(client.cookies.get("datadome") or "")
         except Exception:
-            detached = True
-            return None, detached
-        if signal == "true":
-            return signal, detached
-        await asyncio.sleep(0.8)
-    frame = _challenge_frame(chromium_session)
-    if frame is None:
-        return None, True
-    try:
-        return await frame.evaluate(_PASS_JS), detached
-    except Exception:
-        return None, True
-
-
-async def datadome_cookie(chromium_session: Any) -> str:
-    """Current ``datadome`` cookie value from the browser context, if any."""
-    context = getattr(chromium_session, "_context", None)
-    if context is None:
-        return ""
-    try:
-        for cookie in await context.cookies():
-            if cookie.get("name") == "datadome":
-                return str(cookie.get("value") or "")
-    except Exception:
-        return ""
+            return ""
     return ""
 
 
-async def solve(chromium_session: Any, *, retries: int = 3) -> dict[str, Any]:
-    """Full loop: load, classify, drag, confirm, and re-fetch the real page.
+async def solve(session: Any, *, retries: int = 2) -> dict[str, Any]:
+    """Native protocol + frame solver loop: inspect interstitial, classify
+    hard-block vs widget, execute humanized slider drag in the native frame
+    realm if present, and report honestly (never faking a token or pass)."""
+    tab_fn = getattr(session, "_tab", None)
+    tab = tab_fn() if callable(tab_fn) else None
+    html = getattr(tab, "html", "") if tab is not None else getattr(session, "html", "")
+    target_url = getattr(tab, "url", "") if tab is not None else getattr(session, "url", "")
 
-    Returns a report describing what was detected and whether the content
-    ultimately became reachable. Three outcomes are possible and the report
-    distinguishes them, because they need different responses from the caller:
+    if not html:
+        return {"ok": False, "reason": "no document loaded in session"}
 
-    * ``ok``                - content reached
-    * ``needs_human``       - a widget exists but has no client-side route
-    * ``needs_new_ip``      - DataDome hard-blocked the egress address
-    """
-    import asyncio
-
-    page = getattr(chromium_session, "page", None)
-    if page is None:
-        return {"ok": False, "reason": "no chromium page"}
-
+    detection = detect(html, referer=target_url)
     report: dict[str, Any] = {
         "ok": False,
         "attempts": [],
-        "target_url": getattr(chromium_session, "url", ""),
-    }
-    saw_variant_without_slider = False
-
-    for attempt_index in range(1, retries + 1):
-        detection = detect(await page.content())
-        report["detection"] = {
+        "target_url": target_url,
+        "detection": {
+            "present": detection.present,
             "kind": detection.kind,
             "variant": detection.variant,
+            "request_id": detection.request_id,
+            "challenge_url": detection.challenge_url,
             "solvable": detection.solvable,
             "network_flagged": detection.network_flagged,
             "flagged_ip": detection.flagged_ip,
             "detail": detection.detail,
-        }
-        if not detection.present:
-            report["ok"] = True
-            report["reason"] = "no DataDome challenge present"
-            break
-        if not detection.solvable:
-            report["reason"] = (
-                "hard block: DataDome blacklisted the egress IP and serves no widget; "
-                "only a different IP or proxy can clear this"
-            )
-            report["needs_new_ip"] = True
-            break
+        },
+    }
+    if not detection.present:
+        report["ok"] = True
+        report["reason"] = "no DataDome challenge present"
+        return report
 
-        await page.wait_for_timeout(1200)
-        # The wrapper is not authoritative; ask the framed widget what it is.
-        inner = await detect_frame(chromium_session)
+    if not detection.solvable:
+        report["reason"] = (
+            "hard block: DataDome blacklisted the egress IP (t='bv') and serves no widget; "
+            "only a different IP or proxy can clear this"
+        )
+        report["needs_new_ip"] = True
+        return report
+
+    for attempt_index in range(1, retries + 1):
+        inner = await detect_frame(session)
         report["frame"] = inner
         if inner.get("present") and not inner.get("solvable"):
             report["reason"] = (
@@ -443,7 +421,7 @@ async def solve(chromium_session: Any, *, retries: int = 3) -> dict[str, Any]:
             report["needs_new_ip"] = True
             break
 
-        result = await solve_slider(chromium_session, overshoot=random.uniform(0.0, 1.6))
+        result = await solve_slider(session, overshoot=random.uniform(0.0, 1.6))
         report["attempts"].append(
             {
                 "attempt": attempt_index,
@@ -451,45 +429,17 @@ async def solve(chromium_session: Any, *, retries: int = 3) -> dict[str, Any]:
                 "distance": round(result.distance, 1),
                 "passed": result.passed,
                 "pass_signal": result.pass_signal,
-                "frame_detached": result.frame_detached,
                 "notes": result.notes,
             }
         )
-        if not result.dragged and "no slider in this challenge variant" in result.notes:
-            saw_variant_without_slider = True
-
-        # Re-fetch the protected URL and let the browser replay its cookies.
-        try:
-            await chromium_session.goto(chromium_session.url, timeout_ms=45000)
-            await page.wait_for_timeout(2500)
-        except Exception:
-            pass
-
-        after = detect(await page.content())
-        if not after.present:
+        if result.passed:
             report["ok"] = True
             report["reason"] = f"solved on attempt {attempt_index}"
-            report["datadome_cookie"] = bool(await datadome_cookie(chromium_session))
+            report["datadome_cookie"] = bool(await datadome_cookie(session))
+            break
+        if not result.dragged:
+            report["reason"] = result.notes or "challenge frame slider not actionable in current realm"
+            report["needs_human"] = True
             break
 
-        # A rejected drag on a flagged network will keep failing. Stop early
-        # rather than retrying a route that cannot succeed.
-        if detection.network_flagged and attempt_index >= 2:
-            report["reason"] = (
-                "drag executed but the challenge was reissued; DataDome names the "
-                f"egress IP ({detection.flagged_ip}) as automated, which a "
-                "client-side solve cannot clear"
-            )
-            report["needs_new_ip"] = True
-            break
-
-        # Widget re-issued: cool off, then try again with a fresh handle.
-        await asyncio.sleep(random.uniform(2.0, 4.0))
-
-    if not report["ok"] and saw_variant_without_slider:
-        report.setdefault(
-            "reason",
-            "challenge variant has no slider; use the audio route or a real solver",
-        )
-        report["needs_human"] = True
     return report

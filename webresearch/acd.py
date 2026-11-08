@@ -89,8 +89,11 @@ def build_acd(
     frames: list[FrameInfo] | None = None,
     js_info: dict | None = None,
     max_blocks: int = 400,
+    include_references: bool = False,
 ) -> Acd:
     js_info = js_info or {}
+    if not include_references and js_info.get("include_references"):
+        include_references = True
     targets = targets or []
     links = links or []
     frames = frames or []
@@ -129,7 +132,7 @@ def build_acd(
             blocks.append(block)
 
         for node in candidates:
-            if inside_chrome(node, stop=root):
+            if inside_chrome(node, stop=root, include_references=include_references):
                 chrome_skipped += 1
                 continue
             tag = node.tag or ""
@@ -196,7 +199,7 @@ def build_acd(
         if not budget_hit:
             regions = [
                 node for node in root.css(REGION_SEL)
-                if not inside_chrome(node, stop=root)
+                if not inside_chrome(node, stop=root, include_references=include_references)
             ]
 
             def _other_regions(node):
@@ -303,6 +306,89 @@ def build_acd(
                     if availability:
                         bits.append(availability.rsplit("/", 1)[-1])
                     _pending(type="text", text=" — ".join(bits))
+        elif etype == "Recipe":
+            r_name = str(entity.get("name") or "").strip()
+            if r_name:
+                _pending(type="heading", level=3, text=f"Recipe: {r_name}")
+            ingredients = entity.get("recipeIngredient")
+            if isinstance(ingredients, list):
+                for ing in ingredients:
+                    s_ing = str(ing or "").strip()
+                    if s_ing:
+                        _pending(type="list", text=f"Ingredient: {s_ing}")
+            instructions = entity.get("recipeInstructions")
+            if isinstance(instructions, list):
+                for inst in instructions:
+                    inst_txt = str(inst.get("text") if isinstance(inst, dict) else inst or "").strip()
+                    if inst_txt:
+                        _pending(type="list", text=inst_txt)
+            elif isinstance(instructions, str) and instructions.strip():
+                _pending(type="text", text=instructions.strip())
+        elif etype in {"Article", "NewsArticle", "BlogPosting", "TechArticle", "ScholarlyArticle"}:
+            headline = str(entity.get("headline") or entity.get("name") or "").strip()
+            body_txt = str(entity.get("articleBody") or entity.get("description") or "").strip()
+            if headline:
+                _pending(type="heading", level=3, text=headline)
+            if body_txt:
+                clean_b = " ".join(HTMLParser(body_txt).text(separator=" ", strip=True).split()) if "<" in body_txt else body_txt
+                _pending(type="text", text=clean_b)
+        elif etype == "Event":
+            ev_name = str(entity.get("name") or "").strip()
+            start_date = str(entity.get("startDate") or "").strip()
+            loc_obj = entity.get("location")
+            loc_name = str(loc_obj.get("name") if isinstance(loc_obj, dict) else loc_obj or "").strip()
+            if ev_name:
+                parts = [f"Event: {ev_name}"]
+                if start_date:
+                    parts.append(f"Date: {start_date}")
+                if loc_name:
+                    parts.append(f"Location: {loc_name}")
+                _pending(type="text", text=" | ".join(parts))
+        elif etype == "JobPosting":
+            j_title = str(entity.get("title") or entity.get("name") or "").strip()
+            org = entity.get("hiringOrganization")
+            org_name = str(org.get("name") if isinstance(org, dict) else org or "").strip()
+            j_desc = str(entity.get("description") or "").strip()
+            if j_title:
+                hdr = f"Job: {j_title}" + (f" at {org_name}" if org_name else "")
+                _pending(type="heading", level=4, text=hdr)
+            if j_desc:
+                clean_j = " ".join(HTMLParser(j_desc).text(separator=" ", strip=True).split()) if "<" in j_desc else j_desc
+                _pending(type="text", text=clean_j)
+        elif etype in {"LocalBusiness", "Restaurant", "Store"}:
+            b_name = str(entity.get("name") or "").strip()
+            b_desc = str(entity.get("description") or "").strip()
+            if b_name:
+                _pending(type="heading", level=4, text=f"Business: {b_name}")
+            if b_desc:
+                _pending(type="text", text=b_desc)
+        elif etype == "BreadcrumbList" and isinstance(entity.get("itemListElement"), list):
+            crumbs: list[str] = []
+            for item in entity["itemListElement"]:
+                if not isinstance(item, dict):
+                    continue
+                c_name = str(item.get("name") or (item.get("item") or {}).get("name") if isinstance(item.get("item"), dict) else item.get("name") or "").strip()
+                if c_name:
+                    crumbs.append(c_name)
+            if crumbs:
+                _pending(type="text", text="Breadcrumbs: " + " > ".join(crumbs))
+
+    # ACD v2 (§2.2): project loaded child frame content into blocks so
+    # embedded widgets/iframes are visible to browser_query and browser_slice.
+    for f_info in frames:
+        f_excerpt = str(getattr(f_info, "html_excerpt", "") or "").strip()
+        f_ref = str(getattr(f_info, "ref", "") or getattr(f_info, "ref_id", "") or "frame").strip()
+        if f_excerpt:
+            f_text = " ".join(HTMLParser(f_excerpt).text(separator=" ", strip=True).split()) if "<" in f_excerpt else f_excerpt
+            if f_text:
+                _pending(type="text", text=f"[{f_ref}] {f_text}", role="frame", locator=f_ref)
+    if tree is not None and not frames:
+        for idx, iframe_node in enumerate(tree.css("iframe[srcdoc]"), start=1):
+            sdoc = (iframe_node.attributes or {}).get("srcdoc") or ""
+            if sdoc.strip():
+                f_text = " ".join(HTMLParser(sdoc).text(separator=" ", strip=True).split())
+                if f_text:
+                    _pending(type="text", text=f"[frame-{idx}] {f_text}", role="frame", locator=f"frame-{idx}")
     blocks_total += len(pending)
     for kwargs in pending:
         if len(blocks) >= max_blocks:
