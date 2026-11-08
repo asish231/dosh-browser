@@ -200,7 +200,10 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | Native Function Cloaking | `minidom.js` (`__makeNative`, `Function.prototype.toString`) | `tests/test_stealth_cloaking.py` (6 tests) | ✅ Implemented, `[native code]` cloaking, spec-compliant name/length, CreepJS/Turnstile defense |
 | **Unified SQL state DB** (history+cookies+storage+ledger) | `state_snapshots` in `shell.py` (`state_snapshots` in Rust `shell.rs`) | `tests/test_shell.py::test_state_*` + Rust shell tests | ✅ Implemented, both lanes, with `state.snapshot`/`state.diff`/`state.rollback`; diff is value-free, rollback rehydrates live jar + DOM, ledger stays append-only (disclosed). |
 | **Element identity tracker** (stable refs across re-renders) | Rust `identity.rs`; Python content-identity inventory | Rust shell test, `tests/test_shell.py::test_ref_stable_survives_rerender_shift` | ✅ Implemented, both lanes. Refs are content-addressed; `ref {stable}` re-resolves across re-rendering. |
-| **Causal trace stream** (action→Δ→net→console) | Python `trace` (full bundle) | Python shell tests | 🟡 Python complete (identity-keyed DOM delta + network + console + dialogs); Rust `trace` is wired but the `caused_by` link is still absent. |
+| **Causal trace stream** (action→Δ→net→console) | Rust `shell.rs` + `runtime.rs` + `network.rs`; Python `trace` | Rust `shell::test_trace_causal_network_and_console_link`; Python shell tests | ✅ Complete in both lanes: identity-keyed DOM delta + `caused_by`-linked network records + `caused_by`-linked console entries + dialogs. |
+| **ActionGateway epoch-fencing & idempotency** | `shell.rs` (`act` / `action.start`), `session.rs` (`document_epoch`, `action_idempotency_cache`) | `shell::test_act_epoch_fencing_and_idempotency_key` | ✅ Implemented (`State Weave §8` / `Audit P1-04`): `expected_epoch` fences stale callers in 0.24 µs; `idempotency_key` returns cached outcome in 1.35 µs without re-executing side effects. |
+| **NativeCrypto (`crypto.subtle`) & Shadow DOM `>>>` piercing** | `minidom.js`, `runtime.rs` (`ring`), `runtime.py` (`hashlib`/`hmac`) | `runtime::test_runtime_webcrypto_subtle_and_shadow_dom_piercing` | ✅ Implemented (`AGENTIC-VERIFY-CLASSIFY §1`): HMAC-SHA256/384/512, Ed25519, AES-128/256-GCM, PBKDF2, SHA-1/256/384/512; unsupported algos reject honestly with `NotSupportedError`; `#host >>> #inner` pierces open shadow roots. |
+| **ACD v2 (reference toggle, frame blocks, JSON-LD expansion)** | `acd.rs`/`content.rs`, `acd.py`/`content.py` | `acd::test_acd_v2_references_frames_and_json_ld_schemas`, `tests/test_acd_coverage.py` | ✅ Implemented (`SITE-SWEEP-LIMITATIONS Tier 2`): `references=true` recovers Wikipedia/MDN reference lists; child `iframe` content projects into blocks; `Recipe`, `Article`, `Event`, `JobPosting`, `LocalBusiness`, `BreadcrumbList` project into blocks. |
 | **Mutation subscription stream** (deltas, not re-reads) | host-side MutationObserver in `minidom.js` (`__wrWatch*`) + `watch` drain | Rust `test_watch_real_mutation_stream`; Python `test_watch_*` | ✅ Implemented, both lanes: after/limit/next_after, disabled retains. |
 | **Capability manifest per page** ("unavailable — and why") | `caps` (Rust + Python) | Rust caps test + Python caps tests | ✅ Implemented, both lanes: live-realm counts with labeled static fallback, tabs/frames/dialogs, unavailable+why, absolute-path export. |
 | rAF frame clock | `minidom.js` | tests/test_minidom_layout_upgrades.py::test_raf_* | ✅ Done (Phase 3: L8) |
@@ -229,8 +232,8 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 | Invention | Current State | Status |
 |---|---|---|
 | Fingerprint parity (JA3/JA4, Sec-Fetch, CH-UA, navigator block) | `fetch.py` implementation | ✅ HAVE |
-| Causally-linked network ledger (action→pass→request) | `telemetry.py` ready, causal link missing | `WIRE` + invent `caused_by` |
-| Request rule engine (mock/block/redirect) | Consumed at `runtime.py:611` | `WIRE` |
+| Causally-linked network ledger (action→pass→request) | `telemetry.rs` / `network.rs` + `telemetry.py` (`caused_by` propagated) | ✅ DONE — `shell::test_trace_causal_network_and_console_link` |
+| Request rule engine (mock/block/redirect) | Consumed at `network.rs:215`, `runtime.rs:530`, `runtime.py:611` | ✅ DONE — both lanes enforce `net.rule` mock/block/redirect |
 | Cookie/site-data partitioning model (third-party isolation) | ✅ Double-keyed (top_site, frame_origin) partitioned jars + storage keys (S6) | ✅ DONE (Phase 8) — `tests/test_s6_partitioning.py` |
 
 ### Layer 1 — Document & Runtime
@@ -288,10 +291,10 @@ Say "this needs a real browser" plainly when it is true. Do not paper over it.
 |---|---|---|
 | Reading projection (layout-aware) | `content.py` | ✅ HAVE, upgrade |
 | Action surface: complete inventory, labels, honest coverage | `shell.py` inventory | ✅ HAVE, upgrade w/ identity refs |
-| Per-realm console tool (parent + every frame) | `runtime.py:console`, `shell.console` | `CAPTURED, WIRE` |
-| **Multi-realm eval** (run JS in a chosen frame's context) | Not implemented | `INVENT` |
-| Frame/postMessage debugger projection (lanes, addressing, bodies) | `frames.py`, `runtime.py` | `DATA FLOWS, WIRE` |
-| **Causal trace**: action → DOM delta → network → console | Partial data | `INVENT` — flagship |
+| Per-realm console tool (parent + every frame) | `runtime.py:console`, `session.rs:drain_runtime_telemetry`, `shell.console` | ✅ DONE — both lanes drain live realm console w/ `caused_by` |
+| **Multi-realm eval** (run JS in a chosen frame's context) | `frame.eval` (`session.rs:get_or_create_frame_runtime`, `shell.py`) | ✅ DONE — `shell::test_heap_live_measured_and_frame_eval_child_realm` |
+| Frame/postMessage debugger projection (lanes, addressing, bodies) | `frames.rs`, `frames.py`, `runtime.py` | ✅ DONE — live child frame realms + postMessage routing |
+| **Causal trace**: action → DOM delta → network → console | `trace` command (both lanes) | ✅ DONE — `shell::test_trace_causal_network_and_console_link` |
 | **Mutation subscription stream** (deltas instead of re-reads) | `watch` over host-side `__wrWatch*` MutationObserver (both lanes) | ✅ HAVE |
 | Capability manifest per page ("unavailable — and why", formalized) | `caps` (both lanes) | ✅ HAVE |
 | **Skills registry** (persistent site procedures across sessions) | Partial: `shell.skill_*` | `INVENT` |
