@@ -221,6 +221,66 @@ fn heap_band(memory_limit: usize) -> (usize, usize, usize, usize) {
     }
 }
 
+/// Build a Parena from the shared tree-JSON shape (see
+/// `DoshEngine::set_parena_from_tree_json`). Free-standing so BOTH the
+/// engine method and the actor path (`DoshActorHandle::set_parena`,
+/// which takes an owned arena) can use the same projection.
+/// Returns (arena, node_count).
+pub fn parena_from_tree_json(tree_json: &str) -> Result<(parena::Parena, usize), String> {
+    let tree: serde_json::Value =
+        serde_json::from_str(tree_json).map_err(|e| format!("tree json parse: {e}"))?;
+    let mut arena = parena::Parena::new();
+    let count = project_tree_into(&mut arena, &tree, 0)?;
+    Ok((arena, count))
+}
+
+fn project_tree_into(
+    arena: &mut parena::Parena,
+    node: &serde_json::Value,
+    parent: u32,
+) -> Result<usize, String> {
+    let obj = node
+        .as_object()
+        .ok_or_else(|| "tree node must be an object".to_string())?;
+    let tag = obj.get("t").and_then(|v| v.as_str()).unwrap_or("");
+    let text = obj.get("x").and_then(|v| v.as_str()).unwrap_or("");
+    let attrs_v = obj.get("a").cloned().unwrap_or(serde_json::json!({}));
+    let attrs: Vec<(String, String)> = attrs_v
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let attr_refs: Vec<(&str, &str)> =
+        attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let tag_id = if tag == "#text" {
+        parena::TagId::TextNode
+    } else if tag == "document" {
+        parena::TagId::Document
+    } else {
+        parena::TagId::from_name(tag)
+    };
+    // Element text lives in #text children; a node with "x" of its own
+    // (only #text nodes have it) carries it directly.
+    let id = arena.add_node(tag_id, parent, &attr_refs, text);
+
+    let mut count = 1usize;
+    if let Some(children) = obj.get("c").and_then(|v| v.as_array()) {
+        for child in children {
+            count += project_tree_into(arena, child, id)?;
+        }
+    }
+    Ok(count)
+}
+
 /// Stage-1 pressure-graded near-heap-limit response.
 ///
 /// V8's contract for this callback: it fires when the heap approaches the
@@ -1142,6 +1202,24 @@ impl DoshEngine {
         })
     }
 
+    /// Stage-3 integration: project a parsed document tree into a fresh
+    /// Parena, replacing any existing one. The tree JSON is the shape both
+    /// lanes already share — `{"t": tag, "a": {attrs}, "c": [children]}`
+    /// with `#text` nodes carrying `"x"` (Rust `tree::html_to_tree` and
+    /// Python `engine/tree.py::html_to_tree` produce identical output).
+    /// Returns the node count.
+    ///
+    /// Honest scope: this is the INITIAL-document projection (hydration
+    /// time). Live minidom mutations after load are not mirrored into the
+    /// arena — that is future work; spill/checkpoint/fork/external-report
+    /// apply to the projected initial content from here on.
+    pub fn set_parena_from_tree_json(&mut self, tree_json: &str) -> Result<usize, String> {
+        let (arena, count) = parena_from_tree_json(tree_json)?;
+        self.set_parena(arena);
+        Ok(count)
+    }
+
+
     /// Register a host callable in the realm as a JS wrapper over the
     /// dispatcher. Names are plain `A-Za-z0-9_` (the engine's are `host_*`).
     pub fn add_host(&mut self, name: &str) -> Result<(), String> {
@@ -1427,6 +1505,15 @@ impl DoshEngine {
             self.heap_ceil,
             self.current_limit.load(Ordering::SeqCst),
         )
+    }
+
+    /// Nominal-cap honesty: the CONFIGURED limit (0 = uncapped). V8 enforces
+    /// its own internal minimum heap, so a configured cap below that minimum
+    /// is nominal — the true envelope is cap + max(64 MiB, cap/2) and the
+    /// granted limit grows through the ladder. This exposes the requested
+    /// value so hosts can report "requested X, effective Y".
+    pub fn requested_limit(&self) -> usize {
+        self.memory_limit
     }
 
     /// Stage-2: override the envelope at runtime (MiB). The ceiling clamps

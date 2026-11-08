@@ -158,9 +158,27 @@ impl DoshContext {
         (f as u64, c as u64, g as u64)
     }
 
+    /// Nominal-cap honesty: the CONFIGURED limit (0 = uncapped). V8 enforces
+    /// its own internal minimum heap, so a configured cap below that minimum
+    /// is nominal; the true envelope is cap + max(64 MiB, cap/2).
+    fn requested_limit(&mut self) -> u64 {
+        self.engine.requested_limit() as u64
+    }
+
     /// Stage-5: times the shrink pass asked V8 for a low-memory GC.
     fn shrink_fires(&mut self) -> u32 {
         self.engine.shrink_fires()
+    }
+
+    /// Stage-3 integration: project the parsed document tree into the
+    /// engine's Parena (initial-document snapshot). `tree_json` is the
+    /// shared tree shape (`{"t","a","c"}`, `#text` carries `"x"`). Returns
+    /// the projected node count.
+    fn load_parena(&mut self, tree_json: &str) -> PyResult<u64> {
+        self.engine
+            .set_parena_from_tree_json(tree_json)
+            .map(|n| n as u64)
+            .map_err(PyRuntimeError::new_err)
     }
 
     /// Stage-5: Parena residency — (ram_bytes, spill_bytes, text_bytes).

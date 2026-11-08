@@ -1138,8 +1138,18 @@ class DoshShell:
             else:
                 if hasattr(ctx, "heap_band"):
                     floor, ceil, granted = ctx.heap_band()
-                    out["available"]["heap_band"] = {
+                    band = {
                         "floor_bytes": floor, "ceil_bytes": ceil, "granted_bytes": granted}
+                    if hasattr(ctx, "requested_limit"):
+                        requested = ctx.requested_limit()
+                        if requested:
+                            band["requested_bytes"] = requested
+                            if granted != requested:
+                                band["note"] = (
+                                    f"requested {requested} bytes, effective {granted}; "
+                                    "V8 enforces its own minimum heap, so small caps are nominal — "
+                                    "the true envelope ceiling is requested + max(64MiB, requested/2)")
+                    out["available"]["heap_band"] = band
                 else:
                     notes.append("heap_band not exposed by this engine build")
                 if hasattr(ctx, "pressure_epoch"):
