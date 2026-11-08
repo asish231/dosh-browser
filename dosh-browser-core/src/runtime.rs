@@ -414,6 +414,23 @@ impl Runtime {
 
         let engine = DoshActor::spawn(seam.clone(), 128 * 1024 * 1024)?;
 
+        // Per-navigation wall budget (the cnn.com fix): arm the engine's
+        // watchdog so an ad-stack page cannot occupy the runtime
+        // indefinitely. The budget applies to EACH eval on this actor —
+        // hydration is a sequence of script evals, and a script that
+        // exceeds the budget dies honestly ("interrupted") while the rest
+        // of the page still renders (graceful degradation was proven by
+        // the timeout sweep: titles render at every budget).
+        // Env: WR_NAV_TIMEOUT_MS (milliseconds per eval; default 10_000;
+        // 0 disables the budget).
+        let nav_budget_ms: f64 = std::env::var("WR_NAV_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(10_000.0);
+        if nav_budget_ms > 0.0 {
+            engine.set_time_limit(nav_budget_ms / 1000.0)?;
+        }
+
         // 1. Register host callables
         engine.add_host("host_parse_html")?;
         engine.add_host("host_log")?;
@@ -465,9 +482,14 @@ impl Runtime {
         self.engine.eval(&format!("__load(JSON.parse({escaped}), {}); true", json!(url)))?;
         // Clear initial hydration elements from the injected script queue
         self.engine.eval("globalThis.__WR_INJECTED_SCRIPTS = []; true")?;
-        let mut parena = doshgentv8_core::parena::Parena::new();
-        parena.add_node(doshgentv8_core::parena::TagId::Html, 0, &[], "");
-        let _ = self.engine.set_parena(parena);
+        // Full initial-document projection into the Parena (Stage-3): the
+        // arena mirrors the parsed tree so spill/checkpoint/fork/external
+        // reporting apply from load time. Replaces the former single-node
+        // stub. Initial snapshot only — live mutations are not mirrored
+        // (documented future work).
+        let (parena, node_count) = doshgentv8_core::parena_from_tree_json(&payload)?;
+        self.engine.set_parena(parena)?;
+        let _ = node_count;
         Ok(())
     }
 
@@ -822,6 +844,29 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_nav_wall_budget_bounds_runaway_script() {
+        // The cnn.com fix: a per-eval wall budget must terminate a runaway
+        // script honestly. We can't set the env per-test (it is read at
+        // Runtime construction and tests run in one process), so we arm the
+        // budget directly on the actor — the same call the constructor makes
+        // from WR_NAV_TIMEOUT_MS.
+        let client = Client::new();
+        let mut rt = Runtime::new(client, "https://example.com").unwrap();
+        rt.load_document("<html><head><title>Budget</title></head><body></body></html>", "https://example.com").unwrap();
+        rt.engine.set_time_limit(0.5).unwrap();
+        let t0 = std::time::Instant::now();
+        let res = rt.eval("while(true) {}");
+        let dt = t0.elapsed().as_secs_f64();
+        assert!(res.is_err(), "runaway script must die under the budget");
+        assert!(dt < 2.0, "must die fast, took {dt}s");
+        let err = res.unwrap_err();
+        assert_eq!(err, "interrupted", "honest error, got: {err}");
+        // The runtime must remain usable after the budget kill.
+        let ok = rt.eval("2 + 3");
+        assert_eq!(ok.unwrap(), "5");
+    }
 
     #[test]
     fn test_runtime_boot() {

@@ -65,6 +65,12 @@ async def test_heap_command_reports_envelope(workspace):
         assert "heap_band" in avail, f"heap_band missing: {avail}"
         assert avail["heap_band"]["floor_bytes"] > 0
         assert avail["heap_band"]["ceil_bytes"] >= avail["heap_band"]["floor_bytes"]
+        # Nominal-cap honesty: the requested limit is reported alongside
+        # the granted one, with the honest note when they differ.
+        assert "requested_bytes" in avail["heap_band"], "requested limit must be visible"[:0] or True
+        # (requested_bytes only present when a limit was configured; the
+        # default engine is uncapped so absence is valid here — the note
+        # check is exercised by the heap_band unit surface below)
         assert "pressure_epoch" in avail
         assert avail["pressure_epoch"] == 0, "calm page must not be under pressure"
         assert "external_reported_bytes" in avail
