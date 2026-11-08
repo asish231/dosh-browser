@@ -143,12 +143,49 @@ impl DoshResponse {
     }
 
     pub fn as_str(&self) -> Option<&str> {
+        let bytes = self.as_bytes()?;
+        std::str::from_utf8(bytes).ok()
+    }
+
+    pub fn as_bytes(&self) -> Option<&[u8]> {
         if self.result_data.is_null() || self.result_len == 0 {
             return None;
         }
-        unsafe {
-            let slice = std::slice::from_raw_parts(self.result_data, self.result_len as usize);
-            std::str::from_utf8(slice).ok()
+        unsafe { Some(std::slice::from_raw_parts(self.result_data, self.result_len as usize)) }
+    }
+
+    /// Convert into an owned, lifetime-safe `DoshOwnedResponse` suitable for
+    /// cross-thread actor messaging without dangling raw pointers (Audit P0-04).
+    pub fn to_owned_response(&self) -> DoshOwnedResponse {
+        let data = self.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
+        DoshOwnedResponse {
+            status: self.status,
+            data_type: self.data_type,
+            numeric_val: self.numeric_val,
+            data,
+        }
+    }
+}
+
+/// Safe owned DCP response (no raw pointers, safe to send across actor threads).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoshOwnedResponse {
+    pub status: u8,
+    pub data_type: u8,
+    pub numeric_val: u64,
+    pub data: Vec<u8>,
+}
+
+impl DoshOwnedResponse {
+    pub fn is_ok(&self) -> bool {
+        self.status == DoshStatusCode::Ok as u8
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        if self.data.is_empty() {
+            None
+        } else {
+            std::str::from_utf8(&self.data).ok()
         }
     }
 }

@@ -431,6 +431,60 @@ fn host_dispatch(
     }
 
     // Direct Parena verbs from JS runtime (synchronous, avoids actor channel deadlock)
+    if name == "__dosh_parena_node" || name == "host_parena_node" {
+        let id_str = host_args.first().cloned().unwrap_or_default();
+        let node_id = id_str.parse::<u32>().unwrap_or(0);
+        if let Ok(p_guard) = bridge.parena.lock() {
+            if let Some(p) = p_guard.as_ref() {
+                if (node_id as usize) < p.len() {
+                    let tag = p.get_tag(node_id).as_str();
+                    let parent = p.get_parent(node_id);
+                    let text = p.get_text(node_id);
+                    let attrs = p.get_attrs(node_id);
+                    let payload = serde_json::json!({
+                        "node_id": node_id,
+                        "epoch_id": p.epoch_id,
+                        "tag": tag,
+                        "parent": parent,
+                        "text": text,
+                        "attrs": attrs,
+                    })
+                    .to_string();
+                    let s = v8::String::new(scope, &payload)
+                        .unwrap_or_else(|| v8::String::empty(scope));
+                    rv.set(s.into());
+                    return;
+                }
+            }
+        }
+        rv.set_null();
+        return;
+    }
+
+    if name == "__dosh_parena_stats" || name == "host_parena_stats" {
+        if let Ok(p_guard) = bridge.parena.lock() {
+            if let Some(p) = p_guard.as_ref() {
+                let payload = serde_json::json!({
+                    "epoch_id": p.epoch_id,
+                    "node_count": p.len(),
+                    "external_bytes": p.external_bytes(),
+                    "spill_bytes": p.spill_bytes(),
+                    "text_len": p.text_len(),
+                    "attr_len": p.attr_len(),
+                })
+                .to_string();
+                let s = v8::String::new(scope, &payload)
+                    .unwrap_or_else(|| v8::String::empty(scope));
+                rv.set(s.into());
+                return;
+            }
+        }
+        let s = v8::String::new(scope, "{\"node_count\":0,\"external_bytes\":0,\"spill_bytes\":0,\"text_len\":0,\"attr_len\":0}")
+            .unwrap_or_else(|| v8::String::empty(scope));
+        rv.set(s.into());
+        return;
+    }
+
     if name == "__dosh_checkpoint" || name == "host_checkpoint" {
         if let Ok(mut c_map) = bridge.checkpoints.lock() {
             if let Ok(p_guard) = bridge.parena.lock() {
@@ -886,6 +940,14 @@ const EXTENSIONS_SCRIPT: &str = r#"
         },
         batchRead: function(nodeIds) {
             return globalThis.__dispatchHost("__dosh_batch_read", JSON.stringify(nodeIds));
+        },
+        parenaNode: function(nodeId) {
+            const raw = globalThis.__dispatchHost("__dosh_parena_node", String(nodeId));
+            return raw ? JSON.parse(raw) : null;
+        },
+        parenaStats: function() {
+            const raw = globalThis.__dispatchHost("__dosh_parena_stats");
+            return raw ? JSON.parse(raw) : null;
         }
     };
 })();
@@ -950,6 +1012,10 @@ pub struct DoshEngine {
     action_allowed: Arc<AtomicBool>,
     control_realm: Arc<AtomicBool>,
     layout_buffer: Vec<protocol::DoshButterflyRect>,
+    /// Engine-owned scratch buffer backing `DoshResponse::result_data` so C-ABI
+    /// callers never observe a dangling pointer into a dropped local `String`
+    /// or `Vec<u8>` (Audit P0-04 fix).
+    dcp_scratch: Vec<u8>,
     pub telemetry_ring: protocol::DoshTelemetryRing,
     pub parena: Arc<Mutex<Option<parena::Parena>>>,
     pub checkpoints: Arc<Mutex<HashMap<u64, parena::Checkpoint>>>,
@@ -1081,6 +1147,7 @@ impl DoshEngine {
             action_allowed,
             control_realm,
             layout_buffer: Vec::new(),
+            dcp_scratch: Vec::new(),
             telemetry_ring: protocol::DoshTelemetryRing::new(),
             parena,
             checkpoints,
@@ -1196,6 +1263,7 @@ impl DoshEngine {
             action_allowed,
             control_realm,
             layout_buffer: Vec::new(),
+            dcp_scratch: Vec::new(),
             telemetry_ring: protocol::DoshTelemetryRing::new(),
             parena,
             checkpoints,
@@ -1770,18 +1838,76 @@ impl DoshEngine {
         }
     }
 
+    fn dcp_store_error(&mut self, msg: &str) -> protocol::DoshResponse {
+        self.dcp_scratch.clear();
+        self.dcp_scratch.extend_from_slice(msg.as_bytes());
+        protocol::DoshResponse {
+            status: protocol::DoshStatusCode::Error as u8,
+            data_type: 1,
+            reserved: 0,
+            result_len: self.dcp_scratch.len() as u32,
+            numeric_val: 0,
+            result_data: if self.dcp_scratch.is_empty() {
+                std::ptr::null()
+            } else {
+                self.dcp_scratch.as_ptr()
+            },
+        }
+    }
+
+    fn dcp_store_string(&mut self, s: &str) -> protocol::DoshResponse {
+        self.dcp_scratch.clear();
+        self.dcp_scratch.extend_from_slice(s.as_bytes());
+        protocol::DoshResponse {
+            status: protocol::DoshStatusCode::Ok as u8,
+            data_type: 1,
+            reserved: 0,
+            result_len: self.dcp_scratch.len() as u32,
+            numeric_val: self.dcp_scratch.len() as u64,
+            result_data: if self.dcp_scratch.is_empty() {
+                std::ptr::null()
+            } else {
+                self.dcp_scratch.as_ptr()
+            },
+        }
+    }
+
+    fn dcp_store_bytes(&mut self, bytes: Vec<u8>, numeric_val: u64) -> protocol::DoshResponse {
+        self.dcp_scratch = bytes;
+        protocol::DoshResponse {
+            status: protocol::DoshStatusCode::Ok as u8,
+            data_type: 4,
+            reserved: 0,
+            result_len: self.dcp_scratch.len() as u32,
+            numeric_val,
+            result_data: if self.dcp_scratch.is_empty() {
+                std::ptr::null()
+            } else {
+                self.dcp_scratch.as_ptr()
+            },
+        }
+    }
+
+    /// Dispatch a DCP command and return an owned, lifetime-safe response.
+    pub fn dispatch_owned(&mut self, cmd: &protocol::DoshCommand) -> protocol::DoshOwnedResponse {
+        self.dispatch_command(cmd).to_owned_response()
+    }
+
     /// Dispatch an in-memory DCP command directly to the V8 C++ engine.
+    /// All string/buffer pointers in the returned `DoshResponse` are backed by
+    /// `self.dcp_scratch` or `self.layout_buffer` and remain valid until the
+    /// next mutating call on `self` (Audit P0-04 fix).
     pub fn dispatch_command(&mut self, cmd: &protocol::DoshCommand) -> protocol::DoshResponse {
         match cmd.opcode {
             0x00 => protocol::DoshResponse::ok(),
             0x01 => {
                 if let Some(code) = cmd.as_payload_str() {
                     match self.eval(code) {
-                        Ok(_) => protocol::DoshResponse::ok(),
-                        Err(e) => protocol::DoshResponse::error(&e),
+                        Ok(out) => self.dcp_store_string(&out),
+                        Err(e) => self.dcp_store_error(&e),
                     }
                 } else {
-                    protocol::DoshResponse::error("missing payload for EVAL")
+                    self.dcp_store_error("missing payload for EVAL")
                 }
             }
             0x02 => {
@@ -1792,14 +1918,14 @@ impl DoshEngine {
                 let rem = self.fuel_remaining();
                 protocol::DoshResponse::with_numeric(rem)
             }
-            0x04 => {
-                let _ = self.set_virtual_time(cmd.param as f64);
-                protocol::DoshResponse::ok()
-            }
-            0x05 => {
-                let _ = self.set_random_seed(cmd.param);
-                protocol::DoshResponse::ok()
-            }
+            0x04 => match self.set_virtual_time(cmd.param as f64) {
+                Ok(()) => protocol::DoshResponse::ok(),
+                Err(e) => self.dcp_store_error(&e),
+            },
+            0x05 => match self.set_random_seed(cmd.param) {
+                Ok(()) => protocol::DoshResponse::ok(),
+                Err(e) => self.dcp_store_error(&e),
+            },
             0x06 => {
                 let _ = self.set_eval_allowed((cmd.param & 1) != 0);
                 let _ = self.set_wasm_allowed((cmd.param & 2) != 0);
@@ -1832,13 +1958,17 @@ impl DoshEngine {
             }
             0x0A => {
                 let allowed = cmd.param != 0;
-                let _ = self.set_action_allowed(allowed);
-                protocol::DoshResponse::ok()
+                match self.set_action_allowed(allowed) {
+                    Ok(()) => protocol::DoshResponse::ok(),
+                    Err(e) => self.dcp_store_error(&e),
+                }
             }
             0x0B => {
                 let enabled = cmd.param != 0;
-                let _ = self.set_control_realm(enabled);
-                protocol::DoshResponse::ok()
+                match self.set_control_realm(enabled) {
+                    Ok(()) => protocol::DoshResponse::ok(),
+                    Err(e) => self.dcp_store_error(&e),
+                }
             }
             0x0C => {
                 let mut node_ids = Vec::new();
@@ -1852,43 +1982,49 @@ impl DoshEngine {
                     node_ids.push(cmd.param as u32);
                 }
                 match self.batch_read_parena(&node_ids) {
-                    Ok(bytes) => protocol::DoshResponse {
-                        status: protocol::DoshStatusCode::Ok as u8,
-                        data_type: 4, // Buffer
-                        reserved: 0,
-                        result_len: bytes.len() as u32,
-                        numeric_val: node_ids.len() as u64,
-                        result_data: bytes.as_ptr(),
-                    },
-                    Err(e) => protocol::DoshResponse::error(&e),
+                    Ok(bytes) => self.dcp_store_bytes(bytes, node_ids.len() as u64),
+                    Err(e) => self.dcp_store_error(&e),
                 }
             }
             0x0D => {
                 let drained = self.telemetry_ring.drain();
-                protocol::DoshResponse::with_numeric(drained.len() as u64)
+                let count = drained.len() as u64;
+                let json_events: Vec<serde_json::Value> = drained
+                    .into_iter()
+                    .map(|(seq, kind, msg, ts)| {
+                        serde_json::json!({
+                            "seq": seq,
+                            "kind": kind as u8,
+                            "message": msg,
+                            "timestamp_ms": ts,
+                        })
+                    })
+                    .collect();
+                let serialized = serde_json::to_vec(&json_events).unwrap_or_default();
+                self.dcp_store_bytes(serialized, count)
             }
             0x0E => {
                 // ForkParena
                 match self.fork_parena() {
-                    Ok(_) => protocol::DoshResponse::ok(),
-                    Err(e) => protocol::DoshResponse::error(&e),
+                    Ok(forked) => protocol::DoshResponse::with_numeric(forked.epoch_id),
+                    Err(e) => self.dcp_store_error(&e),
                 }
             }
             0x0F => {
                 // CheckpointParena
                 match self.checkpoint_parena() {
                     Ok(id) => protocol::DoshResponse::with_numeric(id),
-                    Err(e) => protocol::DoshResponse::error(&e),
+                    Err(e) => self.dcp_store_error(&e),
                 }
             }
             0x10 => {
                 // RewindParena
                 match self.rewind_parena(cmd.param) {
                     Ok(bytes) => protocol::DoshResponse::with_numeric(bytes as u64),
-                    Err(e) => protocol::DoshResponse::error(&e),
+                    Err(e) => self.dcp_store_error(&e),
                 }
             }
-            _ => protocol::DoshResponse::error("unknown opcode"),
+            _ => self.dcp_store_error("unknown opcode"),
         }
     }
 }
@@ -2698,5 +2834,50 @@ mod tests {
         // Evaluates immediately without needing to re-compile extensions
         let res = engine.eval("typeof globalThis.Butterfly + ' ' + typeof globalThis.dosh.text").unwrap();
         assert_eq!(res, "function function");
+    }
+
+    #[test]
+    fn test_dcp_scratch_pointer_lifetime_and_owned_response() {
+        use protocol::{DoshCommand, DoshOpCode, DoshStatusCode};
+        let mut engine = DoshEngine::new(Arc::new(DummySeam)).unwrap();
+
+        // 1. Eval returns the actual evaluated string in scratch buffer (not discarded, not dangling)
+        let cmd = DoshCommand::new(DoshOpCode::Eval).with_payload("'dcp_' + (20 + 22)");
+        let resp = engine.dispatch_command(&cmd);
+        assert_eq!(resp.status, DoshStatusCode::Ok as u8);
+        assert_eq!(resp.as_str(), Some("dcp_42"));
+
+        // 2. Error response points into engine's dcp_scratch (never dangles into dropped String)
+        let err_cmd = DoshCommand::new(DoshOpCode::Eval).with_payload("throw new Error('dcp_boom')");
+        let err_resp = engine.dispatch_owned(&err_cmd);
+        assert_eq!(err_resp.status, DoshStatusCode::Error as u8);
+        assert!(err_resp.as_str().unwrap_or_default().contains("dcp_boom"));
+
+        // 3. BatchRead returns valid bytes backed by dcp_scratch + borrowed-view JS helpers
+        let mut arena = parena::Parena::new();
+        let n0 = arena.add_node(parena::TagId::H1, u32::MAX, &[("id", "hero")], "State Weave Live");
+        engine.set_parena(arena);
+
+        let batch_cmd = DoshCommand::new(DoshOpCode::BatchRead).with_param(0);
+        // Node 0 via param=0 fallback or payload
+        let ids_bytes = n0.to_le_bytes();
+        let mut batch_cmd_buf = batch_cmd;
+        batch_cmd_buf.payload = ids_bytes.as_ptr();
+        batch_cmd_buf.payload_len = 4;
+        let b_resp = engine.dispatch_owned(&batch_cmd_buf);
+        assert!(b_resp.is_ok());
+        assert_eq!(b_resp.numeric_val, 1);
+        assert!(b_resp.data.len() > 14);
+        let text_slice = std::str::from_utf8(&b_resp.data[18..]).unwrap();
+        assert_eq!(text_slice, "State Weave Live");
+
+        // 4. Borrowed-view JS helpers: dosh.parenaNode(0) and dosh.parenaStats()
+        let node_json = engine.eval("JSON.stringify(dosh.parenaNode(0))").unwrap();
+        assert!(node_json.contains("\"tag\":\"h1\""));
+        assert!(node_json.contains("\"text\":\"State Weave Live\""));
+        assert!(node_json.contains("\"hero\""));
+
+        let stats_json = engine.eval("JSON.stringify(dosh.parenaStats())").unwrap();
+        assert!(stats_json.contains("\"node_count\":1"));
     }
 }

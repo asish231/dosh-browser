@@ -204,10 +204,15 @@ pub struct Checkpoint {
     pub text_lens: Vec<u32>,
     pub attr_offsets: Vec<u32>,
     pub attr_lens: Vec<u32>,
+    /// Future A: when a checkpoint is taken over a spilled arena (or via
+    /// `warm_checkpoint`), records the backing spill file path and watermark
+    /// so the spill file serves as a warm checkpoint without un-spilling.
+    pub spill_path: Option<std::path::PathBuf>,
+    pub spilled_from: Option<usize>,
 }
 
-/// The cold tail of the text arena, offloaded to a host file (Stage 3).
-/// File offset 0 corresponds to text offset `spilled_from`. Addressed by
+/// The cold tail of the text or attribute arena, offloaded to a host file (Stage 3 + Future A).
+/// File offset 0 corresponds to logical offset `spilled_from`. Addressed by
 /// offset via stable `read_at`/`write_at`; the OS page cache does residency.
 /// Not mmap-backed only because no mmap crate is vendored offline — the
 /// semantics (cold tail on disk, hot prefix in RAM) are identical.
@@ -220,7 +225,16 @@ pub struct SpillFile {
 
 impl SpillFile {
     fn create(epoch_id: u64, hot: &[u8]) -> Result<Self, String> {
-        let path = std::env::temp_dir().join(format!("dosh-parena-spill-{}-{}", epoch_id, std::process::id()));
+        Self::create_labeled(epoch_id, "text", hot)
+    }
+
+    fn create_labeled(epoch_id: u64, column: &str, hot: &[u8]) -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!(
+            "dosh-parena-spill-{}-{}-{}",
+            column,
+            epoch_id,
+            std::process::id()
+        ));
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -233,6 +247,11 @@ impl SpillFile {
             sf.append(hot)?;
         }
         Ok(sf)
+    }
+
+    /// Path to the backing spill file on disk.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     fn append(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -281,23 +300,32 @@ pub struct Parena {
     pub spilled_from: usize,
     /// The offloaded cold tail (None = everything resident).
     pub spill: Option<SpillFile>,
+    /// Future A: attribute-column spill tier (`attr_data` cold tail on disk).
+    pub attr_spilled_from: usize,
+    pub attr_spill: Option<SpillFile>,
 }
 
 impl Clone for Parena {
     /// A clone is a fork of the bytes: it materializes the FULL logical text
-    /// (hot prefix + spill tail) back into RAM. Forking a spilled arena is
-    /// thus re-resident by construction — no partial-clone bug possible.
+    /// and attribute data (hot prefix + spill tail) back into RAM. Forking a
+    /// spilled arena is thus re-resident by construction — no partial-clone
+    /// bug possible.
     fn clone(&self) -> Self {
         let mut text_arena = self.text_arena.clone();
         if self.spill.is_some() {
             let tail = self.text_bytes(self.spilled_from, self.text_len() - self.spilled_from);
             text_arena.extend_from_slice(&tail);
         }
+        let mut attr_data = self.attr_data.clone();
+        if self.attr_spill.is_some() {
+            let tail = self.attr_bytes(self.attr_spilled_from, self.attr_len() - self.attr_spilled_from);
+            attr_data.extend_from_slice(&tail);
+        }
         Self {
             epoch_id: self.epoch_id,
             tags: self.tags.clone(),
             parents: self.parents.clone(),
-            attr_data: self.attr_data.clone(),
+            attr_data,
             attr_offsets: self.attr_offsets.clone(),
             attr_lens: self.attr_lens.clone(),
             text_arena,
@@ -307,6 +335,8 @@ impl Clone for Parena {
             dirty_log: self.dirty_log.clone(),
             spilled_from: 0,
             spill: None,
+            attr_spilled_from: 0,
+            attr_spill: None,
         }
     }
 }
@@ -335,6 +365,8 @@ impl Parena {
             dirty_log: Vec::new(),
             spilled_from: 0,
             spill: None,
+            attr_spilled_from: 0,
+            attr_spill: None,
         }
     }
 
@@ -374,11 +406,113 @@ impl Parena {
         }
     }
 
-    /// Bytes of the cold tail currently offloaded to disk.
+    /// Total LOGICAL attribute bytes (hot prefix + attr spill tail).
+    pub fn attr_len(&self) -> usize {
+        match &self.attr_spill {
+            Some(sp) => self.attr_spilled_from + sp.len,
+            None => self.attr_data.len(),
+        }
+    }
+
+    /// Bytes of the cold tail currently offloaded to disk (text + attr columns).
     pub fn spill_bytes(&self) -> usize {
-        match &self.spill {
-            Some(sp) => sp.len,
-            None => 0,
+        let t = self.spill.as_ref().map(|sp| sp.len).unwrap_or(0);
+        let a = self.attr_spill.as_ref().map(|sp| sp.len).unwrap_or(0);
+        t + a
+    }
+
+    /// Stitched read of `attr_data[off..off+len]` across the hot/spill boundary.
+    pub fn attr_bytes(&self, off: usize, len: usize) -> std::borrow::Cow<'_, [u8]> {
+        use std::borrow::Cow;
+        if len == 0 {
+            return Cow::Borrowed(&[]);
+        }
+        let spill = match &self.attr_spill {
+            Some(sp) => sp,
+            None => return Cow::Borrowed(&self.attr_data[off..off + len]),
+        };
+        if off + len <= self.attr_spilled_from {
+            Cow::Borrowed(&self.attr_data[off..off + len])
+        } else if off >= self.attr_spilled_from {
+            let mut buf = vec![0u8; len];
+            let _ = spill.read_into(off - self.attr_spilled_from, &mut buf);
+            Cow::Owned(buf)
+        } else {
+            let hot = self.attr_spilled_from - off;
+            let mut buf = Vec::with_capacity(len);
+            buf.extend_from_slice(&self.attr_data[off..self.attr_spilled_from]);
+            let mut tail = vec![0u8; len - hot];
+            let _ = spill.read_into(0, &mut tail);
+            buf.extend_from_slice(&tail);
+            Cow::Owned(buf)
+        }
+    }
+
+    fn append_attr(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.attr_spill.is_some() {
+            if let Some(sp) = self.attr_spill.as_mut() {
+                if sp.append(bytes).is_err() {
+                    self.un_spill_attr();
+                    self.attr_data.extend_from_slice(bytes);
+                }
+            }
+        } else {
+            self.attr_data.extend_from_slice(bytes);
+        }
+    }
+
+    /// Bring the attribute spill tail back into RAM and drop the file.
+    pub fn un_spill_attr(&mut self) {
+        if let Some(sp) = self.attr_spill.take() {
+            let mut tail = vec![0u8; sp.len];
+            let _ = sp.read_into(0, &mut tail);
+            self.attr_data.extend_from_slice(&tail);
+            self.attr_spilled_from = 0;
+        }
+    }
+
+    /// Future A: move the cold tail `[watermark..]` of `attr_data` to a host
+    /// file and release the RAM reservation.
+    pub fn spill_attr_tail(&mut self, watermark: usize) -> bool {
+        if self.attr_spill.is_some() || self.attr_data.len() <= watermark {
+            return false;
+        }
+        let hot = self.attr_data.split_off(watermark);
+        match SpillFile::create_labeled(self.epoch_id, "attr", &hot) {
+            Ok(sf) => {
+                self.attr_spilled_from = watermark;
+                self.attr_spill = Some(sf);
+                self.attr_data.shrink_to_fit();
+                true
+            }
+            Err(_) => {
+                self.attr_data.extend_from_slice(&hot);
+                false
+            }
+        }
+    }
+
+    /// Future A: compute a liveness-aware cold watermark from `dirty_log`.
+    /// If dirty mutations occurred near the end of `text_arena`, keeps at least
+    /// up to `max_hot_bytes` covering the earliest dirty text mutation when
+    /// feasible; otherwise falls back to `max_hot_bytes`.
+    pub fn cold_watermark_from_dirty_log(&self, max_hot_bytes: usize) -> usize {
+        let mut max_dirty_end = 0usize;
+        for d in &self.dirty_log {
+            if d.frame == 0 {
+                let end = d.offset.saturating_add(d.old_bytes.len());
+                if end > max_dirty_end {
+                    max_dirty_end = end;
+                }
+            }
+        }
+        if max_dirty_end > 0 && max_dirty_end <= max_hot_bytes {
+            max_dirty_end
+        } else {
+            max_hot_bytes
         }
     }
 
@@ -443,6 +577,7 @@ impl Parena {
             self.text_arena.extend_from_slice(&tail);
             self.spilled_from = 0;
         }
+        self.un_spill_attr();
     }
 
     /// Stage-3 spill tier: move the cold tail `[watermark..]` of the text
@@ -450,24 +585,28 @@ impl Parena {
     /// happened. No-op when already spilled (appends extend the spill) or
     /// when the arena is under the watermark.
     pub fn spill_tail(&mut self, watermark: usize) -> bool {
-        if self.spill.is_some() || self.text_arena.len() <= watermark {
-            return false;
-        }
-        let hot = self.text_arena.split_off(watermark);
-        match SpillFile::create(self.epoch_id, &hot) {
-            Ok(sf) => {
-                self.spilled_from = watermark;
-                self.spill = Some(sf);
-                // Release the reservation — the RAM cost is the point.
-                self.text_arena.shrink_to_fit();
-                true
+        let mut any = false;
+        if self.spill.is_none() && self.text_arena.len() > watermark {
+            let hot = self.text_arena.split_off(watermark);
+            match SpillFile::create(self.epoch_id, &hot) {
+                Ok(sf) => {
+                    self.spilled_from = watermark;
+                    self.spill = Some(sf);
+                    // Release the reservation — the RAM cost is the point.
+                    self.text_arena.shrink_to_fit();
+                    any = true;
+                }
+                Err(_) => {
+                    // Disk failed: keep everything resident (correctness first).
+                    self.text_arena.extend_from_slice(&hot);
+                }
             }
-            Err(_) => {
-                // Disk failed: keep everything resident (correctness first).
-                self.text_arena.extend_from_slice(&hot);
-                false
-            }
         }
+        // Future A: also tier attr_data when it exceeds the watermark.
+        if self.spill_attr_tail(watermark) {
+            any = true;
+        }
+        any
     }
 
     /// Add a node to the arena, returning its node ID (0-indexed).
@@ -484,17 +623,19 @@ impl Parena {
         self.parents.push(parent_id);
 
         // Pack attributes: [key_len: u16, val_len: u16, key_bytes, val_bytes]*
-        let attr_offset = self.attr_data.len() as u32;
+        let attr_offset = self.attr_len() as u32;
         let mut attr_len = 0u32;
+        let mut packed_attrs = Vec::new();
         for (k, v) in attrs {
             let k_bytes = k.as_bytes();
             let v_bytes = v.as_bytes();
-            self.attr_data.extend_from_slice(&(k_bytes.len() as u16).to_le_bytes());
-            self.attr_data.extend_from_slice(&(v_bytes.len() as u16).to_le_bytes());
-            self.attr_data.extend_from_slice(k_bytes);
-            self.attr_data.extend_from_slice(v_bytes);
+            packed_attrs.extend_from_slice(&(k_bytes.len() as u16).to_le_bytes());
+            packed_attrs.extend_from_slice(&(v_bytes.len() as u16).to_le_bytes());
+            packed_attrs.extend_from_slice(k_bytes);
+            packed_attrs.extend_from_slice(v_bytes);
             attr_len += 4 + k_bytes.len() as u32 + v_bytes.len() as u32;
         }
+        self.append_attr(&packed_attrs);
         self.attr_offsets.push(attr_offset);
         self.attr_lens.push(attr_len);
 
@@ -599,11 +740,11 @@ impl Parena {
         }
         let off = self.attr_offsets[idx] as usize;
         let total_len = self.attr_lens[idx] as usize;
-        if off + total_len > self.attr_data.len() {
+        if off + total_len > self.attr_len() {
             return map;
         }
 
-        let slice = &self.attr_data[off..off + total_len];
+        let slice = self.attr_bytes(off, total_len);
         let mut cursor = 0;
         while cursor + 4 <= slice.len() {
             let k_len = u16::from_le_bytes([slice[cursor], slice[cursor + 1]]) as usize;
@@ -693,13 +834,24 @@ impl Parena {
             dirty_cursor: self.dirty_log.len(),
             node_count: self.tags.len(),
             text_len: self.text_len(),
-            attr_len: self.attr_data.len(),
+            attr_len: self.attr_len(),
             actions_len: self.actions.len(),
             text_offsets: self.text_offsets.clone(),
             text_lens: self.text_lens.clone(),
             attr_offsets: self.attr_offsets.clone(),
             attr_lens: self.attr_lens.clone(),
+            spill_path: self.spill.as_ref().map(|sp| sp.path().to_path_buf()),
+            spilled_from: self.spill.as_ref().map(|_| self.spilled_from),
         }
+    }
+
+    /// Future A: take a warm checkpoint that spills cold bytes beyond
+    /// `max_hot_bytes` (using `dirty_log` liveness) and records the spill file
+    /// directly in the checkpoint ("spill = checkpoint that stays live").
+    pub fn warm_checkpoint(&mut self, max_hot_bytes: usize) -> Checkpoint {
+        let wm = self.cold_watermark_from_dirty_log(max_hot_bytes);
+        let _ = self.spill_tail(wm);
+        self.checkpoint()
     }
 
     /// Roll back the arena state to a previously captured checkpoint.
@@ -868,5 +1020,39 @@ mod tests {
         assert!(!bytes.is_empty());
         let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_parena_attr_spill_and_warm_checkpoint() {
+        let mut arena = Parena::new();
+        let n0 = arena.add_node(
+            TagId::Div,
+            u32::MAX,
+            &[("id", "hot-node"), ("data-payload", "0123456789abcdef")],
+            "Hot text prefix",
+        );
+        let n1 = arena.add_node(
+            TagId::Span,
+            n0,
+            &[("class", "cold-attr-tail"), ("title", "spilled-attribute-value-xyz")],
+            "Cold text tail that gets spilled to disk",
+        );
+
+        let cp = arena.warm_checkpoint(8);
+        assert!(cp.spill_path.is_some(), "warm checkpoint must record spill path");
+        assert_eq!(cp.spilled_from, Some(8));
+        assert!(arena.attr_spill.is_some(), "attr_data must also spill past watermark");
+
+        // Stitched reads across hot and spilled tiers for both text and attributes
+        assert_eq!(arena.get_text(n0), "Hot text prefix");
+        assert_eq!(arena.get_text(n1), "Cold text tail that gets spilled to disk");
+        let attrs0 = arena.get_attrs(n0);
+        assert_eq!(attrs0.get("id").map(|s| s.as_str()), Some("hot-node"));
+        let attrs1 = arena.get_attrs(n1);
+        assert_eq!(attrs1.get("title").map(|s| s.as_str()), Some("spilled-attribute-value-xyz"));
+
+        // Forking a spilled arena must materialize both text and attr columns intact
+        let forked = arena.fork();
+        assert_eq!(forked.get_attrs(n1).get("class").map(|s| s.as_str()), Some("cold-attr-tail"));
     }
 }

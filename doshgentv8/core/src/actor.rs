@@ -14,8 +14,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
-use crate::protocol::{DoshButterflyRect, DoshCommand, DoshResponse};
+use crate::protocol::{DoshButterflyRect, DoshCommand, DoshOwnedResponse, DoshResponse};
 use crate::{DoshEngine, HostSeam, JsValue};
+
+/// Full live heap, envelope, pressure, and Parena snapshot from a resident actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorHeapReport {
+    pub used_heap_bytes: usize,
+    pub total_heap_bytes: usize,
+    pub requested_limit_bytes: usize,
+    pub floor_bytes: usize,
+    pub ceil_bytes: usize,
+    pub granted_bytes: usize,
+    pub pressure_epoch: u8,
+    pub external_reported_bytes: usize,
+    pub shrink_fires: u32,
+    pub parena_ram_bytes: usize,
+    pub parena_spill_bytes: usize,
+    pub parena_text_bytes: usize,
+    pub eval_count: usize,
+}
 
 static ACTOR_ID_GEN: AtomicU64 = AtomicU64::new(1);
 
@@ -127,8 +145,15 @@ pub enum ActorCommand {
         cmd: DoshCommand,
         reply: Sender<DoshResponse>,
     },
+    DispatchOwned {
+        cmd: DoshCommand,
+        reply: Sender<DoshOwnedResponse>,
+    },
     GetHeapStats {
         reply: Sender<(usize, usize)>, // (used, total)
+    },
+    GetHeapReport {
+        reply: Sender<ActorHeapReport>,
     },
     EvalCount {
         reply: Sender<usize>,
@@ -492,12 +517,32 @@ impl DoshActorHandle {
         rx.recv().map_err(|e| format!("actor recv error: {e}"))
     }
 
+    /// Dispatch a DCP command and return an owned, thread-safe response.
+    pub fn dispatch_owned(&self, cmd: DoshCommand) -> Result<DoshOwnedResponse, String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::DispatchOwned { cmd, reply: tx })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))
+    }
+
     /// Query heap statistics: `(used_heap_bytes, total_heap_bytes)`.
     pub fn get_heap_stats(&self) -> Result<(usize, usize), String> {
         let (tx, rx) = channel();
         self.inner
             .sender
             .send(ActorCommand::GetHeapStats { reply: tx })
+            .map_err(|e| format!("actor send error: {e}"))?;
+        rx.recv().map_err(|e| format!("actor recv error: {e}"))
+    }
+
+    /// Query full live heap, envelope, pressure, and Parena telemetry from the resident actor.
+    pub fn get_heap_report(&self) -> Result<ActorHeapReport, String> {
+        let (tx, rx) = channel();
+        self.inner
+            .sender
+            .send(ActorCommand::GetHeapReport { reply: tx })
             .map_err(|e| format!("actor send error: {e}"))?;
         rx.recv().map_err(|e| format!("actor recv error: {e}"))
     }
@@ -745,10 +790,40 @@ impl DoshActor {
                     let resp = engine.dispatch_command(&cmd);
                     let _ = reply.send(resp);
                 }
+                ActorCommand::DispatchOwned { cmd, reply } => {
+                    let resp = engine.dispatch_owned(&cmd);
+                    let _ = reply.send(resp);
+                }
                 ActorCommand::GetHeapStats { reply } => {
                     let used = engine.used_heap_size();
                     let total = engine.total_heap_size();
                     let _ = reply.send((used, total));
+                }
+                ActorCommand::GetHeapReport { reply } => {
+                    let used_heap_bytes = engine.used_heap_size();
+                    let total_heap_bytes = engine.total_heap_size();
+                    let requested_limit_bytes = engine.requested_limit();
+                    let (floor_bytes, ceil_bytes, granted_bytes) = engine.heap_band();
+                    let pressure_epoch = engine.pressure_epoch();
+                    let external_reported_bytes = engine.external_reported();
+                    let shrink_fires = engine.shrink_fires();
+                    let (parena_ram_bytes, parena_spill_bytes, parena_text_bytes) = engine.parena_stats();
+                    let eval_count = engine.eval_count();
+                    let _ = reply.send(ActorHeapReport {
+                        used_heap_bytes,
+                        total_heap_bytes,
+                        requested_limit_bytes,
+                        floor_bytes,
+                        ceil_bytes,
+                        granted_bytes,
+                        pressure_epoch,
+                        external_reported_bytes,
+                        shrink_fires,
+                        parena_ram_bytes,
+                        parena_spill_bytes,
+                        parena_text_bytes,
+                        eval_count,
+                    });
                 }
                 ActorCommand::EvalCount { reply } => {
                     let count = engine.eval_count();
