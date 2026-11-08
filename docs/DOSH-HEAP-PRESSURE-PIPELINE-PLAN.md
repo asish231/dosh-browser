@@ -99,6 +99,16 @@ All four designed stages are now shipped and tested (46/46 core, 251/251
 dosh-browser-core, 197 Python-side, bridge oracle GREEN):
 
 ### Stage 2 — Measured heap envelope (DONE)
+
+**Nominal-cap semantics (user-facing):** a configured heap cap
+(`WR_JS_MEMORY_LIMIT_MB` / `new_with_limit`) is the envelope's START, not a
+wall. V8 enforces its own internal minimum heap, so caps below that minimum
+are nominal, and the ladder may grow the heap to
+`cap + max(64 MiB, cap/2)` before declaring genuine exhaustion (proven by the
+stress gauntlet: 4 MiB cap / 68 MiB ceiling — 80 MiB live passes, 120 MiB
+fails honestly). The `heap` shell command reports both `requested_bytes`
+and `granted_bytes` with this note whenever they differ, so the effective
+envelope is always visible rather than assumed.
 - `heap_band(memory_limit)` computes (floor, ceil, hard, initial) at isolate
   construction; env knobs `WR_JS_HEAP_FLOOR_MB` (default 32) /
   `WR_JS_HEAP_CEIL_MB` (default 512).
