@@ -66,6 +66,16 @@ DOWNLOAD_CONTENT_TYPES = (
 )
 
 
+def _history_limit() -> int:
+    """Max back/forward entries per tab. WR_HISTORY_LIMIT (default 50;
+    0 = unbounded). Bounds the session-layer RSS drift measured by the
+    stress gauntlet (~1 MB/visit from unbounded list[Page] history)."""
+    try:
+        return max(0, int(os.environ.get("WR_HISTORY_LIMIT", "50")))
+    except ValueError:
+        return 50
+
+
 def _is_download_response(kind: str, content_type: str, disposition: str) -> bool:
     """True when a navigation response is a file, not a document."""
     if kind != "other":
@@ -175,6 +185,20 @@ class Tab:
             self.history.append(page)
             self.index = len(self.history) - 1
             pushed_page = page
+            # Bounded session history (the ~1MB/visit RSS drift fix): a real
+            # browser caps back/forward entries; an unbounded list[Page]
+            # grows monotonically with every navigation in long-lived
+            # sessions. Trim the OLDEST entries past the cap, keeping the
+            # current index valid (the entry the user is on is never evicted).
+            # Env: WR_HISTORY_LIMIT (default 50; 0 = unbounded).
+            limit = _history_limit()
+            if limit > 0 and len(self.history) > limit:
+                overflow = len(self.history) - limit
+                del self.history[:overflow]
+                del self.snapshots[:overflow]
+                del self.bf_ctx[:overflow]
+                self.index -= overflow
+                self._doc_seq -= overflow
         # Document identity: an explicit doc_id (pushState inheriting the
         # current document, a history-move rebuild keeping the restored
         # entry's) wins; an in-place replace keeps the entry's existing id;

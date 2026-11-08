@@ -49,7 +49,7 @@ def _default_db_path() -> str:
 class SessionEntry:
     """One live browser session in the registry."""
 
-    __slots__ = ("session_id", "session", "shell", "last_attach", "attached_clients", "store")
+    __slots__ = ("session_id", "session", "shell", "last_attach", "attached_clients", "store", "pressure_mark")
 
     def __init__(self, session_id: str, session: Session, store: Any = None):
         self.session_id = session_id
@@ -58,6 +58,7 @@ class SessionEntry:
         self.last_attach = time.monotonic()
         self.attached_clients: int = 0
         self.store = store  # ShellStore for checkpoint/restore
+        self.pressure_mark: int = 0  # >=1 = pressured (eviction-first)
 
 
 class SessionRegistry:
@@ -173,7 +174,11 @@ class SessionRegistry:
                 pressure = {}
                 if ctx is not None:
                     if hasattr(ctx, "pressure_epoch"):
-                        pressure["epoch"] = ctx.pressure_epoch()
+                        epoch = ctx.pressure_epoch()
+                        pressure["epoch"] = epoch
+                        # Auto-mark: observed pressure drives eviction policy.
+                        if epoch >= 1:
+                            e.pressure_mark = max(e.pressure_mark, epoch)
                     if hasattr(ctx, "heap_band"):
                         floor, ceil, granted = ctx.heap_band()
                         pressure["heap_granted_bytes"] = granted
@@ -218,10 +223,37 @@ class SessionRegistry:
         return None
 
     def _evict_lru_locked(self):
-        """Evict least-recently-used sessions if over capacity. Called under lock."""
+        """Evict least-recently-used sessions if over capacity. Called under lock.
+
+        Pressure-driven policy (Future C): sessions marked under pressure
+        (epoch >= 1) are evicted FIRST — a hot session is the one burning
+        process memory, so reclaiming it is the highest-value eviction;
+        calm sessions outlive them. Within each class, LRU order holds.
+        """
         while len(self._sessions) > self._max_live:
-            sid, entry = self._sessions.popitem(last=False)  # oldest
+            # Pressured-first: scan for any entry with a pressure mark.
+            pressured = next(
+                (sid for sid, e in self._sessions.items() if e.pressure_mark >= 1),
+                None,
+            )
+            if pressured is not None:
+                entry = self._sessions.pop(pressured)
+                self._checkpoint_and_close_locked(entry)
+                continue
+            sid, entry = self._sessions.popitem(last=False)  # oldest (LRU)
             self._checkpoint_and_close_locked(entry)
+
+    def mark_pressure(self, session_id: str, epoch: int) -> None:
+        """Mark (or clear) a session's pressure level. epoch >= 1 makes the
+        session eviction-first; 0 clears the mark. Hosts (Loom TTL loop,
+        agents) call this from observed pressure signals."""
+        entry = self._sessions.get(session_id)
+        if entry is not None:
+            entry.pressure_mark = max(0, epoch)
+
+    def pressured_sessions(self) -> list[str]:
+        """IDs of sessions currently marked under pressure."""
+        return [sid for sid, e in self._sessions.items() if e.pressure_mark >= 1]
 
     def _checkpoint_and_close_locked(self, entry: SessionEntry):
         """Checkpoint a session to SQLite and close its client. Sync, under lock."""
