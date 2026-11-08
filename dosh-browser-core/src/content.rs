@@ -125,8 +125,22 @@ pub fn is_ancestor_of(node: &NodeRef, ancestor: &NodeRef) -> bool {
     false
 }
 
+const REFERENCE_CLASS_TOKENS: &[&str] = &[
+    "reference", "references", "mw-references-wrap", "mw-references", "reflist",
+];
+
 /// True if node sits in nav/aside/toc/infobox/ads, stopping at the article root.
 pub fn inside_chrome(node: &NodeRef, stop: Option<&NodeRef>) -> bool {
+    inside_chrome_with_opts(node, stop, false)
+}
+
+/// Same as `inside_chrome`, with `include_references` toggle (ACD v2 §2.1).
+pub fn inside_chrome_with_opts(
+    node: &NodeRef,
+    stop: Option<&NodeRef>,
+    include_references: bool,
+) -> bool {
+    let skip_set = skip_class_tokens_set(include_references);
     let mut current = Some(node.clone());
     while let Some(ref cur) = current {
         if let Some(s) = stop {
@@ -149,12 +163,14 @@ pub fn inside_chrome(node: &NodeRef, stop: Option<&NodeRef>) -> bool {
         if SKIP_IDS.contains(&nid.as_str()) {
             return true;
         }
-        let has_skip_sub = nid.replace('_', "-").split('-')
+        let has_skip_sub = nid
+            .replace('_', "-")
+            .split('-')
             .any(|sub| !sub.is_empty() && SKIP_IDS.contains(&sub));
         if has_skip_sub {
             return true;
         }
-        if !class_tokens(cur).is_disjoint(&skip_class_tokens_set()) {
+        if !class_tokens(cur).is_disjoint(&skip_set) {
             return true;
         }
         current = cur.parent();
@@ -162,8 +178,12 @@ pub fn inside_chrome(node: &NodeRef, stop: Option<&NodeRef>) -> bool {
     false
 }
 
-fn skip_class_tokens_set() -> HashSet<String> {
-    SKIP_CLASS_TOKENS.iter().map(|s| s.to_string()).collect()
+fn skip_class_tokens_set(include_references: bool) -> HashSet<String> {
+    SKIP_CLASS_TOKENS
+        .iter()
+        .filter(|s| !include_references || !REFERENCE_CLASS_TOKENS.contains(*s))
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Score a reading container by its projected non-chrome content.

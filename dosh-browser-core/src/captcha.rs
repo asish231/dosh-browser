@@ -71,21 +71,47 @@ pub fn inspect_captcha(
 
     // Check main HTML if not found in frames
     if !report.present {
+        let re_key = Regex::new(r#"data-sitekey=["']([^"']+)["']"#).unwrap();
+        let site_key = re_key
+            .captures(html)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+
         if lower_html.contains("g-recaptcha") || lower_html.contains("recaptcha") {
-            let re_key = Regex::new(r#"data-sitekey="([^"]+)""#).unwrap();
-            if let Some(caps) = re_key.captures(html) {
-                if let Some(m) = caps.get(1) {
-                    report.site_key = m.as_str().to_string();
-                    report.present = true;
-                    report.kind = "recaptcha".to_string();
-                }
+            if !site_key.is_empty() {
+                report.site_key = site_key;
+                report.present = true;
+                report.kind = "recaptcha".to_string();
             }
         } else if lower_html.contains("h-captcha") || lower_html.contains("hcaptcha") {
             report.present = true;
             report.kind = "hcaptcha".to_string();
-        } else if lower_html.contains("cf-turnstile") {
+            report.site_key = site_key;
+        } else if lower_html.contains("cf-turnstile")
+            || lower_html.contains("challenges.cloudflare.com")
+            || lower_html.contains("_cf_chl_opt")
+        {
             report.present = true;
             report.kind = "turnstile".to_string();
+            report.site_key = site_key;
+        } else if lower_html.contains("captcha-delivery.com")
+            || lower_html.contains("data-dd-captcha-container")
+            || lower_html.contains("dd-response-page")
+        {
+            report.present = true;
+            let is_hard_block = lower_html.contains("dd-response-page--hard-block")
+                || lower_html.contains("'t':'bv'")
+                || lower_html.contains("'t': 'bv'");
+            report.kind = if is_hard_block {
+                "datadome:hard-block".to_string()
+            } else {
+                "datadome:captcha".to_string()
+            };
+            let re_cid = Regex::new(r#"['"]?cid['"]?\s*:\s*['"]([^'"]+)['"]"#).unwrap();
+            if let Some(c) = re_cid.captures(html).and_then(|c| c.get(1)) {
+                report.site_key = c.as_str().to_string();
+            }
         }
     }
 

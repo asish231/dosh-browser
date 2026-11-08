@@ -211,7 +211,87 @@ impl NetworkEngine {
     }
 
     /// Primary entry point: process a request through the full network pipeline.
-    pub async fn fetch(&self, req: NetworkRequest) -> Result<FetchResult, NetworkError> {
+    pub async fn fetch(&self, mut req: NetworkRequest) -> Result<FetchResult, NetworkError> {
+        // 0. Request rule engine (mock / block / redirect — Audit P1-06):
+        // Check operator-configured `net.rule` rules before network dispatch.
+        let matched_rule = {
+            let ledger = self.ledger.lock().await;
+            ledger.match_rule(&req.url).cloned()
+        };
+        if let Some(rule) = matched_rule {
+            match rule.action.as_str() {
+                "block" => {
+                    let mut ledger = self.ledger.lock().await;
+                    ledger.append(NetworkRecord {
+                        source: "rule_block".into(),
+                        url: req.url.clone(),
+                        method: req.method.clone(),
+                        status: None,
+                        request_headers: req.headers.clone(),
+                        state: "blocked_by_rule".into(),
+                        network_sent: Some(false),
+                        caused_by: req.caused_by.clone(),
+                        initiator_stack: req.initiator_stack.clone(),
+                        ..Default::default()
+                    });
+                    return Err(NetworkError::HttpTransport(format!(
+                        "blocked by rule #{} ({})",
+                        rule.id, rule.pattern
+                    )));
+                }
+                "mock" => {
+                    let mut resp_headers = HashMap::new();
+                    resp_headers.insert("content-type".to_string(), rule.content_type.clone());
+                    let sealed = SealedRequest {
+                        record_id: 0,
+                        url: req.url.clone(),
+                        method: req.method.clone(),
+                        headers: req.headers.clone(),
+                        body: req.body.clone().unwrap_or_default().into_bytes(),
+                        response_body: rule.body.as_bytes().to_vec(),
+                        content_type: rule.content_type.clone(),
+                    };
+                    let mut ledger = self.ledger.lock().await;
+                    let capture = ledger.capture_bodies;
+                    ledger.append_with_sealed(
+                        NetworkRecord {
+                            source: "rule_mock".into(),
+                            url: req.url.clone(),
+                            method: req.method.clone(),
+                            status: Some(rule.status),
+                            content_type: rule.content_type.clone(),
+                            bytes: rule.body.len(),
+                            request_headers: req.headers.clone(),
+                            response_headers: resp_headers.clone(),
+                            response_body: if capture { Some(rule.body.clone()) } else { None },
+                            state: "complete".into(),
+                            network_sent: Some(false),
+                            caused_by: req.caused_by.clone(),
+                            initiator_stack: req.initiator_stack.clone(),
+                            ..Default::default()
+                        },
+                        Some(sealed),
+                    );
+                    drop(ledger);
+                    let kind = classify(&rule.content_type).to_string();
+                    return Ok(FetchResult {
+                        url: req.url.clone(),
+                        final_url: req.url,
+                        status: rule.status,
+                        content_type: rule.content_type,
+                        headers: resp_headers,
+                        kind,
+                        body: rule.body,
+                        truncated: false,
+                    });
+                }
+                "redirect" if !rule.redirect_url.is_empty() => {
+                    req.url = rule.redirect_url;
+                }
+                _ => {}
+            }
+        }
+
         let parsed_url = Url::parse(&req.url)
             .map_err(|e| NetworkError::InvalidUrl(format!("{}: {}", req.url, e)))?;
 
@@ -307,6 +387,8 @@ impl NetworkEngine {
                         network_sent: Some(false),
                         bytes: entry.body.len(),
                         content_type: entry.resp_headers.get("content-type").cloned().unwrap_or_default(),
+                        caused_by: req.caused_by.clone(),
+                        initiator_stack: req.initiator_stack.clone(),
                         ..Default::default()
                     });
 
@@ -586,6 +668,7 @@ impl NetworkEngine {
                         ttfb_ms,
                         duration_ms,
                     }),
+                    caused_by: req.caused_by.clone(),
                     initiator_stack: req.initiator_stack.clone(),
                     truncated,
                     ..Default::default()

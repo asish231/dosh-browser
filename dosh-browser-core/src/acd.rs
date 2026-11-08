@@ -9,7 +9,7 @@ use kuchiki::traits::TendrilSink;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-use crate::content::{content_root, inside_chrome, tag_name, text_content, attr};
+use crate::content::{content_root, inside_chrome_with_opts, tag_name, text_content, attr};
 use crate::types::*;
 use crate::provenance::extract_provenance;
 use crate::features::extract_features;
@@ -144,7 +144,12 @@ pub fn build_acd(
     let tree = kuchiki::parse_html().one(html);
     // tree IS the root document node.
     let root = content_root(&tree).unwrap_or(tree.clone());
-    
+    let include_references = js_info
+        .get("include_references")
+        .or_else(|| js_info.get("references"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let mut blocks: Vec<AcdBlock> = Vec::new();
     let mut counter = 0i64;
     let mut chrome_skipped = 0i64;
@@ -160,11 +165,11 @@ pub fn build_acd(
             }
         }
     }
-    
+
     let mut blocks_total = all_block_nodes.len() as i64;
 
     for node in &all_block_nodes {
-        if inside_chrome(node, Some(&root)) {
+        if inside_chrome_with_opts(node, Some(&root), include_references) {
             chrome_skipped += 1;
             continue;
         }
@@ -230,7 +235,7 @@ pub fn build_acd(
             if let Ok(sel_iter) = root.select(sel) {
                 for node in sel_iter {
                     let n = node.as_node();
-                    if inside_chrome(n, Some(&root)) { continue; }
+                    if inside_chrome_with_opts(n, Some(&root), include_references) { continue; }
                     if crate::actions::is_inline_hidden(n) { continue; }
                     region_nodes.push(n.clone());
                 }
@@ -401,7 +406,187 @@ pub fn build_acd(
                         }
                     }
                 }
+                "Recipe" => {
+                    let r_name = entity.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    if !r_name.is_empty() {
+                        pending.push(("heading".into(), Some(3), format!("Recipe: {}", r_name), vec![]));
+                    }
+                    if let Some(Value::Array(ingredients)) = entity.get("recipeIngredient") {
+                        for ing in ingredients {
+                            if let Some(s) = ing.as_str() {
+                                let st = s.trim();
+                                if !st.is_empty() {
+                                    pending.push(("list".into(), None, format!("Ingredient: {}", st), vec![]));
+                                }
+                            }
+                        }
+                    }
+                    match entity.get("recipeInstructions") {
+                        Some(Value::Array(insts)) => {
+                            for inst in insts {
+                                let txt = inst
+                                    .as_object()
+                                    .and_then(|o| o.get("text"))
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| inst.as_str())
+                                    .unwrap_or("")
+                                    .trim();
+                                if !txt.is_empty() {
+                                    pending.push(("list".into(), None, txt.to_string(), vec![]));
+                                }
+                            }
+                        }
+                        Some(Value::String(s)) if !s.trim().is_empty() => {
+                            pending.push(("text".into(), None, s.trim().to_string(), vec![]));
+                        }
+                        _ => {}
+                    }
+                }
+                "Article" | "NewsArticle" | "BlogPosting" | "TechArticle" | "ScholarlyArticle" => {
+                    let headline = entity
+                        .get("headline")
+                        .or_else(|| entity.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let body_txt = entity
+                        .get("articleBody")
+                        .or_else(|| entity.get("description"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if !headline.is_empty() {
+                        pending.push(("heading".into(), Some(3), headline.to_string(), vec![]));
+                    }
+                    if !body_txt.is_empty() {
+                        let clean_b = if body_txt.contains('<') {
+                            let dom = kuchiki::parse_html().one(body_txt);
+                            text_content(&dom)
+                        } else {
+                            body_txt.to_string()
+                        };
+                        pending.push(("text".into(), None, clean_b, vec![]));
+                    }
+                }
+                "Event" => {
+                    let ev_name = entity.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let start_date = entity.get("startDate").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let loc_name = entity
+                        .get("location")
+                        .and_then(|l| l.as_object().and_then(|o| o.get("name")).and_then(|v| v.as_str()).or_else(|| l.as_str()))
+                        .unwrap_or("")
+                        .trim();
+                    if !ev_name.is_empty() {
+                        let mut parts = vec![format!("Event: {}", ev_name)];
+                        if !start_date.is_empty() {
+                            parts.push(format!("Date: {}", start_date));
+                        }
+                        if !loc_name.is_empty() {
+                            parts.push(format!("Location: {}", loc_name));
+                        }
+                        pending.push(("text".into(), None, parts.join(" | "), vec![]));
+                    }
+                }
+                "JobPosting" => {
+                    let j_title = entity
+                        .get("title")
+                        .or_else(|| entity.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let org_name = entity
+                        .get("hiringOrganization")
+                        .and_then(|o| o.as_object().and_then(|m| m.get("name")).and_then(|v| v.as_str()).or_else(|| o.as_str()))
+                        .unwrap_or("")
+                        .trim();
+                    let j_desc = entity.get("description").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    if !j_title.is_empty() {
+                        let hdr = if !org_name.is_empty() {
+                            format!("Job: {} at {}", j_title, org_name)
+                        } else {
+                            format!("Job: {}", j_title)
+                        };
+                        pending.push(("heading".into(), Some(4), hdr, vec![]));
+                    }
+                    if !j_desc.is_empty() {
+                        let clean_j = if j_desc.contains('<') {
+                            let dom = kuchiki::parse_html().one(j_desc);
+                            text_content(&dom)
+                        } else {
+                            j_desc.to_string()
+                        };
+                        pending.push(("text".into(), None, clean_j, vec![]));
+                    }
+                }
+                "LocalBusiness" | "Restaurant" | "Store" => {
+                    let b_name = entity.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let b_desc = entity.get("description").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    if !b_name.is_empty() {
+                        pending.push(("heading".into(), Some(4), format!("Business: {}", b_name), vec![]));
+                    }
+                    if !b_desc.is_empty() {
+                        pending.push(("text".into(), None, b_desc.to_string(), vec![]));
+                    }
+                }
+                "BreadcrumbList" => {
+                    if let Some(Value::Array(items)) = entity.get("itemListElement") {
+                        let mut crumbs = Vec::new();
+                        for item in items {
+                            if let Some(obj) = item.as_object() {
+                                let c_name = obj
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| {
+                                        obj.get("item")
+                                            .and_then(|i| i.as_object())
+                                            .and_then(|io| io.get("name"))
+                                            .and_then(|v| v.as_str())
+                                    })
+                                    .unwrap_or("")
+                                    .trim();
+                                if !c_name.is_empty() {
+                                    crumbs.push(c_name.to_string());
+                                }
+                            }
+                        }
+                        if !crumbs.is_empty() {
+                            pending.push(("text".into(), None, format!("Breadcrumbs: {}", crumbs.join(" > ")), vec![]));
+                        }
+                    }
+                }
                 _ => {}
+            }
+        }
+    }
+
+    // ACD v2 (§2.2): project loaded child frame content into blocks
+    for f_info in frames {
+        let excerpt = f_info.html_excerpt.trim();
+        if !excerpt.is_empty() {
+            let f_text = if excerpt.contains('<') {
+                let dom = kuchiki::parse_html().one(excerpt);
+                text_content(&dom)
+            } else {
+                excerpt.to_string()
+            };
+            if !f_text.is_empty() {
+                let f_ref = if !f_info.ref_id.is_empty() { f_info.ref_id.as_str() } else { "frame" };
+                pending.push(("text".into(), None, format!("[{}] {}", f_ref, f_text), vec![]));
+            }
+        }
+    }
+    if frames.is_empty() {
+        if let Ok(sel) = tree.select("iframe[srcdoc]") {
+            for (idx, node) in sel.enumerate() {
+                if let Some(sdoc) = attr(node.as_node(), "srcdoc") {
+                    if !sdoc.trim().is_empty() {
+                        let dom = kuchiki::parse_html().one(sdoc);
+                        let f_text = text_content(&dom);
+                        if !f_text.is_empty() {
+                            pending.push(("text".into(), None, format!("[frame-{}] {}", idx + 1, f_text), vec![]));
+                        }
+                    }
+                }
             }
         }
     }
@@ -799,6 +984,46 @@ mod tests {
         let acd = build_acd("https://a.com", "Test", &html, &[], &[], &[], &js_info, 100);
         assert!(acd.blocks.iter().any(|b| b.text.starts_with("Q: Q1")));
         assert_eq!(acd.framework.get("json_ld").is_some(), true);
+    }
+
+    #[test]
+    fn test_acd_v2_references_frames_and_json_ld_schemas() {
+        let html = r#"
+            <main>
+                <p>Article lead paragraph.</p>
+                <ol class="mw-references references">
+                    <li>Citation [1]: Browser Architecture Paper</li>
+                </ol>
+                <iframe srcdoc="<p>Embedded widget content inside srcdoc</p>"></iframe>
+                <script type="application/ld+json">
+                [
+                    {"@type": "Recipe", "name": "Masala Chai", "recipeIngredient": ["Tea leaves", "Cardamom"], "recipeInstructions": "Boil with milk."},
+                    {"@type": "JobPosting", "title": "Systems Engineer", "hiringOrganization": {"name": "Dosh Labs"}, "description": "Build agent browsers."},
+                    {"@type": "BreadcrumbList", "itemListElement": [{"name": "Home"}, {"name": "Docs"}]}
+                ]
+                </script>
+            </main>
+        "#;
+        // 1. Default: references skipped as chrome, but srcdoc frame + JSON-LD schemas projected
+        let acd_def = build_acd("https://en.wikipedia.org/wiki/Test", "Test", html, &[], &[], &[], &serde_json::json!({}), 100);
+        assert!(!acd_def.blocks.iter().any(|b| b.text.contains("Citation [1]")));
+        assert!(acd_def.blocks.iter().any(|b| b.text.contains("[frame-1] Embedded widget content")));
+        assert!(acd_def.blocks.iter().any(|b| b.text.contains("Recipe: Masala Chai")));
+        assert!(acd_def.blocks.iter().any(|b| b.text.contains("Job: Systems Engineer at Dosh Labs")));
+        assert!(acd_def.blocks.iter().any(|b| b.text.contains("Breadcrumbs: Home > Docs")));
+
+        // 2. With include_references=true: reference list is projected!
+        let acd_refs = build_acd(
+            "https://en.wikipedia.org/wiki/Test",
+            "Test",
+            html,
+            &[],
+            &[],
+            &[],
+            &serde_json::json!({"include_references": true}),
+            100,
+        );
+        assert!(acd_refs.blocks.iter().any(|b| b.text.contains("Citation [1]: Browser Architecture Paper")));
     }
 
     #[test]

@@ -300,7 +300,13 @@ pub async fn handle_mcp_message(
                 "browser_click" => {
                     let r = arguments["ref"].as_str().unwrap_or("");
                     let mut sess = session.lock().await;
-                    let args = json!({ "ref": r });
+                    let mut args = json!({ "ref": r });
+                    if let Some(ep) = arguments.get("expected_epoch") {
+                        args["expected_epoch"] = ep.clone();
+                    }
+                    if let Some(ik) = arguments.get("idempotency_key") {
+                        args["idempotency_key"] = ik.clone();
+                    }
                     match execute_command("act", &args, &mut sess, store).await {
                         Ok(res) => res.to_string(),
                         Err(e) => format!("Error clicking {}: {}", r, e),
@@ -310,7 +316,13 @@ pub async fn handle_mcp_message(
                     let r = arguments["ref"].as_str().unwrap_or("");
                     let text = arguments["text"].as_str().unwrap_or("");
                     let mut sess = session.lock().await;
-                    let args = json!({ "ref": r, "text": text });
+                    let mut args = json!({ "ref": r, "text": text });
+                    if let Some(ep) = arguments.get("expected_epoch") {
+                        args["expected_epoch"] = ep.clone();
+                    }
+                    if let Some(ik) = arguments.get("idempotency_key") {
+                        args["idempotency_key"] = ik.clone();
+                    }
                     match execute_command("act", &args, &mut sess, store).await {
                         Ok(res) => res.to_string(),
                         Err(e) => format!("Error typing into {}: {}", r, e),

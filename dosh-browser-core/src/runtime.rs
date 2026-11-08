@@ -31,6 +31,8 @@ pub struct ConsoleEntry {
     pub level: String,
     pub message: String,
     pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caused_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -82,6 +84,9 @@ pub struct InnerSeam {
     pub ws_ledger: Option<crate::ws::SharedLedger>,
     /// Live socket registry (pump tasks + send/close channels + inbox).
     pub ws_registry: Mutex<Option<crate::ws::WsRegistry>>,
+    /// Active causal action ID for tagging network requests and console logs
+    /// emitted during an `act` / `trace` pass.
+    pub active_cause: Mutex<Option<String>>,
 }
 
 /// Thread-safe wrapper implementing HostSeam.
@@ -108,12 +113,14 @@ impl HostSeam for SharedSeam {
                 let msg = args.first().cloned().unwrap_or_default();
                 let level = args.get(1).cloned().unwrap_or_else(|| "log".into());
                 let current_url = self.0.url.lock().map(|u| u.clone()).unwrap_or_default();
+                let caused_by = self.0.active_cause.lock().ok().and_then(|g| g.clone());
                 if let Ok(mut cons) = self.0.console.lock() {
                     if cons.len() < 500 {
                         cons.push(ConsoleEntry {
                             level,
                             message: msg,
                             url: current_url,
+                            caused_by,
                         });
                     }
                 }
@@ -124,12 +131,139 @@ impl HostSeam for SharedSeam {
                 let data_hex = args.get(1).cloned().unwrap_or_default();
                 let bytes = hex::decode(&data_hex).unwrap_or_default();
                 let hash = match algo.to_lowercase().replace('-', "").as_str() {
+                    "sha1" => hex::encode(
+                        ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &bytes).as_ref(),
+                    ),
                     "sha256" => hex::encode(Sha256::digest(&bytes)),
                     "sha384" => hex::encode(Sha384::digest(&bytes)),
                     "sha512" => hex::encode(Sha512::digest(&bytes)),
-                    _ => hex::encode(Sha256::digest(&bytes)),
+                    _ => return Err(format!("NotSupportedError: unsupported digest algorithm '{algo}'")),
                 };
                 Ok(Some(hash))
+            }
+            "host_crypto_subtle" => {
+                // NativeCrypto suite: HMAC, Ed25519, AES-GCM, PBKDF2, HKDF via ring.
+                // args: [op, algo, key_hex, data_hex, extra_hex]
+                let op = args.first().map(|s| s.as_str()).unwrap_or("");
+                let algo = args.get(1).map(|s| s.to_lowercase().replace('-', "")).unwrap_or_default();
+                let key_bytes = hex::decode(args.get(2).map(|s| s.as_str()).unwrap_or("")).unwrap_or_default();
+                let data_bytes = hex::decode(args.get(3).map(|s| s.as_str()).unwrap_or("")).unwrap_or_default();
+                let extra_str = args.get(4).map(|s| s.as_str()).unwrap_or("");
+                match op {
+                    "hmac_sign" => {
+                        let hmac_alg = match algo.as_str() {
+                            "sha256" | "hmacsha256" => ring::hmac::HMAC_SHA256,
+                            "sha384" | "hmacsha384" => ring::hmac::HMAC_SHA384,
+                            "sha512" | "hmacsha512" => ring::hmac::HMAC_SHA512,
+                            _ => return Err(format!("NotSupportedError: unsupported HMAC hash '{algo}'")),
+                        };
+                        let key = ring::hmac::Key::new(hmac_alg, &key_bytes);
+                        let tag = ring::hmac::sign(&key, &data_bytes);
+                        Ok(Some(hex::encode(tag.as_ref())))
+                    }
+                    "hmac_verify" => {
+                        let hmac_alg = match algo.as_str() {
+                            "sha256" | "hmacsha256" => ring::hmac::HMAC_SHA256,
+                            "sha384" | "hmacsha384" => ring::hmac::HMAC_SHA384,
+                            "sha512" | "hmacsha512" => ring::hmac::HMAC_SHA512,
+                            _ => return Err(format!("NotSupportedError: unsupported HMAC hash '{algo}'")),
+                        };
+                        let sig_bytes = hex::decode(extra_str).unwrap_or_default();
+                        let key = ring::hmac::Key::new(hmac_alg, &key_bytes);
+                        let ok = ring::hmac::verify(&key, &data_bytes, &sig_bytes).is_ok();
+                        Ok(Some(if ok { "true".into() } else { "false".into() }))
+                    }
+                    "ed25519_sign" => {
+                        if key_bytes.len() != 32 {
+                            return Err("InvalidAccessError: Ed25519 seed must be 32 bytes".into());
+                        }
+                        let kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&key_bytes)
+                            .map_err(|_| "OperationError: invalid Ed25519 seed".to_string())?;
+                        let sig = kp.sign(&data_bytes);
+                        Ok(Some(hex::encode(sig.as_ref())))
+                    }
+                    "ed25519_pubkey" => {
+                        if key_bytes.len() != 32 {
+                            return Err("InvalidAccessError: Ed25519 seed must be 32 bytes".into());
+                        }
+                        use ring::signature::KeyPair;
+                        let kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&key_bytes)
+                            .map_err(|_| "OperationError: invalid Ed25519 seed".to_string())?;
+                        Ok(Some(hex::encode(kp.public_key().as_ref())))
+                    }
+                    "ed25519_verify" => {
+                        let sig_bytes = hex::decode(extra_str).unwrap_or_default();
+                        let pub_key = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key_bytes);
+                        let ok = pub_key.verify(&data_bytes, &sig_bytes).is_ok();
+                        Ok(Some(if ok { "true".into() } else { "false".into() }))
+                    }
+                    "aes_gcm_encrypt" => {
+                        let aead_alg = match key_bytes.len() {
+                            16 => &ring::aead::AES_128_GCM,
+                            32 => &ring::aead::AES_256_GCM,
+                            _ => return Err("InvalidAccessError: AES-GCM key must be 128 or 256 bits".into()),
+                        };
+                        let iv_bytes = hex::decode(extra_str).unwrap_or_default();
+                        if iv_bytes.len() != 12 {
+                            return Err("OperationError: AES-GCM IV must be 12 bytes".into());
+                        }
+                        let mut iv_arr = [0u8; 12];
+                        iv_arr.copy_from_slice(&iv_bytes);
+                        let unbound = ring::aead::UnboundKey::new(aead_alg, &key_bytes)
+                            .map_err(|_| "OperationError: invalid AES-GCM key".to_string())?;
+                        let less_safe = ring::aead::LessSafeKey::new(unbound);
+                        let nonce = ring::aead::Nonce::assume_unique_for_key(iv_arr);
+                        let mut in_out = data_bytes;
+                        less_safe
+                            .seal_in_place_append_tag(nonce, ring::aead::Aad::empty(), &mut in_out)
+                            .map_err(|_| "OperationError: AES-GCM seal failed".to_string())?;
+                        Ok(Some(hex::encode(&in_out)))
+                    }
+                    "aes_gcm_decrypt" => {
+                        let aead_alg = match key_bytes.len() {
+                            16 => &ring::aead::AES_128_GCM,
+                            32 => &ring::aead::AES_256_GCM,
+                            _ => return Err("InvalidAccessError: AES-GCM key must be 128 or 256 bits".into()),
+                        };
+                        let iv_bytes = hex::decode(extra_str).unwrap_or_default();
+                        if iv_bytes.len() != 12 {
+                            return Err("OperationError: AES-GCM IV must be 12 bytes".into());
+                        }
+                        let mut iv_arr = [0u8; 12];
+                        iv_arr.copy_from_slice(&iv_bytes);
+                        let unbound = ring::aead::UnboundKey::new(aead_alg, &key_bytes)
+                            .map_err(|_| "OperationError: invalid AES-GCM key".to_string())?;
+                        let less_safe = ring::aead::LessSafeKey::new(unbound);
+                        let nonce = ring::aead::Nonce::assume_unique_for_key(iv_arr);
+                        let mut in_out = data_bytes;
+                        let plain = less_safe
+                            .open_in_place(nonce, ring::aead::Aad::empty(), &mut in_out)
+                            .map_err(|_| "OperationError: AES-GCM authentication failed".to_string())?;
+                        Ok(Some(hex::encode(plain)))
+                    }
+                    "pbkdf2" => {
+                        // extra_str: "<iterations>:<length_bytes>"
+                        let mut parts = extra_str.split(':');
+                        let iters: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1000).max(1);
+                        let out_len: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(32).clamp(1, 512);
+                        let pbkdf2_alg = match algo.as_str() {
+                            "sha256" => ring::pbkdf2::PBKDF2_HMAC_SHA256,
+                            "sha384" => ring::pbkdf2::PBKDF2_HMAC_SHA384,
+                            "sha512" => ring::pbkdf2::PBKDF2_HMAC_SHA512,
+                            _ => ring::pbkdf2::PBKDF2_HMAC_SHA256,
+                        };
+                        let mut out = vec![0u8; out_len];
+                        ring::pbkdf2::derive(
+                            pbkdf2_alg,
+                            std::num::NonZeroU32::new(iters).unwrap(),
+                            &data_bytes, // salt
+                            &key_bytes,  // password/key material
+                            &mut out,
+                        );
+                        Ok(Some(hex::encode(&out)))
+                    }
+                    _ => Err(format!("NotSupportedError: unsupported subtle operation '{op}'")),
+                }
             }
             "host_get_cookie" => {
                 let map = self.0.cookies.lock().map_err(|_| "cookie lock poisoned")?;
@@ -205,6 +339,13 @@ impl HostSeam for SharedSeam {
                 let network_opt = self.0.network.clone();
                 let client = self.0.client.clone();
                 let page_origin = crate::shell::get_origin(&page_url);
+                let active_cause = self
+                    .0
+                    .active_cause
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .or_else(|| Some("v8_script".into()));
 
                 let do_fetch = async move {
                     if let Some(net) = network_opt {
@@ -212,7 +353,7 @@ impl HostSeam for SharedSeam {
                         req.method = method;
                         req.body = body;
                         req.client_origin = Some(page_origin);
-                        req.caused_by = Some("v8_script".into());
+                        req.caused_by = active_cause;
                         req.is_subresource = true;
                         req.initiator_stack = initiator_stack;
                         if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&headers_json) {
@@ -244,7 +385,75 @@ impl HostSeam for SharedSeam {
                 }
             }
             "host_load_module" => {
-                Ok(Some(json!({"url": "", "code": ""}).to_string()))
+                // Audit P2-01: resolve specifier against base URL + import map,
+                // fetch module source via NetworkEngine, and translate ESM syntax.
+                let specifier = args.first().cloned().unwrap_or_default();
+                let page_url = self.0.url.lock().map(|u| u.clone()).unwrap_or_default();
+                let base_url = args
+                    .get(1)
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| page_url.clone());
+                let import_map: HashMap<String, String> = args
+                    .get(2)
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+
+                let resolved = crate::modules::resolve_specifier(&specifier, &base_url, &import_map)
+                    .or_else(|| {
+                        url::Url::parse(&base_url)
+                            .ok()
+                            .and_then(|b| b.join(&specifier).ok())
+                            .map(|u| u.to_string())
+                    })
+                    .unwrap_or(specifier.clone());
+
+                if !resolved.starts_with("http://") && !resolved.starts_with("https://") {
+                    return Ok(Some(json!({"url": resolved, "code": "", "translated": ""}).to_string()));
+                }
+
+                let network_opt = self.0.network.clone();
+                let client = self.0.client.clone();
+                let page_origin = crate::shell::get_origin(&page_url);
+                let active_cause = self
+                    .0
+                    .active_cause
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .or_else(|| Some("esm_loader".into()));
+                let fetch_url = resolved.clone();
+
+                let do_fetch = async move {
+                    if let Some(net) = network_opt {
+                        let mut req = crate::network::NetworkRequest::new(&fetch_url);
+                        req.method = "GET".to_string();
+                        req.client_origin = Some(page_origin);
+                        req.caused_by = active_cause;
+                        req.is_subresource = true;
+                        net.fetch(req).await.map_err(|e| e.to_string())
+                    } else {
+                        fetch::fetch(&client, &fetch_url, "GET", None, "", 4_000_000)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                };
+
+                let res = run_async_host_call(do_fetch);
+                match res {
+                    Ok(r) if r.status >= 200 && r.status < 300 => {
+                        let translated = crate::modules::translate_module(&r.body, &r.final_url, &import_map);
+                        Ok(Some(
+                            json!({
+                                "url": r.final_url,
+                                "code": r.body,
+                                "translated": translated
+                            })
+                            .to_string(),
+                        ))
+                    }
+                    _ => Ok(Some(json!({"url": resolved, "code": "", "translated": ""}).to_string())),
+                }
             }
             "host_ws_connect" => {
                 // args: [url, protocols_json]. RFC 6455 handshake, recorded
@@ -352,13 +561,16 @@ where
     F: std::future::Future<Output = T>,
 {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
-        let _ = ctx;
-        rt.block_on(fut)
-    } else {
-        unreachable!("no tokio runtime available for host call")
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            return tokio::task::block_in_place(|| handle.block_on(fut));
+        }
     }
+    let _ = ctx;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio current_thread runtime");
+    rt.block_on(fut)
 }
 
 /// The usual form: plain async work, no extra context string.
@@ -410,6 +622,7 @@ impl Runtime {
             ctx_key: ctx_key.clone(),
             ws_ledger: network.as_ref().map(|n| n.ledger.clone()),
             ws_registry: Mutex::new(None),
+            active_cause: Mutex::new(None),
         }));
 
         let engine = DoshActor::spawn(seam.clone(), 128 * 1024 * 1024)?;
@@ -435,6 +648,7 @@ impl Runtime {
         engine.add_host("host_parse_html")?;
         engine.add_host("host_log")?;
         engine.add_host("host_crypto_digest")?;
+        engine.add_host("host_crypto_subtle")?;
         engine.add_host("host_get_cookie")?;
         engine.add_host("host_set_cookie")?;
         engine.add_host("host_post_message")?;
@@ -539,14 +753,135 @@ impl Runtime {
         Ok(())
     }
 
+    /// Fetch an external script or module source through the central NetworkEngine
+    /// rule table (mock/block) or opt-in external script transport.
+    fn fetch_script_source(&self, script_src: &str, base_url: &str, caused_by: &str) -> Option<(String, String)> {
+        if !self.engine.is_network_allowed().unwrap_or(true) {
+            return None;
+        }
+        let abs_url = if script_src.starts_with("http://") || script_src.starts_with("https://") {
+            script_src.to_string()
+        } else if let Ok(base) = url::Url::parse(base_url) {
+            base.join(script_src).ok()?.to_string()
+        } else {
+            return None;
+        };
+        let cause = self
+            .seam
+            .0
+            .active_cause
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| caused_by.to_string());
+
+        // 1. Check central NetworkLedger rules (mock / block / redirect) synchronously
+        if let Some(ref net) = self.seam.0.network {
+            if let Ok(mut ledger) = net.ledger.try_lock() {
+                if let Some(rule) = ledger.match_rule(&abs_url).cloned() {
+                    match rule.action.as_str() {
+                        "block" => {
+                            ledger.append(crate::telemetry::NetworkRecord {
+                                source: "rule_block".into(),
+                                url: abs_url,
+                                method: "GET".into(),
+                                state: "blocked_by_rule".into(),
+                                network_sent: Some(false),
+                                caused_by: Some(cause),
+                                ..Default::default()
+                            });
+                            return None;
+                        }
+                        "mock" => {
+                            let mut resp_headers = HashMap::new();
+                            resp_headers.insert("content-type".to_string(), rule.content_type.clone());
+                            let capture = ledger.capture_bodies;
+                            ledger.append(crate::telemetry::NetworkRecord {
+                                source: "rule_mock".into(),
+                                url: abs_url.clone(),
+                                method: "GET".into(),
+                                status: Some(rule.status),
+                                content_type: rule.content_type,
+                                bytes: rule.body.len(),
+                                response_headers: resp_headers,
+                                response_body: if capture { Some(rule.body.clone()) } else { None },
+                                state: "complete".into(),
+                                network_sent: Some(false),
+                                caused_by: Some(cause),
+                                ..Default::default()
+                            });
+                            if rule.status >= 200 && rule.status < 300 && !rule.body.trim().is_empty() {
+                                return Some((abs_url, rule.body));
+                            }
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // 2. Live external subresource script fetch (opt-in via WR_FETCH_EXTERNAL_SCRIPTS=1
+        // so synchronous page loads on single-threaded runtimes never block on CDN bundles)
+        if !std::env::var("WR_FETCH_EXTERNAL_SCRIPTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let target_url = abs_url.clone();
+        let res = std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                let fresh_client = Client::builder()
+                    .timeout(std::time::Duration::from_secs(3))
+                    .build()
+                    .ok()?;
+                rt.block_on(fetch::fetch(&fresh_client, &target_url, "GET", None, "", 4_000_000))
+                    .ok()
+            })
+            .join()
+            .ok()
+            .flatten()
+        });
+        match res {
+            Some(r) if r.status >= 200 && r.status < 300 && !r.body.trim().is_empty() => {
+                Some((r.final_url, r.body))
+            }
+            _ => None,
+        }
+    }
+
     /// Drain injected script queue (created via createElement + appendChild).
     fn drain_injected_scripts(&mut self) -> Result<(), String> {
         let raw = self.engine.eval("JSON.stringify(globalThis.__WR_INJECTED_SCRIPTS || [])")?;
         if let Ok(scripts) = serde_json::from_str::<Vec<Value>>(&raw) {
+            let base_url = self.url.clone();
+            let empty_map = HashMap::new();
             for s in scripts.iter().take(40) {
+                let st = s["type"].as_str().unwrap_or_default().to_lowercase();
+                let is_mod = st == "module";
                 let text = s["text"].as_str().unwrap_or_default().trim();
+                let src = s["src"].as_str().unwrap_or_default().trim();
                 if !text.is_empty() {
-                    let _ = self.engine.eval(text);
+                    let code = if is_mod {
+                        crate::modules::translate_module(text, &base_url, &empty_map)
+                    } else {
+                        text.to_string()
+                    };
+                    let _ = self.engine.eval(&code);
+                } else if !src.is_empty() {
+                    if let Some((final_url, fetched_code)) = self.fetch_script_source(src, &base_url, "injected_script") {
+                        let code = if is_mod {
+                            crate::modules::translate_module(&fetched_code, &final_url, &empty_map)
+                        } else {
+                            fetched_code
+                        };
+                        let _ = self.engine.eval(&code);
+                    }
                 }
             }
         }
@@ -564,6 +899,7 @@ impl Runtime {
             ..Default::default()
         };
 
+        let import_map = crate::modules::extract_import_map(html);
         let scripts = tree::extract_scripts(html);
         let mut classic = Vec::new();
         let mut deferred = Vec::new();
@@ -573,36 +909,57 @@ impl Runtime {
             if st.contains("ld+json") || st.contains("json") || st.contains("importmap") {
                 continue;
             }
-            if s.defer {
+            if s.defer || st == "module" {
                 deferred.push(s);
             } else {
                 classic.push(s);
             }
         }
 
-        // 1. Run classic & deferred scripts in order
+        // 1. Run classic & deferred/module scripts in order
         let mut ran_count = 0;
+        let mut mod_count = 0;
         for s in classic.into_iter().chain(deferred.into_iter()) {
             if ran_count >= MAX_SCRIPTS {
                 break;
             }
-            if !s.code.trim().is_empty() {
-                match self.engine.eval(&s.code) {
-                    Ok(_) => {
-                        ran_count += 1;
-                        self.engine.pump_jobs();
-                        let _ = self.drain_injected_scripts();
+            let is_module = s.r#type.eq_ignore_ascii_case("module");
+            let (script_url, raw_code) = if !s.code.trim().is_empty() {
+                (url.to_string(), s.code)
+            } else if !s.src.trim().is_empty() {
+                match self.fetch_script_source(&s.src, url, "script_tag") {
+                    Some(pair) => pair,
+                    None => continue,
+                }
+            } else {
+                continue;
+            };
+
+            let exec_code = if is_module {
+                crate::modules::translate_module(&raw_code, &script_url, &import_map)
+            } else {
+                raw_code
+            };
+
+            match self.engine.eval(&exec_code) {
+                Ok(_) => {
+                    ran_count += 1;
+                    if is_module {
+                        mod_count += 1;
                     }
-                    Err(e) => {
-                        info.errors += 1;
-                        if info.error_messages.len() < 25 {
-                            info.error_messages.push(e);
-                        }
+                    self.engine.pump_jobs();
+                    let _ = self.drain_injected_scripts();
+                }
+                Err(e) => {
+                    info.errors += 1;
+                    if info.error_messages.len() < 25 {
+                        info.error_messages.push(e);
                     }
                 }
             }
         }
         info.scripts = ran_count;
+        info.modules = mod_count;
 
         // 2. Dispatch DOM events
         let _ = self.engine.eval(
@@ -1065,5 +1422,81 @@ mod tests {
         let val: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(val["hasShadowRoot"], true);
         assert_eq!(val["shadowText"], "Inside Shadow");
+    }
+
+    #[test]
+    fn test_runtime_webcrypto_subtle_and_shadow_dom_piercing() {
+        let client = Client::new();
+        let mut rt = Runtime::new(client, "https://example.com").unwrap();
+        let html = r#"
+            <html><body>
+                <div id="host">
+                    <template shadowrootmode="open">
+                        <button id="pierced-btn" class="inner">ShadowAction</button>
+                    </template>
+                </div>
+            </body></html>
+        "#;
+        rt.load_document(html, "https://example.com").unwrap();
+        let js = r##"
+            (function() {
+                globalThis.__CRYPTO_RES = {};
+                // 1. Shadow-piercing >>> combinator and ShadowRoot.getElementById
+                var pierced = document.querySelector("#host >>> #pierced-btn");
+                var byId = document.getElementById("host").shadowRoot.getElementById("pierced-btn");
+                globalThis.__CRYPTO_RES.piercedText = pierced ? pierced.textContent : null;
+                globalThis.__CRYPTO_RES.sameNode = (pierced === byId);
+
+                // 2. WebCrypto HMAC sign + verify + AES-GCM encrypt/decrypt + error-honest unsupported
+                var enc = new TextEncoder();
+                crypto.subtle.importKey(
+                    "raw",
+                    enc.encode("super-secret-hmac-key-32-bytes!!"),
+                    { name: "HMAC", hash: "SHA-256" },
+                    true,
+                    ["sign", "verify"]
+                ).then(function(key) {
+                    return crypto.subtle.sign("HMAC", key, enc.encode("payload-123")).then(function(sig) {
+                        globalThis.__CRYPTO_RES.hmacLen = sig.byteLength;
+                        return crypto.subtle.verify("HMAC", key, sig, enc.encode("payload-123"));
+                    });
+                }).then(function(verified) {
+                    globalThis.__CRYPTO_RES.hmacVerified = verified;
+                    return crypto.subtle.importKey(
+                        "raw",
+                        new Uint8Array(16),
+                        { name: "AES-GCM" },
+                        false,
+                        ["encrypt", "decrypt"]
+                    );
+                }).then(function(aesKey) {
+                    var iv = new Uint8Array(12);
+                    return crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, aesKey, enc.encode("secret-msg")).then(function(ct) {
+                        globalThis.__CRYPTO_RES.ctLen = ct.byteLength;
+                        return crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, aesKey, ct);
+                    });
+                }).then(function(pt) {
+                    globalThis.__CRYPTO_RES.decrypted = (new TextDecoder()).decode(pt);
+                    return crypto.subtle.importKey("raw", new Uint8Array(8), { name: "RSA-OAEP" }, false, ["encrypt"]).then(function() {
+                        globalThis.__CRYPTO_RES.unsupportedRejected = false;
+                    }, function(err) {
+                        globalThis.__CRYPTO_RES.unsupportedRejected = true;
+                        globalThis.__CRYPTO_RES.unsupportedName = err.name || String(err);
+                    });
+                });
+            })()
+        "##;
+        rt.eval(js).unwrap();
+        rt.engine.pump_jobs();
+        let _ = rt.drain_timers();
+        let out = rt.eval("JSON.stringify(globalThis.__CRYPTO_RES)").unwrap();
+        let val: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(val["piercedText"], "ShadowAction");
+        assert_eq!(val["sameNode"], true);
+        assert_eq!(val["hmacLen"], 32);
+        assert_eq!(val["hmacVerified"], true);
+        assert_eq!(val["ctLen"], 26); // 10 bytes + 16-byte GCM tag
+        assert_eq!(val["decrypted"], "secret-msg");
+        assert_eq!(val["unsupportedRejected"], true);
     }
 }

@@ -96,8 +96,8 @@ impl FrameDocument {
             .split_whitespace()
             .collect::<Vec<&str>>()
             .join(" ");
-        let excerpt = if excerpt.len() > MAX_EXCERPT {
-            excerpt[..MAX_EXCERPT].to_string()
+        let excerpt = if excerpt.chars().count() > MAX_EXCERPT {
+            excerpt.chars().take(MAX_EXCERPT).collect::<String>()
         } else {
             excerpt
         };
@@ -191,6 +191,96 @@ pub async fn load_frames(
         };
 
         match crate::fetch::fetch(client, &resolved_url, "GET", None, "{}", 4_000_000).await {
+            Ok(res) => {
+                docs.push(FrameDocument {
+                    ref_id,
+                    parent_ref: seed.parent_ref.clone(),
+                    url: res.final_url,
+                    title: seed.title.clone(),
+                    name: seed.name.clone(),
+                    depth: seed.depth,
+                    status: res.status,
+                    content_type: res.content_type,
+                    html: res.body,
+                    error: String::new(),
+                    origin_url: resolved_url,
+                    seed_src: seed.src.clone(),
+                    seed_srcdoc: String::new(),
+                    delivered_count: 0,
+                });
+            }
+            Err(e) => {
+                docs.push(FrameDocument {
+                    ref_id,
+                    parent_ref: seed.parent_ref.clone(),
+                    url: resolved_url.clone(),
+                    title: seed.title.clone(),
+                    name: seed.name.clone(),
+                    depth: seed.depth,
+                    status: 0,
+                    content_type: String::new(),
+                    html: String::new(),
+                    error: e.to_string(),
+                    origin_url: resolved_url,
+                    seed_src: seed.src.clone(),
+                    seed_srcdoc: String::new(),
+                    delivered_count: 0,
+                });
+            }
+        }
+    }
+
+    docs
+}
+
+/// Fetch and load frame documents through the central NetworkEngine (SSRF, rules, ledger).
+pub async fn load_frames_with_network(
+    network: &crate::network::NetworkEngine,
+    seeds: &[FrameSeed],
+    max_frames: usize,
+) -> Vec<FrameDocument> {
+    let mut docs = Vec::new();
+    let limit = seeds.len().min(max_frames).min(MAX_FRAMES);
+
+    for (i, seed) in seeds.iter().take(limit).enumerate() {
+        let ref_id = format!("frame-{}", i + 1);
+        if !seed.srcdoc.is_empty() {
+            docs.push(FrameDocument {
+                ref_id,
+                parent_ref: seed.parent_ref.clone(),
+                url: format!("about:srcdoc#{}", i + 1),
+                title: seed.title.clone(),
+                name: seed.name.clone(),
+                depth: seed.depth,
+                status: 200,
+                content_type: "text/html".to_string(),
+                html: seed.srcdoc.clone(),
+                error: String::new(),
+                origin_url: seed.parent_url.clone(),
+                seed_src: seed.src.clone(),
+                seed_srcdoc: seed.srcdoc.clone(),
+                delivered_count: 0,
+            });
+            continue;
+        }
+
+        if seed.src.is_empty() || seed.src.starts_with("javascript:") {
+            continue;
+        }
+
+        let resolved_url = match Url::parse(&seed.parent_url) {
+            Ok(base) => base.join(&seed.src).map(|u| u.to_string()).unwrap_or_else(|_| seed.src.clone()),
+            Err(_) => seed.src.clone(),
+        };
+
+        let mut req = crate::network::NetworkRequest::new(&resolved_url);
+        req.caused_by = Some("iframe_load".to_string());
+        req.is_subresource = true;
+        if !seed.parent_url.is_empty() {
+            req.client_origin = Some(extract_origin(&seed.parent_url));
+        }
+
+        match network.fetch(req).await {
             Ok(res) => {
                 docs.push(FrameDocument {
                     ref_id,

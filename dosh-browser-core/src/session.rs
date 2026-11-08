@@ -207,6 +207,16 @@ pub struct Session {
     pub loaded_runtimes: std::collections::HashSet<String>,
     /// Checkpointed page HTML snapshots keyed by checkpoint ID
     pub session_checkpoints: HashMap<u64, String>,
+    /// Monotonically increasing document epoch (incremented on every navigation and DOM mutation).
+    pub document_epoch: u64,
+    /// ActionGateway idempotency cache: maps `idempotency_key -> action result JSON` (State Weave §8).
+    pub action_idempotency_cache: HashMap<String, serde_json::Value>,
+    /// Active in-memory OTP checkpoints (never persisted to disk, max 3 attempts, 10m TTL).
+    pub otp_checkpoints: HashMap<String, crate::login::OtpCheckpoint>,
+    /// Per-frame resident V8 runtimes keyed by `frame_ref` (e.g. `"frame-1"`).
+    pub frame_runtimes: HashMap<String, crate::runtime::Runtime>,
+    /// Loaded frame documents for the current tab.
+    pub frame_docs: Vec<crate::frames::FrameDocument>,
 }
 
 impl Session {
@@ -244,6 +254,11 @@ impl Session {
             runtimes: HashMap::new(),
             loaded_runtimes: std::collections::HashSet::new(),
             session_checkpoints: HashMap::new(),
+            document_epoch: 1,
+            action_idempotency_cache: HashMap::new(),
+            otp_checkpoints: HashMap::new(),
+            frame_runtimes: HashMap::new(),
+            frame_docs: Vec::new(),
         }
     }
 
@@ -272,8 +287,13 @@ impl Session {
         if let Some(ms) = self.virtual_clock_ms {
             let _ = rt.engine.set_virtual_time(ms as f64);
         }
-        if let Some(seed) = self.prng_seed {
-            let _ = rt.engine.set_random_seed(seed);
+        match self.prng_seed {
+            Some(seed) => {
+                let _ = rt.engine.set_random_seed(seed);
+            }
+            None => {
+                let _ = rt.engine.reset_random();
+            }
         }
         if let Some(fuel) = self.wasm_fuel {
             let _ = rt.engine.set_fuel(fuel);
@@ -281,6 +301,68 @@ impl Session {
         let _ = rt.engine.set_eval_allowed(self.gate_eval);
         let _ = rt.engine.set_wasm_allowed(self.gate_wasm);
         let _ = rt.engine.set_network_allowed(self.gate_network);
+    }
+
+    /// Transactionally apply current session configuration to the active tab's
+    /// live resident runtime (if one exists), propagating errors (Audit P0-06).
+    pub fn sync_live_runtime_config(&self) -> Result<(), String> {
+        let tab_id = self.current_tab().id.clone();
+        if let Some(rt) = self.runtimes.get(&tab_id) {
+            if let Some(ms) = self.virtual_clock_ms {
+                rt.engine.set_virtual_time(ms as f64)?;
+            }
+            match self.prng_seed {
+                Some(seed) => rt.engine.set_random_seed(seed)?,
+                None => rt.engine.reset_random()?,
+            }
+            if let Some(fuel) = self.wasm_fuel {
+                rt.engine.set_fuel(fuel)?;
+            }
+            rt.engine.set_eval_allowed(self.gate_eval)?;
+            rt.engine.set_wasm_allowed(self.gate_wasm)?;
+            rt.engine.set_network_allowed(self.gate_network)?;
+        }
+        Ok(())
+    }
+
+    /// Drain console logs, dialogs, popups, and web storage from a runtime into
+    /// the session's authoritative state (Audit P1-07 / P1-09).
+    pub fn drain_runtime_telemetry(&mut self, rt: &crate::runtime::Runtime) {
+        if let Ok(mut cons) = rt.seam.0.console.lock() {
+            for entry in cons.drain(..) {
+                let mut obj = serde_json::json!({
+                    "level": entry.level,
+                    "message": entry.message,
+                    "url": entry.url,
+                });
+                if let Some(cb) = entry.caused_by {
+                    obj["caused_by"] = serde_json::Value::String(cb);
+                }
+                self.console_logs.push(obj);
+            }
+        }
+        // Drain localStorage & sessionStorage from the live realm into Session
+        let origin = crate::shell::get_origin(&self.current_tab().url);
+        if !origin.is_empty() && origin != "null" {
+            if let Ok(ls_raw) = rt.engine.eval(
+                "(function(){ try { return JSON.stringify(localStorage && localStorage._store ? localStorage._store : {}); } catch(e){ return '{}'; } })()",
+            ) {
+                if let Ok(ls_map) = serde_json::from_str::<HashMap<String, String>>(&ls_raw) {
+                    if !ls_map.is_empty() {
+                        self.local_storage.insert(origin.clone(), ls_map);
+                    }
+                }
+            }
+            if let Ok(ss_raw) = rt.engine.eval(
+                "(function(){ try { return JSON.stringify(sessionStorage && sessionStorage._store ? sessionStorage._store : {}); } catch(e){ return '{}'; } })()",
+            ) {
+                if let Ok(ss_map) = serde_json::from_str::<HashMap<String, String>>(&ss_raw) {
+                    if !ss_map.is_empty() {
+                        self.current_tab_mut().session_storage.insert(origin, ss_map);
+                    }
+                }
+            }
+        }
     }
 
     /// True when the current tab's resident runtime has no document loaded yet,
@@ -393,9 +475,13 @@ impl Session {
                         }
                     }
                 }
+                self.drain_runtime_telemetry(&rt);
             }
             self.mark_runtime_loaded(&result.final_url);
         }
+        self.document_epoch = self.document_epoch.saturating_add(1);
+        self.frame_runtimes.clear();
+        self.frame_docs.clear();
 
         // 3. Build action targets, links, and frame inventory
         let targets = crate::actions::extract_actions(&html, &result.final_url, 100);
@@ -585,8 +671,12 @@ impl Session {
                     }
                 }
             }
+            self.drain_runtime_telemetry(&rt);
         }
         self.mark_runtime_loaded(url);
+        self.document_epoch = self.document_epoch.saturating_add(1);
+        self.frame_runtimes.clear();
+        self.frame_docs.clear();
 
         let targets = crate::actions::extract_actions(&final_html, url, 100);
         self.identity_tracker.update(&targets);
@@ -740,12 +830,14 @@ impl Session {
 
         rt.apply_action(&action_payload)?;
         let mutated = rt.serialize()?;
+        self.drain_runtime_telemetry(&rt);
         Self::check_action_error(&mut rt)?;
 
         if let Some(page) = self.dispatch_action_effects(&mut rt, &url).await? {
             return Ok(page);
         }
 
+        self.document_epoch = self.document_epoch.saturating_add(1);
         self.update_page_after_action(&url, &mutated, 8000)
     }
 
@@ -826,12 +918,14 @@ impl Session {
 
         rt.apply_action(&action_payload)?;
         let mutated = rt.serialize()?;
+        self.drain_runtime_telemetry(&rt);
         Self::check_action_error(&mut rt)?;
 
         if let Some(page) = self.dispatch_action_effects(&mut rt, &url).await? {
             return Ok(page);
         }
 
+        self.document_epoch = self.document_epoch.saturating_add(1);
         self.update_page_after_action(&url, &mutated, 8000)
     }
 
@@ -915,8 +1009,10 @@ impl Session {
 
         rt.apply_action(&action_payload)?;
         let mutated = rt.serialize()?;
+        self.drain_runtime_telemetry(&rt);
         Self::check_action_error(&mut rt)?;
 
+        self.document_epoch = self.document_epoch.saturating_add(1);
         self.update_page_after_action(&url, &mutated, 8000)
     }
 
@@ -1054,6 +1150,254 @@ impl Session {
     pub fn discover_frame_seeds(&self) -> Vec<crate::frames::FrameSeed> {
         let tab = self.current_tab();
         crate::frames::discover_seeds(&tab.html, &tab.url, "top", 0)
+    }
+
+    /// Ensure frame documents are fetched/hydrated for the current tab and
+    /// return the loaded `FrameDocument` list (Audit P2-02).
+    pub async fn ensure_frame_docs(&mut self) -> Vec<crate::frames::FrameDocument> {
+        if !self.frame_docs.is_empty() {
+            return self.frame_docs.clone();
+        }
+        let seeds = self.discover_frame_seeds();
+        if seeds.is_empty() {
+            return Vec::new();
+        }
+        let docs = crate::frames::load_frames_with_network(&self.network, &seeds, crate::frames::MAX_FRAMES).await;
+        self.frame_docs = docs.clone();
+        docs
+    }
+
+    /// Retrieve or create a resident V8 runtime for a specific child frame
+    /// (`frame_selector` matches `ref_id` e.g. `"frame-1"`, `name`, `title`, or
+    /// URL substring; empty selector defaults to `"frame-1"`).
+    pub async fn get_or_create_frame_runtime(
+        &mut self,
+        frame_selector: &str,
+    ) -> Result<(String, String, crate::runtime::Runtime), String> {
+        let docs = self.ensure_frame_docs().await;
+        if docs.is_empty() {
+            return Err("no child frames present on the current document".to_string());
+        }
+        let sel = frame_selector.trim();
+        let matched = if sel.is_empty() {
+            docs.first()
+        } else {
+            docs.iter().find(|d| {
+                d.ref_id.eq_ignore_ascii_case(sel)
+                    || (!d.name.is_empty() && d.name.eq_ignore_ascii_case(sel))
+                    || (!d.title.is_empty() && d.title.eq_ignore_ascii_case(sel))
+                    || (!d.url.is_empty() && d.url.contains(sel))
+                    || (!d.seed_src.is_empty() && d.seed_src.contains(sel))
+            })
+        }
+        .ok_or_else(|| {
+            let available: Vec<String> = docs.iter().map(|d| format!("{} ({})", d.ref_id, d.url)).collect();
+            format!(
+                "frame '{}' not found; available frames: {}",
+                sel,
+                available.join(", ")
+            )
+        })?
+        .clone();
+
+        if let Some(rt) = self.frame_runtimes.get(&matched.ref_id) {
+            return Ok((matched.ref_id, matched.url, rt.clone()));
+        }
+
+        let mut rt = crate::runtime::Runtime::new_with_network(
+            self.client.clone(),
+            &matched.url,
+            Some(std::sync::Arc::new(self.network.clone())),
+        )?;
+        self.configure_runtime(&rt);
+        // Same-origin frame storage sharing (S4 parity): seed localStorage if same origin as parent
+        let parent_origin = crate::shell::get_origin(&self.current_tab().url);
+        let frame_origin = crate::shell::get_origin(&matched.origin_url);
+        if !parent_origin.is_empty() && parent_origin == frame_origin {
+            if let Some(seed_map) = self.local_storage.get(&parent_origin) {
+                if let Ok(seed_json) = serde_json::to_string(seed_map) {
+                    let _ = rt.engine.eval(&format!("globalThis.__WR_STORAGE_SEED = {seed_json}; true"));
+                }
+            }
+        }
+        if !matched.html.is_empty() {
+            let _ = rt.run_scripts(&matched.html, &matched.url);
+            self.drain_runtime_telemetry(&rt);
+        }
+        self.frame_runtimes.insert(matched.ref_id.clone(), rt.clone());
+        Ok((matched.ref_id, matched.url, rt))
+    }
+
+    /// Native memory-only login flow (Audit P0-07 fix: never writes credentials
+    /// to temporary files or shells out to Python).
+    pub async fn login(
+        &mut self,
+        url: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<serde_json::Value, String> {
+        if url.is_empty() || username.is_empty() || password.is_empty() {
+            return Err("login requires non-empty url, username, and password".to_string());
+        }
+        let pre_url = if self.current_tab().url != url && !url.starts_with("mock://") {
+            let p = self.goto(url, 8000).await.map_err(|e| e.to_string())?;
+            p.url
+        } else {
+            self.current_tab().url.clone()
+        };
+
+        let html = self.current_tab().html.clone();
+        let status = self.current_tab().page().map(|p| p.status).unwrap_or(200);
+        let targets = crate::actions::extract_actions(&html, &pre_url, 1000);
+        let wall = crate::login::detect_login_wall(&html, &pre_url, &targets, status);
+
+        let Some(wall) = wall else {
+            return Ok(serde_json::json!({
+                "verdict": "failed",
+                "url": pre_url,
+                "reason": "no login wall (password field) detected on page",
+                "what_next": "verify the login URL or inspect `actions` to locate sign-in controls",
+                "secrets_persisted": false,
+            }));
+        };
+
+        if !wall.username_ref.is_empty() {
+            let _ = self.type_text(&wall.username_ref, username).await?;
+        }
+        if !wall.password_ref.is_empty() {
+            let _ = self.type_text(&wall.password_ref, password).await?;
+        }
+        if !wall.submit_ref.is_empty() {
+            let _ = self.click(&wall.submit_ref).await?;
+        }
+
+        let post_html = self.current_tab().html.clone();
+        let post_url = self.current_tab().url.clone();
+        let post_status = self.current_tab().page().map(|p| p.status).unwrap_or(200);
+        let post_targets = crate::actions::extract_actions(&post_html, &post_url, 1000);
+        let cookies = self.current_cookies();
+
+        let verdict = crate::login::verify_logged_in(
+            &post_html,
+            &post_url,
+            &pre_url,
+            Some(&cookies),
+            post_status,
+        );
+
+        if verdict == "otp_required" {
+            if let Some(otp_wall) = crate::login::detect_otp_page(&post_html, &post_url, &post_targets) {
+                let cp_id = format!(
+                    "otp_{:x}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(1)
+                );
+                let mut cp = crate::login::OtpCheckpoint::new(cp_id.clone(), post_url.clone());
+                cp.refs = otp_wall.refs.clone();
+                cp.expected_length = otp_wall.expected_length;
+                cp.split_boxes = otp_wall.split_boxes;
+                cp.submit_ref = post_targets
+                    .iter()
+                    .find(|t| t.role == "button")
+                    .map(|t| t.ref_id.clone())
+                    .unwrap_or_default();
+                let attempts_left = cp.attempts_left();
+                self.otp_checkpoints.insert(cp_id.clone(), cp);
+                return Ok(serde_json::json!({
+                    "verdict": "otp_required",
+                    "url": post_url,
+                    "checkpoint_id": cp_id,
+                    "expected_length": otp_wall.expected_length,
+                    "split_boxes": otp_wall.split_boxes,
+                    "attempts_left": attempts_left,
+                    "what_next": format!("Ask the user for the one-time code and call submit_otp with checkpoint_id='{cp_id}'. Never guess the code."),
+                    "secrets_persisted": false,
+                }));
+            }
+        }
+
+        let what_next = match verdict {
+            "verified" => "Session is authenticated; proceed with post-login actions.",
+            "account_locked" => "Stop immediately and inform the user that the account is locked.",
+            "human_only" => "Stop and ask the user to complete the out-of-band human verification.",
+            _ => "Check credentials or inspect page errors before retrying.",
+        };
+
+        Ok(serde_json::json!({
+            "verdict": verdict,
+            "url": post_url,
+            "what_next": what_next,
+            "secrets_persisted": false,
+        }))
+    }
+
+    /// Submit a one-time passcode against an active in-memory `OtpCheckpoint`.
+    pub async fn submit_otp(
+        &mut self,
+        checkpoint_id: &str,
+        code: &str,
+    ) -> Result<serde_json::Value, String> {
+        let code_trimmed = code.trim();
+        if code_trimmed.is_empty() {
+            return Err("OTP code must not be empty".to_string());
+        }
+        let mut cp = self
+            .otp_checkpoints
+            .get(checkpoint_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown OTP checkpoint: {checkpoint_id}"))?;
+
+        if cp.expired() {
+            self.otp_checkpoints.remove(checkpoint_id);
+            return Err(format!("OTP checkpoint '{checkpoint_id}' has expired (>600s TTL)"));
+        }
+        if cp.attempts_left() == 0 {
+            return Err(format!(
+                "OTP checkpoint '{checkpoint_id}' exhausted maximum attempts ({})",
+                crate::login::MAX_OTP_ATTEMPTS
+            ));
+        }
+
+        cp.attempts += 1;
+        let attempts_left = cp.attempts_left();
+        self.otp_checkpoints.insert(checkpoint_id.to_string(), cp.clone());
+
+        if cp.split_boxes && cp.refs.len() > 1 {
+            for (r, ch) in cp.refs.iter().zip(code_trimmed.chars()) {
+                let _ = self.type_text(r, &ch.to_string()).await?;
+            }
+        } else if let Some(first_ref) = cp.refs.first() {
+            let _ = self.type_text(first_ref, code_trimmed).await?;
+        }
+        if !cp.submit_ref.is_empty() {
+            let _ = self.click(&cp.submit_ref).await?;
+        }
+
+        let post_html = self.current_tab().html.clone();
+        let post_url = self.current_tab().url.clone();
+        let post_status = self.current_tab().page().map(|p| p.status).unwrap_or(200);
+        let cookies = self.current_cookies();
+        let verdict = crate::login::verify_logged_in(
+            &post_html,
+            &post_url,
+            &cp.url,
+            Some(&cookies),
+            post_status,
+        );
+        if verdict == "verified" {
+            self.otp_checkpoints.remove(checkpoint_id);
+        }
+
+        Ok(serde_json::json!({
+            "verdict": verdict,
+            "checkpoint_id": checkpoint_id,
+            "attempts_used": cp.attempts,
+            "attempts_left": attempts_left,
+            "url": post_url,
+            "secrets_persisted": false,
+        }))
     }
 
     /// Check if current page is behind a login wall.

@@ -71,13 +71,17 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("trace", "Act on a ref and return the causal bundle: DOM delta, network, console, dialogs."),
     ("watch", "Subscribe to engine mutations: enable, then drain records with after/limit."),
     ("solve_captcha", "Inspect the current page's reCAPTCHA v2 challenge (solving runs in the Python lane)."),
-    ("login", "Login with url, username, and password. Solves captcha and submits."),
+    ("login", "Login with url, username, and password (memory-only credentials, native wall + OTP detection)."),
+    ("submit_otp", "Submit a one-time passcode against an active in-memory OTP checkpoint: checkpoint_id, code."),
     ("wasm", "Query or configure Liftoff WASM execution fuel, memory, and export telemetry: fuel, action."),
     ("clock", "Inspect or set deterministic virtual host clock: now, set, advance (millis)."),
     ("rng", "Set deterministic PRNG seed for Math.random replays: seed, reset."),
-    ("heap", "Inspect 128MB pruned V8 heap statistics: used, total, limit, and GC count."),
+    ("heap", "Inspect live V8 heap statistics, envelope band, pressure epoch, Parena spill tier, and AB pool."),
     ("gate", "Configure security capability gates: gate (eval/net/wasm), allowed (bool)."),
     ("assist", "Run the in-session DevTools agent walkthrough against the live page: inspects cookies, storage, and discovered APIs, then synthesizes a unified replay command. goal (string)."),
+    ("find", "Find text matches in the loaded document with match index, snippet, and nearest action ref: query, index, case_sensitive."),
+    ("page_query", "Structured graph query across ACD blocks, action refs, and collections: term, kind, role, category, limit."),
+    ("canvas2digest", "Extract non-pixel agent digest of Canvas 2D elements: dimensions, non-blank ratio, dominant RGBA palette, and bounding rect."),
 ];
 
 pub fn get_origin(u: &str) -> String {
@@ -503,12 +507,23 @@ pub async fn execute_command(
         }
         "status" => {
             let tab = session.current_tab();
+            let has_live_actor = session.runtimes.contains_key(&tab.id);
             Ok(serde_json::json!({
+                "session_id": session.id,
                 "tab": tab.id,
                 "url": tab.url,
+                "document_epoch": session.document_epoch,
+                "live_actor": has_live_actor,
                 "history_len": tab.history.len(),
                 "tabs": session.tabs.len(),
+                "frames_loaded": session.frame_docs.len(),
                 "persistent_workspace": store.persistent,
+                "gates": {
+                    "eval": session.gate_eval,
+                    "wasm": session.gate_wasm,
+                    "network": session.gate_network,
+                    "secret_reveal": session.gate_secret_reveal,
+                }
             }))
         }
         "open" => {
@@ -520,18 +535,20 @@ pub async fn execute_command(
             let tab = session.current_tab();
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
             let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let actions = crate::actions::extract_actions(&tab.html, &tab.url, offset + limit);
-            let total = actions.len();
+            let all_actions = crate::actions::extract_actions(&tab.html, &tab.url, 10_000);
+            let total = all_actions.len();
             let sliced = if offset < total {
-                actions[offset..std::cmp::min(offset + limit, total)].to_vec()
+                all_actions[offset..std::cmp::min(offset + limit, total)].to_vec()
             } else {
                 Vec::new()
             };
             Ok(serde_json::json!({
                 "actions": sliced,
                 "total": total,
+                "returned": sliced.len(),
                 "offset": offset,
                 "limit": limit,
+                "document_epoch": session.document_epoch,
             }))
         }
         "select" => {
@@ -542,10 +559,35 @@ pub async fn execute_command(
             Ok(serde_json::json!({
                 "url": page.url,
                 "status": page.status,
+                "document_epoch": session.document_epoch,
                 "note": "text-selection drag lane: mousedown → selection → mouseup; fires selectstart/select/selectionchange; distinct from element DnD"
             }))
         }
-        "act" => {
+        "act" | "action.start" => {
+            // State Weave §8 + Audit P1-04: ActionGateway with expected_epoch
+            // fencing and idempotency_key replay protection.
+            if let Some(idem_key) = args.get("idempotency_key").and_then(|v| v.as_str()) {
+                if !idem_key.is_empty() {
+                    if let Some(cached) = session.action_idempotency_cache.get(idem_key).cloned() {
+                        let mut out = cached;
+                        if let Some(obj) = out.as_object_mut() {
+                            obj.insert("replayed_idempotent".to_string(), serde_json::json!(true));
+                            obj.insert("idempotency_key".to_string(), serde_json::json!(idem_key));
+                        }
+                        return Ok(out);
+                    }
+                }
+            }
+            if let Some(expected_epoch) = args.get("expected_epoch").and_then(|v| v.as_u64()) {
+                if expected_epoch != session.document_epoch {
+                    return Err(format!(
+                        "stale_epoch: expected document_epoch {}, but current document_epoch is {}",
+                        expected_epoch, session.document_epoch
+                    )
+                    .into());
+                }
+            }
+            let old_epoch = session.document_epoch;
             let ref_id = args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
             let page = if !text.is_empty() {
@@ -553,7 +595,21 @@ pub async fn execute_command(
             } else {
                 session.click(ref_id).await?
             };
-            Ok(serde_json::to_value(page)?)
+            let mut val = serde_json::to_value(page)?;
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("old_document_epoch".to_string(), serde_json::json!(old_epoch));
+                obj.insert("new_document_epoch".to_string(), serde_json::json!(session.document_epoch));
+                obj.insert("replayed_idempotent".to_string(), serde_json::json!(false));
+            }
+            if let Some(idem_key) = args.get("idempotency_key").and_then(|v| v.as_str()) {
+                if !idem_key.is_empty() {
+                    if session.action_idempotency_cache.len() >= 256 {
+                        session.action_idempotency_cache.clear();
+                    }
+                    session.action_idempotency_cache.insert(idem_key.to_string(), val.clone());
+                }
+            }
+            Ok(val)
         }
         "net" => {
             let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
@@ -765,6 +821,7 @@ pub async fn execute_command(
                 session.mark_runtime_loaded(&url);
             }
             let result = rt.eval_bounded(expr, true, allow_actions, &script_args)?;
+            session.drain_runtime_telemetry(&rt);
             Ok(serde_json::json!({ "evaluated": true, "result": result }))
         }
         "skill.save" => {
@@ -812,6 +869,7 @@ pub async fn execute_command(
                 session.mark_runtime_loaded(&url);
             }
             let result = rt.eval_bounded(source, true, allow_actions, &[])?;
+            session.drain_runtime_telemetry(&rt);
             Ok(serde_json::json!({
                 "skill": name,
                 "version": skill["version"],
@@ -973,11 +1031,59 @@ pub async fn execute_command(
             let after_id = args.get("after").and_then(|v| v.as_i64()).unwrap_or(0);
             let s1 = store.get_snapshot(before_id)?;
             let s2 = store.get_snapshot(after_id)?;
+            let d1: serde_json::Value = s1
+                .get("data")
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let d2: serde_json::Value = s2
+                .get("data")
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let mut refs1 = HashMap::new();
+            if let Some(arr) = d1.get("actions").and_then(|v| v.as_array()) {
+                for a in arr {
+                    if let Some(r) = a.get("ref_id").and_then(|v| v.as_str()) {
+                        let txt = a.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        refs1.insert(r.to_string(), txt);
+                    }
+                }
+            }
+            let mut refs2 = HashMap::new();
+            if let Some(arr) = d2.get("actions").and_then(|v| v.as_array()) {
+                for a in arr {
+                    if let Some(r) = a.get("ref_id").and_then(|v| v.as_str()) {
+                        let txt = a.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        refs2.insert(r.to_string(), txt);
+                    }
+                }
+            }
+            let mut added_refs: Vec<String> = refs2.keys().filter(|k| !refs1.contains_key(*k)).cloned().collect();
+            let mut removed_refs: Vec<String> = refs1.keys().filter(|k| !refs2.contains_key(*k)).cloned().collect();
+            let mut changed_labels: Vec<String> = Vec::new();
+            for (k, v2) in &refs2 {
+                if let Some(v1) = refs1.get(k) {
+                    if v1 != v2 {
+                        changed_labels.push(k.clone());
+                    }
+                }
+            }
+            added_refs.sort();
+            removed_refs.sort();
+            changed_labels.sort();
             Ok(serde_json::json!({
                 "before": before_id,
                 "after": after_id,
                 "url_changed": s1["url"] != s2["url"],
-                "note": "evidence snapshot comparison"
+                "actions": {
+                    "before_count": refs1.len(),
+                    "after_count": refs2.len(),
+                    "added_refs": added_refs,
+                    "removed_refs": removed_refs,
+                    "changed_labels": changed_labels,
+                },
+                "note": "control evidence snapshot diff (URL + action surface delta)"
             }))
         }
         "checkpoint" => {
@@ -985,12 +1091,16 @@ pub async fn execute_command(
             let default_id = format!("chk_{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
             let id = args.get("id").and_then(|v| v.as_str()).unwrap_or(&default_id);
             let title = tab.page().map(|p| p.title).unwrap_or_default();
-            let cookies = serde_json::to_string(&tab.headers).unwrap_or_default();
+            let cookies = serde_json::to_string(&session.current_cookies()).unwrap_or_default();
             let storage = serde_json::to_string(&session.local_storage).unwrap_or_default();
             let history = serde_json::to_string(&tab.history).unwrap_or_default();
             let res = store.save_checkpoint(id, &tab.id, &tab.url, &title, &tab.html, &cookies, &storage, &history)
                 .map_err(|e| e.to_string())?;
-            Ok(serde_json::json!({ "checkpoint": res, "note": "durable session checkpoint saved to SQLite" }))
+            Ok(serde_json::json!({
+                "checkpoint": res,
+                "restore_level": "document_and_storage",
+                "note": "durable session checkpoint (DOM + live cookie jar + storage + history) saved to SQLite"
+            }))
         }
         "restore" => {
             let id = args.get("id").and_then(|v| v.as_str()).ok_or("id is required to restore checkpoint")?;
@@ -1018,11 +1128,32 @@ pub async fn execute_command(
                     tab.index = (tab.history.len() as isize) - 1;
                 }
             }
+            // Audit P0-09: rehydrate the resident runtime with the restored
+            // HTML and cookies so post-restore actions/evals never touch a
+            // stale actor.
+            let tab_id = session.current_tab().id.clone();
+            let url = session.current_tab().url.clone();
+            let html = session.current_tab().html.clone();
+            if let Some(rt) = session.runtimes.get(&tab_id) {
+                if let Ok(mut jar) = rt.seam.0.cookies.lock() {
+                    if let Some(c) = chk["cookies"].as_str() {
+                        *jar = serde_json::from_str(c).unwrap_or_default();
+                    }
+                }
+            }
+            if !html.is_empty() {
+                let mut rt = session.get_or_create_runtime(&url)?;
+                rt.load_document(&html, &url)?;
+                session.mark_runtime_loaded(&url);
+            }
+            session.document_epoch = session.document_epoch.saturating_add(1);
             Ok(serde_json::json!({
                 "restored": id,
                 "url": chk["url"],
                 "title": chk["title"],
-                "note": "session rehydrated from checkpoint"
+                "document_epoch": session.document_epoch,
+                "restore_level": "document_and_storage",
+                "note": "session document, storage, history, and live runtime DOM rehydrated from checkpoint (JS closures are rebuilt, not VM-heap snapshotted)"
             }))
         }
         "state.snapshot" => {
@@ -1203,9 +1334,16 @@ pub async fn execute_command(
             }))
         }
         "layers" => {
-            let tab = session.current_tab();
-            let mut rt = crate::runtime::Runtime::new(session.client.clone(), &tab.url)?;
-            rt.load_document(&tab.html, &tab.url)?;
+            // Audit P1-07: inspect the LIVE resident runtime so dynamic
+            // overlays, open popovers, and promoted dialogs are reflected.
+            let url = session.current_tab().url.clone();
+            let html = session.current_tab().html.clone();
+            let mut rt = session.get_or_create_runtime(&url)?;
+            session.configure_runtime(&rt);
+            if session.runtime_needs_document(&url) && !html.is_empty() {
+                rt.load_document(&html, &url)?;
+                session.mark_runtime_loaded(&url);
+            }
             let _ = rt.sync_butterfly_layout();
             let rect_count = rt.get_butterfly_layout().len();
             let layers_json = rt.eval("__inspectLayers()")?;
@@ -1213,13 +1351,32 @@ pub async fn execute_command(
             Ok(serde_json::json!({
                 "projection": parsed,
                 "butterfly_rects_count": rect_count,
+                "source": "live-realm",
                 "authoritative_hit_test": false,
-                "note": "strata are computed heuristic block layers backed by zero-copy Butterfly storage"
+                "note": "strata are computed heuristic block layers from the live resident runtime backed by Butterfly storage"
             }))
         }
         "frames" => {
-            let seeds = session.discover_frame_seeds();
-            Ok(serde_json::json!({ "frames": seeds, "total": seeds.len() }))
+            let docs = session.ensure_frame_docs().await;
+            let frames_view: Vec<serde_json::Value> = docs
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "ref_id": d.ref_id,
+                        "parent_ref": d.parent_ref,
+                        "url": d.url,
+                        "title": d.title,
+                        "name": d.name,
+                        "status": d.status,
+                        "depth": d.depth,
+                        "challenge": d.is_challenge(),
+                        "loaded_realm": session.frame_runtimes.contains_key(&d.ref_id),
+                        "delivered_count": d.delivered_count,
+                        "error": d.error,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "frames": frames_view, "total": frames_view.len() }))
         }
         "tabs" => {
             if let Some(id) = args.get("id").and_then(|v| v.as_str()) {
@@ -1254,14 +1411,27 @@ pub async fn execute_command(
                 .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default();
             let title = tab.page().map(|p| p.title).unwrap_or_default();
-            let acd = crate::acd::build_acd(&tab.url, &title, &tab.html, &[], &[], &[], &serde_json::json!({}), 400);
+            let include_refs = args.get("references").and_then(|v| v.as_bool()).unwrap_or(false);
+            let acd = crate::acd::build_acd(
+                &tab.url,
+                &title,
+                &tab.html,
+                &[],
+                &[],
+                &[],
+                &serde_json::json!({ "include_references": include_refs }),
+                400,
+            );
             let reading_blocks: Vec<serde_json::Value> = acd.blocks.iter()
                 .filter(|b| b.block_type != "table" && !since_hashes.contains(&b.content_hash))
                 .skip(offset)
                 .take(limit)
                 .map(|b| {
-                    let mut text = b.text.clone();
-                    if text.len() > max_chars { text.truncate(max_chars); }
+                    let text = if b.text.chars().count() > max_chars {
+                        b.text.chars().take(max_chars).collect::<String>()
+                    } else {
+                        b.text.clone()
+                    };
                     serde_json::json!({
                         "type": b.block_type,
                         "text": text,
@@ -1304,20 +1474,51 @@ pub async fn execute_command(
             Ok(serde_json::json!({ "current_index": tab.index, "history": history }))
         }
         "wait" => {
+            // Audit P1-08: timeout-bounded polling over the live resident
+            // runtime (drains timers/microtasks and re-serializes DOM until
+            // the condition is met or timeout_secs expires).
             let url_need = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
             let text_need = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
             let ref_need = args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
-            let timeout_secs = args.get("timeout").and_then(|v| v.as_f64()).unwrap_or(5.0);
+            let timeout_secs = args.get("timeout").and_then(|v| v.as_f64()).unwrap_or(5.0).clamp(0.0, 30.0);
 
-            let tab = session.current_tab();
-            let ok_url = url_need.is_empty() || tab.url.contains(url_need);
-            let ok_text = text_need.is_empty() || tab.html.contains(text_need);
-            let actions = crate::actions::extract_actions(&tab.html, &tab.url, 100);
-            let ok_ref = ref_need.is_empty() || actions.iter().any(|a| a.ref_id == ref_need);
+            let start = std::time::Instant::now();
+            let mut polls = 0u32;
+            let (mut ok_url, mut ok_text, mut ok_ref);
+            loop {
+                polls += 1;
+                let (cur_url, cur_html) = {
+                    let tab = session.current_tab();
+                    (tab.url.clone(), tab.html.clone())
+                };
+                ok_url = url_need.is_empty() || cur_url.contains(url_need);
+                ok_text = text_need.is_empty() || cur_html.contains(text_need);
+                let actions = crate::actions::extract_actions(&cur_html, &cur_url, 500);
+                ok_ref = ref_need.is_empty() || actions.iter().any(|a| a.ref_id == ref_need);
+
+                if (ok_url && ok_text && ok_ref) || start.elapsed().as_secs_f64() >= timeout_secs {
+                    break;
+                }
+                // Advance the resident runtime's timer queue by 50ms and re-serialize
+                let tab_id = session.current_tab().id.clone();
+                if let Some(mut rt) = session.runtimes.get(&tab_id).cloned() {
+                    let _ = rt.engine.eval("__advanceTimerClock(50); __drainTimers()");
+                    rt.engine.pump_jobs();
+                    if let Ok(serialized) = rt.serialize() {
+                        if !serialized.is_empty() {
+                            session.current_tab_mut().html = serialized;
+                        }
+                    }
+                    session.drain_runtime_telemetry(&rt);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
 
             let met = ok_url && ok_text && ok_ref;
             Ok(serde_json::json!({
                 "met": met,
+                "polls": polls,
+                "elapsed_ms": start.elapsed().as_millis() as u64,
                 "timeout_secs": timeout_secs,
                 "checks": { "url": ok_url, "text": ok_text, "ref": ok_ref }
             }))
@@ -1485,10 +1686,24 @@ pub async fn execute_command(
             Ok(manifest)
         }
         "screenshot" => {
-            let tab = session.current_tab();
-            let mut rt = crate::runtime::Runtime::new(session.client.clone(), &tab.url)?;
-            rt.load_document(&tab.html, &tab.url)?;
-            let svg = rt.eval("__screenshotSVG()")?;
+            // Audit P1-07: use the live resident runtime (or the selected
+            // child frame's realm) so drawn canvases, top-layer dialogs, and
+            // DOM mutations appear in the SVG diagram.
+            let frame_sel = args.get("frame").and_then(|v| v.as_str()).unwrap_or("");
+            let svg = if !frame_sel.is_empty() {
+                let (_ref_id, _furl, mut frt) = session.get_or_create_frame_runtime(frame_sel).await?;
+                frt.eval("__screenshotSVG()")?
+            } else {
+                let url = session.current_tab().url.clone();
+                let html = session.current_tab().html.clone();
+                let mut rt = session.get_or_create_runtime(&url)?;
+                session.configure_runtime(&rt);
+                if session.runtime_needs_document(&url) && !html.is_empty() {
+                    rt.load_document(&html, &url)?;
+                    session.mark_runtime_loaded(&url);
+                }
+                rt.eval("__screenshotSVG()")?
+            };
             let dest_dir = args.get("dest_dir").and_then(|v| v.as_str()).map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
             let _ = std::fs::create_dir_all(&dest_dir);
             let filename = format!("dosh-screenshot-{}.svg", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
@@ -1497,16 +1712,39 @@ pub async fn execute_command(
             Ok(serde_json::json!({
                 "path": path.to_string_lossy(),
                 "bytes": svg.len(),
-                "note": "approximate SVG layout diagram from computed boxes/colors/text"
+                "source": "live-realm",
+                "note": "SVG layout diagram from live resident runtime (drawn canvases embedded as PNG data URLs)"
             }))
         }
         "frame.eval" => {
-            let expr = args.get("expr").and_then(|v| v.as_str()).unwrap_or("");
-            let tab = session.current_tab();
-            let mut rt = crate::runtime::Runtime::new(session.client.clone(), &tab.url)?;
-            rt.load_document(&tab.html, &tab.url)?;
+            // Audit P1-07 / P2-02: evaluate inside the selected child frame's
+            // live realm when `frame` is provided (or when child frames exist),
+            // falling back to the top-level resident runtime only when top/page
+            // is requested or no child frames exist.
+            let expr = args.get("expr").or_else(|| args.get("source")).and_then(|v| v.as_str()).unwrap_or("");
+            let frame_sel = args.get("frame").and_then(|v| v.as_str()).unwrap_or("");
+            if !frame_sel.is_empty() && frame_sel != "top" && frame_sel != "main" {
+                let (frame_ref, frame_url, mut frt) = session.get_or_create_frame_runtime(frame_sel).await?;
+                let res = frt.eval(expr)?;
+                session.drain_runtime_telemetry(&frt);
+                return Ok(serde_json::json!({
+                    "evaluated": true,
+                    "result": res,
+                    "realm": frame_ref,
+                    "frame_url": frame_url,
+                }));
+            }
+            let url = session.current_tab().url.clone();
+            let html = session.current_tab().html.clone();
+            let mut rt = session.get_or_create_runtime(&url)?;
+            session.configure_runtime(&rt);
+            if session.runtime_needs_document(&url) && !html.is_empty() {
+                rt.load_document(&html, &url)?;
+                session.mark_runtime_loaded(&url);
+            }
             let res = rt.eval(expr)?;
-            Ok(serde_json::json!({ "evaluated": true, "result": res, "realm": "page-frame" }))
+            session.drain_runtime_telemetry(&rt);
+            Ok(serde_json::json!({ "evaluated": true, "result": res, "realm": "page-frame", "frame_url": url }))
         }
         "ref" => {
             let query = args.get("stable")
@@ -1531,34 +1769,94 @@ pub async fn execute_command(
             }
         }
         "trace" => {
+            // Audit P1-08 + AGENTS.md causal trace completion: propagate
+            // `caused_by = act_id` into the resident runtime's seam so every
+            // network request and console message emitted during the action
+            // is causally linked, plus compute identity-keyed DOM action deltas.
             let ref_id = args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let act_id = format!("act-{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+            let act_id = format!(
+                "act-{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
             let before_actions = session.actions();
-            let page = if !text.is_empty() {
-                session.type_text(ref_id, text).await?
+            let before_refs: std::collections::HashSet<String> =
+                before_actions.iter().map(|a| a.ref_id.clone()).collect();
+
+            let url = session.current_tab().url.clone();
+            if let Ok(rt) = session.get_or_create_runtime(&url) {
+                if let Ok(mut cause_slot) = rt.seam.0.active_cause.lock() {
+                    *cause_slot = Some(act_id.clone());
+                }
+            }
+
+            let action_res = if !text.is_empty() {
+                session.type_text(ref_id, text).await
             } else {
-                session.click(ref_id).await?
+                session.click(ref_id).await
             };
+
+            let cur_url = session.current_tab().url.clone();
+            if let Ok(rt) = session.get_or_create_runtime(&cur_url) {
+                if let Ok(mut cause_slot) = rt.seam.0.active_cause.lock() {
+                    *cause_slot = None;
+                }
+                session.drain_runtime_telemetry(&rt);
+            }
+
+            let page = action_res?;
             let after_actions = session.actions();
-            let caused_network: Vec<serde_json::Value> = Vec::new();
-            let caused_console: Vec<_> = session.console_logs
+            let after_refs: std::collections::HashSet<String> =
+                after_actions.iter().map(|a| a.ref_id.clone()).collect();
+
+            let added: Vec<serde_json::Value> = after_actions
+                .iter()
+                .filter(|a| !before_refs.contains(&a.ref_id))
+                .map(|a| serde_json::json!({ "ref": a.ref_id, "role": a.role, "text": a.text }))
+                .collect();
+            let removed: Vec<serde_json::Value> = before_actions
+                .iter()
+                .filter(|a| !after_refs.contains(&a.ref_id))
+                .map(|a| serde_json::json!({ "ref": a.ref_id, "role": a.role, "text": a.text }))
+                .collect();
+
+            let ledger_view = session.network_ledger.lock().await.query(0, 500, "");
+            let caused_network: Vec<serde_json::Value> = ledger_view["records"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|r| r.get("caused_by").and_then(|v| v.as_str()) == Some(&act_id))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let caused_console: Vec<_> = session
+                .console_logs
                 .iter()
                 .filter(|c| c.get("caused_by").and_then(|v| v.as_str()) == Some(&act_id))
                 .cloned()
                 .collect();
+
             Ok(serde_json::json!({
                 "action_id": act_id,
+                "caused_by": act_id,
                 "acted": { "ref": ref_id, "text": text },
-                "page": { "url": page.url, "status": page.status, "title": page.title },
+                "page": { "url": page.url, "status": page.status, "title": page.title, "document_epoch": session.document_epoch },
                 "dom_delta": {
                     "before_count": before_actions.len(),
                     "after_count": after_actions.len(),
                     "net_delta": after_actions.len() as i64 - before_actions.len() as i64,
+                    "added": added,
+                    "removed": removed,
                 },
                 "network": caused_network,
                 "console": caused_console,
-                "note": "causal action footprint"
+                "dialogs": session.last_dialogs,
+                "note": "causal action footprint (action_id propagated to network ledger and console)"
             }))
         }
         "watch" => {
@@ -1654,50 +1952,43 @@ pub async fn execute_command(
             }))
         }
         "login" => {
+            // Audit P0-07 fix: native memory-only login in Rust (never writes
+            // plaintext credentials to a temporary file on disk).
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
             let username = args.get("username").and_then(|v| v.as_str()).unwrap_or("");
             let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
-            if url.is_empty() || username.is_empty() || password.is_empty() {
-                return Err("login requires url, username, and password".into());
-            }
-            let template = include_str!("../templates/login_runner.py.template");
-            let script = template
-                .replace("{url}", url)
-                .replace("{username}", username)
-                .replace("{password}", password);
-            let tmp_dir = std::env::temp_dir().join("dosh-login");
-            let _ = std::fs::create_dir_all(&tmp_dir);
-            let script_path = tmp_dir.join("login.py");
-            std::fs::write(&script_path, &script).map_err(|e| format!("write login script: {e}"))?;
-            let mut cmd = std::process::Command::new(".venv/bin/python3");
-            cmd.arg(&script_path)
-                .env("WEBRESEARCH_TLS_PROCEED_HOSTS", "erp.aktu.ac.in");
-            // Try to find the project root (parent of dosh-browser-core)
-            let proj_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent()
-                .unwrap_or(std::path::Path::new("."));
-            cmd.current_dir(proj_root);
-            let result = cmd.output().map_err(|e| format!("login subprocess failed: {e}"))?;
-            let output = String::from_utf8_lossy(&result.stdout);
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            for line in output.lines() {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                    return Ok(val);
-                }
-            }
-            Ok(serde_json::json!({
-                "output": output.to_string(),
-                "stderr": stderr.to_string(),
-            }))
+            let out = session.login(url, username, password).await?;
+            Ok(out)
+        }
+        "submit_otp" => {
+            let checkpoint_id = args
+                .get("checkpoint_id")
+                .or_else(|| args.get("checkpoint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let code = args.get("code").and_then(|v| v.as_str()).unwrap_or("");
+            let out = session.submit_otp(checkpoint_id, code).await?;
+            Ok(out)
         }
         "wasm" => {
             if let Some(fuel) = args.get("fuel").and_then(|v| v.as_u64()) {
                 session.wasm_fuel = Some(fuel);
+                session.sync_live_runtime_config()?;
             }
+            let tab_id = session.current_tab().id.clone();
+            let live_fuel = session
+                .runtimes
+                .get(&tab_id)
+                .and_then(|rt| rt.engine.fuel_remaining().ok())
+                .or(session.wasm_fuel)
+                .unwrap_or(0);
             Ok(serde_json::json!({
-                "fuel_remaining": session.wasm_fuel.unwrap_or(0),
+                "fuel_remaining": live_fuel,
+                "configured_fuel": session.wasm_fuel.unwrap_or(0),
                 "anti_tarpit_enabled": session.wasm_fuel.is_some(),
+                "wasm_allowed": session.gate_wasm,
                 "memory_pages_limit": 256,
-                "active_instances": 1,
+                "active_instances": if session.runtimes.contains_key(&tab_id) { 1 } else { 0 },
                 "liftoff_compiled": true,
                 "patch_applied": "0010-liftoff-fuel-trap",
             }))
@@ -1705,6 +1996,7 @@ pub async fn execute_command(
         "clock" => {
             if let Some(set_ms) = args.get("set").and_then(|v| v.as_u64()) {
                 session.virtual_clock_ms = Some(set_ms);
+                session.sync_live_runtime_config()?;
             } else if let Some(adv_ms) = args.get("advance").and_then(|v| v.as_u64()) {
                 let curr = session.virtual_clock_ms.unwrap_or_else(|| {
                     SystemTime::now()
@@ -1713,16 +2005,24 @@ pub async fn execute_command(
                         .as_millis() as u64
                 });
                 session.virtual_clock_ms = Some(curr + adv_ms);
+                session.sync_live_runtime_config()?;
             }
-            let now_ms = session.virtual_clock_ms.unwrap_or_else(|| {
+            let tab_id = session.current_tab().id.clone();
+            let live_vt = session
+                .runtimes
+                .get(&tab_id)
+                .and_then(|rt| rt.engine.virtual_time().ok().flatten())
+                .map(|v| v as u64)
+                .or(session.virtual_clock_ms);
+            let now_ms = live_vt.unwrap_or_else(|| {
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64
             });
             Ok(serde_json::json!({
-                "virtual_clock_ms": session.virtual_clock_ms,
-                "is_virtual": session.virtual_clock_ms.is_some(),
+                "virtual_clock_ms": live_vt,
+                "is_virtual": live_vt.is_some(),
                 "now_ms": now_ms,
                 "patch_applied": "0001-virtual-host-clock",
             }))
@@ -1730,8 +2030,10 @@ pub async fn execute_command(
         "rng" => {
             if let Some(seed) = args.get("seed").and_then(|v| v.as_u64()) {
                 session.prng_seed = Some(seed);
+                session.sync_live_runtime_config()?;
             } else if args.get("reset").and_then(|v| v.as_bool()).unwrap_or(false) {
                 session.prng_seed = None;
+                session.sync_live_runtime_config()?;
             }
             Ok(serde_json::json!({
                 "seed": session.prng_seed,
@@ -1741,13 +2043,80 @@ pub async fn execute_command(
             }))
         }
         "heap" => {
+            // Audit P0-05 + Stage 5: report real live measurements from the
+            // resident V8 actor, envelope band, pressure ladder, Parena spill
+            // tier, and ArrayBuffer pool.
+            let tab_id = session.current_tab().id.clone();
+            let pool = doshgentv8_core::ab_pool::ab_pool_stats();
+            if let Some(rt) = session.runtimes.get(&tab_id) {
+                if let Ok(rep) = rt.engine.get_heap_report() {
+                    let req_mb = if rep.requested_limit_bytes > 0 {
+                        rep.requested_limit_bytes / (1024 * 1024)
+                    } else {
+                        128
+                    };
+                    let nominal_note = if rep.requested_limit_bytes > 0
+                        && rep.granted_bytes != rep.requested_limit_bytes
+                    {
+                        "configured limit is the envelope start (nominal below V8's minimum or raised by the pressure ladder)"
+                    } else {
+                        "granted limit matches requested initial limit"
+                    };
+                    return Ok(serde_json::json!({
+                        "engine": "doshgentv8",
+                        "live_measured": true,
+                        "used_heap_bytes": rep.used_heap_bytes,
+                        "total_heap_bytes": rep.total_heap_bytes,
+                        "heap_limit_bytes": rep.requested_limit_bytes,
+                        "heap_limit_mb": req_mb,
+                        "envelope": {
+                            "requested_bytes": rep.requested_limit_bytes,
+                            "floor_bytes": rep.floor_bytes,
+                            "ceil_bytes": rep.ceil_bytes,
+                            "granted_bytes": rep.granted_bytes,
+                            "note": nominal_note,
+                        },
+                        "pressure_epoch": rep.pressure_epoch,
+                        "external_reported_bytes": rep.external_reported_bytes,
+                        "shrink_fires": rep.shrink_fires,
+                        "eval_count": rep.eval_count,
+                        "parena": {
+                            "ram_bytes": rep.parena_ram_bytes,
+                            "spill_bytes": rep.parena_spill_bytes,
+                            "logical_text_bytes": rep.parena_text_bytes,
+                        },
+                        "ab_pool": {
+                            "enabled": doshgentv8_core::ab_pool::ab_pool_enabled(),
+                            "live_bytes": pool.live,
+                            "peak_bytes": pool.peak,
+                            "allocs": pool.allocs,
+                            "budget_bytes": pool.budget,
+                        },
+                        "semi_space_size_mb": 1,
+                        "turbofan_pruned": true,
+                        "maglev_pruned": true,
+                        "gc_policy": "pressure_graded_envelope",
+                        "patch_applied": "0003-memory-heap-reservation-prune",
+                    }));
+                }
+            }
             Ok(serde_json::json!({
+                "engine": "doshgentv8",
+                "live_measured": false,
+                "note": "no resident actor spawned for this tab yet; reporting default envelope parameters",
                 "heap_limit_bytes": 134217728,
                 "heap_limit_mb": 128,
+                "ab_pool": {
+                    "enabled": doshgentv8_core::ab_pool::ab_pool_enabled(),
+                    "live_bytes": pool.live,
+                    "peak_bytes": pool.peak,
+                    "allocs": pool.allocs,
+                    "budget_bytes": pool.budget,
+                },
                 "semi_space_size_mb": 1,
                 "turbofan_pruned": true,
                 "maglev_pruned": true,
-                "gc_policy": "explicit_drain",
+                "gc_policy": "pressure_graded_envelope",
                 "patch_applied": "0003-memory-heap-reservation-prune",
             }))
         }
@@ -1787,13 +2156,13 @@ pub async fn execute_command(
                             .lock()
                             .await
                             .set_secret_reveal(val);
-                        if val {
-                            session.gate_secret_reveal = true;
-                        }
+                        session.gate_secret_reveal = val;
                     }
                 }
                 _ => {}
             }
+            // Audit P0-06: immediately propagate gate changes to the live actor.
+            session.sync_live_runtime_config()?;
             let reveal_allowed = session
                 .network_ledger
                 .lock()
@@ -1813,6 +2182,196 @@ pub async fn execute_command(
                 .unwrap_or("inspect this page and collect tokens");
             let result = Box::pin(crate::assist::plan_walkthrough(goal, session, store)).await;
             Ok(serde_json::to_value(&result)?)
+        }
+        "find" => {
+            // AGENTIC-VERIFY-CLASSIFY §3: in-page find / find-next with match
+            // count, active match index, block id, and nearest action ref.
+            let query = args
+                .get("query")
+                .or_else(|| args.get("term"))
+                .or_else(|| args.get("q"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if query.is_empty() {
+                return Err("find requires a non-empty query string".into());
+            }
+            let case_sensitive = args.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false);
+            let index = args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let tab = session.current_tab();
+            let title = tab.page().map(|p| p.title).unwrap_or_default();
+            let actions = crate::actions::extract_actions(&tab.html, &tab.url, 500);
+            let acd = crate::acd::build_acd(&tab.url, &title, &tab.html, &actions, &[], &[], &serde_json::json!({}), 500);
+            let needle = if case_sensitive { query.to_string() } else { query.to_lowercase() };
+
+            let mut matches = Vec::new();
+            for block in &acd.blocks {
+                let hay = if case_sensitive { block.text.clone() } else { block.text.to_lowercase() };
+                if let Some(pos) = hay.find(&needle) {
+                    let start = pos.saturating_sub(40);
+                    let end = (pos + needle.len() + 60).min(block.text.len());
+                    // Safe UTF-8 char boundary slicing
+                    let snippet: String = block
+                        .text
+                        .char_indices()
+                        .filter(|&(i, _)| i >= start && i < end)
+                        .map(|(_, c)| c)
+                        .collect();
+                    let linked_ref = actions
+                        .iter()
+                        .find(|a| {
+                            let at = if case_sensitive { a.text.clone() } else { a.text.to_lowercase() };
+                            !at.is_empty() && (at.contains(&needle) || hay.contains(&at))
+                        })
+                        .map(|a| a.ref_id.clone());
+                    matches.push(serde_json::json!({
+                        "match_index": matches.len(),
+                        "block_id": block.id,
+                        "block_type": block.block_type,
+                        "locator": block.locator,
+                        "snippet": snippet,
+                        "action_ref": linked_ref,
+                    }));
+                }
+            }
+            let current = matches.get(index).cloned().unwrap_or(serde_json::Value::Null);
+            Ok(serde_json::json!({
+                "query": query,
+                "total_matches": matches.len(),
+                "active_index": if matches.is_empty() { serde_json::Value::Null } else { serde_json::json!(index.min(matches.len() - 1)) },
+                "active_match": current,
+                "matches": matches,
+            }))
+        }
+        "page_query" => {
+            // AGENTIC-VERIFY-CLASSIFY §3: structured traversal over ACD blocks,
+            // action surface, and collections in one query.
+            let term = args.get("term").or_else(|| args.get("query")).and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let kind_filter = args.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let role_filter = args.get("role").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let category_filter = args.get("category").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+
+            let tab = session.current_tab();
+            let title = tab.page().map(|p| p.title).unwrap_or_default();
+            let actions = crate::actions::extract_actions(&tab.html, &tab.url, 500);
+            let acd = crate::acd::build_acd(&tab.url, &title, &tab.html, &actions, &[], &[], &serde_json::json!({}), 500);
+
+            let matched_blocks: Vec<serde_json::Value> = acd
+                .blocks
+                .iter()
+                .filter(|b| {
+                    if !term.is_empty() && !b.text.to_lowercase().contains(&term) {
+                        return false;
+                    }
+                    if !category_filter.is_empty() {
+                        let cat = b.semantic_category.as_deref().unwrap_or("").to_lowercase();
+                        if !cat.contains(&category_filter) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .take(limit)
+                .filter_map(|b| serde_json::to_value(b).ok())
+                .collect();
+
+            let matched_actions: Vec<serde_json::Value> = acd
+                .actions
+                .iter()
+                .filter(|a| {
+                    if !term.is_empty()
+                        && !a.label.to_lowercase().contains(&term)
+                        && !a.name.to_lowercase().contains(&term)
+                    {
+                        return false;
+                    }
+                    if !kind_filter.is_empty() && a.kind.to_lowercase() != kind_filter {
+                        return false;
+                    }
+                    if !role_filter.is_empty() && a.role.to_lowercase() != role_filter {
+                        return false;
+                    }
+                    true
+                })
+                .take(limit)
+                .filter_map(|a| serde_json::to_value(a).ok())
+                .collect();
+
+            Ok(serde_json::json!({
+                "url": tab.url,
+                "document_epoch": session.document_epoch,
+                "blocks": matched_blocks,
+                "actions": matched_actions,
+                "collections": acd.collections,
+                "counts": {
+                    "blocks_matched": matched_blocks.len(),
+                    "actions_matched": matched_actions.len(),
+                    "collections_total": acd.collections.len(),
+                }
+            }))
+        }
+        "canvas2digest" => {
+            // AGENTIC-VERIFY-CLASSIFY §4: non-pixel Canvas 2D translator
+            // (dimensions, drawn state, non-blank ratio, dominant RGBA palette).
+            let url = session.current_tab().url.clone();
+            let html = session.current_tab().html.clone();
+            let mut rt = session.get_or_create_runtime(&url)?;
+            session.configure_runtime(&rt);
+            if session.runtime_needs_document(&url) && !html.is_empty() {
+                rt.load_document(&html, &url)?;
+                session.mark_runtime_loaded(&url);
+            }
+            let probe = r#"(function(){
+                var els = document.querySelectorAll('canvas');
+                var out = [];
+                for (var i = 0; i < els.length; i++) {
+                    var c = els[i];
+                    var w = Number(c.width || 300), h = Number(c.height || 150);
+                    var rect = c.getBoundingClientRect ? c.getBoundingClientRect() : {x:0,y:0,width:w,height:h};
+                    var nonBlank = 0, total = w * h;
+                    var palette = {};
+                    var pix = (c.__raster && c.__raster.pix) ? c.__raster.pix : (c.__ctx2d && c.__ctx2d.__raster && c.__ctx2d.__raster.pix) ? c.__ctx2d.__raster.pix : null;
+                    if (!pix && c.getContext) {
+                        try {
+                            var id = c.getContext('2d').getImageData(0, 0, w, h);
+                            if (id && id.data) pix = id.data;
+                        } catch(e){}
+                    }
+                    if (pix) {
+                        var step = Math.max(1, Math.floor((w * h) / 4096));
+                        var sampled = 0;
+                        for (var p = 0; p < pix.length; p += 4 * step) {
+                            sampled++;
+                            var r = pix[p], g = pix[p+1], b = pix[p+2], a = pix[p+3];
+                            if (a > 0) {
+                                nonBlank++;
+                                var hex = '#' + [r,g,b].map(function(x){ var s=x.toString(16); return s.length===1?'0'+s:s; }).join('');
+                                palette[hex] = (palette[hex] || 0) + 1;
+                            }
+                        }
+                        total = sampled || 1;
+                    }
+                    var topColors = Object.keys(palette).sort(function(a,b){ return palette[b]-palette[a]; }).slice(0, 8).map(function(k){
+                        return { color: k, samples: palette[k] };
+                    });
+                    out.push({
+                        index: i,
+                        id: c.id || '',
+                        width: w,
+                        height: h,
+                        ops_count: Number(c.__ops || 0),
+                        drawn: nonBlank > 0 || Number(c.__ops || 0) > 0,
+                        non_blank_ratio: total > 0 ? Math.round((nonBlank / total) * 1000) / 1000 : 0,
+                        dominant_palette: topColors,
+                        rect: rect
+                    });
+                }
+                return JSON.stringify({ canvases: out, count: out.length });
+            })()"#;
+            let raw = rt.eval(probe)?;
+            let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({ "canvases": [], "count": 0 }));
+            Ok(parsed)
         }
         _ => {
             Err(format!("unknown command: {}", command).into())
@@ -2595,8 +3154,9 @@ mod tests {
     async fn test_shell_45_commands_completeness() {
         // 46 original commands + 6 Phase-1 additions (net.stream/ws/cors/
         // timing/replay/decode) + 3 Phase-2 additions (state.snapshot/
-        // state.diff/state.rollback) + select (Phase 3 E2).
-        assert_eq!(COMMANDS.len(), 56);
+        // state.diff/state.rollback) + select (Phase 3 E2) + 4 audit/agentic
+        // additions (submit_otp, find, page_query, canvas2digest).
+        assert_eq!(COMMANDS.len(), 60);
         let client = reqwest::Client::new();
         let mut session = Session::new(client);
         let store = ShellStore::new(None).unwrap();
@@ -2663,5 +3223,260 @@ mod tests {
         assert_eq!(res["imported"], true);
         assert!(session.current_cookies().contains_key("sid"));
         assert_eq!(session.current_cookies().get("sid").unwrap(), "xyz123abc");
+    }
+
+    #[tokio::test]
+    async fn test_act_epoch_fencing_and_idempotency_key() {
+        // State Weave §8 + Audit P1-04: idempotency_key prevents duplicate
+        // action side effects, and expected_epoch fences stale callers.
+        let client = reqwest::Client::new();
+        let mut session = Session::new(client);
+        let store = ShellStore::new(None).unwrap();
+
+        let html = "<html><head><title>idem</title></head><body>\
+            <span id=\"cnt\">0</span>\
+            <button id=\"inc\" onclick=\"var c=document.getElementById('cnt');c.textContent=String(Number(c.textContent)+1)\">Increment</button>\
+            </body></html>";
+        session.goto_html("https://example.com/", html, 4000).unwrap();
+        let epoch0 = session.document_epoch;
+
+        let inv = execute_command("actions", &serde_json::json!({}), &mut session, &store).await.unwrap();
+        let ref_id = inv["actions"][0]["ref_id"].as_str().unwrap().to_string();
+
+        // First call with expected_epoch and idempotency_key
+        let r1 = execute_command(
+            "act",
+            &serde_json::json!({
+                "ref": ref_id,
+                "expected_epoch": epoch0,
+                "idempotency_key": "click-inc-1"
+            }),
+            &mut session,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r1["replayed_idempotent"], false);
+        assert_eq!(r1["old_document_epoch"], epoch0);
+        assert!(r1["new_document_epoch"].as_u64().unwrap() > epoch0);
+
+        // Retry with the SAME idempotency_key: returns cached outcome without incrementing counter again!
+        let r2 = execute_command(
+            "act",
+            &serde_json::json!({
+                "ref": ref_id,
+                "expected_epoch": epoch0,
+                "idempotency_key": "click-inc-1"
+            }),
+            &mut session,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r2["replayed_idempotent"], true);
+
+        let check = execute_command(
+            "eval",
+            &serde_json::json!({ "source": "return document.getElementById('cnt').textContent" }),
+            &mut session,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert_eq!(check["result"], "1", "counter must only have incremented once");
+
+        // New action with a STALE expected_epoch must be refused honestly
+        let stale = execute_command(
+            "act",
+            &serde_json::json!({
+                "ref": ref_id,
+                "expected_epoch": epoch0,
+                "idempotency_key": "click-inc-2"
+            }),
+            &mut session,
+            &store,
+        )
+        .await;
+        assert!(stale.is_err());
+        assert!(stale.unwrap_err().to_string().contains("stale_epoch"));
+    }
+
+    #[tokio::test]
+    async fn test_trace_causal_network_and_console_link() {
+        // Audit P1-08 + AGENTS.md causal trace: `trace` links DOM delta,
+        // network requests (caused_by == action_id), and console messages.
+        let client = reqwest::Client::new();
+        let mut session = Session::new(client);
+        let store = ShellStore::new(None).unwrap();
+
+        // Mock an API endpoint so the button click's fetch succeeds hermetically
+        execute_command(
+            "net.rule",
+            &serde_json::json!({
+                "action": "mock",
+                "pattern": "api.example.com/ping",
+                "status": 200,
+                "body": "{\"pong\":true}",
+                "content_type": "application/json"
+            }),
+            &mut session,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        let html = "<html><head><title>trace</title></head><body>\
+            <div id=\"box\"></div>\
+            <button id=\"ping\" onclick=\"console.log('ping_clicked'); fetch('https://api.example.com/ping'); var b=document.createElement('button'); b.id='after_btn'; b.textContent='After'; document.getElementById('box').appendChild(b);\">Ping</button>\
+            </body></html>";
+        session.goto_html("https://example.com/", html, 4000).unwrap();
+
+        let inv = execute_command("actions", &serde_json::json!({}), &mut session, &store).await.unwrap();
+        let ref_id = inv["actions"][0]["ref_id"].as_str().unwrap().to_string();
+
+        let tr = execute_command("trace", &serde_json::json!({ "ref": ref_id }), &mut session, &store)
+            .await
+            .unwrap();
+        let act_id = tr["action_id"].as_str().unwrap();
+        assert!(act_id.starts_with("act-"));
+        assert_eq!(tr["caused_by"], act_id);
+        assert_eq!(tr["dom_delta"]["added"].as_array().unwrap().len(), 1);
+        assert_eq!(tr["dom_delta"]["added"][0]["text"], "After");
+        assert_eq!(tr["console"].as_array().unwrap().len(), 1);
+        assert_eq!(tr["console"][0]["message"], "ping_clicked");
+        assert_eq!(tr["console"][0]["caused_by"], act_id);
+        assert_eq!(tr["network"].as_array().unwrap().len(), 1);
+        assert_eq!(tr["network"][0]["caused_by"], act_id);
+    }
+
+    #[tokio::test]
+    async fn test_heap_live_measured_and_frame_eval_child_realm() {
+        let client = reqwest::Client::new();
+        let mut session = Session::new(client);
+        let store = ShellStore::new(None).unwrap();
+
+        let html = "<html><head><title>parent</title></head><body>\
+            <canvas id=\"c\" width=\"40\" height=\"40\"></canvas>\
+            <script>var ctx=document.getElementById('c').getContext('2d'); ctx.fillStyle='#ff0000'; ctx.fillRect(0,0,20,20);</script>\
+            <iframe name=\"child\" srcdoc=\"<html><head><title>ChildFrame</title></head><body><script>window.__childVal = 99;</script><p>Inner frame text</p></body></html>\"></iframe>\
+            </body></html>";
+        session.goto_html("https://example.com/", html, 4000).unwrap();
+
+        // 1. Live heap report from resident actor
+        let hp = execute_command("heap", &serde_json::json!({}), &mut session, &store).await.unwrap();
+        assert_eq!(hp["live_measured"], true);
+        assert!(hp["used_heap_bytes"].as_u64().unwrap() > 0);
+        assert!(hp["parena"]["ram_bytes"].as_u64().unwrap() > 0);
+
+        // 2. Child frame evaluation in its own isolated realm
+        let fe = execute_command(
+            "frame.eval",
+            &serde_json::json!({ "frame": "frame-1", "expr": "document.title + ':' + window.__childVal" }),
+            &mut session,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fe["realm"], "frame-1");
+        assert_eq!(fe["result"], "ChildFrame:99");
+
+        // 3. Canvas2digest non-pixel agent summary
+        let cd = execute_command("canvas2digest", &serde_json::json!({}), &mut session, &store).await.unwrap();
+        assert_eq!(cd["count"], 1);
+        assert_eq!(cd["canvases"][0]["drawn"], true);
+        assert!(cd["canvases"][0]["non_blank_ratio"].as_f64().unwrap() > 0.0);
+        assert_eq!(cd["canvases"][0]["dominant_palette"][0]["color"], "#ff0000");
+
+        // 4. Find & page_query
+        let fnd = execute_command("find", &serde_json::json!({ "query": "parent" }), &mut session, &store).await.unwrap();
+        assert!(fnd["total_matches"].as_u64().unwrap_or(0) == 0);
+        let pq = execute_command("page_query", &serde_json::json!({}), &mut session, &store).await.unwrap();
+        assert!(pq["counts"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_native_memory_only_login_and_external_esm_loader() {
+        let client = reqwest::Client::new();
+        let mut session = Session::new(client);
+        let store = ShellStore::new(None).unwrap();
+
+        // 1. Mock an external ES module script via net.rule
+        execute_command(
+            "net.rule",
+            &serde_json::json!({
+                "action": "mock",
+                "pattern": "example.com/app.mjs",
+                "status": 200,
+                "body": "export const GREETING = 'ESM_LOADED_OK'; window.__esmVal = GREETING;",
+                "content_type": "application/javascript"
+            }),
+            &mut session,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        let html = r#"<html><head><title>Login</title></head><body>
+            <script type="module" src="https://example.com/app.mjs"></script>
+            <script>
+                window.__toOtp = function() {
+                    document.body.innerHTML = '<h2>Verify your identity</h2><p>Enter the 6-digit verification code we sent</p><input id="otp" name="otp" maxlength="6" /><button id="vbtn" type="button" onclick="window.__finishOtp()">Verify</button>';
+                };
+                window.__finishOtp = function() {
+                    document.body.innerHTML = '<h1>Welcome back</h1><a href="/logout">Log out</a>';
+                };
+            </script>
+            <form id="f">
+                <input id="user" name="username" type="text" placeholder="Email" />
+                <input id="pass" name="password" type="password" placeholder="Password" />
+                <button id="go" type="button" onclick="window.__toOtp()">Sign in</button>
+            </form>
+        </body></html>"#;
+        session.goto_html("https://example.com/login", html, 4000).unwrap();
+
+        // Verify external ES module executed via rule mock
+        let esm_chk = execute_command(
+            "eval",
+            &serde_json::json!({ "source": "return String(window.__esmVal || '')" }),
+            &mut session,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert_eq!(esm_chk["result"], "ESM_LOADED_OK");
+
+        // 2. Native memory-only login transitions to otp_required checkpoint
+        let login_res = execute_command(
+            "login",
+            &serde_json::json!({
+                "url": "mock://current",
+                "username": "alice@example.com",
+                "password": "correct-horse-battery-staple"
+            }),
+            &mut session,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert_eq!(login_res["verdict"], "otp_required");
+        assert_eq!(login_res["secrets_persisted"], false);
+        let raw_login = serde_json::to_string(&login_res).unwrap();
+        assert!(!raw_login.contains("correct-horse-battery-staple"), "password must never leak in result");
+
+        let cp_id = login_res["checkpoint_id"].as_str().unwrap().to_string();
+        let otp_res = execute_command(
+            "submit_otp",
+            &serde_json::json!({
+                "checkpoint_id": cp_id,
+                "code": "123456"
+            }),
+            &mut session,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert_eq!(otp_res["verdict"], "verified");
+        let raw_otp = serde_json::to_string(&otp_res).unwrap();
+        assert!(!raw_otp.contains("123456"), "OTP code must never leak in result");
     }
 }

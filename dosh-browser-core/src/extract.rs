@@ -65,8 +65,8 @@ pub fn extract_fields(
                     .split_whitespace()
                     .collect::<Vec<&str>>()
                     .join(" ");
-                let capped = if collapsed.len() > 4000 {
-                    collapsed[..4000].to_string()
+                let capped = if collapsed.chars().count() > 4000 {
+                    collapsed.chars().take(4000).collect::<String>()
                 } else {
                     collapsed
                 };
